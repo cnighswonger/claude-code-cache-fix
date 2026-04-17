@@ -504,6 +504,262 @@ function findDeferredToolsBlockInBody(body) {
   return null;
 }
 
+// --------------------------------------------------------------------------
+// cache_control_sticky — preserve historical marker positions across turns
+// --------------------------------------------------------------------------
+//
+// Covers a cache-miss class that cache_control_normalize can't reach by
+// itself. CC maintains at most one user-side cache_control marker at a time:
+// as conversation grows, CC moves the marker from the tail of one user turn
+// to the tail of the next, DROPPING it from the previous position. The
+// dropped position's block loses the ~43 bytes of `"cache_control":{"type":
+// "ephemeral","ttl":"1h"}` framing — a tail-of-message byte diff that
+// invalidates every downstream cached block (~600K tokens' worth on a
+// long-running session).
+//
+// Observed instance: at 16:27:13 UTC today, a 1284-message session emitted
+// cw=804,428 (hit=2.3%). Diff of main-session bodies 585 → 587 showed ONE
+// message diverged — msg[1281] — which lost its cache_control marker (43
+// bytes) because CC had moved the marker to the new last user msg[1283].
+//
+// cache_control_normalize places exactly ONE canonical marker at the last
+// block of the last user message on every outbound body. That solves the
+// current-marker-drift class but cannot preserve historical markers — CC
+// has already dropped them by the time the payload reaches this extension.
+//
+// This sticky extension maintains per-session state tracking where markers
+// have appeared in prior turns, and reinstates them on future turns as
+// additive preservation. Up to 3 historical message-level markers are
+// tracked (Anthropic's hard limit is 4 cache_control markers total — 1 for
+// system[2] + 3 for message-level breakpoints). When a historical position
+// would exceed the cap, the oldest tracked entry is dropped (LRU).
+//
+// Messages are identified by a stable hash so that compaction rewrites /
+// index shifts don't confuse the tracker:
+//   - If the message has a tool_use or tool_result block with an `id` or
+//     `tool_use_id`, hash `role|id`.
+//   - Otherwise hash `role|firstTextContent.slice(0, 256)`.
+//
+// Pipeline order: runs AFTER cache_control_normalize (when it's present) so
+// normalize first pins the canonical marker at the last user msg, then
+// sticky re-adds historical markers on their hashed messages. Skips any
+// message already carrying a marker (fast no-op when sticky fires first).
+//
+// Opt-out via CACHE_FIX_SKIP_CACHE_CONTROL_STICKY=1 (defaults ON).
+// --------------------------------------------------------------------------
+
+const CACHE_CONTROL_STICKY_DIR = join(homedir(), ".claude", "cache-fix-state");
+const CACHE_CONTROL_STICKY_MAX_POSITIONS = 3;
+const CACHE_CONTROL_STICKY_DEFAULT_MARKER = { type: "ephemeral", ttl: "1h" };
+
+/**
+ * Build the absolute state-file path for a given project key. Exported so
+ * tests can assert on path derivation without duplicating hash logic.
+ */
+function cacheControlStickyStatePath(key) {
+  const hash = createHash("sha1").update(String(key)).digest("hex").slice(0, 16);
+  return join(CACHE_CONTROL_STICKY_DIR, `cache-control-sticky-${hash}.json`);
+}
+
+/**
+ * Compute a stable hash identifier for a message that survives content-
+ * block insertions (e.g. smoosh_split peeling a reminder into a new block
+ * but the first text block's first 256 bytes don't change) and index shifts
+ * (e.g. compaction). Returns null if the message has no identifiable
+ * content. Pure; exported for unit tests.
+ */
+function computeStickyMessageHash(msg) {
+  if (!msg || typeof msg !== "object") return null;
+  const role = typeof msg.role === "string" ? msg.role : "";
+  if (!Array.isArray(msg.content) || msg.content.length === 0) return null;
+  // Prefer tool_use/tool_result identifiers when present — they're the
+  // most stable anchors.
+  for (const b of msg.content) {
+    if (!b || typeof b !== "object") continue;
+    if (b.type === "tool_use" && typeof b.id === "string" && b.id) {
+      return createHash("sha1").update(`${role}|tool_use|${b.id}`).digest("hex").slice(0, 16);
+    }
+    if (b.type === "tool_result" && typeof b.tool_use_id === "string" && b.tool_use_id) {
+      return createHash("sha1").update(`${role}|tool_result|${b.tool_use_id}`).digest("hex").slice(0, 16);
+    }
+  }
+  // Fallback: first text block's first 256 bytes.
+  for (const b of msg.content) {
+    if (!b || typeof b !== "object") continue;
+    if (b.type === "text" && typeof b.text === "string") {
+      const prefix = b.text.slice(0, 256);
+      return createHash("sha1").update(`${role}|text|${prefix}`).digest("hex").slice(0, 16);
+    }
+  }
+  return null;
+}
+
+/**
+ * Read persisted sticky state for a project key. Returns a fresh empty
+ * state on missing file, unreadable file, or corrupt JSON — never throws.
+ * Shape: `{ version: 1, positions: [{msg_hash, position_hint, marker}] }`.
+ */
+function readCacheControlStickyState(key) {
+  const path = cacheControlStickyStatePath(key);
+  let raw;
+  try {
+    raw = readFileSync(path, "utf-8");
+  } catch {
+    return { version: 1, positions: [] };
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.positions)) {
+      debugLog("cache_control_sticky: state file malformed shape — resetting");
+      return { version: 1, positions: [] };
+    }
+    const positions = [];
+    for (const p of parsed.positions) {
+      if (!p || typeof p !== "object") continue;
+      if (typeof p.msg_hash !== "string" || !p.msg_hash) continue;
+      positions.push({
+        msg_hash: p.msg_hash,
+        position_hint: p.position_hint === "last_block" ? "last_block" : "last_block",
+        marker:
+          p.marker && typeof p.marker === "object" && typeof p.marker.type === "string"
+            ? { ...p.marker }
+            : { ...CACHE_CONTROL_STICKY_DEFAULT_MARKER },
+      });
+    }
+    return { version: 1, positions };
+  } catch (e) {
+    debugLog(`cache_control_sticky: state JSON parse error (${e?.message}) — resetting`);
+    return { version: 1, positions: [] };
+  }
+}
+
+/**
+ * Atomic-write persisted sticky state. Best-effort; silent on I/O errors.
+ */
+function writeCacheControlStickyState(key, state) {
+  const path = cacheControlStickyStatePath(key);
+  try {
+    mkdirSync(CACHE_CONTROL_STICKY_DIR, { recursive: true });
+    const tmp = path + ".tmp";
+    writeFileSync(tmp, JSON.stringify(state, null, 2), "utf-8");
+    renameSync(tmp, path);
+  } catch (e) {
+    debugLog(`cache_control_sticky: state write error (${e?.message})`);
+  }
+}
+
+/**
+ * Pure core: given a body and the currently-persisted state, compute the
+ * next state and the list of marker mutations to apply to the body. No
+ * I/O, no body mutation — the wrapper is responsible for applying results.
+ *
+ * Algorithm:
+ *  1. Walk user-role messages; for each block-with-cache_control, record
+ *     `{msg_hash, marker}` into `observed`. Duplicate hashes keep the
+ *     first (most recent in message order).
+ *  2. Merge `observed` into the prior `state.positions`: newly-observed
+ *     hashes are appended (or moved to the front if re-seen); absent-from-
+ *     this-body hashes are kept so they persist across turns.
+ *  3. For each hash in the new state, locate the corresponding message in
+ *     the body (by hash match). If found AND the message's last block
+ *     does NOT already carry a marker, emit a mutation to set it.
+ *  4. Cap the new state at CACHE_CONTROL_STICKY_MAX_POSITIONS (oldest
+ *     entries dropped first — LRU keyed on most-recent touch).
+ *
+ * Returns `{newState, mutations}` where mutations =
+ * `[{msgIdx, blockIdx, marker}]`. Pure; exported for unit tests.
+ */
+function updateCacheControlStickyState(body, priorState) {
+  const empty = { newState: { version: 1, positions: [] }, mutations: [] };
+  if (!body || typeof body !== "object" || !Array.isArray(body.messages)) return empty;
+  const prior =
+    priorState && Array.isArray(priorState.positions)
+      ? { version: 1, positions: priorState.positions.slice() }
+      : { version: 1, positions: [] };
+
+  // Build hash → msgIdx index for this body's user messages.
+  const hashToMsgIdx = new Map();
+  const observed = []; // [{msg_hash, marker}] in message order
+  for (let m = 0; m < body.messages.length; m++) {
+    const msg = body.messages[m];
+    if (!msg || msg.role !== "user" || !Array.isArray(msg.content) || msg.content.length === 0) continue;
+    const h = computeStickyMessageHash(msg);
+    if (!h) continue;
+    if (!hashToMsgIdx.has(h)) hashToMsgIdx.set(h, m);
+    // Observe any existing marker on this message (any block).
+    for (const b of msg.content) {
+      if (b && typeof b === "object" && b.cache_control && typeof b.cache_control === "object") {
+        observed.push({ msg_hash: h, marker: { ...b.cache_control } });
+        break;
+      }
+    }
+  }
+
+  // Merge observed into prior: move observed hashes to the end (most
+  // recent), refresh their marker. Unobserved prior entries stay in place.
+  const priorIndex = new Map(prior.positions.map((p, i) => [p.msg_hash, i]));
+  const nextPositions = prior.positions.slice();
+  for (const ob of observed) {
+    if (priorIndex.has(ob.msg_hash)) {
+      const i = priorIndex.get(ob.msg_hash);
+      nextPositions[i] = { msg_hash: ob.msg_hash, position_hint: "last_block", marker: ob.marker };
+    } else {
+      nextPositions.push({ msg_hash: ob.msg_hash, position_hint: "last_block", marker: ob.marker });
+      priorIndex.set(ob.msg_hash, nextPositions.length - 1);
+    }
+  }
+
+  // Cap at MAX_POSITIONS: keep the NEWEST (end of array) entries.
+  let capped = nextPositions;
+  if (capped.length > CACHE_CONTROL_STICKY_MAX_POSITIONS) {
+    capped = capped.slice(capped.length - CACHE_CONTROL_STICKY_MAX_POSITIONS);
+  }
+
+  // Compute mutations: for each tracked hash present in this body, if the
+  // message doesn't already have any marker, add one at its last block.
+  const mutations = [];
+  for (const pos of capped) {
+    const msgIdx = hashToMsgIdx.get(pos.msg_hash);
+    if (msgIdx === undefined) continue;
+    const msg = body.messages[msgIdx];
+    if (!msg || !Array.isArray(msg.content) || msg.content.length === 0) continue;
+    const hasMarker = msg.content.some(
+      (b) => b && typeof b === "object" && b.cache_control && typeof b.cache_control === "object"
+    );
+    if (hasMarker) continue;
+    mutations.push({
+      msgIdx,
+      blockIdx: msg.content.length - 1,
+      marker: { ...pos.marker },
+    });
+  }
+
+  return { newState: { version: 1, positions: capped }, mutations };
+}
+
+/**
+ * Wrapper: read state, compute mutations via
+ * updateCacheControlStickyState, apply mutations to `body` in place, write
+ * next state. Returns the count of marker mutations applied. Silent on
+ * any I/O error (best-effort).
+ */
+function applyCacheControlSticky(body, key) {
+  if (!body || typeof body !== "object" || !Array.isArray(body.messages)) return 0;
+  const prior = readCacheControlStickyState(key);
+  const { newState, mutations } = updateCacheControlStickyState(body, prior);
+  for (const mut of mutations) {
+    const msg = body.messages[mut.msgIdx];
+    if (!msg || !Array.isArray(msg.content)) continue;
+    const newContent = msg.content.slice();
+    const target = newContent[mut.blockIdx];
+    if (!target || typeof target !== "object") continue;
+    newContent[mut.blockIdx] = { ...target, cache_control: { ...mut.marker } };
+    body.messages[mut.msgIdx] = { ...msg, content: newContent };
+  }
+  writeCacheControlStickyState(key, newState);
+  return mutations.length;
+}
+
 /**
  * Core fix: on EVERY call, scan the entire message array for the LATEST
  * relocatable blocks (skills, MCP, deferred tools, hooks) and ensure they
@@ -905,6 +1161,7 @@ const _STATS_SCHEMA = {
   session_start_normalize: { applied: 0, skipped: 0, lastApplied: null },
   continue_trailer_strip: { applied: 0, skipped: 0, lastApplied: null },
   deferred_tools_restore: { applied: 0, skipped: 0, lastApplied: null },
+  cache_control_sticky: { applied: 0, skipped: 0, lastApplied: null },
 };
 
 function _createEmptyStats() {
@@ -1761,6 +2018,34 @@ globalThis.fetch = async function (url, options) {
         }
       }
 
+      // Extension: cache_control_sticky — reinstate historical cache_control
+      // markers on messages whose position CC has moved past. CC maintains
+      // at most one user-side marker at a time; as it moves the marker to
+      // the tail of each new user turn, the previous position loses the ~43
+      // bytes of cache_control framing — a tail-of-message byte drift that
+      // breaks every downstream cached block. This extension tracks marker
+      // positions by stable message-hash across turns (up to 3) and re-adds
+      // them on future bodies. Runs AFTER cache_control_normalize (when
+      // present) so normalize pins the canonical tail-marker first and
+      // sticky re-adds the historical ones. State file is per-project at
+      // ~/.claude/cache-fix-state/cache-control-sticky-<sha1(cwd)>.json.
+      // Opt-out via CACHE_FIX_SKIP_CACHE_CONTROL_STICKY=1 (defaults ON).
+      if (shouldApplyFix("cache_control_sticky") && payload.messages) {
+        try {
+          const stickyApplied = applyCacheControlSticky(payload, process.cwd());
+          if (stickyApplied > 0) {
+            modified = true;
+            debugLog(`APPLIED: cache_control_sticky reinstated ${stickyApplied} historical marker(s)`);
+            recordFixResult("cache_control_sticky", "applied");
+          } else {
+            recordFixResult("cache_control_sticky", "skipped");
+          }
+        } catch (e) {
+          debugLog(`cache_control_sticky: error (${e?.message}) — skipped`);
+          recordFixResult("cache_control_sticky", "skipped");
+        }
+      }
+
       // Bug 5: TTL enforcement (configurable per request type)
       // The client gates 1h cache TTL behind a GrowthBook allowlist that checks
       // querySource against patterns like "repl_main_thread*", "sdk", "auto_mode".
@@ -2193,5 +2478,13 @@ export {
   deferredToolsSnapshotPath,
   DEFERRED_TOOLS_AVAILABLE_MARKER,
   DEFERRED_TOOLS_UNAVAILABLE_MARKER,
+  computeStickyMessageHash,
+  cacheControlStickyStatePath,
+  updateCacheControlStickyState,
+  applyCacheControlSticky,
+  readCacheControlStickyState,
+  writeCacheControlStickyState,
+  CACHE_CONTROL_STICKY_MAX_POSITIONS,
+  CACHE_CONTROL_STICKY_DEFAULT_MARKER,
   _pinnedBlocks,  // exported so tests can reset between runs
 };
