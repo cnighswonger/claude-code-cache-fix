@@ -388,6 +388,106 @@ function normalizeSessionStartText(text) {
   return [out, count];
 }
 
+// --------------------------------------------------------------------------
+// tool_use.input field-set normalization
+// --------------------------------------------------------------------------
+//
+// CC's serialization of `tool_use.input` can drift between turns when the
+// caller passes fields not declared in the tool's `input_schema.properties`.
+// Observed case: a SendMessage tool call where the caller passed
+// `{to, summary, message, type, recipient, content}`. Pre-miss body
+// serialized input as `{to, summary, message}` (3 schema-only keys).
+// Post-miss body (same tool_use_id, same turn position) serialized the
+// same block as `{to, summary, message, type, recipient, content}` (6 keys
+// — extras preserved). That byte drift at a mid-history assistant message
+// re-caches every block from that message forward → full-session-cost miss.
+//
+// Concrete instance: 2334-byte drift on ONE assistant-side tool_use block
+// caused a 619,722 `cache_creation_input_tokens` miss at 15:16:52 UTC on
+// msg[844] of a long-running session.
+//
+// This helper walks every assistant-role message's tool_use blocks, looks
+// up the tool's declared `input_schema.properties` from `body.tools`, and
+// rewrites `input` to contain ONLY the schema keys (in schema declaration
+// order). Tools with no schema in `body.tools` are left untouched — we
+// can't determine what's legitimate vs extra.
+//
+// Agent behavior is unaffected — extras weren't declared in the schema so
+// downstream consumers shouldn't rely on them. The point of this pass is
+// to pin the serialization to the schema's field set so CC's own drift
+// between turns can't break cache.
+// --------------------------------------------------------------------------
+
+/**
+ * Mutate `body` in place: for every assistant-role message's tool_use
+ * blocks whose tool name matches an entry in `body.tools` with a known
+ * `input_schema.properties`, replace `input` with a new object containing
+ * ONLY the schema-declared keys, preserved in schema declaration order.
+ * Returns the count of tool_use blocks modified (0 if nothing changed or
+ * preconditions missing). Pure transform: safe to call repeatedly.
+ */
+function normalizeToolUseInputsInBody(body) {
+  if (!body || typeof body !== "object") return 0;
+  if (!Array.isArray(body.messages) || !Array.isArray(body.tools)) return 0;
+
+  // Build toolSchemas: { name: orderedKeys[] } from body.tools entries
+  // that declare input_schema.properties.
+  const toolSchemas = Object.create(null);
+  for (const tool of body.tools) {
+    if (!tool || typeof tool !== "object") continue;
+    const name = tool.name;
+    if (typeof name !== "string") continue;
+    const props = tool.input_schema && tool.input_schema.properties;
+    if (!props || typeof props !== "object") continue;
+    toolSchemas[name] = Object.keys(props);
+  }
+
+  let modified = 0;
+  for (const msg of body.messages) {
+    if (!msg || msg.role !== "assistant") continue;
+    if (!Array.isArray(msg.content)) continue;
+    for (let i = 0; i < msg.content.length; i++) {
+      const block = msg.content[i];
+      if (!block || block.type !== "tool_use") continue;
+      if (!block.input || typeof block.input !== "object" || Array.isArray(block.input)) continue;
+      const schemaKeys = toolSchemas[block.name];
+      if (!schemaKeys) continue; // unknown tool — skip
+      const currentKeys = Object.keys(block.input);
+      // Determine if any non-schema key is present. If all current keys
+      // are in schema AND their order already matches a subset of
+      // schemaKeys order, we could skip — but we always rebuild to also
+      // canonicalize key order, which is what JSON.stringify consumers
+      // depend on for byte stability.
+      const schemaKeySet = new Set(schemaKeys);
+      const hasExtras = currentKeys.some((k) => !schemaKeySet.has(k));
+      // Also rebuild when order differs from schema declaration order,
+      // because extras stripping alone doesn't guarantee a canonical
+      // byte sequence across turns.
+      const presentSchemaKeys = schemaKeys.filter((k) =>
+        Object.prototype.hasOwnProperty.call(block.input, k)
+      );
+      const currentInSchema = currentKeys.filter((k) => schemaKeySet.has(k));
+      let orderDiffers = presentSchemaKeys.length !== currentInSchema.length;
+      if (!orderDiffers) {
+        for (let j = 0; j < presentSchemaKeys.length; j++) {
+          if (presentSchemaKeys[j] !== currentInSchema[j]) {
+            orderDiffers = true;
+            break;
+          }
+        }
+      }
+      if (!hasExtras && !orderDiffers) continue;
+      const newInput = {};
+      for (const k of presentSchemaKeys) {
+        newInput[k] = block.input[k];
+      }
+      msg.content[i] = { ...block, input: newInput };
+      modified++;
+    }
+  }
+  return modified;
+}
+
 /**
  * Core fix: on EVERY call, scan the entire message array for the LATEST
  * relocatable blocks (skills, MCP, deferred tools, hooks) and ensure they
@@ -787,6 +887,7 @@ const _STATS_SCHEMA = {
   smoosh_normalize: { applied: 0, skipped: 0, lastApplied: null },
   smoosh_split: { applied: 0, skipped: 0, lastApplied: null },
   session_start_normalize: { applied: 0, skipped: 0, lastApplied: null },
+  tool_use_input_normalize: { applied: 0, skipped: 0, lastApplied: null },
 };
 
 function _createEmptyStats() {
@@ -1446,6 +1547,29 @@ globalThis.fetch = async function (url, options) {
         }
       }
 
+      // Extension: tool_use_input_normalize — strip tool_use.input keys not
+      // declared in body.tools[*].input_schema.properties. CC's serialization
+      // of tool_use.input can drift between turns when the caller passed
+      // extra fields; the pre-miss body may serialize only the schema keys
+      // while the post-miss body serializes the full caller-supplied set
+      // (or vice versa). That byte drift at a mid-history assistant message
+      // re-caches every block from that message forward.
+      //
+      // Runs AFTER session_start_normalize so mid-history drift is pinned
+      // before any downstream pass (smoosh_*, fingerprint, ttl) hashes the
+      // same block. Default ON, opt-out via
+      // CACHE_FIX_SKIP_TOOL_USE_INPUT_NORMALIZE=1.
+      if (shouldApplyFix("tool_use_input_normalize")) {
+        const tuinApplied = normalizeToolUseInputsInBody(payload);
+        if (tuinApplied > 0) {
+          modified = true;
+          debugLog(`APPLIED: tool-use-input-normalize rewrote ${tuinApplied} tool_use block(s)`);
+          recordFixResult("tool_use_input_normalize", "applied");
+        } else {
+          recordFixResult("tool_use_input_normalize", "skipped");
+        }
+      }
+
       // Optimization: normalize smooshed dynamic system-reminders in tool_result content
       // CC's smooshSystemReminderSiblings (messages.ts:1835) folds <system-reminder> text
       // blocks into tool_result.content strings. Dynamic values (token_usage, budget_usd,
@@ -1997,5 +2121,6 @@ export {
   rewriteOutputEfficiencyInstruction,
   normalizeOutputEfficiencyReplacement,
   normalizeSessionStartText,
+  normalizeToolUseInputsInBody,
   _pinnedBlocks,  // exported so tests can reset between runs
 };
