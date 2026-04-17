@@ -388,6 +388,65 @@ function normalizeSessionStartText(text) {
   return [out, count];
 }
 
+// --------------------------------------------------------------------------
+// Bookkeeping-reminder strip
+// --------------------------------------------------------------------------
+//
+// Complements `smoosh_normalize` / `smoosh_split`: where normalize stabilizes
+// bytes in-place and split peels smooshed reminders back into standalone
+// text blocks, this pass REMOVES purely-bookkeeping reminder blocks entirely
+// from the outbound body. Zero model visibility, zero drift.
+//
+// Targeted patterns (all CC-internal, per-turn values the agent doesn't need
+// to condition behavior on):
+//   - `Token usage: <N>/<M>; <K> remaining`
+//   - `Output tokens — turn: <X> · session: <Y>`
+//   - `USD budget: $<X>/$<Y>; $<Z> remaining`
+//   - `The task tools haven't been used recently. …`
+//   - `The TodoWrite tool hasn't been used recently. …`
+//   - `Remaining conversation turns: <N>`
+//   - `Messages until auto-compact: <N>`
+//
+// Hook-injected reminders (thinking-enrichment, action-tracker,
+// PreToolUse/PostToolUse blocking errors, UserPromptSubmit additional
+// context, custom user hooks) are deliberately NOT stripped here — the
+// agent needs that feedback visible in the turn it fires, and attempting a
+// history-only filter creates per-turn drift of its own (the "last user
+// message" shifts each turn, so a reminder preserved at turn N gets
+// stripped at N+1 when its host message falls into history). Leaving hook
+// reminders untouched is the safer choice; their residual drift is small
+// compared to bookkeeping churn.
+// --------------------------------------------------------------------------
+
+const REMINDER_WRAP_REGEX =
+  /^<system-reminder>\n([\s\S]*?)\n<\/system-reminder>\s*$/;
+
+const BOOKKEEPING_REMINDER_PATTERNS = [
+  /^Token usage: \d+\/\d+; \d+ remaining\s*$/,
+  /^Output tokens \u2014 turn: [^\n]+ \u00b7 session: [^\n]+\s*$/,
+  /^USD budget: \$[\d.]+\/\$[\d.]+; \$[\d.]+ remaining\s*$/,
+  /^The task tools haven't been used recently\./,
+  /^The TodoWrite tool hasn't been used recently\./,
+  /^Remaining conversation turns: /,
+  /^Messages? until auto-compact: /,
+];
+
+/**
+ * Returns true iff the text is a `<system-reminder>`-wrapped block whose
+ * inner content matches a bookkeeping pattern. Pure predicate, exported
+ * for unit tests.
+ */
+function isBookkeepingReminder(text) {
+  if (typeof text !== "string") return false;
+  const m = text.match(REMINDER_WRAP_REGEX);
+  if (!m) return false;
+  const inner = m[1];
+  for (const rx of BOOKKEEPING_REMINDER_PATTERNS) {
+    if (rx.test(inner)) return true;
+  }
+  return false;
+}
+
 /**
  * Core fix: on EVERY call, scan the entire message array for the LATEST
  * relocatable blocks (skills, MCP, deferred tools, hooks) and ensure they
@@ -787,6 +846,7 @@ const _STATS_SCHEMA = {
   smoosh_normalize: { applied: 0, skipped: 0, lastApplied: null },
   smoosh_split: { applied: 0, skipped: 0, lastApplied: null },
   session_start_normalize: { applied: 0, skipped: 0, lastApplied: null },
+  reminder_strip: { applied: 0, skipped: 0, lastApplied: null },
 };
 
 function _createEmptyStats() {
@@ -1571,6 +1631,36 @@ globalThis.fetch = async function (url, options) {
         }
       }
 
+      // Extension: reminder_strip — remove bookkeeping system-reminder blocks
+      // (Token usage / USD budget / Output tokens / TodoWrite nudge / turn
+      // counters) entirely from user messages. Runs AFTER smoosh_split so
+      // blocks peeled out of tool_result.content are visible as standalone
+      // text and can be matched by isBookkeepingReminder.
+      // Zero model visibility, zero drift.
+      // Opt-out via CACHE_FIX_SKIP_REMINDER_STRIP=1 (defaults ON).
+      if (shouldApplyFix("reminder_strip") && payload.messages) {
+        let reminderStripped = 0;
+        for (const msg of payload.messages) {
+          if (msg?.role !== "user" || !Array.isArray(msg.content)) continue;
+          const kept = msg.content.filter((block) => {
+            if (block?.type !== "text") return true;
+            if (isBookkeepingReminder(block.text)) {
+              reminderStripped++;
+              return false;
+            }
+            return true;
+          });
+          if (kept.length !== msg.content.length) msg.content = kept;
+        }
+        if (reminderStripped > 0) {
+          modified = true;
+          debugLog(`APPLIED: reminder-strip removed ${reminderStripped} bookkeeping reminder block(s)`);
+          recordFixResult("reminder_strip", "applied");
+        } else {
+          recordFixResult("reminder_strip", "skipped");
+        }
+      }
+
       // Bug 5: TTL enforcement (configurable per request type)
       // The client gates 1h cache TTL behind a GrowthBook allowlist that checks
       // querySource against patterns like "repl_main_thread*", "sdk", "auto_mode".
@@ -1997,5 +2087,6 @@ export {
   rewriteOutputEfficiencyInstruction,
   normalizeOutputEfficiencyReplacement,
   normalizeSessionStartText,
+  isBookkeepingReminder,
   _pinnedBlocks,  // exported so tests can reset between runs
 };
