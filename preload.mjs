@@ -388,6 +388,70 @@ function normalizeSessionStartText(text) {
   return [out, count];
 }
 
+// --------------------------------------------------------------------------
+// cache_control marker position-normalizer
+// --------------------------------------------------------------------------
+//
+// Anthropic's prompt-cache uses `cache_control: {type: "ephemeral", ttl: ...}`
+// markers on content blocks as cache breakpoints. CC places this marker on
+// "the last block of the last user message" each turn — which shifts as new
+// turns arrive. When the marker moves, the PREVIOUS last-block's JSON loses
+// the cache_control field → that block's bytes differ from the server's
+// cached version → partial re-cache on top of the stable system-prompt
+// cache.
+//
+// Enforce a canonical position on every outbound body:
+//   1. Strip every existing cache_control marker from user-message content
+//      blocks.
+//   2. Place a single {type: "ephemeral", ttl: "1h"} marker on the LAST
+//      content block of the LAST user message.
+//
+// Fast path: if the canonical block already has the correct marker AND it's
+// the only user-side marker, the body is left untouched — ensures the pass
+// is a true no-op when nothing changed.
+//
+// System-side markers (e.g., on `system[2]` for the global prompt) are NOT
+// touched — they're CC's stable breakpoint for the system prompt and work
+// correctly.
+// --------------------------------------------------------------------------
+
+const CACHE_CONTROL_CANONICAL_MARKER = { type: "ephemeral", ttl: "1h" };
+
+/**
+ * Strip every cache_control marker from a single user message's content
+ * blocks. Returns the number stripped. Mutates the message's content array
+ * in place.
+ */
+function stripCacheControlMarkers(msg) {
+  if (!msg || msg.role !== "user" || !Array.isArray(msg.content)) return 0;
+  let n = 0;
+  for (let i = 0; i < msg.content.length; i++) {
+    const block = msg.content[i];
+    if (block && typeof block === "object" && block.cache_control) {
+      const { cache_control, ...rest } = block;
+      msg.content[i] = rest;
+      n++;
+    }
+  }
+  return n;
+}
+
+/**
+ * Count cache_control markers across all user-message content blocks.
+ * Exported so the call-site's fast-path check has a tested helper.
+ */
+function countUserCacheControlMarkers(body) {
+  if (!body || !Array.isArray(body.messages)) return 0;
+  let n = 0;
+  for (const msg of body.messages) {
+    if (msg?.role !== "user" || !Array.isArray(msg.content)) continue;
+    for (const block of msg.content) {
+      if (block && typeof block === "object" && block.cache_control) n++;
+    }
+  }
+  return n;
+}
+
 /**
  * Core fix: on EVERY call, scan the entire message array for the LATEST
  * relocatable blocks (skills, MCP, deferred tools, hooks) and ensure they
@@ -787,6 +851,7 @@ const _STATS_SCHEMA = {
   smoosh_normalize: { applied: 0, skipped: 0, lastApplied: null },
   smoosh_split: { applied: 0, skipped: 0, lastApplied: null },
   session_start_normalize: { applied: 0, skipped: 0, lastApplied: null },
+  cache_control_normalize: { applied: 0, skipped: 0, lastApplied: null },
 };
 
 function _createEmptyStats() {
@@ -1571,6 +1636,57 @@ globalThis.fetch = async function (url, options) {
         }
       }
 
+      // Extension: cache_control_normalize — pin the cache_control marker at
+      // a canonical position (last block of last user message) on every
+      // outbound body. Prevents marker-shuffle drift between turns from
+      // invalidating the previous-last-block's cached bytes. Runs LAST
+      // (after smoosh_split and any other content-mutating pass) so the
+      // canonical position is calculated against the final content array.
+      // Fast path: if canonical position already holds the correct marker
+      // and it's the only user-side marker, body passes through untouched.
+      // Opt-out via CACHE_FIX_SKIP_CACHE_CONTROL_NORMALIZE=1 (defaults ON).
+      if (shouldApplyFix("cache_control_normalize") && payload.messages && payload.messages.length > 0) {
+        // Locate canonical position: last block of last user message with an
+        // array content. If no valid target, skip.
+        let targetMsgIdx = -1;
+        let targetBlockIdx = -1;
+        for (let i = payload.messages.length - 1; i >= 0; i--) {
+          const m = payload.messages[i];
+          if (m?.role !== "user") continue;
+          if (!Array.isArray(m.content) || m.content.length === 0) break;
+          targetMsgIdx = i;
+          targetBlockIdx = m.content.length - 1;
+          break;
+        }
+
+        let ccMutated = false;
+        if (targetMsgIdx !== -1) {
+          const targetBlock = payload.messages[targetMsgIdx].content[targetBlockIdx];
+          const existingCC = targetBlock?.cache_control;
+          const canonicalAlreadyCorrect =
+            existingCC &&
+            existingCC.type === CACHE_CONTROL_CANONICAL_MARKER.type &&
+            existingCC.ttl === CACHE_CONTROL_CANONICAL_MARKER.ttl;
+
+          if (!(canonicalAlreadyCorrect && countUserCacheControlMarkers(payload) === 1)) {
+            // Strip all markers from user messages, then place canonical.
+            for (const msg of payload.messages) stripCacheControlMarkers(msg);
+            const tm = payload.messages[targetMsgIdx];
+            const newContent = tm.content.slice();
+            newContent[targetBlockIdx] = { ...newContent[targetBlockIdx], cache_control: { ...CACHE_CONTROL_CANONICAL_MARKER } };
+            payload.messages[targetMsgIdx] = { ...tm, content: newContent };
+            ccMutated = true;
+          }
+        }
+        if (ccMutated) {
+          modified = true;
+          debugLog(`APPLIED: cache_control_normalize pinned marker at msg[${targetMsgIdx}].content[${targetBlockIdx}]`);
+          recordFixResult("cache_control_normalize", "applied");
+        } else {
+          recordFixResult("cache_control_normalize", "skipped");
+        }
+      }
+
       // Bug 5: TTL enforcement (configurable per request type)
       // The client gates 1h cache TTL behind a GrowthBook allowlist that checks
       // querySource against patterns like "repl_main_thread*", "sdk", "auto_mode".
@@ -1997,5 +2113,8 @@ export {
   rewriteOutputEfficiencyInstruction,
   normalizeOutputEfficiencyReplacement,
   normalizeSessionStartText,
+  stripCacheControlMarkers,
+  countUserCacheControlMarkers,
+  CACHE_CONTROL_CANONICAL_MARKER,
   _pinnedBlocks,  // exported so tests can reset between runs
 };
