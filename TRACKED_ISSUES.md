@@ -2,7 +2,7 @@
 
 Issues we are actively monitoring, have commented on, or are directly relevant to our interceptor work.
 
-Last updated: 2026-04-22 (v3.0.1 proxy shipped, v2.1.117 upgrade, Q7d binding constraint confirmed)
+Last updated: 2026-04-23 (v3.0.5 shipped, Max 20x upgrade, three new CC issues filed, llm-relay deployed)
 
 ## Legend
 
@@ -136,6 +136,9 @@ Last updated: 2026-04-22 (v3.0.1 proxy shipped, v2.1.117 upgrade, Q7d binding co
 | @nikhilsitaram | Called out Anthropic's 1h→5m TTL contradiction (#45756, Apr 21) — Boris references 1h cache windows while server enforces 5m. |
 | @AlfredGuquan | Documented skill listing duplication on resume (#45188, Apr 19) — 8+ injections per session, ~3-4K tokens each. |
 | @YuriyKrasilnikov | Maintaining evidence map and appendix on #50513. Engaged ArkNill for cross-validation. |
+| @ThatDragonOverThere | 5 detailed posts on #41930 (Apr 23): 54% Q7d in 34.5h on v2.1.118, confirmed default effort silently upgraded to high for all models, identified three compounding factors on 4.7 launch. Best independent analysis of the effort+pricing+context triple hit. |
+| @ANogin | Bedrock/LiteLLM cache_read double-counting (#45756, Apr 22-23). 19.3M input / 19.2M cache_read suggests input includes cache_read on Bedrock path. We disambiguated: direct Anthropic auth shows 0.1x weight, not double-counted. |
+| @TheAuditorTool | Max20 depleted in 32 minutes, one Q5h = 18% weekly (#38335, Apr 23). Previously assessed our tool as "LEGITIMATE." Now documenting the cost crisis himself. |
 
 ## Media Coverage
 
@@ -168,6 +171,20 @@ Users who have confirmed the interceptor resolved their issue:
 |---|-------|-------|---------------|
 | [#47098](https://github.com/anthropics/claude-code/issues/47098) | New sessions will NEVER hit a full cache | Open | Skills + CLAUDE.md blocks in `messages[0]` are not prefix-cacheable. Regenerated non-deterministically on fresh session / `/clear`. 6,505+ tokens of cache_creation even seconds after prior session. Separate from TTL issue — prefix placement problem. **Our issue #12.** |
 | [#47107](https://github.com/anthropics/claude-code/issues/47107) | Uncachable system prompt caused by git status | Open | `includeGitInstructions` (default: true) injects live `git status` into `system[]`. Every file edit busts the entire system-prompt cache prefix. **Our issue #11.** |
+
+### Completed (2026-04-23 — v3.0.3/v3.0.4/v3.0.5 shipped, three CC issues filed)
+- **v3.0.3** — corp proxy support (PR #54, @X-15), Korean README (PR #56, @ArkNill), Chinese README restructured
+- **v3.0.4** — cache-telemetry extension now persists quota state to disk (was broken since v3.0.0 for all proxy users)
+- **v3.0.5** — status bar reads from quota-status.json instead of dead claude-meter.jsonl
+- **Filed CC #52376** — thinking.display for subscription sessions (thinking content server-gated, signature = encoded billing token)
+- **Filed CC #52470** — MCP hot-reload without session restart
+- **Filed CC #52534** — Opus 4.7 ignores CLAUDE_CODE_EFFORT_LEVEL env var and settings.json (pins to xhigh)
+- **Binary analysis findings:** CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING only matches 4.6 model strings, silently ignored on 4.7. Opus 4.7 defaults to xhigh effort (not high as ThatDragonOverThere reported — it's worse). Thinking block "signature" field = encoded content used for billing via tl8() function (length * 0.75 = tokens).
+- **#45756** — Posted cache_read double-counting disambiguation. Direct Anthropic auth = 0.1x weight (not double-counted). ANogin's finding is Bedrock/LiteLLM-specific.
+- **#41930** — ThatDragonOverThere posted 5 detailed comments: 54% Q7d in 34.5h, default effort silently upgraded, three compounding factors on 4.7 launch.
+- **#38335** — TheAuditorTool: Max20 depleted in 32 minutes, one Q5h window = 18% weekly (was 8.5% before Mar 23). mhbosch: Codex gained 1M users in two weeks (German press).
+- **All three filed issues got bot "duplicate" responses** — no actual dups linked (known bot behavior).
+- **No Anthropic engineer responses** on any tracked issue today.
 
 ### Completed (2026-04-22 — v3.0.1 shipped, issue sweep)
 - **v3.0.1 proxy shipped to npm**, v3.0.0 proxy architecture issue #40 closed.
