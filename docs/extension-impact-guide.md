@@ -94,6 +94,34 @@ All measurements unless noted are from our production telemetry: 24,667 calls (A
 - Peak hour flag (weekday 13:00-19:00 UTC)
 - All `anthropic-ratelimit-unified-*` response headers
 
+### 8. `overage-warning` (order 610) — opt-in via `CACHE_FIX_OVERAGE_WARNING=1`
+
+**What it fixes:** Nothing — advisory only. When Anthropic's response headers indicate the user is approaching or has crossed the overage threshold (`anthropic-ratelimit-unified-status: allowed_warning|throttled` plus a non-empty `anthropic-ratelimit-unified-7d-surpassed-threshold`), emits a one-time-per-threshold-per-Q5h-window warning to stderr AND appends a structured record to `~/.claude/overage-warnings.jsonl`.
+
+**ON (`CACHE_FIX_OVERAGE_WARNING=1`):** You learn about a threshold crossing on the response that Anthropic flagged it on, with a coarse projection of minutes-to-100% and an estimated burn rate at API rates. The JSONL record is consumable by status lines, dashboards, or downstream alerting.
+
+**OFF (env var unset, default):** No file is created, no state is allocated, no warning emitted. The extension is loaded but every hook returns on the first line.
+
+**Stderr line format (full projection):**
+```
+[overage-warning] 2026-04-25T18:42:11Z Q5h=78% Q7d=82% (surpassed 0.75) — projected 100% in ~22 min, estimated continued burn ≈ $4.10/hr at API rates (coarse). Upgrade paths: upgrade_plan, overage.
+```
+
+**Stderr line format (warm-up — fewer than 3 stream samples available):**
+```
+[overage-warning] 2026-04-25T18:42:11Z Q5h=78% Q7d=82% (surpassed 0.75) — projection unavailable (warming up). Upgrade paths: upgrade_plan, overage.
+```
+
+**Important caveats:**
+- The cost-per-hour number is **deliberately coarse** (single weighted constant in `proxy/rates.mjs`). It is right to one significant figure; it is not a precise quote. A precise per-tier cost engine is a v3.3.0 follow-up.
+- Dedup state (which thresholds we've already warned at) lives in proxy memory and resets on proxy restart. You may see a duplicate warning for the same threshold in a Q5h window if the proxy restarted between calls.
+
+**Other env vars:**
+- `CACHE_FIX_OVERAGE_WARNING_QUIET=1` — suppress stderr emission, keep JSONL output.
+- `CACHE_FIX_OVERAGE_WARNING_DIR=/path` — override JSONL output directory (defaults to `~/.claude/`).
+
+See `docs/directives/proxy-overage-cost-warning.md` for the full design.
+
 ## Preload-Only Features (v2.x, CC ≤v2.1.112)
 
 These features only work with the preload interceptor (`NODE_OPTIONS="--import ..."`). They do NOT work on CC v2.1.113+ (Bun binary). Use the proxy extensions above for current CC versions.
