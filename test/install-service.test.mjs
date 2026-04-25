@@ -10,10 +10,14 @@ import { promisify } from "node:util";
 import {
   renderSystemdTemplate,
   renderLaunchdTemplate,
+  renderHealthcheckServiceTemplate,
+  renderHealthcheckTimerTemplate,
   getPaths,
   installSystemd,
+  installSystemdHealthcheck,
   installLaunchd,
   uninstallSystemd,
+  uninstallSystemdHealthcheck,
   uninstallLaunchd,
   install,
   TEMPLATE_DIR,
@@ -106,6 +110,32 @@ test("renderLaunchdTemplate: omits CACHE_FIX_PROXY_UPSTREAM/DEBUG when not set",
   assert.ok(!out.includes("CACHE_FIX_DEBUG"));
 });
 
+// --- Healthcheck template rendering ---
+
+test("renderHealthcheckServiceTemplate: substitutes PORT", async () => {
+  const tpl = await readFile(
+    join(TEMPLATE_DIR, "cache-fix-proxy-healthcheck.service.template"),
+    "utf-8",
+  );
+  const out = renderHealthcheckServiceTemplate(tpl, { port: "9988" });
+  assert.ok(out.includes("http://127.0.0.1:9988/health"));
+  assert.ok(out.includes("systemctl --user start cache-fix-proxy.service"));
+  assert.ok(out.includes("Type=oneshot"));
+  assert.ok(!out.includes("{{"));
+});
+
+test("renderHealthcheckTimerTemplate: returns template unchanged (no placeholders today)", async () => {
+  const tpl = await readFile(
+    join(TEMPLATE_DIR, "cache-fix-proxy-healthcheck.timer.template"),
+    "utf-8",
+  );
+  const out = renderHealthcheckTimerTemplate(tpl);
+  assert.equal(out, tpl);
+  assert.ok(out.includes("OnUnitActiveSec=2min"));
+  assert.ok(out.includes("Unit=cache-fix-proxy-healthcheck.service"));
+  assert.ok(out.includes("WantedBy=timers.target"));
+});
+
 // --- Platform detection ---
 
 test("getPaths: linux returns systemd shape", () => {
@@ -113,6 +143,8 @@ test("getPaths: linux returns systemd shape", () => {
   assert.equal(p.kind, "systemd");
   assert.ok(p.configDir.endsWith(".config/systemd/user"));
   assert.equal(p.configFile, "cache-fix-proxy.service");
+  assert.equal(p.healthcheckServiceFile, "cache-fix-proxy-healthcheck.service");
+  assert.equal(p.healthcheckTimerFile, "cache-fix-proxy-healthcheck.timer");
 });
 
 test("getPaths: darwin returns launchd shape", () => {
@@ -138,6 +170,8 @@ test("installSystemd: writes file to configDir; uninstall removes it", async () 
       kind: "systemd",
       configDir: dir,
       configFile: "cache-fix-proxy.service",
+      healthcheckServiceFile: "cache-fix-proxy-healthcheck.service",
+      healthcheckTimerFile: "cache-fix-proxy-healthcheck.timer",
     };
     const r1 = await installSystemd({ paths, defaults: { port: "9999", upstream: "", debug: "", workingDir: "/tmp" } });
     assert.ok(r1.ok);
@@ -156,7 +190,7 @@ test("installSystemd: writes file to configDir; uninstall removes it", async () 
 test("installSystemd: refuses overwrite without force", async () => {
   const dir = await newTmp();
   try {
-    const paths = { kind: "systemd", configDir: dir, configFile: "cache-fix-proxy.service" };
+    const paths = { kind: "systemd", configDir: dir, configFile: "cache-fix-proxy.service", healthcheckServiceFile: "cache-fix-proxy-healthcheck.service", healthcheckTimerFile: "cache-fix-proxy-healthcheck.timer" };
     await installSystemd({ paths, defaults: { port: "9801", upstream: "", debug: "", workingDir: "/tmp" } });
     const r2 = await installSystemd({ paths, defaults: { port: "9999", upstream: "", debug: "", workingDir: "/tmp" } });
     assert.equal(r2.ok, false);
@@ -172,7 +206,7 @@ test("installSystemd: refuses overwrite without force", async () => {
 test("installSystemd: --force overwrites existing", async () => {
   const dir = await newTmp();
   try {
-    const paths = { kind: "systemd", configDir: dir, configFile: "cache-fix-proxy.service" };
+    const paths = { kind: "systemd", configDir: dir, configFile: "cache-fix-proxy.service", healthcheckServiceFile: "cache-fix-proxy-healthcheck.service", healthcheckTimerFile: "cache-fix-proxy-healthcheck.timer" };
     await installSystemd({ paths, defaults: { port: "9801", upstream: "", debug: "", workingDir: "/tmp" } });
     const r2 = await installSystemd({
       paths,
@@ -190,10 +224,165 @@ test("installSystemd: --force overwrites existing", async () => {
 test("uninstallSystemd: not-installed when file missing", async () => {
   const dir = await newTmp();
   try {
-    const paths = { kind: "systemd", configDir: dir, configFile: "cache-fix-proxy.service" };
+    const paths = { kind: "systemd", configDir: dir, configFile: "cache-fix-proxy.service", healthcheckServiceFile: "cache-fix-proxy-healthcheck.service", healthcheckTimerFile: "cache-fix-proxy-healthcheck.timer" };
     const r = await uninstallSystemd({ paths });
     assert.equal(r.ok, false);
     assert.equal(r.reason, "not-installed");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// --- Healthcheck install/uninstall round-trip ---
+
+test("installSystemdHealthcheck: writes both service and timer files", async () => {
+  const dir = await newTmp();
+  try {
+    const paths = {
+      kind: "systemd",
+      configDir: dir,
+      configFile: "cache-fix-proxy.service",
+      healthcheckServiceFile: "cache-fix-proxy-healthcheck.service",
+      healthcheckTimerFile: "cache-fix-proxy-healthcheck.timer",
+    };
+    const r = await installSystemdHealthcheck({
+      paths,
+      defaults: { port: "9801", upstream: "", debug: "", workingDir: "/tmp" },
+    });
+    assert.equal(r.installed, true);
+    const svc = await readFile(join(dir, "cache-fix-proxy-healthcheck.service"), "utf-8");
+    const tmr = await readFile(join(dir, "cache-fix-proxy-healthcheck.timer"), "utf-8");
+    assert.ok(svc.includes("http://127.0.0.1:9801/health"));
+    assert.ok(tmr.includes("OnUnitActiveSec=2min"));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("installSystemdHealthcheck: refuses overwrite without force; force overwrites", async () => {
+  const dir = await newTmp();
+  try {
+    const paths = {
+      kind: "systemd",
+      configDir: dir,
+      configFile: "cache-fix-proxy.service",
+      healthcheckServiceFile: "cache-fix-proxy-healthcheck.service",
+      healthcheckTimerFile: "cache-fix-proxy-healthcheck.timer",
+    };
+    await installSystemdHealthcheck({
+      paths,
+      defaults: { port: "9801", upstream: "", debug: "", workingDir: "/tmp" },
+    });
+    // Second install without force → refuses
+    const r2 = await installSystemdHealthcheck({
+      paths,
+      defaults: { port: "9988", upstream: "", debug: "", workingDir: "/tmp" },
+    });
+    assert.equal(r2.installed, false);
+    assert.equal(r2.reason, "already-installed");
+    const svc = await readFile(join(dir, "cache-fix-proxy-healthcheck.service"), "utf-8");
+    assert.ok(svc.includes(":9801/"), "file should not have been overwritten");
+
+    // With force → overwrites
+    const r3 = await installSystemdHealthcheck({
+      paths,
+      defaults: { port: "9988", upstream: "", debug: "", workingDir: "/tmp" },
+      force: true,
+    });
+    assert.equal(r3.installed, true);
+    const svc2 = await readFile(join(dir, "cache-fix-proxy-healthcheck.service"), "utf-8");
+    assert.ok(svc2.includes(":9988/"), "file should have been overwritten");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("uninstallSystemdHealthcheck: removes both files; counts how many removed", async () => {
+  const dir = await newTmp();
+  try {
+    const paths = {
+      kind: "systemd",
+      configDir: dir,
+      configFile: "cache-fix-proxy.service",
+      healthcheckServiceFile: "cache-fix-proxy-healthcheck.service",
+      healthcheckTimerFile: "cache-fix-proxy-healthcheck.timer",
+    };
+    await installSystemdHealthcheck({
+      paths,
+      defaults: { port: "9801", upstream: "", debug: "", workingDir: "/tmp" },
+    });
+    const r = await uninstallSystemdHealthcheck({ paths });
+    assert.equal(r.removed, 2);
+    const files = await readdir(dir);
+    assert.deepEqual(files, []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("uninstallSystemdHealthcheck: missing files counted as 0 removed (no error)", async () => {
+  const dir = await newTmp();
+  try {
+    const paths = {
+      kind: "systemd",
+      configDir: dir,
+      configFile: "cache-fix-proxy.service",
+      healthcheckServiceFile: "cache-fix-proxy-healthcheck.service",
+      healthcheckTimerFile: "cache-fix-proxy-healthcheck.timer",
+    };
+    const r = await uninstallSystemdHealthcheck({ paths });
+    assert.equal(r.removed, 0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("installSystemd: now also drops healthcheck companion alongside main unit", async () => {
+  const dir = await newTmp();
+  try {
+    const paths = {
+      kind: "systemd",
+      configDir: dir,
+      configFile: "cache-fix-proxy.service",
+      healthcheckServiceFile: "cache-fix-proxy-healthcheck.service",
+      healthcheckTimerFile: "cache-fix-proxy-healthcheck.timer",
+    };
+    const r = await installSystemd({
+      paths,
+      defaults: { port: "9801", upstream: "", debug: "", workingDir: "/tmp" },
+    });
+    assert.ok(r.ok);
+    assert.ok(r.healthcheck?.installed, "healthcheck should be installed alongside main unit");
+    const files = (await readdir(dir)).sort();
+    assert.deepEqual(files, [
+      "cache-fix-proxy-healthcheck.service",
+      "cache-fix-proxy-healthcheck.timer",
+      "cache-fix-proxy.service",
+    ]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("uninstallSystemd: now also removes healthcheck companion alongside main unit", async () => {
+  const dir = await newTmp();
+  try {
+    const paths = {
+      kind: "systemd",
+      configDir: dir,
+      configFile: "cache-fix-proxy.service",
+      healthcheckServiceFile: "cache-fix-proxy-healthcheck.service",
+      healthcheckTimerFile: "cache-fix-proxy-healthcheck.timer",
+    };
+    await installSystemd({
+      paths,
+      defaults: { port: "9801", upstream: "", debug: "", workingDir: "/tmp" },
+    });
+    const r = await uninstallSystemd({ paths });
+    assert.ok(r.ok);
+    assert.equal(r.healthcheck?.removed, 2, "uninstall should remove both companion files");
+    const files = await readdir(dir);
+    assert.deepEqual(files, []);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

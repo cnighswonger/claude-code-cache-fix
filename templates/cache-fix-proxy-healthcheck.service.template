@@ -1,0 +1,7 @@
+[Unit]
+Description=Claude Code Cache Fix Proxy — health check + auto-restart
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'curl -fs --max-time 3 http://127.0.0.1:{{PORT}}/health > /dev/null || systemctl --user start cache-fix-proxy.service'

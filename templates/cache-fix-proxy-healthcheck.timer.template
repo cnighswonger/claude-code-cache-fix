@@ -1,0 +1,14 @@
+[Unit]
+Description=Claude Code Cache Fix Proxy — health check timer (every 2 min)
+Documentation=https://github.com/cnighswonger/claude-code-cache-fix
+
+[Timer]
+# Run 30s after boot, then every 2 minutes thereafter. Off-round minute
+# so the firing distribution doesn't pile up on :00.
+OnBootSec=30s
+OnUnitActiveSec=2min
+AccuracySec=15s
+Unit=cache-fix-proxy-healthcheck.service
+
+[Install]
+WantedBy=timers.target

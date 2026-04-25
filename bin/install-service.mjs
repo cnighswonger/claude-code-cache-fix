@@ -34,6 +34,13 @@ function getPaths(plat = platform()) {
       configDir: join(homedir(), ".config", "systemd", "user"),
       configFile: "cache-fix-proxy.service",
       label: "cache-fix-proxy",
+      // Healthcheck companion units (oneshot service + timer) for
+      // auto-recovery if the proxy is ever stopped from any cause:
+      // a crash, an external `systemctl stop`, an OOM, anything.
+      // The timer runs the service every 2 minutes; the oneshot does
+      // a curl /health probe and `systemctl --user start` if it fails.
+      healthcheckServiceFile: "cache-fix-proxy-healthcheck.service",
+      healthcheckTimerFile: "cache-fix-proxy-healthcheck.timer",
     };
   }
   if (plat === "darwin") {
@@ -43,6 +50,8 @@ function getPaths(plat = platform()) {
       configFile: "com.cnighswonger.cache-fix-proxy.plist",
       label: "com.cnighswonger.cache-fix-proxy",
       logDir: join(homedir(), "Library", "Logs"),
+      // launchd's KeepAlive already auto-restarts the agent on any exit
+      // (clean or unclean), so a separate healthcheck isn't needed on macOS.
     };
   }
   return { kind: "unsupported", platform: plat };
@@ -90,6 +99,15 @@ function renderLaunchdTemplate(template, vars) {
     .replace(/\n\n+/g, "\n");
 }
 
+function renderHealthcheckServiceTemplate(template, vars) {
+  return template.replaceAll("{{PORT}}", vars.port);
+}
+
+function renderHealthcheckTimerTemplate(template) {
+  // No placeholders today, but keep the function for symmetry + future expansion.
+  return template;
+}
+
 async function fileExists(path) {
   try {
     await stat(path);
@@ -134,7 +152,49 @@ async function installSystemd({ paths, defaults, force = false } = {}) {
   });
   await mkdir(paths.configDir, { recursive: true });
   await writeFile(targetPath, rendered);
-  return { ok: true, path: targetPath };
+
+  // Healthcheck companion: oneshot service + timer. Auto-recovery from any
+  // proxy stop, including clean stops where Restart=on-failure does NOT fire
+  // (see incident analysis: 2026-04-25 01:46:53 UTC — proxy was stopped by
+  // an unidentified caller during the Anthropic outage and stayed down for
+  // 10 hours because no auto-recovery existed).
+  const healthcheckPaths = await installSystemdHealthcheck({ paths, defaults, force });
+
+  return {
+    ok: true,
+    path: targetPath,
+    healthcheck: healthcheckPaths,
+  };
+}
+
+async function installSystemdHealthcheck({ paths, defaults, force = false } = {}) {
+  paths = paths || getPaths("linux");
+  defaults = defaults || getDefaults();
+  const servicePath = join(paths.configDir, paths.healthcheckServiceFile);
+  const timerPath = join(paths.configDir, paths.healthcheckTimerFile);
+
+  // If either exists and force is not set, leave both alone (atomic semantic
+  // — partial installs are confusing). Caller already checked the main unit.
+  if ((await fileExists(servicePath)) && !force) {
+    return {
+      installed: false,
+      reason: "already-installed",
+      servicePath,
+      timerPath,
+    };
+  }
+
+  const serviceTpl = await readFile(
+    join(TEMPLATE_DIR, "cache-fix-proxy-healthcheck.service.template"),
+    "utf-8",
+  );
+  const timerTpl = await readFile(
+    join(TEMPLATE_DIR, "cache-fix-proxy-healthcheck.timer.template"),
+    "utf-8",
+  );
+  await writeFile(servicePath, renderHealthcheckServiceTemplate(serviceTpl, { port: defaults.port }));
+  await writeFile(timerPath, renderHealthcheckTimerTemplate(timerTpl));
+  return { installed: true, servicePath, timerPath };
 }
 
 async function installLaunchd({ paths, defaults, force = false } = {}) {
@@ -174,7 +234,28 @@ async function uninstallSystemd({ paths } = {}) {
     return { ok: false, reason: "not-installed", path: targetPath };
   }
   await unlink(targetPath);
-  return { ok: true, path: targetPath };
+  // Also remove the healthcheck companion if it exists. Best-effort —
+  // missing files are not an error here.
+  const healthcheckRemoved = await uninstallSystemdHealthcheck({ paths });
+  return { ok: true, path: targetPath, healthcheck: healthcheckRemoved };
+}
+
+async function uninstallSystemdHealthcheck({ paths } = {}) {
+  paths = paths || getPaths("linux");
+  const servicePath = join(paths.configDir, paths.healthcheckServiceFile);
+  const timerPath = join(paths.configDir, paths.healthcheckTimerFile);
+  let removed = 0;
+  for (const p of [timerPath, servicePath]) {
+    if (await fileExists(p)) {
+      try {
+        await unlink(p);
+        removed++;
+      } catch {
+        /* best-effort */
+      }
+    }
+  }
+  return { removed, servicePath, timerPath };
 }
 
 async function uninstallLaunchd({ paths } = {}) {
@@ -208,12 +289,21 @@ async function install({ force = false } = {}) {
       if (r.hint) process.stderr.write(`  ${r.hint}\n`);
       return 1;
     }
+    const hcLines =
+      r.healthcheck?.installed
+        ? `Wrote healthcheck companion: ${r.healthcheck.servicePath}\n` +
+          `Wrote healthcheck timer:     ${r.healthcheck.timerPath}\n\n`
+        : r.healthcheck?.reason === "already-installed"
+          ? `Healthcheck companion already installed (use --force to overwrite).\n\n`
+          : "";
     process.stdout.write(
-      `Wrote systemd unit: ${r.path}\n\n` +
+      `Wrote systemd unit: ${r.path}\n` +
+        hcLines +
         `Next steps:\n` +
         `  systemctl --user daemon-reload\n` +
         `  systemctl --user enable --now cache-fix-proxy\n` +
-        `  loginctl enable-linger ${process.env.USER || "<your-user>"}   # optional: start on boot vs login\n`,
+        `  systemctl --user enable --now cache-fix-proxy-healthcheck.timer  # auto-recovery if proxy is ever stopped\n` +
+        `  loginctl enable-linger ${process.env.USER || "<your-user>"}      # optional: start on boot vs login\n`,
     );
     return 0;
   }
@@ -261,7 +351,11 @@ async function uninstall() {
     return 1;
   }
   if (paths.kind === "systemd") {
-    // Best-effort stop + disable before removing the file
+    // Best-effort stop + disable for the healthcheck companion FIRST so it
+    // doesn't immediately restart the proxy we're about to stop.
+    await runCmd("systemctl", ["--user", "stop", "cache-fix-proxy-healthcheck.timer"]);
+    await runCmd("systemctl", ["--user", "disable", "cache-fix-proxy-healthcheck.timer"]);
+    // Then stop + disable the main service.
     await runCmd("systemctl", ["--user", "stop", "cache-fix-proxy"]);
     await runCmd("systemctl", ["--user", "disable", "cache-fix-proxy"]);
     let r;
@@ -275,7 +369,11 @@ async function uninstall() {
       return 1;
     }
     await runCmd("systemctl", ["--user", "daemon-reload"]);
-    process.stdout.write(`Removed: ${r.path}\n`);
+    const hcMsg =
+      r.healthcheck?.removed > 0
+        ? ` (+ ${r.healthcheck.removed} healthcheck file${r.healthcheck.removed === 1 ? "" : "s"})`
+        : "";
+    process.stdout.write(`Removed: ${r.path}${hcMsg}\n`);
     return 0;
   }
   if (paths.kind === "launchd") {
@@ -301,11 +399,15 @@ export {
   // Pure helpers (test surface)
   renderSystemdTemplate,
   renderLaunchdTemplate,
+  renderHealthcheckServiceTemplate,
+  renderHealthcheckTimerTemplate,
   getPaths,
   getDefaults,
   installSystemd,
+  installSystemdHealthcheck,
   installLaunchd,
   uninstallSystemd,
+  uninstallSystemdHealthcheck,
   uninstallLaunchd,
   // Orchestration
   install,
