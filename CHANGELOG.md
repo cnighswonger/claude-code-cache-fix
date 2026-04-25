@@ -1,5 +1,38 @@
 # Changelog
 
+## 3.1.1 (2026-04-25)
+
+**`cache-fix-proxy install-service` subcommand** (#73, closes #48):
+
+- New CLI dispatch supports `install-service` (systemd on Linux, launchd on macOS), `uninstall-service`, `server` (run just the proxy in foreground for ExecStart), and `help`.
+- Existing `cache-fix-proxy` no-subcommand wrapper behavior is unchanged (back-compat).
+- Refuses to overwrite existing config without `--force`. Picks up `CACHE_FIX_PROXY_PORT`, `CACHE_FIX_PROXY_UPSTREAM`, `CACHE_FIX_DEBUG` from the env at install time.
+- Templates ship in new `templates/` directory.
+
+**Healthcheck companion for proxy auto-recovery** (#75):
+
+After the 2026-04-25 incident where the proxy was stopped by an unidentified caller during the Anthropic outage and stayed down for ~10 hours (`Restart=on-failure` doesn't fire on clean stops), `install-service` now also drops a healthcheck companion on Linux:
+
+- `cache-fix-proxy-healthcheck.service` — oneshot that does `curl -fs http://127.0.0.1:<port>/health` and `systemctl --user start cache-fix-proxy.service` if the probe fails
+- `cache-fix-proxy-healthcheck.timer` — fires the oneshot 30s after boot then every 2 minutes (AccuracySec=15s)
+- `uninstall-service` stops the timer FIRST, then the proxy, then removes all three files
+
+Recovery within 2 minutes from any stop cause: clean stop, crash, OOM, an external `systemctl stop`. macOS doesn't need it — launchd's `KeepAlive` already auto-restarts on any exit.
+
+**Hardening + security**:
+
+- Port string is now validated before being interpolated into the healthcheck shell command. A hostile `CACHE_FIX_PROXY_PORT` value (with shell metacharacters) would have allowed command injection; rejected with a clear error message now.
+- Symmetric existence check on the healthcheck pair: refuses overwrite if either the service file OR the timer file exists (caught case where one was a half-installed stale artifact).
+- Half-install rollback: if the healthcheck install throws after the main unit is written, the main unit is removed so users aren't left in a partial state.
+
+**New doc: `docs/security-hardening.md`** (#74):
+
+Honest assessment of the trust model around running CC + cache-fix proxy. Ranked threat surface, practical mitigations, what we explicitly DON'T defend against. Includes the proposed dangerous-command filter as a future v3.2.0 candidate, and audit-trail enablement docs (systemd user manager debug logging) for forensic recovery.
+
+**Tests**: 433 → 465 (32 new). No breaking changes. No migration required.
+
+---
+
 ## 3.1.0 (2026-04-25)
 
 **New proxy extensions** (drop-in, behavior described inline):
