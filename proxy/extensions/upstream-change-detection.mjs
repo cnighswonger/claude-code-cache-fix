@@ -145,19 +145,14 @@ export function bucketMaxTokens(n) {
 
 export function matchKnownSectionMarkers(text) {
   if (typeof text !== "string" || !text) return [];
+  // Strict line-based match. The marker must be the ENTIRE line (after split),
+  // otherwise "# Environment Details" would falsely match "# Environment" and
+  // we would record an allowlist index for a marker that didn't actually
+  // appear as a section header.
+  const lineSet = new Set(text.split("\n"));
   const indices = [];
   for (let i = 0; i < KNOWN_SECTION_MARKERS.length; i++) {
-    // Match on a line boundary so substrings inside text don't count.
-    const marker = KNOWN_SECTION_MARKERS[i];
-    if (text.includes(marker + "\n") || text.endsWith(marker) || text.startsWith(marker + "\n")) {
-      indices.push(i);
-    } else if (text === marker) {
-      indices.push(i);
-    } else {
-      // Multi-line search for "\n# Foo\n" style.
-      const idx = text.indexOf("\n" + marker);
-      if (idx !== -1) indices.push(i);
-    }
+    if (lineSet.has(KNOWN_SECTION_MARKERS[i])) indices.push(i);
   }
   return indices;
 }
@@ -197,15 +192,17 @@ export function namespaceKey(model, betaHeadersArr) {
   return sha16(`${model || ""}|${sorted.join(",")}`);
 }
 
-function extractBetaHeaders(body) {
-  // CC sends beta features via `anthropic-beta` request header. The proxy
-  // surfaces request headers in the body when relevant; otherwise an empty
-  // list is the right default. Many builds inline beta hints inside body.
-  // For v3.2.0 we read from body.anthropic_beta if the proxy preserves it,
-  // otherwise empty.
-  const raw = body?.anthropic_beta;
+// Beta features arrive on the `anthropic-beta` REQUEST HEADER (Node http
+// header keys are lowercased). The proxy surfaces request headers on
+// `ctx.headers` to onRequest hooks. The function accepts the headers map
+// (case-insensitive lookup) and falls back to body.anthropic_beta only as
+// a defensive fallback for edge cases where a caller pre-merged it.
+export function extractBetaHeaders(headers, body) {
+  const fromHeader = headers && (headers["anthropic-beta"] || headers["Anthropic-Beta"] || headers["ANTHROPIC-BETA"]);
+  let raw = fromHeader;
+  if (!raw) raw = body?.anthropic_beta;
   if (!raw) return [];
-  if (Array.isArray(raw)) return raw.map(String);
+  if (Array.isArray(raw)) return raw.map(String).map((s) => s.trim()).filter(Boolean);
   if (typeof raw === "string") return raw.split(",").map((s) => s.trim()).filter(Boolean);
   return [];
 }
@@ -331,9 +328,11 @@ function fingerprintRequestExtras(body) {
   };
 }
 
-export function computeFingerprint(body) {
+// Compute a structural fingerprint. `headers` is the request headers map
+// (case-insensitive lookup is internal); pass `{}` if not available.
+export function computeFingerprint(body, headers = {}) {
   const safeBody = body && typeof body === "object" ? body : {};
-  const beta = extractBetaHeaders(safeBody);
+  const beta = extractBetaHeaders(headers, safeBody);
   return {
     version: 1,
     namespace: {
@@ -419,13 +418,13 @@ async function appendEvent(record, fs = DEFAULT_FS, dir = getOutputDir()) {
 }
 
 // Test seam: bypass module-scope state and operate on a caller-supplied map.
-export async function processRequestForTest(body, { dir, map = _namespaceMap, fs = DEFAULT_FS } = {}) {
-  return _processRequest(body, { dir, map, fs });
+export async function processRequestForTest(body, { dir, map = _namespaceMap, fs = DEFAULT_FS, headers = {} } = {}) {
+  return _processRequest(body, headers, { dir, map, fs });
 }
 
-async function _processRequest(body, { dir, map, fs }) {
-  const fingerprint = computeFingerprint(body);
-  const nsKey = namespaceKey(fingerprint.namespace.model, extractBetaHeaders(body));
+async function _processRequest(body, headers, { dir, map, fs }) {
+  const fingerprint = computeFingerprint(body, headers);
+  const nsKey = namespaceKey(fingerprint.namespace.model, extractBetaHeaders(headers, body));
   const ts = new Date().toISOString();
 
   const existing = map.get(nsKey);
@@ -508,7 +507,7 @@ export default {
         await loadBaseline(fs, dir);
         _baselineLoadedFrom = getBaselinePath(dir);
       }
-      const result = await _processRequest(ctx.body, { dir, map: _namespaceMap, fs });
+      const result = await _processRequest(ctx.body, ctx.headers || {}, { dir, map: _namespaceMap, fs });
       // Persist baseline whenever it changed.
       if (result.event === "baseline_established" || result.event === "structural_change") {
         await persistBaseline(fs, dir);

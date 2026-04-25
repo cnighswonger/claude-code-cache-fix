@@ -169,14 +169,33 @@ test("8. different model strings produce separate namespace keys", () => {
 
 // --- 9. Beta header addition ---
 
-test("9. beta header addition produces a new namespace key AND fingerprint diff", () => {
+test("9. beta header addition (via request header) produces a new namespace key AND fingerprint diff", () => {
   const ka = namespaceKey("claude-opus-4-7", ["claude-extended-cache-ttl-2025-04-11"]);
   const kb = namespaceKey("claude-opus-4-7", ["claude-extended-cache-ttl-2025-04-11", "thinking-2025-08-01"]);
   assert.notEqual(ka, kb);
-  const fa = computeFingerprint({ ...makeBody(), anthropic_beta: ["claude-extended-cache-ttl-2025-04-11"] });
-  const fb = computeFingerprint({ ...makeBody(), anthropic_beta: ["claude-extended-cache-ttl-2025-04-11", "thinking-2025-08-01"] });
+  // Beta features arrive on the anthropic-beta REQUEST HEADER, not in the body.
+  const headersA = { "anthropic-beta": "claude-extended-cache-ttl-2025-04-11" };
+  const headersB = { "anthropic-beta": "claude-extended-cache-ttl-2025-04-11,thinking-2025-08-01" };
+  const fa = computeFingerprint(makeBody(), headersA);
+  const fb = computeFingerprint(makeBody(), headersB);
   assert.notEqual(fa.namespace.beta_headers_sorted_hash, fb.namespace.beta_headers_sorted_hash);
   assert.notEqual(fa.namespace.beta_headers_count, fb.namespace.beta_headers_count);
+});
+
+test("9b. beta source is the anthropic-beta request header (not body) — distinct sets do not collapse", () => {
+  // The original bug: extractBetaHeaders read body.anthropic_beta. The proxy
+  // doesn't put beta there — it lives on the request header. So in production,
+  // every request would have the same (empty) beta and distinct sets would
+  // collapse into one namespace.
+  const fHeaderEmpty = computeFingerprint(makeBody(), {});
+  const fHeaderSet = computeFingerprint(makeBody(), { "anthropic-beta": "feature-x,feature-y" });
+  assert.notEqual(
+    fHeaderEmpty.namespace.beta_headers_sorted_hash,
+    fHeaderSet.namespace.beta_headers_sorted_hash,
+    "header presence MUST flip the namespace hash",
+  );
+  assert.equal(fHeaderEmpty.namespace.beta_headers_count, 0);
+  assert.equal(fHeaderSet.namespace.beta_headers_count, 2);
 });
 
 // --- 10. Baseline established event ---
@@ -400,6 +419,27 @@ test("17b. known reminder patterns detected; unknown excluded", () => {
   const known = matchKnownReminderPatterns(text);
   assert.ok(known.includes(0)); // <system-reminder> is index 0
   assert.equal(hasUnknownReminderPattern(text), true);
+});
+
+test("17c. section-marker matching is strict line-based — no prefix-substring matches", () => {
+  // Regression: "# Environment Details" must NOT count as the known marker
+  // "# Environment". The original implementation used substring-based search
+  // which would have falsely set the indices.
+  const text = "intro\n# Environment Details\nstuff\n# Toolset News\n";
+  const known = matchKnownSectionMarkers(text);
+  // Neither "# Environment" (because " Details" follows on the same line) nor
+  // "# Tools" (because "et News" follows) should match.
+  assert.equal(known.length, 0, `expected zero strict matches, got ${JSON.stringify(known)}`);
+  // The shape regex DOES match these lines, so unknown-marker boolean flips.
+  assert.equal(hasUnknownSectionMarker(text), true);
+});
+
+test("17d. section-marker matches the exact line and nothing more", () => {
+  const text = "intro\n# Environment\nlinux\n# Environment Details\nfoo\n";
+  const known = matchKnownSectionMarkers(text);
+  // "# Environment" appears on its own line in addition to "# Environment Details".
+  // The exact-line one matches; the other doesn't.
+  assert.deepEqual(known, [0], "only the exact-line '# Environment' should match");
 });
 
 // --- 18. Content-free guarantee ---
