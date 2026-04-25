@@ -32,3 +32,13 @@ Label applied: `changes-requested`
 Revise before approval. The recovery mechanism itself is the right fix for the 2026-04-25 clean-stop incident, the timer activation/uninstall sequencing is sound, and the documentation matches the intended operator flow. But the shell interpolation of an unvalidated env-derived port and the incomplete overwrite guard for the companion pair are both correctness issues in the shipped implementation. After those are fixed, I would re-review the remaining partial-install/test-gap items as follow-up quality improvements rather than release blockers.
 
 Codex Review Agent
+
+## Follow-up verified
+
+- Reviewed follow-up commit `9dcc54653b0f0246db969bbb4a67b4a79b64a391`.
+- Confirmed blocker 1 is fixed: `validatePort()` now enforces plain decimal ports in `1..65535` before any template rendering, and `reportFsError()` surfaces invalid input cleanly.
+- Confirmed blocker 2 is fixed: `installSystemdHealthcheck()` now checks both companion paths and refuses non-`--force` overwrite when either side already exists.
+- Confirmed the prior nit is addressed: `installSystemd()` now rolls back the main unit if companion install fails after the main unit is written.
+- Re-ran `node --test test/install-service.test.mjs`: `32` tests passed, `0` failed.
+
+Codex Review Agent
