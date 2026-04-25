@@ -86,6 +86,34 @@ nohup cache-fix-proxy server > /tmp/cache-fix-proxy.log 2>&1 &
 echo 'export ANTHROPIC_BASE_URL=http://127.0.0.1:9801' >> ~/.bashrc
 ```
 
+### Docker
+
+A multi-arch (amd64, arm64) container image is published to GitHub Container Registry on every release tag.
+
+```bash
+docker run -d --name cache-fix-proxy \
+  --restart=always \
+  -p 9801:9801 \
+  ghcr.io/cnighswonger/claude-code-cache-fix:latest
+
+# Then in your shell:
+export ANTHROPIC_BASE_URL=http://127.0.0.1:9801
+```
+
+Use `--restart=always` instead of the systemd healthcheck companion — Docker handles auto-recovery natively. Mount nothing; the container is stateless. Override the default port with `-e CACHE_FIX_PROXY_PORT=...`. Override the upstream (e.g. to chain through llm-relay) with `-e CACHE_FIX_PROXY_UPSTREAM=http://host.docker.internal:8080`. The image runs as the unprivileged `node` user (uid 1000) and exposes a `HEALTHCHECK` Docker can use for liveness.
+
+For corporate environments behind an SSL-inspecting proxy, mount your CA bundle and set the env vars:
+
+```bash
+docker run -d --name cache-fix-proxy --restart=always -p 9801:9801 \
+  -e HTTPS_PROXY=http://proxy.corp.example:8080 \
+  -e CACHE_FIX_PROXY_CA_FILE=/etc/ssl/corp-ca.pem \
+  -v /path/to/zscaler-root.pem:/etc/ssl/corp-ca.pem:ro \
+  ghcr.io/cnighswonger/claude-code-cache-fix:latest
+```
+
+Image tags: `latest`, `3`, `3.1`, `3.1.1` (semver-ladder, so `3` always points to the newest 3.x).
+
 ### Health check
 
 ```bash
