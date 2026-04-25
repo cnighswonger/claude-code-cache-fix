@@ -1,5 +1,47 @@
 # Changelog
 
+## 3.1.0 (2026-04-25)
+
+**New proxy extensions** (drop-in, behavior described inline):
+
+- **`prefix-diff`** (opt-in via `CACHE_FIX_PREFIXDIFF=1`) — pure diagnostic. On every request, snapshots a small projection of the prefix (system prompt + tools + first 5 messages) to `~/.claude/cache-fix-snapshots/<key>-last.json`. If a prior snapshot exists and content differs, also writes `<key>-diff.json` and emits a one-line stderr summary. Atomic writes; per-call diff (no boot-flag gating). Closes #59 item 9. (#65)
+- **`deferred-tools-restore`** (defaults ON; opt out via `CACHE_FIX_SKIP_DEFERRED_TOOLS_RESTORE=1`) — preserves cache prefix across the MCP-reconnect race. On `claude --continue`, if MCP servers haven't reconnected before the first post-resume request, the deferred-tools attachment block at `msg[0]` shrinks dramatically and busts the cache at the very top (entire ~940K prompt re-caches). This extension persists the clean form of the block and substitutes it on subsequent shrunken requests, with strict downgrade guard (snapshot must be strictly longer than current). Snapshot keyed on the cwd parsed from CC's `# Environment` section in the system prompt — line-based section parser with ambiguity guard fails open on parse failure. Closes #59 item 6. (#66)
+
+**Default config update** (#69):
+
+- Three pre-existing extensions now enabled in the default `extensions.json`:
+  - `smoosh-split` (order 320) — peels system-reminders out of `tool_result.content` into standalone blocks
+  - `content-strip` (order 330) — removes per-turn bookkeeping reminders (`Token usage:`, `Output tokens —`, idle-tool nudges)
+  - `tool-input-normalize` (order 340) — normalizes tool input fields for cache-stable JSON serialization
+- Triggered by a real-world cache-miss event: a 606K-message context with a warmer running dropped to 5.9% hit rate; recovered to 99.9% within ~2 calls after enabling these. They were Codex-reviewed and merged days ago but had remained dormant.
+
+**Issue #59 closed** (10/10 items resolved): #65 + #66 are the last two ports; item 10 (git-status strip) intentionally not ported because the proxy can't reach the system prompt before CC composes it. README updated to document the technical reason and point users at the native `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1` flag.
+
+**Docs**:
+
+- README + ko/zh translations: removed `claude-code-meter` sharing references — the integration loaded via `NODE_OPTIONS` which CC v2.1.113+ ignores (Bun binary). Tracked in #70 for future refactor. (#71)
+- TRACKED_ISSUES.md backfilled with Apr 23 activity (v3.0.3/4/5 ship notes, three filed CC issues, three new contributor entries). (#68)
+- `docs/deferred/proxy-session-serializer.md` — preserves the Phase 3b session-serializer design as a deferred reference. Tracked in #67. (#68)
+
+**Tests**: 391 → 433 (added 42 for `deferred-tools-restore`, 25 for `prefix-diff`).
+
+**No breaking changes.** No migration required.
+
+---
+
+## 3.0.0 – 3.0.5 (2026-04-22 to 2026-04-23)
+
+CHANGELOG entries were not added for the v3.x patch series at the time. Release notes for each are on GitHub:
+
+- [v3.0.0](https://github.com/cnighswonger/claude-code-cache-fix/releases/tag/v3.0.0) — local proxy with hot-reloadable extension pipeline
+- [v3.0.1](https://github.com/cnighswonger/claude-code-cache-fix/releases/tag/v3.0.1) — README restructure, bin entry fix
+- [v3.0.2](https://github.com/cnighswonger/claude-code-cache-fix/releases/tag/v3.0.2) — Windows proxy fix + preload empty-content guard
+- [v3.0.3](https://github.com/cnighswonger/claude-code-cache-fix/releases/tag/v3.0.3) — corporate proxy support, updated translations
+- [v3.0.4](https://github.com/cnighswonger/claude-code-cache-fix/releases/tag/v3.0.4) — fix proxy telemetry: `quota-status.json` was never written
+- [v3.0.5](https://github.com/cnighswonger/claude-code-cache-fix/releases/tag/v3.0.5) — fix status bar reading stale data
+
+---
+
 ## 2.0.6 (2026-04-20)
 
 - **BUGFIX: `manual-compact.sh` path conversion failed on directories with underscores** — CC normalizes underscores to hyphens in project paths (e.g. `kanfei_test` → `kanfei-test`). The script now handles this. Also improved output to show the exact copy-paste message with the real session ID.
