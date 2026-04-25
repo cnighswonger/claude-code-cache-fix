@@ -45,40 +45,41 @@ Extensions are hot-reloadable — add, remove, or modify `.mjs` files in `proxy/
 
 ### Running as a service
 
-**Linux (systemd — recommended):**
+**Recommended (Linux/macOS) — `install-service` subcommand:**
 
-Create `~/.config/systemd/user/cache-fix-proxy.service`:
-
-```ini
-[Unit]
-Description=Claude Code Cache Fix Proxy (v3.x)
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/node /path/to/claude-code-cache-fix/proxy/server.mjs
-Restart=on-failure
-RestartSec=5
-Environment=CACHE_FIX_PROXY_PORT=9801
-
-[Install]
-WantedBy=default.target
+```bash
+cache-fix-proxy install-service
 ```
+
+Detects your platform and writes the appropriate config:
+
+- **Linux** → `~/.config/systemd/user/cache-fix-proxy.service` (systemd user unit)
+- **macOS** → `~/Library/LaunchAgents/com.cnighswonger.cache-fix-proxy.plist` (launchd agent)
+
+The output prints the next-step commands to enable and start the service. On Linux:
 
 ```bash
 systemctl --user daemon-reload
 systemctl --user enable --now cache-fix-proxy
-
-# Optional: start on boot (before login)
-sudo loginctl enable-linger $USER
+sudo loginctl enable-linger $USER   # optional: start on boot, not just on login
 ```
 
-A `cache-fix-proxy install-service` subcommand is planned for v3.1.0 ([#48](https://github.com/cnighswonger/claude-code-cache-fix/issues/48)).
-
-**Fallback (any OS):**
+On macOS:
 
 ```bash
-nohup node "$(npm root -g)/claude-code-cache-fix/proxy/server.mjs" > /tmp/cache-fix-proxy.log 2>&1 &
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cnighswonger.cache-fix-proxy.plist
+launchctl enable gui/$(id -u)/com.cnighswonger.cache-fix-proxy
+launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
+```
+
+The installed config picks up `CACHE_FIX_PROXY_PORT`, `CACHE_FIX_PROXY_UPSTREAM`, and `CACHE_FIX_DEBUG` from the env at install time. Re-run `install-service --force` to regenerate after env changes, or edit the service file directly. Pair with `cache-fix-proxy uninstall-service` to remove cleanly (stops, disables, deletes).
+
+The service runs `cache-fix-proxy server` in the foreground, which is just the proxy without the wrapper-mode claude launcher.
+
+**Manual (any platform):**
+
+```bash
+nohup cache-fix-proxy server > /tmp/cache-fix-proxy.log 2>&1 &
 echo 'export ANTHROPIC_BASE_URL=http://127.0.0.1:9801' >> ~/.bashrc
 ```
 

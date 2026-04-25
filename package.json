@@ -14,7 +14,8 @@
     "tools/",
     "claude-fixed.bat",
     "proxy/",
-    "bin/"
+    "bin/",
+    "templates/"
   ],
   "engines": {
     "node": ">=18"

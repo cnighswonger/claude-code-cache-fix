@@ -1,0 +1,17 @@
+[Unit]
+Description=Claude Code Cache Fix Proxy
+After=network.target
+{{REQUIRES_LINE}}
+
+[Service]
+Type=simple
+ExecStart={{NODE}} {{SERVER_PATH}}
+Restart=on-failure
+RestartSec=5
+Environment=CACHE_FIX_PROXY_PORT={{PORT}}
+{{UPSTREAM_LINE}}
+{{DEBUG_LINE}}
+WorkingDirectory={{WORKING_DIR}}
+
+[Install]
+WantedBy=default.target

@@ -9,6 +9,63 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const SERVER_PATH = resolve(__dirname, "../proxy/server.mjs");
 
 const args = process.argv.slice(2);
+const SUBCOMMAND = args[0];
+
+// Subcommand dispatch (must come before the wrapper-arg parser so subcommand
+// names don't get treated as claude args). Returns null when no subcommand
+// matched, signaling fall-through to wrapper mode below.
+async function dispatch() {
+  if (SUBCOMMAND === "server") {
+    return new Promise((resolveP) => {
+      const serverProc = spawn(process.execPath, [SERVER_PATH, ...args.slice(1)], {
+        stdio: "inherit",
+        env: process.env,
+      });
+      serverProc.on("close", (code) => resolveP(code ?? 0));
+      serverProc.on("error", (err) => {
+        process.stderr.write(`Failed to start proxy server: ${err.message}\n`);
+        resolveP(1);
+      });
+    });
+  }
+  if (SUBCOMMAND === "install-service") {
+    const force = args.includes("--force");
+    const { install } = await import("./install-service.mjs");
+    return install({ force });
+  }
+  if (SUBCOMMAND === "uninstall-service") {
+    const { uninstall } = await import("./install-service.mjs");
+    return uninstall();
+  }
+  if (SUBCOMMAND === "--help" || SUBCOMMAND === "-h" || SUBCOMMAND === "help") {
+    process.stdout.write(
+      "Usage: cache-fix-proxy [subcommand] [args]\n\n" +
+        "Subcommands:\n" +
+        "  (no subcommand)        Spawn the proxy + launch claude with ANTHROPIC_BASE_URL set.\n" +
+        "                         Pass any claude args after optional --proxy-port / --proxy-upstream.\n" +
+        "  server                 Run just the proxy in the foreground (for systemd/launchd ExecStart).\n" +
+        "  install-service        Install a systemd user service (Linux) or launchd agent (macOS).\n" +
+        "                         Pass --force to overwrite an existing config.\n" +
+        "  uninstall-service      Stop, disable, and remove the installed service.\n" +
+        "  help                   Show this help.\n\n" +
+        "Wrapper-mode flags:\n" +
+        "  --proxy-port <N>       Port for the spawned proxy (default 9801)\n" +
+        "  --proxy-upstream <URL> Upstream URL the proxy forwards to (default api.anthropic.com)\n" +
+        "\nEnvironment:\n" +
+        "  CACHE_FIX_PROXY_PORT     Port for the proxy server\n" +
+        "  CACHE_FIX_PROXY_UPSTREAM Upstream URL\n" +
+        "  CACHE_FIX_DEBUG=1        Verbose proxy logging\n" +
+        "  CACHE_FIX_CLAUDE_CMD     Override the `claude` command for the wrapper\n",
+    );
+    return 0;
+  }
+  return null;
+}
+
+const subcommandExit = await dispatch();
+if (subcommandExit !== null) process.exit(subcommandExit);
+
+// No subcommand matched → wrapper mode (back-compat with v3.0.x behavior).
 let proxyPort = 9801;
 let proxyUpstream = undefined;
 const claudeArgs = [];

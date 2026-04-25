@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.cnighswonger.cache-fix-proxy</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{NODE}}</string>
+        <string>{{SERVER_PATH}}</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>CACHE_FIX_PROXY_PORT</key>
+        <string>{{PORT}}</string>
+{{UPSTREAM_PLIST}}
+{{DEBUG_PLIST}}
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>{{WORKING_DIR}}</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>{{LOG_DIR}}/cache-fix-proxy.log</string>
+    <key>StandardErrorPath</key>
+    <string>{{LOG_DIR}}/cache-fix-proxy.err</string>
+</dict>
+</plist>
