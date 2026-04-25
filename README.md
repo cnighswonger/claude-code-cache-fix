@@ -162,7 +162,7 @@ For manual VS Code wrapper setup (without the VSIX), see [docs/preload-setup.md]
 
 **What it does:** Modifies outgoing request structure (block order, fingerprint, TTL, git-status) to fix cache bugs. Reads response headers and SSE usage data for monitoring.
 
-**What it does NOT do:** No network calls from the proxy or interceptor. All telemetry is written to local files under `~/.claude/`. No data leaves your machine unless you explicitly opt in to [claude-code-meter](https://github.com/cnighswonger/claude-code-meter) sharing (separate package, requires interactive consent).
+**What it does NOT do:** No network calls from the proxy or interceptor. All telemetry is written to local files under `~/.claude/`. No data leaves your machine.
 
 **Supply chain:** Proxy mode: 7 small extension modules in `proxy/extensions/` (each under 200 lines). Preload mode: single unminified file (`preload.mjs`, ~1,700 lines). One dev dependency (`zod` for schema validation in tests only). Review before installing. npm provenance links each published version to its source commit.
 

@@ -137,7 +137,7 @@ NODE_OPTIONS="--import claude-code-cache-fix" claude
 
 **它做什么：** 修改出站请求结构（块排序、指纹、TTL、git-status）以修复缓存 bug。读取响应头和 SSE 使用量数据用于监控。
 
-**它不做什么：** 代理或拦截器不会发起网络调用。所有遥测数据写入 `~/.claude/` 下的本地文件。除非你明确选择加入 [claude-code-meter](https://github.com/cnighswonger/claude-code-meter) 共享（独立包，需要交互式同意），否则数据不会离开你的机器。
+**它不做什么：** 代理或拦截器不会发起网络调用。所有遥测数据写入 `~/.claude/` 下的本地文件。数据不会离开你的机器。
 
 **供应链：** 代理模式：7 个小型扩展模块在 `proxy/extensions/` 中（每个不到 200 行）。预加载模式：单个未压缩文件（`preload.mjs`，约 1,700 行）。一个开发依赖（`zod`，仅用于测试中的模式验证）。安装前请审查代码。npm 出处（provenance）将每个发布版本链接到其源代码提交。
 
