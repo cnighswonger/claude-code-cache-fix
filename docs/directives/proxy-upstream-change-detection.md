@@ -221,11 +221,16 @@ On extension load: best-effort read `<final>` (treat unreadable / corrupt JSON a
 
 ### `~/.claude/upstream-changes.jsonl` (append-only event log)
 
-**Atomicity contract:** each event record is written via a single `fs.promises.appendFile(path, recordString + "\n")` call. The kernel guarantees that under POSIX, writes opened with `O_APPEND` of size ≤ `PIPE_BUF` (4096 bytes on Linux) are atomic with respect to other appenders — no interleaving, no truncation. Each event record is well under 4 KB even for the largest diff payloads.
+**Atomicity contract:** each event record is written via a single `fs.promises.appendFile(path, recordString + "\n")` call. POSIX guarantees that an `O_APPEND` open atomically combines the offset adjustment with the write, so concurrent appenders cannot lose each other's data to torn offsets. POSIX does NOT, however, guarantee that the write itself is non-interleaved at sub-write granularity for regular files — that is a kernel and filesystem implementation detail. (`PIPE_BUF` atomicity, often cited in this context, applies to pipes and FIFOs, not regular files. The previous draft of this directive overclaimed by citing it for this case.)
 
-If a future change pushes records above 4 KB (e.g., very large allowlist diffs), the implementation must switch to the same tmp + rename pattern with per-record file segmentation. Until then, single-syscall append is the contract.
+In practice on Linux with ext4 / xfs / btrfs and a single `write(2)` syscall of a buffer well under one page (4096 bytes), record-level interleaving does not occur. This is empirical Linux kernel behavior, not a portable POSIX guarantee. Test #14 in the test plan exercises it directly: 50 parallel writes, assert no interleaving. If that test ever fails on a platform we support, the implementation must escalate to a stronger mechanism.
 
-The test plan validates this contract by spawning 50 parallel `appendFile` calls and asserting the resulting file has exactly 50 well-formed JSON lines with no truncation or interleaving.
+We accept the empirical guarantee for v3.2.0 because:
+- Each event record is well under 4 KB — small enough to land in a single kernel write buffer.
+- Structural-change events are rare (one per fingerprint change per namespace), so contention is low even under proxy load.
+- Loss or corruption of a single event record is annoying but not catastrophic — this is a diagnostic log, not transactional state.
+
+If a future change makes records larger or events more frequent, the upgrade path is one of: per-record `tmp + rename` (same pattern as the baseline file), `flock(2)`-protected appends, or a single-writer queue. The choice gets documented when the need arises.
 
 ## Env vars
 
@@ -289,7 +294,7 @@ Minimum coverage:
 - [ ] Pure functions exported for testing.
 - [ ] No request mutation — `onRequest` only reads from `ctx.body`.
 - [ ] Baseline file uses atomic write (tmp + rename) with unique-per-invocation tmp suffix.
-- [ ] JSONL writes are single-syscall `appendFile` of `recordString + "\n"`; no record exceeds 4 KB at the time of writing.
+- [ ] JSONL writes are single-syscall `appendFile` of `recordString + "\n"`; no record exceeds 4 KB at the time of writing. Atomicity is empirical Linux kernel behavior (NOT POSIX `PIPE_BUF`, which applies to pipes/FIFOs only); validated by test #14.
 - [ ] First-ever fingerprint produces `baseline_established`, not an alert.
 - [ ] All env vars follow `CACHE_FIX_UPSTREAM_*` naming pattern.
 - [ ] `extensions.json` entry has `enabled: true`; runtime gated by `CACHE_FIX_UPSTREAM_DETECTION=1` (matches `prefix-diff` pattern).
