@@ -145,7 +145,7 @@ Stay inside `proxy/extensions/usage-log.mjs`. Don't split across files.
   - `parseQuotaHeaders(responseHeaders)` → quota object
   - `assembleRecord({ start, delta, quota, headers, sid, prevQ5h, prevQ7d, now })` → full v:1 record
   - `computeDelta(current, previous)` → numeric delta
-- Atomic-append per write — single-syscall `fs.promises.appendFile(path, JSON.stringify(record) + "\n")`. Records are well under 4 KB, so `O_APPEND` + `PIPE_BUF` (4096 bytes on Linux) gives record-level atomicity.
+- Atomic-append per write — single-syscall `fs.promises.appendFile(path, JSON.stringify(record) + "\n")`. POSIX guarantees `O_APPEND` atomically combines offset adjustment with the write (no torn offsets between concurrent appenders). POSIX does NOT guarantee non-interleaved writes to regular files (`PIPE_BUF` atomicity, often cited here, applies to pipes/FIFOs only). In practice on Linux with ext4/xfs/btrfs and a single `write(2)` of a buffer well under one page (4096 bytes), record-level interleaving does not occur — empirical kernel behavior, not POSIX. Each record is well under 4 KB. Test #15 (50 parallel writes, no interleaving) validates this empirically. Escalation path if it fails: per-record `tmp+rename`, `flock(2)`, or single-writer queue.
 
 ## Test plan (cache-fix side)
 
