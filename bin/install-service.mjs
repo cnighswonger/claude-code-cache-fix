@@ -197,7 +197,12 @@ async function install({ force = false } = {}) {
     return 1;
   }
   if (paths.kind === "systemd") {
-    const r = await installSystemd({ paths });
+    let r;
+    try {
+      r = await installSystemd({ paths, force });
+    } catch (err) {
+      return reportFsError("install-service", err);
+    }
     if (!r.ok) {
       process.stderr.write(`[install-service] ${r.reason}: ${r.path}\n`);
       if (r.hint) process.stderr.write(`  ${r.hint}\n`);
@@ -213,7 +218,12 @@ async function install({ force = false } = {}) {
     return 0;
   }
   if (paths.kind === "launchd") {
-    const r = await installLaunchd({ paths });
+    let r;
+    try {
+      r = await installLaunchd({ paths, force });
+    } catch (err) {
+      return reportFsError("install-service", err);
+    }
     if (!r.ok) {
       process.stderr.write(`[install-service] ${r.reason}: ${r.path}\n`);
       if (r.hint) process.stderr.write(`  ${r.hint}\n`);
@@ -231,6 +241,19 @@ async function install({ force = false } = {}) {
   return 1;
 }
 
+// Translate raw fs errors into operator-friendly one-liners. Returns the
+// exit code so callers can pass it straight back.
+function reportFsError(prefix, err) {
+  const code = err?.code ?? "";
+  let hint = "";
+  if (code === "ENOENT") hint = "file or directory not found";
+  else if (code === "EACCES" || code === "EPERM") hint = "permission denied";
+  else if (code === "ENOSPC") hint = "no space left on device";
+  else hint = err?.message || String(err);
+  process.stderr.write(`[${prefix}] ${hint}${err?.path ? `: ${err.path}` : ""}\n`);
+  return 1;
+}
+
 async function uninstall() {
   const paths = getPaths();
   if (paths.kind === "unsupported") {
@@ -241,7 +264,12 @@ async function uninstall() {
     // Best-effort stop + disable before removing the file
     await runCmd("systemctl", ["--user", "stop", "cache-fix-proxy"]);
     await runCmd("systemctl", ["--user", "disable", "cache-fix-proxy"]);
-    const r = await uninstallSystemd({ paths });
+    let r;
+    try {
+      r = await uninstallSystemd({ paths });
+    } catch (err) {
+      return reportFsError("uninstall-service", err);
+    }
     if (!r.ok) {
       process.stderr.write(`[uninstall-service] ${r.reason}: ${r.path}\n`);
       return 1;
@@ -253,7 +281,12 @@ async function uninstall() {
   if (paths.kind === "launchd") {
     const targetPath = join(paths.configDir, paths.configFile);
     await runCmd("launchctl", ["bootout", `gui/${process.getuid()}`, targetPath]);
-    const r = await uninstallLaunchd({ paths });
+    let r;
+    try {
+      r = await uninstallLaunchd({ paths });
+    } catch (err) {
+      return reportFsError("uninstall-service", err);
+    }
     if (!r.ok) {
       process.stderr.write(`[uninstall-service] ${r.reason}: ${r.path}\n`);
       return 1;
