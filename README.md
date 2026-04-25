@@ -112,7 +112,7 @@ docker run -d --name cache-fix-proxy --restart=always -p 9801:9801 \
   ghcr.io/cnighswonger/claude-code-cache-fix:latest
 ```
 
-Image tags: `latest`, `3`, `3.1`, `3.1.1` (semver-ladder, so `3` always points to the newest 3.x). `latest` always tracks the newest tagged release.
+Image tags: `latest`, `3`, `3.2`, `3.2.0` (semver-ladder, so `3` always points to the newest 3.x). `latest` always tracks the newest tagged release.
 
 **Linux note:** the chained-upstream `host.docker.internal` example below is automatic on Docker Desktop (macOS / Windows). On plain Linux Docker Engine you usually need `--add-host=host.docker.internal:host-gateway` so the name resolves to the host bridge. Without it, the container's name lookup fails and the proxy can't reach the upstream service running on the host. Example chaining cache-fix proxy through `llm-relay` running on the host:
 

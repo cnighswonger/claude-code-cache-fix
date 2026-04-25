@@ -1,5 +1,27 @@
 # Changelog
 
+## 3.2.0 (2026-04-25)
+
+Three new opt-in extensions plus a `usage-log` rewrite that aligns the proxy's per-call JSONL with `claude-code-meter`'s strict validator.
+
+**`overage-warning` extension** (#79, closes #47) — opt-in via `CACHE_FIX_OVERAGE_WARNING=1`:
+
+When Anthropic's response headers indicate the user is approaching or has crossed the overage threshold (`anthropic-ratelimit-unified-status: allowed_warning|throttled` plus a non-empty `anthropic-ratelimit-unified-7d-surpassed-threshold`), emit a one-time-per-threshold-per-Q5h-window warning to stderr AND append a structured record to `~/.claude/overage-warnings.jsonl`. Carries a 15-minute rolling sample window to project minutes-to-100% with a coarse cost-per-hour estimate (labeled `coarse` everywhere — the precise per-tier cost engine is a v3.3.0 follow-up). Single emission per response guaranteed by an `emitted` flag on `ctx.meta`. Cross-response dedup keyed by `(threshold, q5h_resets_at)`. New shared rate constant in `proxy/rates.mjs`.
+
+**`upstream-change-detection` extension** (#80, closes #39) — opt-in via `CACHE_FIX_UPSTREAM_DETECTION=1`:
+
+Read-only structural fingerprinter that detects when CC ships updates that change `/v1/messages` request shape (cache_control marker count, system block layout, tools list, system-reminder patterns, beta headers). Per-namespace baseline persists across proxy restarts at `~/.claude/upstream-baseline.json` (atomic tmp + rename with unique suffix). Events appended to `~/.claude/upstream-changes.jsonl`. **Mechanically content-free**: every persisted field is a count, position, boolean, bucket label, or hash of stable identifiers. Allowlist matches stored as hash-of-sorted-indices, never the matched text. Unknown-marker / unknown-pattern detection records ONLY a boolean. Tested with a "secret string" planted throughout a request body — never appears in the fingerprint.
+
+**`usage-log` rewritten to MeterRowSchema v:1** (#81, closes #70):
+
+The proxy's `~/.claude/usage.jsonl` now emits exactly the 29-field record shape that `claude-code-meter`'s strict `z.strictObject({ v: z.literal(1), ... })` validator expects. The wire format is now the cross-repo contract — claude-meter v0.4.0+ tails the proxy's JSONL via `claude-meter ingest --watch`, validates strictly, and persists into the local store the existing analyze/share/status/history/rates already read from. **Breaking change for the `usage-log` row format** — old 9-field rows (with `peak_hour`) in any pre-existing `usage.jsonl` files will fail claude-meter's strict validator and be skipped on the reader side. `peak_hour` is no longer in the wire format (recomputable from `ts` if needed). `org_id` hashed with `sha256(raw).digest("hex").slice(0, 16)` — bit-exact match with claude-meter's algorithm, never raw. Activation pattern unchanged: opt-in via `extensions.json` entry, `CACHE_FIX_USAGE_LOG` is path override only.
+
+**Cross-repo release ordering**: cache-fix v3.2.0 ships first. claude-meter v0.4.0 follows, declaring `claude-code-cache-fix >= 3.2.0` as its supported producer. The two packages are NOT independently shippable for the proxy-mode ingestion path.
+
+**Tests**: 465 → 512+ (47+ new). No migration required for proxy or its other extensions.
+
+---
+
 ## 3.1.1 (2026-04-25)
 
 **`cache-fix-proxy install-service` subcommand** (#73, closes #48):
