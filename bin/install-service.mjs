@@ -20,11 +20,40 @@ const SERVER_PATH = resolve(__dirname, "..", "proxy", "server.mjs");
 
 function getDefaults() {
   return {
-    port: process.env.CACHE_FIX_PROXY_PORT || "9801",
+    port: validatePort(process.env.CACHE_FIX_PROXY_PORT || "9801"),
     upstream: process.env.CACHE_FIX_PROXY_UPSTREAM || "",
     debug: process.env.CACHE_FIX_DEBUG || "",
     workingDir: resolve(__dirname, ".."),
   };
+}
+
+// Validate that a port string is a plain decimal integer in [1, 65535].
+// We render this value into both a systemd Environment= line (safe) AND a
+// /bin/sh -c command in the healthcheck oneshot — DANGEROUS without
+// validation: shell metacharacters or quotes in a port string would let a
+// hostile env var change the executed command. Throw on invalid input so
+// callers report it cleanly via reportFsError.
+function validatePort(raw) {
+  if (typeof raw !== "string" && typeof raw !== "number") {
+    throw new InvalidPortError(`port must be a number or numeric string, got ${typeof raw}`);
+  }
+  const s = String(raw).trim();
+  if (!/^\d+$/.test(s)) {
+    throw new InvalidPortError(`port must be a positive integer (got ${JSON.stringify(raw)})`);
+  }
+  const n = Number(s);
+  if (n < 1 || n > 65535) {
+    throw new InvalidPortError(`port must be in 1..65535 (got ${n})`);
+  }
+  return s;
+}
+
+class InvalidPortError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "InvalidPortError";
+    this.code = "EINVAL";
+  }
 }
 
 function getPaths(plat = platform()) {
@@ -158,7 +187,22 @@ async function installSystemd({ paths, defaults, force = false } = {}) {
   // (see incident analysis: 2026-04-25 01:46:53 UTC — proxy was stopped by
   // an unidentified caller during the Anthropic outage and stayed down for
   // 10 hours because no auto-recovery existed).
-  const healthcheckPaths = await installSystemdHealthcheck({ paths, defaults, force });
+  //
+  // If the healthcheck install fails (template missing, write error, etc.),
+  // roll back the main unit so the user isn't left in a half-installed
+  // state. Without rollback the proxy unit would exist but the auto-recovery
+  // story we just promised in the install message would be incomplete.
+  let healthcheckPaths;
+  try {
+    healthcheckPaths = await installSystemdHealthcheck({ paths, defaults, force });
+  } catch (err) {
+    try {
+      await unlink(targetPath);
+    } catch {
+      /* best-effort rollback */
+    }
+    throw err;
+  }
 
   return {
     ok: true,
@@ -173,14 +217,26 @@ async function installSystemdHealthcheck({ paths, defaults, force = false } = {}
   const servicePath = join(paths.configDir, paths.healthcheckServiceFile);
   const timerPath = join(paths.configDir, paths.healthcheckTimerFile);
 
-  // If either exists and force is not set, leave both alone (atomic semantic
-  // — partial installs are confusing). Caller already checked the main unit.
-  if ((await fileExists(servicePath)) && !force) {
+  // Symmetric existence check: if EITHER the service file OR the timer file
+  // already exists, refuse to overwrite without force. Catches both the
+  // "service exists, timer missing" and "timer exists, service missing"
+  // half-states — those are the artifacts most likely to need explicit
+  // operator review (e.g. a previous install crashed mid-write, or the
+  // operator has hand-edited one of the two).
+  const serviceExists = await fileExists(servicePath);
+  const timerExists = await fileExists(timerPath);
+  if ((serviceExists || timerExists) && !force) {
+    const which = serviceExists && timerExists
+      ? "both files"
+      : serviceExists
+        ? "service file"
+        : "timer file";
     return {
       installed: false,
       reason: "already-installed",
       servicePath,
       timerPath,
+      hint: `${which} already present. Re-run with --force to overwrite, or \`cache-fix-proxy uninstall-service\` first.`,
     };
   }
 
@@ -331,12 +387,13 @@ async function install({ force = false } = {}) {
   return 1;
 }
 
-// Translate raw fs errors into operator-friendly one-liners. Returns the
-// exit code so callers can pass it straight back.
+// Translate raw fs / validation errors into operator-friendly one-liners.
+// Returns the exit code so callers can pass it straight back.
 function reportFsError(prefix, err) {
   const code = err?.code ?? "";
   let hint = "";
-  if (code === "ENOENT") hint = "file or directory not found";
+  if (err?.name === "InvalidPortError") hint = err.message;
+  else if (code === "ENOENT") hint = "file or directory not found";
   else if (code === "EACCES" || code === "EPERM") hint = "permission denied";
   else if (code === "ENOSPC") hint = "no space left on device";
   else hint = err?.message || String(err);
@@ -403,6 +460,8 @@ export {
   renderHealthcheckTimerTemplate,
   getPaths,
   getDefaults,
+  validatePort,
+  InvalidPortError,
   installSystemd,
   installSystemdHealthcheck,
   installLaunchd,

