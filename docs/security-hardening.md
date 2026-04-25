@@ -66,7 +66,7 @@ For each MCP server in `~/.claude.json`:
 - Does any tool shell out, write files, make network requests?
 - Is the MCP server itself a trusted artifact?
 
-`llm-relay` is one we wrote (or vetted) and trust. Third-party MCPs deserve more scrutiny.
+`llm-relay` is written by [@ArkNill](https://github.com/ArkNill); we have vetted it and trust it. Third-party MCPs we haven't vetted deserve more scrutiny.
 
 ### Don't disable TLS
 
