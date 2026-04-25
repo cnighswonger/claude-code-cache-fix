@@ -19,12 +19,12 @@ This is **advisory only**. No request mutation. The user's actions are theirs to
 
 In scope:
 - New extension `overage-warning.mjs` (or extend `cache-telemetry.mjs` — see "Implementation choice" below).
-- Detect `allowed_warning` status + `surpassed-threshold` header presence on `onResponseStart`.
-- Accumulate per-call usage tokens + per-call utilization snapshots in proxy memory.
+- Detect `allowed_warning` status + `surpassed-threshold` header presence on `onResponseStart` (latches eligibility).
+- Accumulate per-call usage tokens + per-call utilization snapshots in proxy memory across the stream lifecycle.
 - Compute a rolling burn rate (tokens/min, utilization-pct/hour) over a sliding window.
-- Project hours-until-100% based on current burn rate.
+- Project minutes-until-100% based on current burn rate.
 - Emit a one-time warning per threshold crossing per Q5h window:
-  - `[overage-warning] Q5h at X% (projected 100% in ~Y min). Continued burn at API rates ≈ $Z/hr. Plan upgrade path: <upgrade_plan options>.`
+  - `[overage-warning] Q5h at X% (projected 100% in ~Y min). Estimated continued burn at API rates ≈ $Z/hr (coarse). Plan upgrade path: <upgrade_plan options>.`
 - Write the warning to stderr (visible in proxy journal/logs) AND to a structured JSON record at `~/.claude/overage-warnings.jsonl` for downstream consumption (status line, dashboards, claude-meter, etc.).
 
 Out of scope (deferred):
@@ -42,6 +42,31 @@ Two options:
 **Decision:** new extension. `cache-telemetry` is a single-responsibility persister of the latest snapshot; the overage warning is a stateful watcher (rolling window, one-time-per-threshold emit, projection math). Mixing them would make `cache-telemetry`'s state model harder to reason about. The new extension can read the same headers — the parsing is cheap.
 
 Order: 610 (immediately after cache-telemetry at 600, so cache-telemetry's persistence happens first; overage-warning then runs against the same response with both header data and cache stats already on `ctx.meta`).
+
+## Activation model
+
+This directive uses the **`prefix-diff` pattern**: `enabled: true` in `extensions.json` (so the module is always loaded) plus an internal env-var gate that no-ops the extension when the user hasn't opted in. Codex review of the previous draft caught that the alternative — `enabled: false` plus an env var — cannot work because a disabled extension is never loaded by `proxy/pipeline.mjs`.
+
+Concretely:
+- `extensions.json` ships with `overage-warning: { enabled: true }`.
+- The extension's hook bodies short-circuit on the very first line if `process.env.CACHE_FIX_OVERAGE_WARNING !== "1"`.
+- No file is created, no state is allocated, no warning is emitted unless the env var is set.
+
+This is identical to how `prefix-diff` is wired (`enabled: true` in config, gated on `CACHE_FIX_PREFIXDIFF=1`). It keeps the user-facing toggle a one-line shell export instead of a JSON edit.
+
+## Hook lifecycle
+
+Detection eligibility is captured early; emission happens once we have enough sample data. The flow:
+
+| Hook | Action |
+|---|---|
+| `onResponseStart(ctx)` | If env-gate off → return. Read response headers (already parsed by `cache-telemetry` into `ctx.meta._quotaData` at order 600). Compute trigger eligibility (status + `surpassed-threshold` + dedup check). If eligible → set `ctx.meta._overageWarning = { eligible: true, trigger, snapshot }`. If not eligible → no-op. |
+| `onStreamEvent(ctx)` for `event.type === "message_start"` | If env-gate off → return. Push input/cache token sample into the module-scope rolling window using `event.message.usage`. |
+| `onStreamEvent(ctx)` for `event.type === "message_delta"` | If env-gate off → return. Push output token sample into the rolling window using `event.usage`. Then: if `ctx.meta._overageWarning?.eligible && !ctx.meta._overageWarning?.emitted` → compute projection from the window, emit the warning (stderr + JSONL), set `ctx.meta._overageWarning.emitted = true`, and record the dedup-key in module-scope state so the same threshold doesn't fire again in this Q5h window. |
+
+**Single emission per response.** The `emitted` flag on `ctx.meta._overageWarning` prevents multiple `message_delta` events in the same response from causing duplicate writes. The module-scope dedup state (keyed by `(threshold, q5h_resets_at)`) prevents the same threshold from firing again across responses within the same Q5h window.
+
+**Warm-up.** If the rolling window has fewer than 3 samples when `message_delta` fires, the projection fields are emitted as `null` and the stderr line falls back to the reduced format (no `~Y min`, no `≈ $Z/hr`). The warning still fires — the trigger crossed; the operator deserves to know — just without forward-looking math.
 
 ## Detection rules
 
@@ -75,18 +100,34 @@ On warning trigger:
 - `util_per_min = delta_util / delta_min` (bounded at 0 if negative — utilization can decrease as old usage rolls off)
 - `min_to_100 = (1.0 - newest_util) / util_per_min` (or `null` if `util_per_min <= 0`)
 
-For cost projection at API rates:
-- Use `usage-log.mjs`-style rate constants (input, cache_read, cache_creation, output). Define them in a shared `proxy/rates.mjs` module so both `usage-log` and `overage-warning` reference the same values.
-- `tokens_per_min = (input_total + cache_creation_total) / window_minutes` (roughly — adjust if cache_read becomes the dominant cost line; see seanGSISG dataset)
-- `cost_per_hr ≈ tokens_per_min * 60 * weighted_avg_rate`
+For cost projection at API rates (v3.2.0 — coarse estimate, explicitly labeled):
 
-If the window has fewer than 3 samples (e.g., proxy just restarted), suppress the projection and emit only the threshold-crossed message without `~Y min` and `≈ $Z/hr`. Document the warm-up requirement.
+The directive does NOT ship a precise per-token pricing engine in v3.2.0. Anthropic's published per-token rates vary by model, by cache tier (read vs write vs ephemeral_1h vs ephemeral_5m), and by overage classification. Encoding all of that correctly is its own subproject.
+
+Instead, v3.2.0 ships a **coarse burn estimate**:
+
+```
+weighted_token_cost_usd = $0.000005     # heuristic blend covering input + cache_read + output at typical Opus mix
+tokens_per_min          = (input_total + cache_creation_total + output_total) / window_minutes
+cost_per_hr_usd_coarse  = tokens_per_min * 60 * weighted_token_cost_usd
+```
+
+The constant `weighted_token_cost_usd` lives in a new `proxy/rates.mjs` module with an explanatory comment block ("This is a deliberate over-simplification for v3.2.0; refine in v3.3.0"). The stderr line and JSONL record both label this number with the word `coarse` so users don't take it as a precise quote.
+
+A precise per-tier cost engine is filed as a follow-up for v3.3.0.
+
+The warm-up rule (described in **Hook lifecycle** above) governs when the projection is suppressed: fewer than 3 samples → emit `null` for both `min_to_100` and `cost_per_hr_usd_coarse`; the threshold-crossed warning still fires.
 
 ## Output format
 
 ### Stderr line (single warning)
 ```
-[overage-warning] 2026-04-25T18:42:11Z Q5h=78% Q7d=82% (surpassed 0.75) — projected 100% in ~22 min, continued burn ≈ $4.10/hr at API rates. Upgrade paths: upgrade_plan, overage.
+[overage-warning] 2026-04-25T18:42:11Z Q5h=78% Q7d=82% (surpassed 0.75) — projected 100% in ~22 min, estimated continued burn ≈ $4.10/hr at API rates (coarse). Upgrade paths: upgrade_plan, overage.
+```
+
+### Stderr line (warm-up — fewer than 3 samples)
+```
+[overage-warning] 2026-04-25T18:42:11Z Q5h=78% Q7d=82% (surpassed 0.75) — projection unavailable (warming up). Upgrade paths: upgrade_plan, overage.
 ```
 
 ### `~/.claude/overage-warnings.jsonl` (one JSON object per line)
@@ -107,7 +148,7 @@ If the window has fewer than 3 samples (e.g., proxy just restarted), suppress th
   "projection": {
     "min_to_100": 22,
     "tokens_per_min": 14500,
-    "cost_per_hr_usd": 4.10,
+    "cost_per_hr_usd_coarse": 4.10,
     "window_samples": 47,
     "window_minutes": 14
   }
@@ -127,8 +168,8 @@ Don't try to be clever about partial overlap (e.g., 0.78 vs 0.80) — Anthropic 
 
 ## Env vars
 
-- `CACHE_FIX_OVERAGE_WARNING=1` — opt-in, default off (consistent with usage-log, prefix-diff). The warning text is informational but the JSONL is a new file users may not expect.
-- `CACHE_FIX_OVERAGE_WARNING_DIR` — override path for `overage-warnings.jsonl` (defaults to `~/.claude/`). Standard test-seam pattern.
+- `CACHE_FIX_OVERAGE_WARNING=1` — runtime activation gate (matches `prefix-diff` pattern). When unset, the extension is loaded but every hook returns immediately on the first line. No file is created, no state is allocated.
+- `CACHE_FIX_OVERAGE_WARNING_DIR` — override path for `overage-warnings.jsonl` (defaults to `~/.claude/`). Runtime override only.
 - `CACHE_FIX_OVERAGE_WARNING_QUIET=1` — suppress stderr emission, keep JSONL. For users who want programmatic-only consumption.
 
 No env var for window size or threshold tuning in v3.2.0 — keep the surface small. If users complain, add them in v3.2.1.
@@ -161,7 +202,7 @@ Minimum coverage:
 11. **Quiet mode**: `CACHE_FIX_OVERAGE_WARNING_QUIET=1` → no stderr, JSONL still written
 12. **Disabled**: `CACHE_FIX_OVERAGE_WARNING` unset → extension is no-op, no file created
 13. **Header absence**: missing `surpassed-threshold` even with `allowed_warning` → no fire (one of the trigger gates)
-14. **Concurrency**: parallel calls to the writer don't corrupt JSONL (atomic-append per write, similar to existing usage-log)
+14. **Concurrency**: parallel calls to the writer don't corrupt JSONL. The writer must use the same single-syscall append pattern that `usage-log` uses (`fs.promises.appendFile` writing the full record + trailing newline as one buffer). The kernel's `O_APPEND` semantics guarantee record-level atomicity for writes under `PIPE_BUF` (4096 bytes on Linux); each emitted record is well under that bound. Test by spawning 50 parallel writes and asserting the resulting file has exactly 50 well-formed JSON lines with no truncation or interleaving.
 
 ## Files modified / created
 
@@ -170,8 +211,8 @@ Minimum coverage:
 | `proxy/extensions/overage-warning.mjs` | NEW — extension module |
 | `proxy/rates.mjs` | NEW — shared rate constants for input/cache_read/cache_creation/output (extract from usage-log if rates already live there) |
 | `proxy/extensions/usage-log.mjs` | MINOR — import rates from `proxy/rates.mjs` instead of inline constants (only if existing constants need to move) |
-| `tests/overage-warning.test.mjs` | NEW — covers all test-plan items |
-| `extensions.json` | Add `overage-warning` entry, default `enabled: false` |
+| `test/overage-warning.test.mjs` | NEW — covers all test-plan items |
+| `extensions.json` | Add `overage-warning` entry, `enabled: true` (extension is always loaded; runtime gated by `CACHE_FIX_OVERAGE_WARNING=1`) |
 | `README.md` | Document new extension + env vars in the extensions table |
 
 ## Reviewer checklist
@@ -185,7 +226,10 @@ Minimum coverage:
 - [ ] All env vars follow the `CACHE_FIX_OVERAGE_WARNING*` naming pattern.
 - [ ] No new top-level dependencies.
 - [ ] Tests pass on Node 18, 20, 22 (CI matrix).
-- [ ] `extensions.json` default is `enabled: false`.
+- [ ] `extensions.json` entry has `enabled: true`; runtime gated by `CACHE_FIX_OVERAGE_WARNING=1` (matches `prefix-diff` pattern).
+- [ ] When `CACHE_FIX_OVERAGE_WARNING` is unset, the extension hooks return on the first line — no file created, no state allocated.
+- [ ] Tests live under `test/`, not `tests/`.
+- [ ] Cost-per-hour number is labeled `coarse` in stderr line, JSONL field, and source comments.
 - [ ] README documents the new extension and links the issue.
 
 ## Out of scope (explicit)
