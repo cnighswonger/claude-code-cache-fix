@@ -377,3 +377,127 @@ test("recordSample respects WINDOW_MS cutoff", () => {
   recordSample(state, { t: now, q5h: 0.7 });
   assert.equal(state.window.length, 2, "old sample beyond 15min window dropped");
 });
+
+// --- Lifecycle correctness (covers Codex review blockers) ---
+
+async function runResponse(ext, headers, { input = 100, cache_creation = 50, cache_read = 1000, output = 200 } = {}) {
+  const ctx = { headers, meta: {}, event: null };
+  await ext.default.onResponseStart(ctx);
+  ctx.event = {
+    type: "message_start",
+    message: {
+      usage: {
+        input_tokens: input,
+        cache_creation_input_tokens: cache_creation,
+        cache_read_input_tokens: cache_read,
+      },
+    },
+  };
+  await ext.default.onStreamEvent(ctx);
+  ctx.event = { type: "message_delta", usage: { output_tokens: output } };
+  await ext.default.onStreamEvent(ctx);
+  return ctx;
+}
+
+test("L1. non-trigger responses warm the rolling window", async () => {
+  process.env.CACHE_FIX_OVERAGE_WARNING = "1";
+  process.env.CACHE_FIX_OVERAGE_WARNING_QUIET = "1";
+  const ext = await freshExt();
+  const dir = await newTmp();
+  process.env.CACHE_FIX_OVERAGE_WARNING_DIR = dir;
+  try {
+    // Three non-eligible responses (status=allowed) that nevertheless carry q5h
+    // headers — these MUST still warm the window per the directive.
+    const cool = mkHeaders({ status: "allowed", surpassed: "" });
+    await runResponse(ext, cool);
+    await runResponse(ext, cool);
+    await runResponse(ext, cool);
+
+    // Now an eligible response — projection should already be past warm-up
+    // because the prior three calls warmed the window.
+    const hot = mkHeaders();
+    await runResponse(ext, hot);
+
+    const text = await readFile(join(dir, "overage-warnings.jsonl"), "utf8");
+    const record = JSON.parse(text.trim().split("\n")[0]);
+    assert.ok(record.projection.window_samples >= 3, `expected ≥3 samples in window, got ${record.projection.window_samples}`);
+  } finally {
+    delete process.env.CACHE_FIX_OVERAGE_WARNING;
+    delete process.env.CACHE_FIX_OVERAGE_WARNING_QUIET;
+    delete process.env.CACHE_FIX_OVERAGE_WARNING_DIR;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("L2. multiple message_delta events in one response emit once", async () => {
+  process.env.CACHE_FIX_OVERAGE_WARNING = "1";
+  process.env.CACHE_FIX_OVERAGE_WARNING_QUIET = "1";
+  const dir = await newTmp();
+  process.env.CACHE_FIX_OVERAGE_WARNING_DIR = dir;
+  const ext = await freshExt();
+  try {
+    const ctx = { headers: mkHeaders(), meta: {}, event: null };
+    await ext.default.onResponseStart(ctx);
+    ctx.event = {
+      type: "message_start",
+      message: { usage: { input_tokens: 100, cache_creation_input_tokens: 50, cache_read_input_tokens: 1000 } },
+    };
+    await ext.default.onStreamEvent(ctx);
+    // Three message_delta events in same response — only the first should emit.
+    for (const out of [100, 50, 25]) {
+      ctx.event = { type: "message_delta", usage: { output_tokens: out } };
+      await ext.default.onStreamEvent(ctx);
+    }
+    const text = await readFile(join(dir, "overage-warnings.jsonl"), "utf8");
+    const lines = text.split("\n").filter(Boolean);
+    assert.equal(lines.length, 1, "expected exactly one emission across multiple message_delta events");
+  } finally {
+    delete process.env.CACHE_FIX_OVERAGE_WARNING;
+    delete process.env.CACHE_FIX_OVERAGE_WARNING_QUIET;
+    delete process.env.CACHE_FIX_OVERAGE_WARNING_DIR;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("L3. interleaved responses don't leak output_tokens between samples", async () => {
+  process.env.CACHE_FIX_OVERAGE_WARNING = "1";
+  process.env.CACHE_FIX_OVERAGE_WARNING_QUIET = "1";
+  const ext = await freshExt();
+  try {
+    // Response A: no quota header at all → no sample created, no _overageSample.
+    const noHdr = {};
+    const ctxA = { headers: noHdr, meta: {}, event: null };
+    await ext.default.onResponseStart(ctxA);
+    ctxA.event = {
+      type: "message_start",
+      message: { usage: { input_tokens: 100, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } },
+    };
+    await ext.default.onStreamEvent(ctxA);
+    assert.equal(ctxA.meta._overageSample, undefined, "no sample expected without quota header");
+
+    // Response B: WITH quota header → sample pushed and handle stored.
+    const ctxB = { headers: mkHeaders({ status: "allowed", surpassed: "" }), meta: {}, event: null };
+    await ext.default.onResponseStart(ctxB);
+    ctxB.event = {
+      type: "message_start",
+      message: { usage: { input_tokens: 100, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } },
+    };
+    await ext.default.onStreamEvent(ctxB);
+    const bSample = ctxB.meta._overageSample;
+    assert.ok(bSample, "response B should own a sample");
+
+    // Response A's message_delta arrives after B's sample is in the window.
+    // It MUST NOT mutate B's sample (the prior bug would have done exactly that).
+    ctxA.event = { type: "message_delta", usage: { output_tokens: 9999 } };
+    await ext.default.onStreamEvent(ctxA);
+    assert.equal(bSample.output, 0, "response A's output_tokens must not leak into response B's sample");
+
+    // Response B's own message_delta — this DOES mutate B's sample.
+    ctxB.event = { type: "message_delta", usage: { output_tokens: 250 } };
+    await ext.default.onStreamEvent(ctxB);
+    assert.equal(bSample.output, 250, "response B's own output_tokens land on its own sample");
+  } finally {
+    delete process.env.CACHE_FIX_OVERAGE_WARNING;
+    delete process.env.CACHE_FIX_OVERAGE_WARNING_QUIET;
+  }
+});

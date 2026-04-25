@@ -275,9 +275,21 @@ export default {
     if (!ctx || !ctx.headers) return;
 
     try {
+      ctx.meta = ctx.meta || {};
+
+      // Always capture quota state if the headers carry it, regardless of
+      // whether THIS response's status crosses a warning threshold. Future
+      // responses need warm samples to project from.
+      const q5hRaw = ctx.headers["anthropic-ratelimit-unified-5h-utilization"];
+      const q5hUtil = q5hRaw ? parseFloat(q5hRaw) : null;
+      if (q5hUtil !== null && Number.isFinite(q5hUtil)) {
+        ctx.meta._overageQuota = { q5h_util: q5hUtil };
+      }
+
+      // Trigger eligibility latch — only set when this response is the one
+      // that crossed a threshold. Keeps emission gate separate from sampling.
       const result = parseTriggerFromHeaders(ctx.headers);
       if (!result.eligible) return;
-      ctx.meta = ctx.meta || {};
       ctx.meta._overageWarning = {
         eligible: true,
         emitted: false,
@@ -295,35 +307,35 @@ export default {
     if (!ctx || !ctx.event) return;
 
     try {
-      // Sample collection — happens regardless of trigger eligibility, so the
-      // window is warm if a later call crosses a threshold.
+      // Sample collection — happens on every response that has a quota
+      // reading, regardless of whether this response is the one that emits.
       if (ctx.event.type === "message_start" && ctx.event.message?.usage) {
         const u = ctx.event.message.usage;
-        const q5hUtil =
-          ctx.meta?._overageWarning?.raw?.q5h_util !== undefined
-            ? ctx.meta._overageWarning.raw.q5h_util
-            : null;
-        // Only push samples when we have a quota reading, otherwise the
-        // burn-rate projection has no reference point.
-        if (q5hUtil !== null) {
-          recordSample(
-            { window: _window },
-            {
-              t: Date.now(),
-              q5h: q5hUtil,
-              input: u.input_tokens || 0,
-              cache_creation: u.cache_creation_input_tokens || 0,
-              cache_read: u.cache_read_input_tokens || 0,
-              output: 0,
-            },
-          );
+        const q5hUtil = ctx.meta?._overageQuota?.q5h_util;
+        if (q5hUtil !== undefined && q5hUtil !== null) {
+          const sample = {
+            t: Date.now(),
+            q5h: q5hUtil,
+            input: u.input_tokens || 0,
+            cache_creation: u.cache_creation_input_tokens || 0,
+            cache_read: u.cache_read_input_tokens || 0,
+            output: 0,
+          };
+          recordSample({ window: _window }, sample);
+          // Hand the response its own sample reference. message_delta updates
+          // THIS sample only — never the window's last sample, which could
+          // belong to a different response under interleaving.
+          ctx.meta._overageSample = sample;
         }
       }
 
       if (ctx.event.type === "message_delta") {
-        // Update the most recent sample with output tokens (best-effort).
-        if (_window.length && ctx.event.usage?.output_tokens) {
-          _window[_window.length - 1].output += ctx.event.usage.output_tokens;
+        // Update THIS response's sample with output tokens. The sample
+        // reference is response-local (set by message_start), so a response
+        // that never sampled cannot leak output tokens into another response.
+        const ownSample = ctx.meta?._overageSample;
+        if (ownSample && ctx.event.usage?.output_tokens) {
+          ownSample.output += ctx.event.usage.output_tokens;
         }
 
         // Emission gate.
