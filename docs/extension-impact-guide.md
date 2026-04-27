@@ -146,6 +146,25 @@ These features only work with the preload interceptor (`NODE_OPTIONS="--import .
 
 **Measured impact:** In a session with 4 screenshots, disabling image stripping added ~250K tokens per turn — equivalent to doubling the context window usage.
 
+### Oversized-image guard (`CACHE_FIX_IMAGE_MAX_DIM=N`)
+
+**What it fixes:** Anthropic enforces a per-image dimension ceiling on multi-image requests. When any single image exceeds the limit (currently 2000px on a side), the API returns:
+
+> "An image in the conversation exceeds the dimension limit for many-image requests (2000px). Start a new session with fewer images."
+
+This fails the request entirely. Common triggers: hi-res manuscript scans, retina screenshots, photo attachments at full resolution.
+
+**ON (e.g. =2000):** On every request, scan all PNG/JPEG images in both user messages and tool results. Replace any whose width OR height exceeds the limit with a forensic placeholder: `[image stripped — exceeded 2000px max dimension (was 3000x1500px)]`. The original dimensions stay visible to the model so it knows why the image was dropped.
+
+**OFF (default):** No dimension check. Hi-res images pass through and the request fails with the dimension-limit error.
+
+**Composes with `CACHE_FIX_IMAGE_KEEP_LAST`:** when both are set, `KEEP_LAST` runs first (drops images from old messages), then `MAX_DIM` runs on whatever remains (strips the oversized).
+
+**Implementation notes:**
+- Pure-JS PNG and JPEG header parsing — no native deps. Other formats (GIF, WebP, AVIF, BMP) are not detected; images of those types pass through unchanged regardless of dimension.
+- Fail-open: if dimensions can't be parsed (truncated header, unsupported format), the image is kept rather than stripped. Better to send a request that might error than to strip a valid image we just couldn't measure.
+- Pre-process locally when you can (`magick convert input.png -resize 2000x2000\> output.png`). This extension is the safety net for sources you forgot to pre-process.
+
 ### Output efficiency rewrite (`CACHE_FIX_OUTPUT_EFFICIENCY_REPLACEMENT`)
 
 **What it fixes:** Nothing directly — allows replacing CC's `# Output efficiency` system prompt section with custom text.

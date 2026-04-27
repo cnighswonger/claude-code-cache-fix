@@ -334,6 +334,16 @@ export CACHE_FIX_IMAGE_KEEP_LAST=3
 
 Keeps images in the last 3 user messages, replaces older ones with a text placeholder. Only targets `tool_result` blocks — user-pasted images are never touched.
 
+### Oversized-image guard
+
+```bash
+export CACHE_FIX_IMAGE_MAX_DIM=2000
+```
+
+Anthropic enforces a per-image dimension ceiling on multi-image requests; any image exceeding the limit (currently 2000px on a side) fails the entire request with `"An image in the conversation exceeds the dimension limit for many-image requests (2000px). Start a new session with fewer images."` Common triggers: hi-res scans, retina screenshots, photos at full resolution.
+
+`CACHE_FIX_IMAGE_MAX_DIM=2000` enables a per-request scan that strips oversized PNG/JPEG images (in both user messages and tool results) and replaces each with a forensic placeholder noting the original dimensions. Pure-JS header parsing — no native deps. Composes with `CACHE_FIX_IMAGE_KEEP_LAST` (keep_last runs first, max_dim then runs on what remains). Other formats (GIF, WebP, AVIF, BMP) pass through unchanged.
+
 ## System prompt rewrite (preload mode, optional)
 
 The interceptor can rewrite Claude Code's `# Output efficiency` system-prompt section. Disabled by default. Enable with `CACHE_FIX_OUTPUT_EFFICIENCY_REPLACEMENT`. See [docs/output-efficiency-prompts.md](docs/output-efficiency-prompts.md) for the three known prompt variants and usage instructions.
