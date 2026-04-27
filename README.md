@@ -340,9 +340,20 @@ Keeps images in the last 3 user messages, replaces older ones with a text placeh
 export CACHE_FIX_IMAGE_MAX_DIM=2000
 ```
 
-Anthropic enforces a per-image dimension ceiling on multi-image requests; any image exceeding the limit (currently 2000px on a side) fails the entire request with `"An image in the conversation exceeds the dimension limit for many-image requests (2000px). Start a new session with fewer images."` Common triggers: hi-res scans, retina screenshots, photos at full resolution.
+The Anthropic API enforces TWO image-related limits on multi-image requests, and the same error message can fire for either:
 
-`CACHE_FIX_IMAGE_MAX_DIM=2000` enables a per-request scan that strips oversized PNG/JPEG images (in both user messages and tool results) and replaces each with a forensic placeholder noting the original dimensions. Pure-JS header parsing — no native deps. Composes with `CACHE_FIX_IMAGE_KEEP_LAST` (keep_last runs first, max_dim then runs on what remains). Other formats (GIF, WebP, AVIF, BMP) pass through unchanged.
+> `"An image in the conversation exceeds the dimension limit for many-image requests (2000px). Start a new session with fewer images."`
+
+Two pressure axes to address them:
+
+| Pressure | Variable | What it does |
+|---|---|---|
+| **Too many images in conversation** | `CACHE_FIX_IMAGE_KEEP_LAST=N` | Strips images from old user messages, keeps only the last N. |
+| **Any single image too large** | `CACHE_FIX_IMAGE_MAX_DIM=2000` | Replaces images exceeding the dimension limit with a forensic placeholder noting the original dimensions. Covers both user-message direct images and tool_result-nested images. |
+
+The two compose: with both set, `KEEP_LAST` runs first (drops the count), then `MAX_DIM` runs on what remains (caps the size of the kept ones). Common triggers for the dimension axis: hi-res manuscript scans, retina screenshots, photos at full resolution.
+
+Pure-JS PNG and JPEG header parsing — no native deps. Other formats (GIF, WebP, AVIF, BMP) pass through unchanged regardless of dimension. Fail-open: images whose dimensions can't be parsed (truncated header, unsupported format) are kept rather than stripped — better to send a request that might error than to strip a valid image we just couldn't measure.
 
 ## System prompt rewrite (preload mode, optional)
 
