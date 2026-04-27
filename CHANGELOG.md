@@ -1,5 +1,19 @@
 # Changelog
 
+## 3.2.1 (2026-04-27)
+
+**Oversized-image guard for `image-strip`** (#84, requested by @X-15):
+
+New `CACHE_FIX_IMAGE_MAX_DIM=<pixels>` env var on the existing `image-strip` extension. When an image's pixel dimensions exceed the cap (Anthropic's per-image dimension ceiling for many-image requests is 2000px), the image is replaced with a forensic placeholder noting the original dimensions and tool_use_id. Covers both user-message direct images and tool_result-nested images. Pure-JS PNG and JPEG header parsing in new `proxy/image-dimensions.mjs` — no native dependencies.
+
+Composes with the existing `CACHE_FIX_IMAGE_KEEP_LAST` (count axis): when both are set, `KEEP_LAST` runs first (drops images from old messages), then `MAX_DIM` runs on whatever survives (caps the size of the kept ones). Common triggers for the dimension axis: hi-res manuscript scans, retina screenshots, photos at full resolution.
+
+**Tests**: 526 → 553 (27 new — 16 in `proxy-image-dimensions.test.mjs` covering synthesized PNG/JPEG headers, 11 in `proxy-image-strip.test.mjs` covering MAX_DIM behavior, fail-open semantics, and KEEP_LAST + MAX_DIM composition).
+
+No behavior change for users not setting `CACHE_FIX_IMAGE_MAX_DIM`. No migration required.
+
+---
+
 ## 3.2.0 (2026-04-25)
 
 Three new opt-in extensions plus a `usage-log` rewrite that aligns the proxy's per-call JSONL with `claude-code-meter`'s strict validator.
