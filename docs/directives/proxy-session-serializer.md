@@ -83,9 +83,10 @@ In scope:
 Out of scope:
 
 - **Actual serialization (queue + delay).** Phase 0 observes; it does not change behavior. Decision to serialize comes after data lands.
-- **The `onResponseComplete` pipeline hook.** Phase 0 detects response completion via the stream-end / response-close callbacks already available to extensions. If Phase 1 ships, that's where the hook decision gets made.
 - **All four operational concerns from the deferred draft** (queue depth limit, queue timeout, depth-exceeded rejection with 429, queued-timeout rejection with 504). All Phase 1 concerns.
 - **Multi-user / non-localhost scoping.** Original draft was localhost-only; Phase 0 doesn't change that. Phase 1 may.
+
+NOTE: the new `onResponseEnd` pipeline hook IS in scope (per §Scope item #2 above) — it's required for Phase 0's collision-completion measurement and could not be punted to Phase 1. The prior draft of this section listed it as out-of-scope; that was wrong and is corrected here.
 
 ## Activation
 
@@ -148,7 +149,7 @@ JSONL log entry shape (one line per completed request):
 
 `session_key` is the structural fingerprint hash (SHA-256 over the structural fields + process-side ephemeral salt, truncated to 16 hex chars). Per §Session identity, the inputs are STRUCTURAL ONLY — no user prompt text enters the hash — and the salt is per-proxy-startup, ephemeral, in-memory only (not persisted to disk). This means the JSONL log cannot be dictionary-attacked back to user prompt content, AND keys do not correlate across proxy restarts.
 
-`outcome` is one of: `200`, `4xx_<code>`, `5xx_<code>`, `aborted`, `timeout`.
+`outcome` is one of: `200`, `4xx_<code>`, `5xx_<code>`, `aborted`, `timeout`, `error`. (`error` covers upstream connection failures and any other non-HTTP termination — added per Test 23 in §Outcome classification, which the prior draft of this enum was missing.)
 
 Stats are also surfaced on `ctx.meta.sessionObservabilityStats` for any downstream extension that wants them, with the same fields plus running per-session counters.
 
@@ -235,7 +236,7 @@ async function onResponseEnd(ctx, response) {
 }
 ```
 
-The `onResponseEnd` hook needs to fire on stream end OR non-stream body close OR error. If the current pipeline doesn't emit a unified callback, the implementation wraps response handling inline in the extension. Either approach is acceptable for Phase 0; Phase 1 (if it ships) might benefit from a proper hook.
+The `onResponseEnd` hook fires on stream end, non-stream body close, upstream error, AND client abort — all four termination paths, per the §Scope item #2 contract. The pipeline change to add this hook IS part of Phase 0's scope; the implementation does NOT fall back to inline extension-side response handling. (The prior draft's "fall back to inline" text was a holdover from before the hook was scoped in; corrected here.)
 
 ## Test plan (Phase 0)
 
@@ -311,8 +312,9 @@ The `onResponseEnd` hook needs to fire on stream end OR non-stream body close OR
 - FIFO queue + serialization behavior (the actual serializer).
 - Queue depth limits + 429 rejection.
 - Queue timeout + 504 rejection.
-- `onResponseComplete` pipeline hook (vs. extension-local response handling).
 - Multi-user / per-user partitioning.
 - Migration of `docs/deferred/proxy-session-serializer.md` content into a v1 directive (happens IFF Phase 0 greenlights).
+
+NOTE: the `onResponseEnd` pipeline hook is IN scope for Phase 0 (per §Scope item #2). The deferred draft's `onResponseComplete` was a different proposed name; we're shipping `onResponseEnd` in this PR.
 
 — AI Team Lead
