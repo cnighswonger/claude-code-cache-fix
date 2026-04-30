@@ -409,6 +409,29 @@ If `sharp` is missing, Pass 3 skips cleanly (telemetry records `library_missing:
 | `CACHE_FIX_IMAGE_REQUEST_SIZE_MAX` | 31457280 (30 MB) | Pass 2 byte budget. 2 MB headroom from Anthropic's 32 MB ceiling. |
 | `CACHE_FIX_IMAGE_COUNT_MAX` | 100 | Hard image-count cap. Set to 600 for legacy Claude 1/2.x/Instant if needed. |
 
+## Cache breakpoints (proxy mode, opt-in)
+
+Anthropic's prompt cache supports up to **four** `cache_control` markers per request. Claude Code currently uses three of the four; the third (between auto-injected `messages[0]` content — hooks, skills, project CLAUDE.md, deferred tools, MCP server descriptions — and the first real user content) is missing entirely. Without that marker, every change inside the auto-injected span busts the cache for everything that follows. wadabum projected ~6,500 token savings per fresh-session first turn from adding it ([anthropics/claude-code#47098](https://github.com/anthropics/claude-code/issues/47098)).
+
+The proxy can inject the missing marker on opt-in. Default off until validated against community data.
+
+```sh
+export CACHE_FIX_INJECT_MESSAGES_BREAKPOINT=1
+```
+
+The injection is conservative: it only fires when the request already carries 1–3 markers (typical CC shape) and refuses if the request is at the 4-marker limit (would 400) or has zero markers (Agent SDK / API-direct shape this extension isn't built for). Boundary detection covers all five observed auto-injected block kinds — hooks, skills, CLAUDE.md, deferred-tools, MCP — and lands the marker on the LAST auto-injected block.
+
+A diagnostic-only env var dumps the structural shape of `messages[0]` for fixture sourcing without mutating the request:
+
+```sh
+export CACHE_FIX_DUMP_MESSAGES_HEAD=/tmp/messages-head.jsonl
+```
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `CACHE_FIX_INJECT_MESSAGES_BREAKPOINT` | unset | Enable breakpoint #3 injection (`=1` opt-in). |
+| `CACHE_FIX_DUMP_MESSAGES_HEAD` | unset | Diagnostic JSONL dump of `messages[0].content` shape — read-only, no mutation. |
+
 ## System prompt rewrite (preload mode, optional)
 
 The interceptor can rewrite Claude Code's `# Output efficiency` system-prompt section. Disabled by default. Enable with `CACHE_FIX_OUTPUT_EFFICIENCY_REPLACEMENT`. See [docs/output-efficiency-prompts.md](docs/output-efficiency-prompts.md) for the three known prompt variants and usage instructions.
