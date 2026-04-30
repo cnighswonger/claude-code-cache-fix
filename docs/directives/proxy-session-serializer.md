@@ -50,23 +50,35 @@ Key references:
 In scope:
 
 1. New env var `CACHE_FIX_SESSION_OBSERVE=1` — opt-in observability gate. Default off.
-2. New extension `proxy/extensions/session-observability.mjs` registered at order 690 (between `usage-log` at 650 and `request-log` at 700; this is observation, not mutation, so order is non-load-bearing — runs late so other extensions' mutations are already counted).
-3. **Concurrency observation logic**:
+2. **New pipeline hook `onResponseEnd(ctx)`** added to `proxy/pipeline.mjs` and invoked from `proxy/server.mjs` after BOTH the non-streaming response (`clientRes.end(JSON.stringify(resCtx.body))`) and the streaming response (`clientRes.end()` at end of `streamResponse`), AND on the upstream-error / client-abort paths (Codex blocker fix from review #1). Audit confirmed: the current pipeline exposes `onRequest`, `onResponseStart`, and `onResponse` (the latter only fires for non-streaming JSON responses per `proxy/server.mjs:92`; the streaming path at `proxy/stream.mjs:108` bypasses it). Phase 0's collision-completion measurement requires a hook that fires for BOTH paths AND on error / abort. The seam work is scoped INTO Phase 0 here rather than punted to Phase 1.
+
+   Hook contract:
+   ```js
+   await ext.onResponseEnd(ctx);
+   // ctx contains: status, headers (snapshot), meta,
+   //   outcome ("200"|"4xx_NNN"|"5xx_NNN"|"aborted"|"timeout"|"error"),
+   //   start_ts, end_ts
+   ```
+   Errors thrown from `onResponseEnd` are logged and swallowed (same convention as other pipeline hook errors).
+
+3. New extension `proxy/extensions/session-observability.mjs` registered at order 690 (between `usage-log` at 650 and `request-log` at 700; this is observation, not mutation, so order is non-load-bearing — runs late so other extensions' mutations are already counted).
+4. **Concurrency observation logic**:
    - Detect a session/conversation identifier per request (see §Session identity below).
    - Track in-flight requests per session in a process-local Map.
    - On every incoming request, record: arrival timestamp, session key, current in-flight count for that session.
-   - On response completion (stream end OR non-stream body close OR error OR client abort), record: completion timestamp, latency, outcome (200 / 4xx / 5xx / aborted / timeout).
-4. **Concurrent-event detection**:
+   - On response completion via the new `onResponseEnd` hook (which fires on stream end, non-stream body close, error, AND client abort), record: completion timestamp, latency, outcome (200 / 4xx / 5xx / aborted / timeout / error).
+5. **Concurrent-event detection**:
    - When a request arrives while another is in-flight on the same session, record a "concurrent collision" event.
    - For each collision: record the collision count, the latency of both requests, and the outcomes.
-5. **Failure-correlation logging**: for each request, also record whether it landed a 5xx response. The Phase 0 question is whether 5xx rates differ between collision and no-collision requests on the same session.
-6. New JSONL log: `~/.claude/session-observability.jsonl` (one line per completed request, including non-collision requests for baseline). Path overridable via `CACHE_FIX_SESSION_OBSERVE_LOG=<path>`.
-7. New analysis tool `tools/session-observability-report.mjs` — reads the JSONL log and reports:
+6. **Failure-correlation logging**: for each request, also record whether it landed a 5xx response. The Phase 0 question is whether 5xx rates differ between collision and no-collision requests on the same session.
+7. New JSONL log: `~/.claude/session-observability.jsonl` (one line per completed request, including non-collision requests for baseline). Path overridable via `CACHE_FIX_SESSION_OBSERVE_LOG=<path>`.
+8. New analysis tool `tools/session-observability-report.mjs` — reads the JSONL log and reports:
    - Collision rate (% of requests that collided with an in-flight request on the same session).
    - 5xx rate by collision-status (collision vs non-collision).
    - Cache-creation tokens by collision-status (proxy for cache invalidation impact).
    - p50 / p95 / p99 latency by collision-status.
-8. README env-var table addition; brief monitoring.md entry.
+   - **Sample-size-aware decision summary** per §Phase 0 success criteria below.
+9. README env-var table addition; brief monitoring.md entry.
 
 Out of scope:
 
@@ -94,10 +106,23 @@ Candidate sources, in order of preference:
 
 1. **Anthropic-specific session header** — if Anthropic exposes one (e.g., `anthropic-conversation-id`). Inspect a captured request body for any header that looks session-scoped.
 2. **CC-emitted session header** — CC may add a `claude-session-id` or similar. The `cc_version` fingerprint is per-process, not per-session, so don't use it.
-3. **Request body fingerprint** — derive a session identifier from `body.system[0].text` (the static system prompt) + the first user message text. Stable within a session, differs across sessions. This is the heuristic the current `cache-telemetry` extension uses to bucket sessions.
+3. **Structural fingerprint** (revised — Codex blocker fix from review #1) — derive a session identifier from STRUCTURAL fields only, NOT from user-prompt content:
+   - `body.model`
+   - `body.system[*].cache_control` markers (presence + position only, not content)
+   - Number of `body.system[]` blocks
+   - Number of `body.tools[]` entries (as a stable count)
+   - Process-side ephemeral salt (random per proxy startup, persisted in memory only)
+
+   The combination is hashed (SHA-256, then truncated to 16 hex chars for display). Rationale: this is stable WITHIN a session (the model + system block layout doesn't change turn-to-turn for a given CC process) but does NOT include any user prompt text, so the hash cannot be dictionary-attacked back to the user's prompt content.
 4. **Connection-level fallback** — same client IP + user-agent within a 30-second window. Imprecise but always available.
 
-Phase 0's observability extension uses (3) — body-fingerprint hashing — as the primary key. If we discover (1) or (2) reliably exists, we promote it in Phase 1. The reason to use (3) for observability: it doesn't depend on hypothetical headers, it's deterministic, and even if it's slightly imprecise (rare cross-session collisions on identical first user messages), the false-positive rate is low enough not to invalidate the collision-rate measurement.
+Phase 0's observability extension uses (3) — **structural fingerprint with process-side salt** — as the primary key. If we discover (1) or (2) reliably exists, we promote it in Phase 1.
+
+**Why NOT use the prompt-text fingerprint** (the prior draft's choice): a deterministic SHA-256 of `body.system[0].text + body.messages[0]` was vulnerable to dictionary attack — an attacker with access to the `session-observability.jsonl` log AND a guess at the user's prompt corpus could recover plaintext prompt content by hashing candidate prompts and matching. Even truncated to 16 chars, the hash still leaks enough to enable confirm-attacks on specific candidate prompts. The structural fingerprint approach above carries no prompt-derived bits and isn't vulnerable.
+
+The trade-off: structural fingerprint may be LESS unique than a prompt-text fingerprint (two different sessions with the same model + tool layout would collide). For Phase 0's collision-rate measurement that's actually fine — we're measuring "concurrent requests on the same session," and false-merging two distinct concurrent sessions would OVER-report collisions, not under-report. The Phase 0 result is a worst-case upper bound on the collision rate, which is the right side to err on.
+
+The process-side ephemeral salt prevents cross-process and cross-restart correlation (a fresh proxy restart produces fresh keys), reducing the long-term re-identification risk further.
 
 ## Telemetry
 
@@ -121,7 +146,7 @@ JSONL log entry shape (one line per completed request):
 }
 ```
 
-`session_key` is hashed (SHA-256, truncated to 16 hex chars displayed) — never the plaintext fingerprint, since the fingerprint contains user prompt text.
+`session_key` is the structural fingerprint hash (SHA-256 over the structural fields + process-side ephemeral salt, truncated to 16 hex chars). Per §Session identity, the inputs are STRUCTURAL ONLY — no user prompt text enters the hash — and the salt is per-proxy-startup, ephemeral, in-memory only (not persisted to disk). This means the JSONL log cannot be dictionary-attacked back to user prompt content, AND keys do not correlate across proxy restarts.
 
 `outcome` is one of: `200`, `4xx_<code>`, `5xx_<code>`, `aborted`, `timeout`.
 
@@ -133,10 +158,24 @@ After 1 week (or 1000+ logged requests, whichever comes first) of running with `
 
 | Gating question | Answered by |
 |-----------------|-------------|
-| 1. Is the failure pattern still observable? | Compare 5xx rate between collision and non-collision requests. If collision-5xx-rate is materially higher (≥ 2× the non-collision baseline), the pattern is observable. If they're statistically indistinguishable, it's been mitigated upstream. |
-| 2. Can the pipeline provide the response-complete signal? | Phase 0 implementation is the answer — if we can build the observability extension at all, we can hook response completion. The deferred draft's `onResponseComplete` hook isn't strictly necessary; stream-close callbacks are sufficient. |
-| 3. Cost/benefit on real workloads? | Compare cache-creation tokens between collision and non-collision requests (collisions correlate with cache invalidation). Compare p50/p95 latency to estimate the queueing cost (latency_ms is what queueing would add to the SECOND request in any pair). Cost/benefit favorable when (cache-creation savings × $rate) > (queueing latency × user friction). |
+| 1. Is the failure pattern still observable? | Sample-size-aware comparison of 5xx rate between collision and non-collision requests. **Minimum samples**: ≥ 50 collision events AND ≥ 50 non-collision events from the same observation window. **Decision rule**: compute Wilson 95% confidence intervals for both 5xx rates; pattern is "observable" only if the LOWER bound of collision-5xx CI exceeds the UPPER bound of non-collision-5xx CI by a factor of ≥ 2. (See §Decision rigor below for the rationale.) If samples are insufficient, the answer is "not enough data; extend the observation window" — NOT "no". |
+| 2. Can the pipeline provide the response-complete signal? | **Yes — answered by the §Scope item #2 work above.** Phase 0 adds an `onResponseEnd` pipeline hook to `proxy/pipeline.mjs` and wires it from both streaming and non-streaming paths in `proxy/server.mjs`. The current pipeline's `onResponse` hook fires only on non-streaming JSON responses (audited at `proxy/server.mjs:92` and `proxy/stream.mjs:108` — streaming bypasses it). Adding the seam is in scope, not deferred. |
+| 3. Cost/benefit on real workloads? | Compare cache-creation tokens between collision and non-collision requests (collisions correlate with cache invalidation). Compare p50/p95/p99 latency between the two populations. Sample-size-aware: same minimum-50 rule per population as question 1. Cost/benefit favorable when (cache-creation token-cost savings) > (estimated queueing latency × user friction quantified as p99 increase). |
 | 4. Single-user localhost only — still right scope? | Determined by Phase 0 user mix. If the proxy is only ever single-user, the scope holds. If we see meaningful multi-user deployment by then, Phase 1 needs a per-user partition; doable but additional design. |
+
+### Decision rigor (Codex blocker fix from review #1)
+
+The original "≥ 2× baseline" rule had no minimum-sample requirement and no uncertainty bounds — so it could fire on 3 collisions vs 100 non-collisions with one 5xx in the collision sample (33% rate vs 1% baseline = 33× difference, meaningless). The corrected rule:
+
+1. **Minimum samples**: ≥ 50 collision events and ≥ 50 non-collision events. Below that, the report says "insufficient data" and recommends extending the observation window.
+2. **Wilson 95% confidence interval** computed for each population's 5xx rate. Wilson is preferred over normal-approximation because it stays well-behaved at small N and rate boundaries (0% and 100%).
+3. **Decision rule**: pattern is "observable" only if `lower_bound(collision_5xx_CI) ≥ 2 × upper_bound(non_collision_5xx_CI)`. The 2× factor is the effect-size threshold; the CI bounds make it statistically defensible at the 95% level.
+4. **Three possible outcomes** per the report:
+   - `OBSERVABLE` — proceed to Phase 1 design.
+   - `NOT_OBSERVABLE` — confidence intervals overlap or the multiplier is < 2; close issue #67 as obsolete.
+   - `INSUFFICIENT_DATA` — at least one population is below 50 samples; extend observation, re-run report.
+
+The `tools/session-observability-report.mjs` outputs all three components (sample counts, both Wilson CIs, decision verdict) so the human reading it can audit the math.
 
 The Phase 0 sprint produces a single-paragraph summary in this PR's comments with the answers. Based on those answers:
 
@@ -149,10 +188,14 @@ The Phase 0 sprint produces a single-paragraph summary in this PR's comments wit
 
 | File | Change |
 |------|--------|
-| `proxy/extensions/session-observability.mjs` | NEW — observation extension per pipeline above |
+| `proxy/pipeline.mjs` | EXTEND — add `runOnResponseEnd(ctx, snapshot)` invoking `ext.onResponseEnd(ctx)` for every loaded extension. Same error-swallow convention as the other hook runners. |
+| `proxy/server.mjs` | EXTEND — call `runOnResponseEnd` after both `clientRes.end(JSON.stringify(resCtx.body))` (non-streaming path, around line 94) AND after `streamResponse` returns (streaming path, around line 117), AND in the upstream-error / client-abort branches. The `outcome` and `start_ts`/`end_ts` fields on the ctx are computed at the call site, not by the extension. |
+| `proxy/stream.mjs` | EXTEND — capture stream-end / error timestamps so server.mjs can populate the ctx for `onResponseEnd`. May not need any change if server.mjs computes timestamps before/after the `await streamResponse(...)`. Verify during implementation. |
+| `proxy/extensions/session-observability.mjs` | NEW — observation extension per pipeline above; only consumes the new `onResponseEnd` hook. |
 | `proxy/extensions.json` | EXTEND — add `"session-observability": { "enabled": true, "order": 690 }` |
-| `tools/session-observability-report.mjs` | NEW — analysis CLI for the JSONL log |
-| `test/proxy-session-observability.test.mjs` | NEW — collision detection, outcome recording, JSONL shape, session-key derivation |
+| `tools/session-observability-report.mjs` | NEW — analysis CLI for the JSONL log; computes Wilson 95% CIs and emits the OBSERVABLE / NOT_OBSERVABLE / INSUFFICIENT_DATA verdict per §Decision rigor. |
+| `test/proxy-session-observability.test.mjs` | NEW — collision detection, outcome recording, JSONL shape, structural-fingerprint derivation, all four `onResponseEnd` paths (stream-end, non-stream, error, abort). |
+| `test/proxy-pipeline-on-response-end.test.mjs` | NEW — unit test for the new pipeline hook itself; verifies it fires once per request across all four paths and swallows errors per convention. |
 | `README.md` | EXTEND — env-var table addition; brief "Session observability (Phase 0)" section |
 | `docs/monitoring.md` | EXTEND — env-var table rows |
 
@@ -196,49 +239,65 @@ The `onResponseEnd` hook needs to fire on stream end OR non-stream body close OR
 
 ## Test plan (Phase 0)
 
-### Session key derivation
-1. Two requests with identical `body.system[0].text` + `body.messages[0]` → same key.
-2. Two requests differing only in `body.messages[1]` (later in conversation) → same key (key derives from session-stable fields).
-3. Two requests differing in `body.system[0].text` (different session) → different keys.
-4. Empty / missing body fields → defensive fallback key (constant or hash-of-headers); doesn't crash.
+### Session key derivation (structural fingerprint per Codex blocker fix)
+1. Two requests with identical `body.model` + system block layout + tool count → same key (regardless of `body.messages` content).
+2. Two requests where `body.messages[0]` text DIFFERS but model + structural fields match → SAME key (verifies prompt text is NOT in the hash inputs — Codex blocker fix #3).
+3. Two requests differing in `body.model` → different keys.
+4. Two requests differing in number of `body.system[]` blocks → different keys.
+5. Two requests differing in number of `body.tools[]` entries → different keys.
+6. Two requests across a proxy-process restart with otherwise identical inputs → DIFFERENT keys (verifies the process-side ephemeral salt rotates on startup).
+7. Empty / missing body fields → defensive fallback key (deterministic constant); doesn't crash.
 
 ### Collision detection
-5. Single request, no in-flight on session → `collision: false`, `collision_count: 0`.
-6. Two requests overlap on session → second records `collision: true`, `collision_count: 1`.
-7. Three concurrent requests on session → first records 0 collisions; second records 1; third records 2.
-8. Two requests on DIFFERENT sessions overlap → both record `collision: false`.
-9. Request completes before second arrives → second records `collision: false`.
+8. Single request, no in-flight on session → `collision: false`, `collision_count: 0`.
+9. Two requests overlap on session → second records `collision: true`, `collision_count: 1`.
+10. Three concurrent requests on session → first records 0 collisions; second records 1; third records 2.
+11. Two requests on DIFFERENT sessions overlap → both record `collision: false`.
+12. Request completes before second arrives → second records `collision: false`.
+
+### Pipeline hook (new — Codex blocker fix #1)
+13. `runOnResponseEnd` fires once per request on the non-streaming JSON path.
+14. `runOnResponseEnd` fires once per request on the streaming path (after `streamResponse` resolves).
+15. `runOnResponseEnd` fires on the upstream-error path with `outcome: "error"` (or specific 5xx if upstream gave one).
+16. `runOnResponseEnd` fires on client-abort with `outcome: "aborted"`.
+17. Errors thrown from an `onResponseEnd` handler are caught and logged to stderr; do NOT propagate; subsequent extensions still run.
 
 ### Outcome classification
-10. 200 OK response → `outcome: "200"`.
-11. 429 Too Many Requests → `outcome: "4xx_429"`.
-12. 500 Internal → `outcome: "5xx_500"`.
-13. Client abort mid-stream → `outcome: "aborted"`.
-14. Stream timeout → `outcome: "timeout"`.
+18. 200 OK response → `outcome: "200"`.
+19. 429 Too Many Requests → `outcome: "4xx_429"`.
+20. 500 Internal → `outcome: "5xx_500"`.
+21. Client abort mid-stream → `outcome: "aborted"`.
+22. Stream timeout → `outcome: "timeout"`.
+23. Upstream connection error (non-HTTP) → `outcome: "error"`.
 
 ### JSONL output
-15. Completed request → JSONL line written with all documented fields.
-16. `session_key` is hashed; plaintext fingerprint never appears in output.
-17. `CACHE_FIX_SESSION_OBSERVE_LOG=<custom>` overrides default path.
-18. Default path is `~/.claude/session-observability.jsonl`.
+24. Completed request → JSONL line written with all documented fields.
+25. `session_key` is the structural-fingerprint hash; verify the input `body.messages[0].content` is NOT recoverable from the JSONL output (test: write a JSONL line, then dump the file and grep for any prompt-text substring; should be 0 matches).
+26. `CACHE_FIX_SESSION_OBSERVE_LOG=<custom>` overrides default path.
+27. Default path is `~/.claude/session-observability.jsonl`.
 
 ### Activation
-19. `CACHE_FIX_SESSION_OBSERVE` unset → extension fires but exits early. No telemetry, no fs activity, no Map mutation.
-20. `CACHE_FIX_SESSION_OBSERVE=1` → all observation behavior runs.
+28. `CACHE_FIX_SESSION_OBSERVE` unset → extension fires but exits early. No telemetry, no fs activity, no Map mutation.
+29. `CACHE_FIX_SESSION_OBSERVE=1` → all observation behavior runs.
 
-### Analysis tool
-21. `tools/session-observability-report.mjs` reads a fixture JSONL and reports collision rate, 5xx rate by collision status, cache-creation tokens by collision status, and latency percentiles.
-22. `--json` mode produces machine-readable output.
+### Analysis tool (Codex blocker fix #2 — sample-size-aware Wilson CIs)
+30. `tools/session-observability-report.mjs` reads a fixture JSONL and reports collision rate, 5xx rate by collision status (with Wilson 95% CIs), cache-creation tokens by collision status, and latency percentiles.
+31. With < 50 samples in either population → verdict is `INSUFFICIENT_DATA`; the recommend-extending-window text is included in the human output.
+32. With ≥ 50 samples in both populations AND `lower(collision_5xx_CI) ≥ 2 × upper(non_collision_5xx_CI)` → verdict is `OBSERVABLE`.
+33. With ≥ 50 samples in both populations AND CI bounds don't satisfy the 2× rule → verdict is `NOT_OBSERVABLE`.
+34. `--json` mode produces machine-readable output including all CI bounds + sample counts + verdict.
 
 ### Regression
-23. All v3.3.0 / #90 / #91 / #85 / #63 tests still pass — extension is purely observational, doesn't mutate request bodies.
+35. All v3.3.0 / #90 / #91 / #85 / #63 tests still pass — observation extension is purely additive, doesn't mutate request bodies. The new `onResponseEnd` pipeline hook is also additive (extensions without that handler are skipped per the existing convention).
 
 ## Reviewer checklist
 
 - [ ] Activation uses `enabled: true` + runtime env-gate (prefix-diff pattern). `extensions.json` updated.
 - [ ] Extension order is 690 (after `usage-log` at 650, before `request-log` at 700).
+- [ ] **`onResponseEnd` pipeline hook added** (Codex blocker fix #1) and wired in `proxy/server.mjs` for ALL four termination paths: non-streaming end, streaming end, upstream error, client abort. Verify each path is covered by the new pipeline test.
 - [ ] **No mutation of `ctx.body`.** This extension is observational only. Reviewer should grep for any assignment to `ctx.body.*` and confirm none.
-- [ ] `deriveSessionKey` produces a hash, not plaintext. Test 16 verifies.
+- [ ] **Structural fingerprint** (Codex blocker fix #3) — `deriveSessionKey` consumes only structural fields (model, system block layout counts, tool count, process-side ephemeral salt). NO user prompt text in inputs. Verify by inspecting the implementation; tests should include a fixture with prompt-text changes that doesn't change the key.
+- [ ] **Wilson 95% confidence intervals** (Codex blocker fix #2) computed in `tools/session-observability-report.mjs`; minimum-50-samples-per-population threshold enforced before producing OBSERVABLE/NOT_OBSERVABLE verdict. INSUFFICIENT_DATA is the third valid output.
 - [ ] Collision detection is correct for overlapping AND non-overlapping cases. Tests 5-9 cover both.
 - [ ] Outcome classification handles 200, 4xx, 5xx, aborted, timeout. Tests 10-14 verify.
 - [ ] JSONL append is async / non-blocking; doesn't slow request handling.
