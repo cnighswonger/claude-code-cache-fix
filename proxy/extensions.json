@@ -1,5 +1,6 @@
 {
   "fingerprint-strip": { "enabled": true, "order": 100 },
+  "image-strip": { "enabled": true, "order": 150 },
   "sort-stabilization": { "enabled": true, "order": 200 },
   "fresh-session-sort": { "enabled": true, "order": 250 },
   "identity-normalization": { "enabled": true, "order": 300 },

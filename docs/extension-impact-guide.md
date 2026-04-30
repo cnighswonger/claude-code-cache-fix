@@ -122,6 +122,48 @@ All measurements unless noted are from our production telemetry: 24,667 calls (A
 
 See `docs/directives/proxy-overage-cost-warning.md` for the full design.
 
+### 9. `image-strip` (order 150) — opt-in via `CACHE_FIX_IMAGE_GUARD=1`
+
+**What it fixes:** Multi-image requests can fail in three different ways — per-image dimension limit (2000 px when count > 20, else 8000 px), 32 MB request body cap, and per-model image-count cap (100 for current models). The legacy `CACHE_FIX_IMAGE_MAX_DIM` shipped in v3.2.1 only addressed the dimension axis with a single static cap; the v3.3.0 pipeline addresses all three conditionally and adds an opt-in client-side Lanczos resize for users who want OCR-quality preservation rather than blind server-side downscale.
+
+**ON (`CACHE_FIX_IMAGE_GUARD=1`):** Runs a pipeline of independent passes:
+
+| Pass | When | Action |
+|------|------|--------|
+| Pass 0 (legacy) | `CACHE_FIX_IMAGE_KEEP_LAST=N` set | Strip tool_result images from user messages older than N most recent |
+| Pass 3 | `CACHE_FIX_IMAGE_PRESERVE_DETAIL=1` AND long edge > native cap | Lanczos resize to native cap (2576 px Opus 4.7, 1568 px otherwise). Requires optional `sharp` peer dep |
+| Pass 1 | long edge > active rejection cap | Strip with forensic placeholder. Cap = `MAX_DIM` if set, else 2000 (count > 20) or 8000 (count ≤ 20) |
+| Pass 2 | body bytes > `CACHE_FIX_IMAGE_REQUEST_SIZE_MAX` (default 30 MB) | Drop oldest images until under budget |
+| Count cap | image count > `CACHE_FIX_IMAGE_COUNT_MAX` (default 100) | Drop oldest images down to cap |
+
+Execution order: **Pass 0 → Pass 3 → Pass 1 → Pass 2 → count cap**. Each pass triggers independently; Pass 1 never resizes, Pass 3 never strips.
+
+**OFF (default):** Pipeline is dormant. Legacy `KEEP_LAST` and `MAX_DIM` continue to work exactly as in v3.2.1 for users who already have them set.
+
+**Pass 3 trade-offs:**
+- *Quality.* Lanczos resize via `sharp` is qualitatively different from the server's blind downscale (algorithm undocumented). For OCR, document extraction, and detail-sensitive workflows, client-side Lanczos is the right tool.
+- *Dependency.* Requires `sharp` (~30 MB native binaries). Declared as an optional peer dependency — users who don't want it pay nothing. If `sharp` is missing, Pass 3 logs `library_missing` and skips; Pass 1 + Pass 2 still run.
+- *Cost.* Resize is pure CPU on the proxy side. For typical workloads (a few images per request) it's well under 100ms per image.
+
+**Telemetry surface (`ctx.meta.imageGuardStats`):**
+```js
+{
+  total_images, count_axis_path,                          // population
+  unsupported_format_count, dimension_probe_fail_count,   // probe outcomes
+  resize_attempted, resize_succeeded, resize_failed,      // Pass 3 outcomes
+  library_missing,                                        // sharp absent flag
+  images_dropped_for_size, images_dropped_for_count_cap,  // Pass 2 / count cap
+  request_bytes_before, request_bytes_after,              // body size
+  request_bytes_headroom,                                 // budget - bytes_after
+  image_bytes_total, image_bytes_dropped,                 // image-bytes telemetry
+  estimated_image_tokens_total,                           // diagnostic, not enforcement
+}
+```
+
+A single stderr line is emitted per processed request when the pipeline did anything observable (e.g. `[image-guard] resized=3 evicted=1 req_bytes=35M->28M (headroom=2M) images=8->7`).
+
+See `docs/directives/proxy-image-guard-pipeline.md` for the full spec, including the precedence matrix for every documented combination of legacy + new env vars.
+
 ## Preload-Only Features (v2.x, CC ≤v2.1.112)
 
 These features only work with the preload interceptor (`NODE_OPTIONS="--import ..."`). They do NOT work on CC v2.1.113+ (Bun binary). Use the proxy extensions above for current CC versions.

@@ -334,7 +334,7 @@ export CACHE_FIX_IMAGE_KEEP_LAST=3
 
 Keeps images in the last 3 user messages, replaces older ones with a text placeholder. Only targets `tool_result` blocks — user-pasted images are never touched.
 
-### Oversized-image guard
+### Oversized-image guard (legacy, v3.2.1)
 
 ```bash
 export CACHE_FIX_IMAGE_MAX_DIM=2000
@@ -354,6 +354,60 @@ Two pressure axes to address them:
 The two compose: with both set, `KEEP_LAST` runs first (drops the count), then `MAX_DIM` runs on what remains (caps the size of the kept ones). Common triggers for the dimension axis: hi-res manuscript scans, retina screenshots, photos at full resolution.
 
 Pure-JS PNG and JPEG header parsing — no native deps. Other formats (GIF, WebP, AVIF, BMP) pass through unchanged regardless of dimension. Fail-open: images whose dimensions can't be parsed (truncated header, unsupported format) are kept rather than stripped — better to send a request that might error than to strip a valid image we just couldn't measure.
+
+### Image-guard pipeline (v3.3.0)
+
+A conditional pipeline that mirrors Anthropic's actual rules. Strictly opt-in via a single env var:
+
+```bash
+export CACHE_FIX_IMAGE_GUARD=1
+```
+
+When enabled, the proxy runs:
+
+| Pass | Trigger | Action |
+|------|---------|--------|
+| **Pass 0** (legacy) | `CACHE_FIX_IMAGE_KEEP_LAST=N` set | Strip tool_result images from user messages older than N most recent |
+| **Pass 3** | `CACHE_FIX_IMAGE_PRESERVE_DETAIL=1` AND image long edge > model native cap | Lanczos resize via `sharp` to native cap (2576 px for Opus 4.7, 1568 px otherwise), preserve aspect ratio and media type |
+| **Pass 1** | image long edge > active rejection cap | Strip and replace with forensic placeholder. Active cap = `MAX_DIM` if set, else 2000 px (when count > 20) or 8000 px (count ≤ 20) |
+| **Pass 2** | request body exceeds `CACHE_FIX_IMAGE_REQUEST_SIZE_MAX` (default 30 MB) | Drop oldest images until under budget |
+| **Count cap** | surviving image count > `CACHE_FIX_IMAGE_COUNT_MAX` (default 100) | Drop oldest images down to the cap |
+
+Execution order: **Pass 0 → Pass 3 → Pass 1 → Pass 2 → count cap**. Each pass is independent — Pass 1 never resizes; Pass 3 never strips.
+
+#### Optional `sharp` dependency
+
+Pass 3 requires [sharp](https://www.npmjs.com/package/sharp) for Lanczos resize. It's declared as an **optional peer dependency** — install separately if you want Pass 3:
+
+```bash
+npm install sharp
+```
+
+If `sharp` is missing, Pass 3 skips cleanly (telemetry records `library_missing: true`); Pass 1 + Pass 2 + the count cap still run.
+
+#### Precedence matrix
+
+| Env var combination | Behavior |
+|---|---|
+| Nothing set | No image processing. |
+| `KEEP_LAST=N` only | Legacy v3.2.1: count cap on tool_result images in user messages. |
+| `MAX_DIM=N` only | Legacy v3.2.1: hard size cap, strip-only. |
+| `KEEP_LAST=N` + `MAX_DIM=N` | Legacy two-step: KEEP_LAST first, then MAX_DIM on survivors. |
+| `IMAGE_GUARD=1` | Pipeline: Pass 1 (conditional cap) + Pass 2 (request-size guard) + count cap. |
+| `IMAGE_GUARD=1` + `MAX_DIM=N` | `MAX_DIM` overrides Pass 1's conditional cap; Pass 2 still runs. |
+| `IMAGE_GUARD=1` + `PRESERVE_DETAIL=1` | Adds Pass 3 (Lanczos resize). Falls back to strip if `sharp` is unavailable. |
+| `IMAGE_GUARD=1` + `KEEP_LAST=N` | KEEP_LAST runs first as Pass 0, pipeline runs on remainder. |
+| `IMAGE_GUARD=1` + `KEEP_LAST=N` + `MAX_DIM=N` | Three-way: Pass 0 first, pipeline next, MAX_DIM overrides Pass 1. |
+| `PRESERVE_DETAIL=1` only | No-op + warning. |
+
+#### Tunables
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `CACHE_FIX_IMAGE_GUARD` | unset | Top-level pipeline gate (`=1` enables). |
+| `CACHE_FIX_IMAGE_PRESERVE_DETAIL` | unset | Enable Pass 3 Lanczos resize via `sharp`. |
+| `CACHE_FIX_IMAGE_REQUEST_SIZE_MAX` | 31457280 (30 MB) | Pass 2 byte budget. 2 MB headroom from Anthropic's 32 MB ceiling. |
+| `CACHE_FIX_IMAGE_COUNT_MAX` | 100 | Hard image-count cap. Set to 600 for legacy Claude 1/2.x/Instant if needed. |
 
 ## System prompt rewrite (preload mode, optional)
 

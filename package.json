@@ -1,6 +1,6 @@
 {
   "name": "claude-code-cache-fix",
-  "version": "3.2.1",
+  "version": "3.3.0",
   "description": "Cache optimization proxy and interceptor for Claude Code. Fixes prompt cache bugs, stabilizes prefix, reduces quota burn.",
   "type": "module",
   "exports": "./preload.mjs",
@@ -26,6 +26,11 @@
   },
   "dependencies": {
     "hpagent": "^1.2.0"
+  },
+  "peerDependenciesMeta": {
+    "sharp": {
+      "optional": true
+    }
   },
   "keywords": [
     "claude-code",
