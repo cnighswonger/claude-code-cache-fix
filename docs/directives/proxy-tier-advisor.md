@@ -210,8 +210,8 @@ State saved to ~/.claude/tier-advisor-state.json
   "projected_q7d_at_reset": 106,
   "recommendation": "upgrade",
   "recommendation_target_plan": "max-20x",
-  "weeks_under_downgrade_threshold": 0,
-  "weeks_over_upgrade_threshold": 1
+  "consecutive_weeks_under_downgrade_threshold": 0,
+  "consecutive_weeks_over_upgrade_threshold": 1
 }
 ```
 
@@ -312,12 +312,12 @@ export {
 16. `decideRecommendation(15, 1, 2)` → `downgrade` (under threshold and 1 prior week + this = 2).
 17. `decideRecommendation(15, 1, 3)` → `ok` (need 3 weeks; only have 2).
 
-### State persistence
-18. First run with no state file → creates initial state with empty history.
-19. Run after upgrade-recommendation → `weeks_over_upgrade_threshold` increments.
-20. Run after under-threshold week → `weeks_under_downgrade_threshold` increments.
-21. Run after over-threshold-then-under-threshold sequence → `weeks_under_downgrade_threshold` resets to 0 mid-sequence.
-22. History rolls to last 8 weeks; older entries dropped.
+### State persistence (calendar-week-scoped per Codex blocker fix #2)
+18. First run with no state file → creates initial state with `state.weeks: []`.
+19. Run AFTER a calendar-week boundary crosses (detected by comparing prior `last_run` to current `now` against the weekly reset boundary) → appends ONE entry to `state.weeks` for the just-completed week. Multiple runs after the same crossing do NOT append duplicates.
+20. Multiple runs WITHIN the same calendar week → `state.weeks` is unchanged; the in-progress current week is evaluated by projection only and does not get a record.
+21. Run sequence across N consecutive weeks all `under_downgrade: true` → `state.weeks` has N new entries; the derived `consecutive_weeks_under_downgrade_threshold` count in the JSON output equals N.
+22. `state.weeks` array rolls to the last 8 entries; older entries dropped.
 
 ### Output formats
 23. Default human-readable output includes: current plan, burn rate, projection, recommendation, "Why" paragraph.
@@ -333,7 +333,7 @@ export {
 30. `--no-state` doesn't read or write the state file; same input twice produces same output (no week-counter drift).
 
 ### Edge cases
-31. quota-status.json missing → use usage.jsonl path; if both missing, error and exit 3.
+31. quota-status.json missing → use usage.jsonl fallback path. If BOTH inputs are missing, this is a hard error: exit 4 (NOT 3 — that's reserved for tier:unknown per the unified §Exit codes contract).
 32. usage.jsonl present but contains no entries this week → can't compute burn rate; output `tier:ok`, exit 0, note the missing data in human output.
 33. Reset timestamp in the past (somehow) → treat as "just reset"; burn rate computes from full week.
 34. Plan unknown (no override + heuristic fails) → recommendation is `tier:unknown`, exit code is 3 (NOT `tier:ok` / exit 0). Human output suggests setting `CACHE_FIX_ADVISOR_PLAN`.
