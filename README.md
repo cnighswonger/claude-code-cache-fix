@@ -432,6 +432,35 @@ export CACHE_FIX_DUMP_MESSAGES_HEAD=/tmp/messages-head.jsonl
 | `CACHE_FIX_INJECT_MESSAGES_BREAKPOINT` | unset | Enable breakpoint #3 injection (`=1` opt-in). |
 | `CACHE_FIX_DUMP_MESSAGES_HEAD` | unset | Diagnostic JSONL dump of `messages[0].content` shape — read-only, no mutation. |
 
+## Microcompact stability (proxy mode, opt-in)
+
+After ~90 minutes idle, Claude Code's `time_based_microcompact` (and the cold-compact path triggered by `FDY()`) replaces old `tool_result` content with a sentinel string. The original content is gone for cache purposes; that part is unrecoverable from the proxy. But the sentinel itself can carry an embedded timestamp (`[Old tool result content cleared at 2026-04-30T13:42:11Z]`), which means a *second* microcompact pass against the same already-cleared position writes different bytes — busting the cache for everything after that position even though no new content was added.
+
+This extension addresses the recoverable half: normalize the sentinel to a byte-stable canonical form so repeat microcompacts don't churn the cache. **Phase 1 only** — diagnostic + opt-in normalization. Phase 2 (snapshot-and-restore of original tool_result content) is deferred to v3.5.0+ pending Phase 1 production data.
+
+```sh
+# Step 1 (diagnostic): characterize what CC's sentinel actually looks like.
+export CACHE_FIX_DUMP_MICROCOMPACT=/tmp/microcompact-dump.jsonl
+
+# Step 2 (normalize): once the sentinel format is confirmed, opt-in.
+export CACHE_FIX_NORMALIZE_MICROCOMPACT=1
+```
+
+Detection has two modes:
+- **Mode A** — exact match against confirmed CC sentinel patterns (the bare form and the ISO-8601 timestamp variant). Mode A matches are eligible for normalization.
+- **Mode B** — prefix-only match (text begins with `[Old tool result content cleared` but does not exactly match a Mode A pattern). Mode B is **diagnostic-only**: never normalized, dump records redact to a 64-char prefix only.
+
+The Mode A/B separation protects against cases where the sentinel might be followed by user-derived content (e.g., a tool that echoed user input back into its result) — the redaction guarantee on Mode B keeps that content out of the diagnostic dump.
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `CACHE_FIX_DUMP_MICROCOMPACT` | unset | Path for diagnostic JSONL dump of detected sentinels. Read-only — no mutation. |
+| `CACHE_FIX_NORMALIZE_MICROCOMPACT` | unset | Enable normalization (`=1` opts in). Mutates Mode A matches to canonical form. |
+| `CACHE_FIX_MICROCOMPACT_NORMALIZED` | `[Old tool result content cleared]` | Override the canonical replacement string. |
+| `CACHE_FIX_MICROCOMPACT_SENTINEL_PATTERN_<N>` | unset | Add custom Mode A regex pattern(s). Numbered (1-indexed, sparse OK). |
+| `CACHE_FIX_MICROCOMPACT_REDACT_LEN` | `64` | Mode B prefix length in dump records. Set to `0` to suppress the prefix entirely. |
+| `CACHE_FIX_DUMP_MICROCOMPACT_INCLUDE_NORMALIZED` | unset | Add post-normalization text alongside (not replacing) raw `sentinel_text` in dump records. |
+
 ## System prompt rewrite (preload mode, optional)
 
 The interceptor can rewrite Claude Code's `# Output efficiency` system-prompt section. Disabled by default. Enable with `CACHE_FIX_OUTPUT_EFFICIENCY_REPLACEMENT`. See [docs/output-efficiency-prompts.md](docs/output-efficiency-prompts.md) for the three known prompt variants and usage instructions.

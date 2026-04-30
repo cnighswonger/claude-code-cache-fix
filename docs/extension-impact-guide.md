@@ -214,6 +214,53 @@ A single stderr line is emitted when enabled (both injection and skip paths) so 
 
 See `docs/directives/proxy-messages-cache-breakpoint.md` for the full spec.
 
+### 11. `microcompact-stability` (order 350) — opt-in via `CACHE_FIX_DUMP_MICROCOMPACT=<path>` and/or `CACHE_FIX_NORMALIZE_MICROCOMPACT=1`
+
+**What it fixes:** When CC's `time_based_microcompact` (or the 90-minute cold-compact path via `FDY()`) fires, it replaces old `tool_result` content with a sentinel string. The original content is gone for cache purposes — that loss is unrecoverable from the proxy. But the sentinel itself may carry volatile fields (timestamps, IDs) that change between microcompact runs even when no new content was added, busting the cache for everything *after* the sentinel position. This extension normalizes the sentinel to a byte-stable canonical form so the "second microcompact, no new content" case stops churning the cache. Phase 1 only; Phase 2 (snapshot-and-restore) is deferred to v3.5.0+ pending production data from Phase 1.
+
+**ON (`CACHE_FIX_DUMP_MICROCOMPACT=<path>`):** Diagnostic-only. Walks `body.messages[].content[]` looking for `tool_result` blocks whose text matches CC's sentinel pattern. Writes a JSONL line per affected request with structural metadata (msg_idx, block_idx, pattern matched, byte length) plus session_id_hash. **No mutation.**
+
+**ON (`CACHE_FIX_NORMALIZE_MICROCOMPACT=1`):** Replaces matched sentinels with the canonical text (default `[Old tool result content cleared]` — the timestamp-stripped form). Only Mode A matches (exact match against confirmed patterns) are normalized. Mode B matches (prefix-only) are recorded in the dump but never mutated.
+
+**OFF (both unset, default):** Extension is loaded but exits at the first line of `onRequest`. No telemetry, no mutation, no fs activity.
+
+**Detection modes:**
+
+| Mode | Match criterion | Normalization | Dump capture |
+|------|-----------------|---------------|--------------|
+| A (exact) | Whole text matches one of the confirmed regex patterns: bare `[Old tool result content cleared]` or the ISO-8601 variant `[Old tool result content cleared at YYYY-MM-DDTHH:MM:SS(.SSS)?Z]` | Eligible — replaced with canonical text when normalize is on | Full `sentinel_text` recorded |
+| B (prefix) | Text begins with `[Old tool result content cleared` but does not exactly match a Mode A pattern | **Never** normalized | Redacted to `prefix_64` (configurable via `CACHE_FIX_MICROCOMPACT_REDACT_LEN`) |
+
+The Mode A/B separation is the privacy guarantee: a Mode B match might be a CC sentinel followed by user-derived content (e.g., a tool that echoed user input back). Redaction prevents that content from landing in the dump.
+
+**Custom patterns** can be added via `CACHE_FIX_MICROCOMPACT_SENTINEL_PATTERN_<N>=<regex>` (1-indexed, sparse OK). Custom patterns are subject to the same Mode A/B treatment as defaults.
+
+**Telemetry surface (`ctx.meta.microcompactStats`):**
+```js
+{
+  diagnostic_enabled, normalization_enabled,
+  sentinel_pattern_used,                // first matched pattern source (Mode A only)
+  total_tool_results_scanned,
+  exact_matches_count, partial_matches_count,
+  sentinels_matched,                    // exact + partial
+  sentinels_normalized,
+  bytes_original, bytes_normalized, bytes_saved,
+  diagnostic_records_written,
+}
+```
+
+`bytes_saved` is a side effect of the timestamp-strip default — the headline value is byte-stability across runs, not byte savings.
+
+A single stderr line is emitted on enabled invocations that did something observable:
+```
+[microcompact] matched=3 normalized=3 bytes=159->90 sentinel_pattern=default
+[microcompact] matched=2 dump=/tmp/microcompact-dump.jsonl (normalize disabled)
+```
+
+**Phase 2 (deferred to v3.5.0+):** snapshot-and-restore of original tool_result content. Requires persistent state across requests, snapshot-format versioning, GC policy, and multi-process write safety — every one a design decision with open questions. Phase 1 ships first; Phase 2 only if Phase 1 data shows normalization alone is insufficient.
+
+See `docs/directives/proxy-microcompact-cache-stability.md` for the full spec.
+
 ## Preload-Only Features (v2.x, CC ≤v2.1.112)
 
 These features only work with the preload interceptor (`NODE_OPTIONS="--import ..."`). They do NOT work on CC v2.1.113+ (Bun binary). Use the proxy extensions above for current CC versions.

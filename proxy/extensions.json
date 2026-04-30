@@ -7,6 +7,7 @@
   "smoosh-split": { "enabled": true, "order": 320 },
   "content-strip": { "enabled": true, "order": 330 },
   "tool-input-normalize": { "enabled": true, "order": 340 },
+  "microcompact-stability": { "enabled": true, "order": 350 },
   "cache-control-normalize": { "enabled": true, "order": 400 },
   "messages-cache-breakpoint": { "enabled": true, "order": 410 },
   "ttl-management": { "enabled": true, "order": 500 },
