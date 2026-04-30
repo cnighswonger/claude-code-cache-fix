@@ -18,7 +18,9 @@ The cache-fix proxy already addresses prefix-stability (image-strip, content-str
 
 In both cases, the 500 errors weren't transient. The downstream symptom was a body whose SNR (signal-to-noise: user/assistant text divided by tool-result/thinking bytes) dropped below 0.30, which appears to put the request in a regime Anthropic's API mishandles. The duplicate-read case is the dominant contributor: a long debugging session re-reads the same handful of files dozens of times, each time appending a fresh ~5–30 KB tool_result block that the model has already seen.
 
-The extension dedupes only when the byte-identical content has appeared before. Drift = no dedupe (the model needs to see the new bytes). The most-recent occurrence is preserved intact so the agent's working copy of each file is current; older occurrences become byte-stable pointers like `(unchanged — see tool_use_id=X in turn N)`.
+The extension dedupes only when the byte-identical content has appeared before. Drift = no dedupe (the model needs to see the new bytes). The **first** occurrence in conversation order is preserved intact; later occurrences become byte-stable pointers like `(unchanged — see tool_use_id=X in turn N)` referencing that first occurrence.
+
+**Why FIRST and not LAST** (Codex blocker fix from review #1): the pointer text contains the keeper's `tool_use_id` and turn number. If the keeper were LAST, then every NEW duplicate at turn N+1 would become the keeper, requiring all earlier pointers to update their bytes — cascading cache misses, not the "one-time miss" the prior draft claimed. Pinning the keeper as FIRST makes the pointer text byte-stable forever for that key: the same earliest-turn keeper is referenced every time, regardless of how many later duplicates accumulate. The agent's "working copy" semantics are unaffected because byte-identical content is byte-identical regardless of which historical occurrence we keep.
 
 ## Source of truth
 
@@ -75,14 +77,31 @@ A `tool_result` block can be matched to its originating `tool_use` by `tool_use_
 For each Read-originated tool_result, compute the dedupe key:
 
 ```
-key = sha256(file_path + "\0" + content + "\0" + (offset ?? "") + "\0" + (limit ?? ""))
+key = sha256(file_path + "\0" + content_text + "\0" + (offset ?? "") + "\0" + (limit ?? ""))
 ```
 
 Notes:
 - Null-byte separators (`\0`) prevent boundary ambiguity (e.g., `file=foo\noffset=10` colliding with `file=foo\noffset=` + `10`).
-- `content` is the actual `tool_result.content` text (or array-text concatenation for array content).
+- `content_text` extraction is restricted to safely-keyable shapes (see §Eligible content shapes below). Mixed arrays containing non-text items are NOT keyed and NOT deduped (Codex blocker fix from review #1).
 - `offset` and `limit` come from the originating `tool_use.input` (Read may be partial). Different offsets/limits = different keys = no dedupe.
 - SHA-256 keeps key length bounded (64 hex chars) and collision-resistant. The cost is ~microseconds per key on modern CPUs; non-issue.
+
+### Eligible content shapes (Codex blocker fix from review #1)
+
+The prior draft said "for array content, hash the concatenated text and leave non-text items untouched." That allowed two different mixed arrays — say `[{type:"text",text:"hello"},{type:"image",source:A}]` and `[{type:"text",text:"hello"},{type:"image",source:B}]` — to produce the same key and be deduped against each other, even though they are NOT byte-identical.
+
+Revised contract: a tool_result is eligible for dedupe if and only if its `content` field has one of these shapes:
+
+| Shape | Eligible? | Key source |
+|-------|-----------|------------|
+| String | Yes | the string itself |
+| Array with exactly ONE element of `{type: "text", text}` | Yes | the text |
+| Array with multiple elements OR any non-text element | **No, skipped** | n/a |
+| Missing / null content | No, skipped | n/a |
+
+This is conservative — Read tool returns text in the common case; mixed-content arrays from Read are rare-to-nonexistent. We trade a small (likely zero) loss of dedupe coverage for a guarantee that any dedupe IS byte-identical.
+
+Skipped shapes are recorded in telemetry as `read_tool_results_skipped_mixed_array` so we can quantify the loss if it ever becomes meaningful.
 
 ### Walk + replace logic
 
@@ -102,16 +121,23 @@ The replacement text follows a stable byte-stable format so repeat runs produce 
 ```
 
 Where:
-- `KEEPER_ID` = `tool_use_id` of the most-recent (kept) occurrence's originating tool_use.
-- `KEEPER_TURN` = 1-indexed conversation turn count, computed from the message position. A "turn" is a user→assistant pair; `messages[0]` (first user message) starts turn 1; the kept occurrence's containing user message determines its turn number via `Math.floor(msg_idx / 2) + 1`.
+- `KEEPER_ID` = `tool_use_id` of the **first** (earliest) occurrence's originating tool_use.
+- `KEEPER_TURN` = 1-indexed conversation turn count of the **first** occurrence, computed from the message position. A "turn" is a user→assistant pair; `messages[0]` (first user message) starts turn 1; the first occurrence's containing user message determines its turn number via `Math.floor(msg_idx / 2) + 1`.
 
-The pointer is byte-stable across requests as long as the keeper's tool_use_id is stable (it is — it's CC-assigned and survives turn boundaries) AND the turn count is stable (it is — turns don't renumber retroactively).
+The pointer is byte-stable across **all** future requests for that key, because:
+- The first occurrence's `tool_use_id` is fixed — CC-assigned at the time it happened, never renamed.
+- The first occurrence's turn number is fixed — turns don't renumber retroactively.
+- Any new duplicate at turn N+M still references the same FIRST keeper at the same earliest turn. Its pointer text is byte-identical to all the prior pointers for the same key.
+
+This is the byte-stability fix Codex flagged. Pinning to FIRST means: once a key has been deduped, every future request with that key produces identical bytes for all the pointer positions. Cache invalidation is one-time per key (when the dedupe first kicks in for that key); subsequent turns benefit from a stable cacheable prefix.
 
 ### Tool_result content shape preservation
 
-`tool_result.content` may be:
-- A string → replace with the pointer string directly.
-- An array of items (mostly `{ type: "text", text }`, occasionally with images) → replace the matched text item with `{ type: "text", text: <pointer> }`. Other items in the array (images, non-matching text) are NOT touched. Image-bearing tool_results are unusual for Read but possible; handle defensively.
+Per §Eligible content shapes, only string content and single-element text-only arrays are eligible for dedupe. Replacement preserves the original shape:
+
+- **String content** → replace with the pointer string directly.
+- **Single-element text-only array** `[{type: "text", text: "<file content>"}]` → replace the inner item's `text` with the pointer string; preserve the array wrapper and the `{type: "text"}` field.
+- **Mixed arrays / non-text content** → skipped at the detection stage (per §Eligible content shapes); never reach the replacement step.
 
 ## Open questions resolved
 
@@ -121,14 +147,20 @@ The issue body raised three open questions. Resolutions for this directive:
 
 **Concern:** mutating earlier-turn tool_result content changes those bytes. Does the prefix cache invalidate when historical turns are mutated, or only check up to the current cache breakpoint?
 
-**Resolution:** the prefix cache invalidates on any byte change before the current cache_control marker. So replacing earlier-turn content WILL bust the cache once on the first turn the dedupe kicks in. Every subsequent turn benefits from a tighter (smaller, more cacheable) prefix.
+**Resolution:** the prefix cache is exact-prefix; any byte change before the current cache_control marker invalidates the match from that point forward.
 
-The one-time cache miss is acceptable because:
-- The request was already over-bloated; the SNR collapse + 500-error pattern is worse than a cache miss.
-- After the dedupe stabilizes, the smaller prefix is byte-stable across subsequent turns and re-caches normally.
-- The pointer text itself is byte-stable (per §Replacement contract), so subsequent dedupes against the same key produce identical bytes.
+With the **FIRST-keeper** choice (per §Replacement contract above), the cache-miss profile is:
 
-We do NOT scope to dedupe-only-within-most-recent-turn. The whole-history sweep is the higher-value behavior. The extension does NOT need to track "first time we deduped" — every fresh dedupe is independent and the pointer is deterministic.
+1. **First time a key gains its 2nd occurrence** — Pass writes a pointer at the earlier (1st) position's *spot is unchanged* (it stays the keeper) but the **2nd occurrence's** position is mutated to the pointer. That changes prefix bytes from message 2nd-occurrence onward; cache misses for the rest of that prefix.
+2. **3rd, 4th, ... Nth occurrences arrive** — only the latest occurrence's position becomes a new pointer; all earlier pointer positions retain identical bytes (because the FIRST keeper hasn't changed). Each new duplicate adds exactly one new pointer to the suffix, no churn to earlier pointer positions.
+
+So the cache-miss profile is **one miss per new duplicate added**, NOT per-turn-of-the-extension's-existence and NOT cascading. Once a key has been deduped, the pointer bytes for every prior occurrence are stable forever.
+
+This is acceptable because:
+- A new duplicate at turn N+1 was going to add bytes to the prefix anyway (the new tool_result). The cache would have missed regardless. Dedupe makes the added bytes much smaller (pointer length vs full file content), so the cache window is tighter and re-caches faster.
+- The request was already over-bloated; the SNR collapse + 500-error pattern is worse than a smaller cache miss.
+
+We do NOT scope to dedupe-only-within-most-recent-turn. The whole-history sweep is the higher-value behavior. The extension does NOT need to track "first time we deduped" — every fresh dedupe is independent and the pointer is deterministic given the FIRST-keeper rule.
 
 ### 2. Age cap
 
@@ -152,6 +184,7 @@ ctx.meta.readDedupeStats = {
   total_tool_results_scanned: number,
   read_tool_results_classified: number,    // matched a Read originating tool_use
   read_tool_results_skipped: number,       // tool_use missing / drift / non-Read
+  read_tool_results_skipped_mixed_array: number,  // ineligible content shape (Codex blocker fix)
   unique_keys: number,                     // distinct (file, content, offset, limit) tuples
   duplicate_keys: number,                  // keys with ≥2 occurrences
   replacements_written: number,            // total older occurrences replaced
@@ -224,15 +257,15 @@ async function runReadDedupe(reqCtx) {
   for (const [key, occurrences] of byKey) {
     if (occurrences.length < 2) continue;
     stats.duplicate_keys++;
-    // Keep the LAST one; replace all earlier ones.
-    const keeper = occurrences[occurrences.length - 1];
+    // Keep the FIRST occurrence; replace all later ones.
+    const keeper = occurrences[0];
     const keeperTurn = computeTurn(keeper.ref.msg_idx);
     const pointer = buildReplacementText(keeper.tool_use_id, keeperTurn);
-    for (let i = 0; i < occurrences.length - 1; i++) {
-      const old = occurrences[i];
-      stats.bytes_original += old.content.length;
+    for (let i = 1; i < occurrences.length; i++) {
+      const dup = occurrences[i];
+      stats.bytes_original += dup.content.length;
       stats.bytes_after += pointer.length;
-      replaceContentInPlace(messages, old.ref, old.content_kind, pointer);
+      replaceContentInPlace(messages, dup.ref, dup.content_kind, pointer);
       stats.replacements_written++;
     }
   }
@@ -245,8 +278,10 @@ async function runReadDedupe(reqCtx) {
 
 ### Detection
 1. Single Read tool_result, no duplicates → `replacements_written === 0`, body unchanged.
-2. Two Read tool_results, same `(path, content, offset, limit)` → 1 replacement, older one becomes pointer.
-3. Three Read tool_results with same key → 2 replacements (oldest two become pointers; most recent stays).
+2. Two Read tool_results, same `(path, content, offset, limit)` → 1 replacement, the LATER one becomes a pointer to the FIRST.
+3. Three Read tool_results with same key → 2 replacements (later two become pointers to the FIRST). The earliest occurrence stays intact.
+3a. Same as Test 3 but verify pointer text bytes are IDENTICAL across the two replaced positions (proves the byte-stable FIRST-keeper claim).
+3b. Add a 4th occurrence to the same key → only ONE new replacement (the new occurrence). The 2 prior pointer positions retain identical bytes (no churn).
 4. Two Reads, same path + content but different `offset` → 0 replacements (different keys).
 5. Two Reads, same path + offset but different content (file changed mid-session) → 0 replacements (different keys).
 6. tool_result whose `tool_use_id` doesn't resolve in toolUseMap (truncated history) → skipped, recorded in `read_tool_results_skipped`.
@@ -260,16 +295,19 @@ async function runReadDedupe(reqCtx) {
 12. Null `offset` and `limit` produce a stable key (Read with no offset/limit case is the common case).
 13. Boundary safety: `(file="a\nb=10", content, offset=null)` does NOT collide with `(file="a", content="\nb=10", offset=null)` — null-byte separators handle it.
 
-### Content shape
-14. tool_result with `content` as a string → replaced with pointer string.
-15. tool_result with `content` as `[{ type: "text", text: "<file content>" }]` → text item replaced; structure preserved.
-16. tool_result with `content` as `[{ type: "text", text: "<file content>" }, { type: "image", ... }]` → text item replaced; image item untouched. (Defensive — Read shouldn't return images, but handle gracefully.)
-17. tool_result with empty content `""` → key is computed and matches; treated as a normal duplicate if seen twice.
+### Content shape (eligibility)
+14. tool_result with `content` as a string → eligible; matches another string-content occurrence with same key; replaced with pointer string.
+15. tool_result with `content` as a single-element array `[{ type: "text", text: "<file content>" }]` → eligible; replaced. Outer array structure preserved; inner text item's `text` field becomes the pointer.
+16. tool_result with `content` as a multi-element array `[{ type: "text", text: "..." }, { type: "image", ... }]` → **NOT eligible**, skipped at detection. Recorded in `read_tool_results_skipped_mixed_array`. Body unchanged. **Codex blocker fix.**
+16a. tool_result with `content` as a single non-text item `[{ type: "image", source: ... }]` → not eligible, skipped (no text to key on).
+16b. Two tool_results both with mixed-array content `[{type:"text",text:"hello"},{type:"image",source:DIFFERENT}]` → both skipped (not eligible); NOT deduped against each other. Verifies the Codex blocker fix.
+17. tool_result with empty content `""` → key is computed (sha256 of empty + path + offset + limit); a matching second empty-content Read produces a dedupe. (Edge case; shouldn't matter in practice.)
 
 ### Replacement contract
 18. Pointer text format matches `(unchanged — see tool_use_id=<id> in turn <n>)` exactly.
 19. Pointer text is byte-stable across two invocations on identical input (no embedded timestamps or counters).
-20. Keeper's `tool_use_id` is the LAST occurrence's id, never an earlier one.
+20. Keeper's `tool_use_id` is the FIRST occurrence's id (Codex blocker fix). Verify by setting up 3 occurrences with ids `t1`, `t2`, `t3` and asserting both replaced positions reference `t1`.
+20a. Adding a 4th occurrence with id `t4` does NOT change the existing pointer references; they still point to `t1`. Only the new 4th position is mutated.
 21. Keeper's turn number is computed correctly — `messages[0]` user → turn 1; `messages[2]` user → turn 2; `messages[N]` user → turn `Math.floor(N/2) + 1`.
 
 ### Activation
@@ -295,9 +333,9 @@ async function runReadDedupe(reqCtx) {
 - [ ] `computeDedupeKey` uses null-byte separators. Test 13 verifies boundary safety.
 - [ ] Read tool_use detection is case-sensitive on `name === "Read"`. Test 7 verifies Bash isn't matched.
 - [ ] Tool_use map is built once per request (single forward pass), not per-block. O(n) overall.
-- [ ] Older occurrences are replaced; the LAST occurrence is preserved. Test 3 verifies.
-- [ ] Pointer text is byte-stable — no timestamps, no counters. Test 19 verifies.
-- [ ] All tool_result content shapes (string, text-array, mixed array with image) are handled. Tests 14-16 verify.
+- [ ] LATER occurrences are replaced; the FIRST occurrence is preserved. Tests 3, 20 verify.
+- [ ] Pointer text is byte-stable — no timestamps, no counters, AND no churn on later duplicates (FIRST-keeper rule). Tests 3a, 3b, 19, 20a verify.
+- [ ] Eligible content shapes are restricted to string + single-element text-only array. Mixed arrays are SKIPPED at detection (recorded in `read_tool_results_skipped_mixed_array`), NOT keyed on text-only and deduped. Tests 16, 16a, 16b verify the Codex blocker fix.
 - [ ] Telemetry surface includes the full counter set on every onRequest invocation when enabled.
 - [ ] Stderr summary line emitted on both duplicate-found and no-op cases (so operators can verify firing).
 - [ ] No new top-level dependencies (sha256 via Node's built-in `crypto` module).
