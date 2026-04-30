@@ -43,7 +43,7 @@ Key references:
 
 In scope:
 
-1. New CLI tool `tools/tier-advisor.mjs` — analyzes `usage.jsonl` history + current `quota-status.json` and prints a recommendation to stdout. Exits 0 always (advisory; non-blocking).
+1. New CLI tool `tools/tier-advisor.mjs` — analyzes `usage.jsonl` history + current `quota-status.json` and prints a recommendation to stdout. Exit-code semantics depend on mode (see §Exit codes below) — there is exactly one exit-code contract, not "exits 0 always" plus "but `--quiet` uses 1/2/3" as the prior draft had.
 2. New env vars (advisor-only; no proxy behavior change):
    - `CACHE_FIX_ADVISOR_USAGE_LOG=<path>` (default `~/.claude/usage.jsonl`)
    - `CACHE_FIX_ADVISOR_QUOTA_STATUS=<path>` (default `~/.claude/quota-status.json`)
@@ -83,11 +83,24 @@ The tool reads:
 
 ### Burn rate calculation
 
-Compute current week's burn rate from the lower of:
-- (a) Q7d %  ÷ hours since weekly reset, OR
-- (b) sum of usage.jsonl tokens this week ÷ hours since reset, normalized to %.
+Compute current week's burn rate via a single deterministic rule (Codex blocker fix from review #1):
 
-Use (a) when available (it's the source of truth from Anthropic's headers); fall back to (b) when `quota-status.json` is missing or stale (>24h old).
+1. **Primary source — `quota-status.json` Q7d header value, if fresh** (file mtime within 24 hours):
+   ```
+   burn_rate = current_Q7d_pct / hours_since_weekly_reset
+   ```
+   This is Anthropic's authoritative number. Use this when available.
+
+2. **Fallback — `usage.jsonl` token sum, when primary is stale or missing**:
+   ```
+   tokens_this_week = sum(weighted_tokens for entries since weekly_reset)
+   burn_rate = (tokens_this_week / plan_total_tokens) * 100 / hours_since_reset
+   ```
+   Where `plan_total_tokens` = 204M for max-5x or 892M for max-20x (from the empirical 4.4× analysis).
+
+The primary-or-fallback decision is binary: use whichever is available, prefer primary. **Never blend, never take a min/max** — those would produce different recommendations on the same data and make the tool's output non-deterministic. The prior draft's "lower of (a) and (b)" wording was wrong; this is the corrected rule.
+
+Output records which source produced the burn rate (`burn_rate_source: "header" | "log"`) so downstream tooling can audit the decision.
 
 ### Projection
 
@@ -111,6 +124,23 @@ Cap projection at 200% — beyond that, the user is in overage anyway and the re
 
 Single-week dips don't trigger downgrade — that's the 2-consecutive-week requirement. Single-week spikes DO trigger upgrade (going over capacity once is enough to recommend; the cost asymmetry favors avoiding overage). Configurable via `CACHE_FIX_ADVISOR_DOWNGRADE_WEEKS`.
 
+**Critical: "consecutive weeks" means CALENDAR WEEKS, not advisor invocations** (Codex blocker fix from review #1). The prior draft's `weeks_under_downgrade_threshold` counter was a per-run mutable counter, which would collapse "2 consecutive weeks" into "2 consecutive advisor runs" — meaning a user with the advisor on hourly cron could trigger downgrade after 2 hours, not 2 weeks.
+
+The corrected mechanism keeps a `weeks` array indexed by week-ending date (Sunday at 00:00 UTC, the natural quota reset boundary):
+
+```js
+state.weeks = [
+  { week_ending: "2026-04-27T00:00:00Z", q7d_actual_at_reset: 22, under_downgrade: true },
+  { week_ending: "2026-04-20T00:00:00Z", q7d_actual_at_reset: 18, under_downgrade: true },
+  { week_ending: "2026-04-13T00:00:00Z", q7d_actual_at_reset: 67, under_downgrade: false },
+  ...
+];
+```
+
+The downgrade decision counts how many of the **last `CACHE_FIX_ADVISOR_DOWNGRADE_WEEKS` consecutive completed weeks** had `under_downgrade: true`. If all of them did, recommend downgrade. The current (in-progress) week is evaluated by projection — if projection puts it under threshold, it counts as "current under threshold" but doesn't reset history.
+
+A new week's record is appended exactly once when the weekly reset crosses (detected by comparing the previous run's `last_run` to the current `now` against the reset boundary). Multiple advisor runs within the same week do NOT append duplicate records and do NOT increment any counter.
+
 ### State persistence
 
 Maintain `~/.claude/tier-advisor-state.json` across runs:
@@ -119,16 +149,17 @@ Maintain `~/.claude/tier-advisor-state.json` across runs:
 {
   "last_run": "2026-04-30T18:00:00Z",
   "last_recommendation": "tier:upgrade",
-  "weeks_under_downgrade_threshold": 0,
-  "weeks_over_upgrade_threshold": 1,
-  "history": [
-    { "week_ending": "2026-04-27T00:00:00Z", "q7d_actual": 22, "tier_assumed": "max-5x" },
-    { "week_ending": "2026-04-20T00:00:00Z", "q7d_actual": 18, "tier_assumed": "max-5x" }
+  "weeks": [
+    { "week_ending": "2026-04-27T00:00:00Z", "q7d_actual_at_reset": 22, "under_downgrade": true,  "tier_assumed": "max-5x" },
+    { "week_ending": "2026-04-20T00:00:00Z", "q7d_actual_at_reset": 18, "under_downgrade": true,  "tier_assumed": "max-5x" },
+    { "week_ending": "2026-04-13T00:00:00Z", "q7d_actual_at_reset": 67, "under_downgrade": false, "tier_assumed": "max-5x" }
   ]
 }
 ```
 
-The `history` array is bounded to the last 8 weeks (rolling). The `weeks_under_downgrade_threshold` counter is what enforces the 2-consecutive-week requirement.
+The `weeks` array is bounded to the last 8 entries (rolling). New entries are appended exactly once per calendar-week reset crossing — multiple advisor runs in the same week don't add duplicate records.
+
+The downgrade decision (per §Noise rejection) inspects the LAST N entries (default N=2 from `CACHE_FIX_ADVISOR_DOWNGRADE_WEEKS`) and recommends downgrade only if every one of those N entries has `under_downgrade: true`. This is what makes "2 consecutive weeks" mean weeks, not advisor invocations.
 
 ### Plan detection
 
@@ -138,7 +169,7 @@ Detection order:
 1. **Explicit override**: `CACHE_FIX_ADVISOR_PLAN=max-5x|max-20x|pro` set → use that.
 2. **From quota-status.json**: if Anthropic's headers expose plan info, parse it. (Currently they don't expose tier directly; this is forward-looking.)
 3. **Heuristic from Q5h budget**: if recent windows show Q5h budget consistent with 5x (~204M tokens/100%), assume 5x; if consistent with 20x (~892M/100%), assume 20x. Documented as imprecise but workable.
-4. **Fallback**: if undetectable, output `tier:unknown` and recommend the user set `CACHE_FIX_ADVISOR_PLAN`.
+4. **Fallback**: if undetectable, output recommendation `tier:unknown` AND exit code 3 (per the unified §Exit codes contract). Recommend the user set `CACHE_FIX_ADVISOR_PLAN`.
 
 ## Output formats
 
@@ -174,6 +205,7 @@ State saved to ~/.claude/tier-advisor-state.json
   "hours_since_reset": 140,
   "hours_until_reset": 28,
   "burn_rate_per_hour": 1.4,
+  "burn_rate_source": "header",
   "burn_rate_window_hours": 24,
   "projected_q7d_at_reset": 106,
   "recommendation": "upgrade",
@@ -185,11 +217,23 @@ State saved to ~/.claude/tier-advisor-state.json
 
 ### --quiet mode
 
-No stdout. Exit code:
-- 0 = no recommendation
-- 1 = recommend upgrade
-- 2 = recommend downgrade
-- 3 = error (can't read inputs, plan undetectable, etc.)
+No stdout (or stderr). Exit code carries the recommendation per the unified contract in §Exit codes below.
+
+### Exit codes (single contract, all modes — Codex blocker fix from review #1)
+
+The prior draft had two contradictory rules ("exits 0 always" vs. "`--quiet` exits 1/2/3"). Replaced with one rule that applies to default, `--json`, and `--quiet` modes uniformly:
+
+| Exit code | Meaning |
+|-----------|---------|
+| 0 | Normal run, no recommendation (`tier:ok`) |
+| 1 | Normal run, **recommend upgrade** |
+| 2 | Normal run, **recommend downgrade** |
+| 3 | Normal run, plan undetectable (recommendation is `tier:unknown` — user should set `CACHE_FIX_ADVISOR_PLAN`) |
+| 4 | Hard error: can't read inputs, malformed state file, etc. |
+
+Codes 1, 2, 3 are NOT errors in the shell sense — they signal the recommendation. Shell scripts that want "tool ran successfully regardless of recommendation" check `$? -lt 4`. Scripts that want "no action needed" check `$? -eq 0`.
+
+This means the prior draft's separate `tier:unknown` vs `tier:ok` distinction is now load-bearing — both exist, with separate exit codes (3 and 0). Update the §Decision matrix's "Fallback: undetectable plan" row to reflect that this case produces `tier:unknown` AND exit 3, NOT `tier:ok` AND exit 0.
 
 ### Statusline integration
 
@@ -278,7 +322,8 @@ export {
 ### Output formats
 23. Default human-readable output includes: current plan, burn rate, projection, recommendation, "Why" paragraph.
 24. `--json` output is parseable JSON with the documented schema.
-25. `--quiet` produces zero stdout bytes; exit code matches `recommendation` (0=ok, 1=upgrade, 2=downgrade, 3=error).
+25. `--quiet` produces zero stdout AND zero stderr bytes. Exit code matches the unified §Exit codes contract: 0=ok, 1=upgrade, 2=downgrade, 3=tier:unknown, 4=hard error.
+25a. Default (non-`--quiet`) mode also follows the unified §Exit codes contract — exit code is the same regardless of mode. Test by capturing exit code from each of `tier-advisor.mjs`, `tier-advisor.mjs --json`, `tier-advisor.mjs --quiet` on the same fixture and asserting they're equal.
 26. Statusline integration: with `last_recommendation: "upgrade"` in state, `quota-statusline.sh` output ends with `tier:upgrade`.
 27. Statusline with `last_recommendation: "ok"` → no `tier:` token in output.
 
@@ -289,9 +334,15 @@ export {
 
 ### Edge cases
 31. quota-status.json missing → use usage.jsonl path; if both missing, error and exit 3.
-32. usage.jsonl present but contains no entries this week → can't compute burn rate; output `tier:ok` and note the missing data.
+32. usage.jsonl present but contains no entries this week → can't compute burn rate; output `tier:ok`, exit 0, note the missing data in human output.
 33. Reset timestamp in the past (somehow) → treat as "just reset"; burn rate computes from full week.
-34. Plan unknown → recommendation is `tier:ok` but human output suggests setting `CACHE_FIX_ADVISOR_PLAN`.
+34. Plan unknown (no override + heuristic fails) → recommendation is `tier:unknown`, exit code is 3 (NOT `tier:ok` / exit 0). Human output suggests setting `CACHE_FIX_ADVISOR_PLAN`.
+
+### Calendar-week semantics (Codex blocker fix)
+35. Run advisor twice in the same calendar week with `under_downgrade: true` both times → `state.weeks` array has exactly ONE new entry, not two. Counter logic does NOT trigger downgrade (only 1 week of history under threshold).
+36. Run advisor once per week for 3 weeks, all `under_downgrade: true` → `state.weeks` has 3 new entries. With default `CACHE_FIX_ADVISOR_DOWNGRADE_WEEKS=2`, downgrade IS triggered after the 2nd week (last 2 entries both `under_downgrade: true`).
+37. Same 3-week sequence but week 2's entry has `under_downgrade: false` (single-week dip ended) → downgrade NOT triggered (last 2 entries: false, true → not consecutive under-threshold).
+38. Run advisor 100 times in a single calendar week with `under_downgrade: true` → `state.weeks` array still has only 1 new entry for that week. NOT 100 entries; downgrade NOT triggered (single-week record only).
 
 ## Reviewer checklist
 
@@ -301,9 +352,11 @@ export {
 - [ ] Projection caps at 200%. Test 7 verifies.
 - [ ] Downgrade requires N consecutive weeks (default 2, configurable). Test 16 verifies.
 - [ ] Upgrade is single-event. Test 13 verifies.
-- [ ] State file at `~/.claude/tier-advisor-state.json` with bounded 8-week history. Test 22 verifies.
+- [ ] State file at `~/.claude/tier-advisor-state.json` with bounded 8-entry weeks array. Test 22 verifies. Verify entries are calendar-week scoped (NOT per-run); Tests 35-38 are the load-bearing checks for the Codex blocker #2 fix.
 - [ ] `--json` schema matches §--json mode documentation. Test 24 verifies.
-- [ ] `--quiet` exit codes match the documented mapping. Test 25 verifies.
+- [ ] **Single exit-code contract** applies to default, `--json`, AND `--quiet` modes (Codex blocker #3 fix). Tests 25 + 25a verify equality across modes. Mapping: 0=ok, 1=upgrade, 2=downgrade, 3=tier:unknown, 4=hard error.
+- [ ] **Single burn-rate rule** (Codex blocker #1 fix): primary = quota-status header when fresh; fallback = usage.jsonl token sum. Never blend, never min/max. `burn_rate_source` field records which source produced the value.
+- [ ] **Calendar-week semantics** for the consecutive-weeks counter: `state.weeks` array indexed by week-ending date, max one new entry per calendar-week reset. Tests 35-38 verify.
 - [ ] `quota-statusline.sh` extension is a single-token append; gracefully handles missing state file. Test 26-27 verify.
 - [ ] No new top-level npm dependencies. Node built-ins only.
 - [ ] CI green on Node 18 / 20 / 22.
