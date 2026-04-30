@@ -60,6 +60,11 @@ Out of scope (deferred to v3.5.0+ pending Phase 1 data):
   - Detection of *when* microcompact is about to fire (we don't currently see it before the rewrite; CC fires it in the request-composition path internally).
   - Interaction with the v3.3.0 image-guard Pass 2 byte budget — restored content can re-inflate the body past the 30 MB threshold.
   - Risk of stale-restore: a snapshot from 90 minutes ago may not match what the user expects to be in context, especially if they've manually edited files between then and now.
+  Phase 2 also has open questions Codex flagged that aren't yet in the bullet list:
+  - **Snapshot retention / GC policy.** Per-session disk usage grows with conversation length × turn count; need a bounded LRU or TTL-based eviction. What's the right ceiling?
+  - **Persisted-format versioning.** If we ship Phase 2 v1, then later change the snapshot format, we need a migration path (or accept that snapshots from prior versions become unreadable and degrade gracefully).
+  - **Multi-process write safety.** If two CC instances connect to the same proxy, snapshot writes need to be atomic; otherwise concurrent microcompacts could clobber each other's snapshots.
+
   Phase 2 is the complete fix but every one of those bullets is its own design decision. Ship Phase 1, gather data, decide if Phase 2 is needed.
 - Direct intervention in the microcompact trigger — impossible from the proxy. The 90-minute timer lives inside CC's process state, not in the request body.
 - Reliance on the `CACHED_MICROCOMPACT` server flag — not under our control; track but don't ship anything that breaks if it's enabled or disabled.
@@ -72,8 +77,8 @@ Out of scope (deferred to v3.5.0+ pending Phase 1 data):
 - Two independent runtime gates inside the extension body:
   - `CACHE_FIX_DUMP_MICROCOMPACT=<path>` enables diagnostic dumping (read-only; no mutation).
   - `CACHE_FIX_NORMALIZE_MICROCOMPACT=1` enables sentinel normalization (mutates `ctx.body.messages[].content`).
-- Both can be on simultaneously (you'll dump the post-normalized snapshot, which is useful for verifying the rule).
-- If neither gate is set, the extension fires but exits early. No telemetry, no mutation.
+- Both can be on simultaneously. The dump always captures the **raw pre-normalization** sentinel text per §Diagnostic capture's contract; setting `CACHE_FIX_DUMP_MICROCOMPACT_INCLUDE_NORMALIZED=1` additionally records the normalized form alongside the raw text.
+- If neither dump nor normalize is enabled, the extension fires but exits early. No telemetry, no mutation, no fs activity.
 
 The repeat error from PR #79 round-1 (`enabled: false` + env-var gate) is avoided by construction.
 
@@ -81,41 +86,74 @@ The repeat error from PR #79 round-1 (`enabled: false` + env-var gate) is avoide
 
 CC's microcompact sentinel is documented as `[Old tool result content cleared]` in earlier comments on the project (per memory entry on microcompact monitoring), but we have not pinned down whether the sentinel embeds volatile fields. Phase 1 diagnostic captures the actual sentinel string from production traffic.
 
-Candidate patterns to match (one or more, OR'd together):
+### Two detection modes (Codex review fix)
+
+The original draft conflated two distinct detection modes. The revised contract separates them:
+
+**Mode A — exact sentinel match.** A `tool_result` content block (or a `text` item inside one) whose ENTIRE text matches one of the **confirmed** sentinel patterns:
 
 ```
 ^\[Old tool result content cleared\]\s*$
-^\[Old tool result content cleared at .+?\]\s*$       // with timestamp variant
-^\[Tool result truncated.*\]\s*$                       // alternative wording
-^\[microcompact.*\]\s*$                                // future variants
+^\[Old tool result content cleared at \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z\]\s*$   // ISO-8601 timestamp variant
 ```
 
-Detection logic: walk `body.messages[].content[]`. For each block where `type === "tool_result"`:
-- If `content` is a string, regex-match against the sentinel patterns.
-- If `content` is an array of items, regex-match each `text` item.
-- Match → record in stats, optionally normalize.
+Mode A matches are **eligible for normalization** when `CACHE_FIX_NORMALIZE_MICROCOMPACT=1`. The text being matched is, by construction, a CC-emitted sentinel — it doesn't carry user content.
 
-Edge cases:
-- **Block has the sentinel but also has additional content** (e.g., partial truncation) → record but DO NOT normalize. Partial truncation suggests the sentinel doesn't represent the full microcompact rewrite, and normalizing might erase real data.
-- **Multiple tool_result blocks all carry the sentinel** → walk all of them; record per-block stats.
-- **The sentinel pattern changes between CC versions** → diagnostic capture (Phase 1) re-establishes ground truth; normalization rule is parameterized via env var override (`CACHE_FIX_MICROCOMPACT_SENTINEL_PATTERN=<regex>`) for hotfix-without-release.
+**Mode B — diagnostic-only partial match.** A `tool_result` content block (or `text` item) whose text begins with the prefix `[Old tool result content cleared` BUT does NOT exactly match a Mode A pattern. This catches:
+- Sentinels with trailing additional content (truncation + appended notes).
+- Future CC variants we haven't seen yet (hence the prefix-only check).
+
+Mode B matches are **NEVER normalized**. The diagnostic dump for Mode B is **redacted**: only `msg_idx`, `block_idx`, `content_kind`, `byte_length`, and a 64-char prefix of the matched text are recorded. The full text is never dumped — this protects against the case where a Mode B match is actually a CC sentinel followed by user-derived content (e.g., a tool that echoed user input back into its result).
+
+The candidate patterns from the prior draft (`^\[Tool result truncated.*\]`, `^\[microcompact.*\]`) are **removed from the default set**: too broad, false-positive risk on tool outputs unrelated to microcompact. They can be re-added via the `CACHE_FIX_MICROCOMPACT_SENTINEL_PATTERN_<N>=<regex>` env-var family when Phase 1 data confirms a specific variant. Until then, Mode B's prefix detection is the right surface for capturing unknowns.
+
+### Detection logic
+
+Walk `body.messages[].content[]`. For each block where `type === "tool_result"`:
+- If `content` is a string, run Mode A patterns first (exact match); then Mode B prefix check.
+- If `content` is an array of items, do the same on each `text` item.
+- A Mode A match is recorded in `exact_matches` (eligible for normalization).
+- A Mode B match (prefix only) is recorded in `partial_matches` (redacted dump only, never normalized).
+- A block can produce at most ONE classification (Mode A wins over Mode B if both would match).
+
+### Edge cases
+
+- **Block has Mode A sentinel as its full text** → Mode A match, normalize if enabled.
+- **Block has the sentinel as a prefix plus additional content** → Mode B match, redacted dump only, no normalization.
+- **Multiple tool_result blocks** → walk all of them; record per-block stats.
+- **The sentinel pattern changes between CC versions** → Phase 1 diagnostic re-establishes ground truth via Mode B prefix capture; once a new exact form is identified, it's promoted to Mode A by adding to the env var pattern set.
 
 ## Diagnostic capture (Phase 1, always-on when env var set)
 
-When `CACHE_FIX_DUMP_MICROCOMPACT=<path>` is set, before any normalization runs, the extension writes a JSONL record to the path for any request whose messages contain a sentinel match:
+**Raw-before-normalize is the rule.** When `CACHE_FIX_DUMP_MICROCOMPACT=<path>` is set, the dump is written BEFORE any normalization runs (Codex review fix — the prior draft contradicted itself by also saying "if both gates are on, the dump captures the post-normalized snapshot," which would defeat Phase 1's whole purpose of characterizing real production sentinel drift). The dump always reflects the original matched bytes the proxy received from CC.
+
+If verification of the normalization rule is also wanted, set `CACHE_FIX_DUMP_MICROCOMPACT_INCLUDE_NORMALIZED=1` to add a second `normalized_text` field to each match record. The raw `sentinel_text` field is preserved either way.
+
+The dump record schema, with the two-mode separation:
 
 ```json
 {
   "ts": "2026-04-30T15:00:00Z",
   "session_id_hash": "abc123",
-  "matched_sentinels": [
+  "exact_matches": [
     {
       "msg_idx": 3,
       "block_idx": 1,
       "content_kind": "string",
-      "matched_pattern": "^\\[Old tool result content cleared\\].*$",
+      "matched_pattern": "^\\[Old tool result content cleared at .+?\\]$",
       "sentinel_text": "[Old tool result content cleared at 2026-04-30T13:42:11Z]",
-      "byte_length": 53
+      "byte_length": 53,
+      "normalized_text": "[Old tool result content cleared]"   // present only when CACHE_FIX_DUMP_MICROCOMPACT_INCLUDE_NORMALIZED=1
+    }
+  ],
+  "partial_matches": [
+    {
+      "msg_idx": 5,
+      "block_idx": 0,
+      "content_kind": "array_item",
+      "byte_length": 142,
+      "prefix_64": "[Old tool result content cleared at 2026-04-30T13:50:00Z] (with extr"
+      // NOTE: NO full text. Mode B always redacts to a 64-char prefix.
     }
   ],
   "total_messages": 12,
@@ -124,9 +162,21 @@ When `CACHE_FIX_DUMP_MICROCOMPACT=<path>` is set, before any normalization runs,
 }
 ```
 
-Privacy: only the sentinel text itself is captured (which by definition doesn't carry user content — it's CC's replacement string). No real tool_result content is dumped. Session ID is hashed.
+### Privacy guarantees (revised, defensible)
 
-This file is the design input for the actual normalization rule. Without production samples we can only normalize against synthesized sentinels, and a wrong normalization rule is worse than no normalization (would produce inconsistent canonicalization across the fleet).
+The Codex review correctly flagged that the prior "no user content" claim was too strong because Mode B partial matches and broad regexes could capture user-derived text. The revised contract is narrow:
+
+- **Mode A (exact match) records**: `sentinel_text` is captured in full. This is safe because the text matches a confirmed CC sentinel pattern — by construction, no user content. The `\d{4}-\d{2}-...` ISO-8601 timestamp constraint in the regex bounds what trailing content the regex will accept.
+- **Mode B (partial match) records**: ONLY `byte_length` and a 64-char prefix. The full text is NEVER dumped. The 64-char prefix is short enough that, for the worst case (CC sentinel + user-derived content concatenated), the user content is unlikely to begin within the first 64 chars (the CC sentinel base form is ~33 chars; a timestamp-bearing variant is ~52 chars; user-derived content begins after).
+- **Session IDs**: always hashed (one-way; SHA-256 truncated to 8 hex chars). Plaintext session ID never written.
+- **Model**: included verbatim — not user data.
+- **Custom user patterns** via `CACHE_FIX_MICROCOMPACT_SENTINEL_PATTERN_<N>` are subject to the same Mode A vs Mode B treatment: a custom pattern that matches exactly is dumped in full; a partial match against a custom prefix gets redacted to 64 chars.
+
+If a deployment has stricter requirements, `CACHE_FIX_MICROCOMPACT_REDACT_LEN=N` overrides the 64-char Mode B prefix length (set to `0` to suppress the prefix entirely; only structural metadata remains).
+
+### Why the dump is needed at all
+
+Without production samples we can only normalize against synthesized sentinels. A wrong normalization rule is worse than no normalization (would produce inconsistent canonicalization across the fleet, churning cache *more*, not less). The diagnostic is the design input for the actual normalization rule.
 
 ## Normalization rule
 
@@ -160,9 +210,9 @@ ctx.meta.microcompactStats = {
   total_tool_results_scanned: number,
   sentinels_matched: number,          // total matches across all blocks
   sentinels_normalized: number,       // matches that were rewritten (always ≤ matched)
-  bytes_original: number,             // sum of matched sentinel byte lengths before
+  bytes_original: number,             // sum of matched sentinel byte lengths before normalization
   bytes_normalized: number,           // sum after normalization
-  bytes_saved: number,                // original - normalized (often negative-ish; the value is "stability over savings")
+  bytes_saved: number,                // bytes_original - bytes_normalized; usually positive (default rule strips timestamp suffix). The headline value of normalization is byte-stability across runs, not byte savings — the savings are a side effect.
   diagnostic_records_written: number, // count of JSONL lines this request produced
 };
 ```
@@ -241,12 +291,20 @@ async function runMicrocompactStability(reqCtx) {
 
 ## Test plan
 
-### Pattern detection
-1. tool_result content `[Old tool result content cleared]` → matches default pattern.
-2. tool_result content `[Old tool result content cleared at 2026-04-30T13:42:11Z]` → matches with-timestamp variant.
-3. tool_result content `[Tool result truncated by user]` → no match (not a microcompact sentinel).
-4. tool_result content with prefix `[Old tool result content cleared]` followed by additional text → matches BUT recorded with `partial_match: true` (no normalize, by design).
-5. User-supplied custom pattern via `CACHE_FIX_MICROCOMPACT_SENTINEL_PATTERN=<regex>` overrides the default list and matches accordingly.
+### Mode A — exact sentinel match (eligible for normalization)
+1. tool_result content exactly `[Old tool result content cleared]` → Mode A match recorded in `exact_matches`.
+2. tool_result content exactly `[Old tool result content cleared at 2026-04-30T13:42:11Z]` → Mode A match (timestamp variant). Verify regex requires the full ISO-8601 form (date + time + Z).
+3. tool_result content `[Old tool result content cleared at not-a-real-timestamp]` → does NOT match Mode A (timestamp regex constrains accepted formats). Falls through to Mode B prefix check.
+4. tool_result content `[Tool result truncated by user]` → no match in either mode (not in default pattern set; rejected from candidates per Codex review).
+
+### Mode B — partial match (diagnostic-only, redacted, NEVER normalized)
+4a. tool_result content `[Old tool result content cleared] (with extra notes)` → Mode B match recorded in `partial_matches` with `prefix_64` only. Full text is NEVER in the dump record. Mutation does NOT occur.
+4b. tool_result content with prefix `[Old tool result content cleared at 2026-04-30T13:50:00Z]` followed by 200 chars of additional text → Mode B match. `prefix_64` captures only the first 64 chars; bytes 65-264 are NOT recorded.
+4c. `CACHE_FIX_MICROCOMPACT_REDACT_LEN=0` set → Mode B match still recorded but `prefix_64` field is empty/absent.
+
+### Custom patterns
+5a. `CACHE_FIX_MICROCOMPACT_SENTINEL_PATTERN_1=<regex>` adds a custom Mode A pattern. Match against it → recorded in `exact_matches` with the matched_pattern source.
+5b. Custom pattern matched as a prefix only (block has trailing extra content) → recorded in `partial_matches`, redacted to `prefix_64`. Same redaction applies to user-supplied patterns as to defaults.
 
 ### Tool_result content shapes
 6. tool_result with `content` as a string containing the sentinel → matched and normalized at string level.
@@ -286,9 +344,11 @@ async function runMicrocompactStability(reqCtx) {
 - [ ] Default canonical text is the maximally-stable form (no timestamps, no IDs). Test 12 verifies.
 - [ ] Custom sentinel pattern via env var overrides correctly. Test 5 verifies.
 - [ ] Custom canonical text via env var overrides correctly. Test 13 verifies.
-- [ ] Diagnostic dump never writes user content, only the matched sentinel text + structural metadata. Test 9 verifies.
+- [ ] Diagnostic dump captures **raw pre-normalization** sentinel bytes in `exact_matches[].sentinel_text`. Post-normalize text appears only when `CACHE_FIX_DUMP_MICROCOMPACT_INCLUDE_NORMALIZED=1` is set, alongside (not replacing) the raw text.
+- [ ] Mode A (exact match) records full `sentinel_text`. Mode B (prefix match) records ONLY `prefix_64` plus structural metadata — full text is never in the dump. Tests 4a-4c verify.
+- [ ] Privacy framing matches the implementation: Mode A = full capture (safe by construction), Mode B = redacted to 64 chars (configurable via `CACHE_FIX_MICROCOMPACT_REDACT_LEN`).
 - [ ] Session ID is hashed in the dump (one-way; no plaintext). Test 9 verifies.
-- [ ] Partial matches (sentinel as prefix only) are recorded but NOT normalized. Test 4 verifies.
+- [ ] Mode B (partial match) is NEVER normalized. Tests 4a-4b verify body bytes unchanged in those cases.
 - [ ] All tool_result content shapes (string and array) are handled. Tests 6-8 verify.
 - [ ] Telemetry surface includes the full counter set on every onRequest invocation when enabled.
 - [ ] Phase 2 (snapshot-and-restore) is explicitly out-of-scope and documented as deferred.
