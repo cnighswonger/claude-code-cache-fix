@@ -63,6 +63,26 @@ function getCustomPatterns() {
   }
   return out;
 }
+
+// Custom Mode B literal prefixes, paired with custom Mode A regex patterns.
+// A user who configures CACHE_FIX_MICROCOMPACT_SENTINEL_PATTERN_<N> for a
+// non-default sentinel family should also set CACHE_FIX_MICROCOMPACT_SENTINEL_PREFIX_<N>
+// to the LITERAL string the family begins with — that's what enables Mode B
+// (redacted prefix capture) for variants that don't exact-match the regex.
+//
+// We can't safely derive a prefix from an arbitrary regex, so we accept the
+// prefix as a separate input. The two env-var families don't have to agree
+// on numeric suffixes; we collect all prefixes regardless of index.
+function getCustomPrefixes() {
+  // CACHE_FIX_MICROCOMPACT_SENTINEL_PREFIX_<N>=<literal>  (1-indexed, sparse OK)
+  const out = [];
+  for (const [k, v] of Object.entries(process.env)) {
+    if (!k.startsWith("CACHE_FIX_MICROCOMPACT_SENTINEL_PREFIX_")) continue;
+    if (typeof v !== "string" || v.length === 0) continue;
+    out.push(v);
+  }
+  return out;
+}
 function isDebug() {
   return process.env.CACHE_FIX_DEBUG === "1";
 }
@@ -108,8 +128,13 @@ export function matchesSentinelPattern(text, extraPatterns = []) {
   return null;
 }
 
-function isPartialMatch(text) {
-  return typeof text === "string" && text.startsWith(SENTINEL_PREFIX);
+function isPartialMatch(text, extraPrefixes = []) {
+  if (typeof text !== "string") return false;
+  if (text.startsWith(SENTINEL_PREFIX)) return true;
+  for (const p of extraPrefixes) {
+    if (text.startsWith(p)) return true;
+  }
+  return false;
 }
 
 // --- Walking tool_result content ---
@@ -126,7 +151,7 @@ function isPartialMatch(text) {
 // `text` on partial_matches is kept on the in-memory record for redaction at
 // serialize time (the dump never persists the full text).
 
-export function walkToolResultsForSentinels(messages, extraPatterns = []) {
+export function walkToolResultsForSentinels(messages, extraPatterns = [], extraPrefixes = []) {
   const exact_matches = [];
   const partial_matches = [];
   let total_tool_results = 0;
@@ -169,7 +194,7 @@ export function walkToolResultsForSentinels(messages, extraPatterns = []) {
       });
       return;
     }
-    if (isPartialMatch(text)) {
+    if (isPartialMatch(text, extraPrefixes)) {
       partial_matches.push({
         msg_idx,
         block_idx,
@@ -322,9 +347,11 @@ export async function runMicrocompactStability(reqCtx) {
   if (!reqCtx || !reqCtx.body || !Array.isArray(reqCtx.body.messages)) return stats;
 
   const extraPatterns = getCustomPatterns();
+  const extraPrefixes = getCustomPrefixes();
   const { exact_matches, partial_matches, total_tool_results } = walkToolResultsForSentinels(
     reqCtx.body.messages,
     extraPatterns,
+    extraPrefixes,
   );
   stats.total_tool_results_scanned = total_tool_results;
   stats.exact_matches_count = exact_matches.length;

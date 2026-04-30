@@ -233,7 +233,7 @@ See `docs/directives/proxy-messages-cache-breakpoint.md` for the full spec.
 
 The Mode A/B separation is the privacy guarantee: a Mode B match might be a CC sentinel followed by user-derived content (e.g., a tool that echoed user input back). Redaction prevents that content from landing in the dump.
 
-**Custom patterns** can be added via `CACHE_FIX_MICROCOMPACT_SENTINEL_PATTERN_<N>=<regex>` (1-indexed, sparse OK). Custom patterns are subject to the same Mode A/B treatment as defaults.
+**Custom patterns** can be added via `CACHE_FIX_MICROCOMPACT_SENTINEL_PATTERN_<N>=<regex>` (1-indexed, sparse OK). To get the same Mode A/B treatment as defaults — including redacted prefix capture for variants of a custom family — pair each custom regex with a literal prefix via `CACHE_FIX_MICROCOMPACT_SENTINEL_PREFIX_<N>=<literal>`. The implementation can't safely derive a prefix from an arbitrary regex, so prefixes are supplied separately. Without the prefix env var, only exact-match (Mode A) capture works for that family.
 
 **Telemetry surface (`ctx.meta.microcompactStats`):**
 ```js

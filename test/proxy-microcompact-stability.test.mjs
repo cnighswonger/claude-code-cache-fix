@@ -236,24 +236,21 @@ test("5a. CACHE_FIX_MICROCOMPACT_SENTINEL_PATTERN_1 adds custom Mode A pattern",
   });
 });
 
-test("5b. custom pattern matched as prefix only → recorded in partial_matches with prefix_64", async () => {
+test("5b. custom Mode A regex + custom Mode B prefix → exact match goes to exact_matches", async () => {
   const dir = await mkdtemp(join(tmpdir(), "mc-"));
   const dumpPath = join(dir, "dump.jsonl");
-  // The custom pattern matches an exact form. A block with that prefix plus
-  // trailing text must NOT match Mode A; it falls through to Mode B (which
-  // detects the default `[Old tool result content cleared` prefix). To
-  // exercise custom-pattern Mode B, use a block that begins with the default
-  // sentinel prefix but does NOT exactly match either default or custom Mode A.
-  const text = "[Old tool result content cleared] custom-trailer";
+  // Exact match against a custom regex from a sentinel family that does NOT
+  // share the built-in prefix. Verifies exact-match path for custom families.
   const body = makeBody([
     assistantMsg("t1"),
-    userMsg([trBlockString("t1", text)]),
+    userMsg([trBlockString("t1", "[CC microcompact rev2]")]),
   ]);
   await silenceStderrAsync(async () => {
     await withEnv(
       {
         CACHE_FIX_DUMP_MICROCOMPACT: dumpPath,
-        CACHE_FIX_MICROCOMPACT_SENTINEL_PATTERN_1: "^\\[Old tool result content cleared\\] specific$",
+        CACHE_FIX_MICROCOMPACT_SENTINEL_PATTERN_1: "^\\[CC microcompact rev2\\]\\s*$",
+        CACHE_FIX_MICROCOMPACT_SENTINEL_PREFIX_1: "[CC microcompact",
       },
       async () => {
         await runExt(body);
@@ -261,9 +258,47 @@ test("5b. custom pattern matched as prefix only → recorded in partial_matches 
     );
   });
   const rec = JSON.parse((await readFile(dumpPath, "utf8")).trim());
+  assert.equal(rec.exact_matches.length, 1);
+  assert.equal(rec.partial_matches.length, 0);
+  assert.equal(rec.exact_matches[0].sentinel_text, "[CC microcompact rev2]");
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("5c. custom Mode B prefix → variant-of-custom-family captured redacted in partial_matches", async () => {
+  // The blocker Codex flagged: a custom sentinel family that matches
+  // EXACTLY normalizes, but its prefix-only variant must also be captured
+  // in Mode B (redacted) — not silently dropped just because the variant
+  // doesn't share the built-in `[Old tool result content cleared` prefix.
+  const dir = await mkdtemp(join(tmpdir(), "mc-"));
+  const dumpPath = join(dir, "dump.jsonl");
+  const text = "[CC microcompact rev2 at 2026-04-30T17:00:00Z] (with trailing content)";
+  const body = makeBody([
+    assistantMsg("t1"),
+    userMsg([trBlockString("t1", text)]),
+  ]);
+  const before = JSON.stringify(body);
+  await silenceStderrAsync(async () => {
+    await withEnv(
+      {
+        CACHE_FIX_DUMP_MICROCOMPACT: dumpPath,
+        CACHE_FIX_NORMALIZE_MICROCOMPACT: "1",
+        // Mode A regex won't match because of the trailing content.
+        CACHE_FIX_MICROCOMPACT_SENTINEL_PATTERN_1: "^\\[CC microcompact rev2\\]\\s*$",
+        // Mode B prefix is what should fire here.
+        CACHE_FIX_MICROCOMPACT_SENTINEL_PREFIX_1: "[CC microcompact",
+      },
+      async () => {
+        await runExt(body);
+      },
+    );
+  });
+  // Body must not mutate — Mode B is never normalized.
+  assert.equal(JSON.stringify(body), before);
+  const rec = JSON.parse((await readFile(dumpPath, "utf8")).trim());
   assert.equal(rec.exact_matches.length, 0);
   assert.equal(rec.partial_matches.length, 1);
-  assert.equal(rec.partial_matches[0].prefix_64.length <= 64, true);
+  assert.equal(rec.partial_matches[0].sentinel_text, undefined); // never full text
+  assert.ok(rec.partial_matches[0].prefix_64.startsWith("[CC microcompact"));
   await rm(dir, { recursive: true, force: true });
 });
 

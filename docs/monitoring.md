@@ -124,5 +124,6 @@ Proxy mode uses extension configuration in `proxy/extensions.json`. These env va
 | `CACHE_FIX_NORMALIZE_MICROCOMPACT` | unset | (proxy) Enable sentinel normalization (`=1` opts in). Mutates Mode A matches to canonical byte-stable form. |
 | `CACHE_FIX_MICROCOMPACT_NORMALIZED` | `[Old tool result content cleared]` | (proxy) Override the canonical replacement string. |
 | `CACHE_FIX_MICROCOMPACT_SENTINEL_PATTERN_<N>` | unset | (proxy) Add custom Mode A regex pattern(s); 1-indexed, sparse OK. |
+| `CACHE_FIX_MICROCOMPACT_SENTINEL_PREFIX_<N>` | unset | (proxy) Custom Mode B literal prefix(es). Pair with a custom Mode A pattern from a non-default sentinel family so prefix-only variants get redacted capture too. |
 | `CACHE_FIX_MICROCOMPACT_REDACT_LEN` | `64` | (proxy) Mode B prefix length in dump records. Set `0` to suppress prefix entirely. |
 | `CACHE_FIX_DUMP_MICROCOMPACT_INCLUDE_NORMALIZED` | unset | (proxy) Add post-normalization text alongside raw `sentinel_text` in dump records (`=1` enables). |
