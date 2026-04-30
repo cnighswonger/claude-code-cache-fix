@@ -140,7 +140,7 @@ The dump record schema, with the two-mode separation:
       "msg_idx": 3,
       "block_idx": 1,
       "content_kind": "string",
-      "matched_pattern": "^\\[Old tool result content cleared at .+?\\]$",
+      "matched_pattern": "^\\[Old tool result content cleared at \\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{3})?Z\\]\\s*$",
       "sentinel_text": "[Old tool result content cleared at 2026-04-30T13:42:11Z]",
       "byte_length": 53,
       "normalized_text": "[Old tool result content cleared]"   // present only when CACHE_FIX_DUMP_MICROCOMPACT_INCLUDE_NORMALIZED=1
@@ -258,15 +258,21 @@ async function runMicrocompactStability(reqCtx) {
   const stats = initStats();
   if (!isDumpEnabled() && !isNormalizeEnabled()) return stats;
 
-  const matches = walkToolResultsForSentinels(reqCtx.body.messages);
-  stats.sentinels_matched = matches.length;
+  const { exact_matches, partial_matches } = walkToolResultsForSentinels(reqCtx.body.messages);
+  stats.exact_matches_count = exact_matches.length;
+  stats.partial_matches_count = partial_matches.length;
   stats.total_tool_results_scanned = countToolResults(reqCtx.body.messages);
 
-  if (isDumpEnabled() && matches.length > 0) {
+  // Diagnostic dump runs FIRST (before any normalization), capturing raw bytes.
+  // Mode A records carry full sentinel_text; Mode B records carry only prefix_64.
+  if (isDumpEnabled() && (exact_matches.length > 0 || partial_matches.length > 0)) {
+    const includeNormalized = isIncludeNormalizedEnabled();
+    const canonicalText = isNormalizeEnabled() ? getCanonicalText() : null;
     await appendDiagnosticRecord(getDumpPath(), {
       ts: new Date().toISOString(),
       session_id_hash: hashSessionId(reqCtx),
-      matched_sentinels: matches.map(serializeMatch),
+      exact_matches: exact_matches.map(m => serializeExactMatch(m, includeNormalized ? canonicalText : null)),
+      partial_matches: partial_matches.map(m => serializePartialMatch(m, getRedactLen())),
       total_messages: reqCtx.body.messages.length,
       total_tool_results: stats.total_tool_results_scanned,
       model: reqCtx.body.model,
@@ -274,9 +280,10 @@ async function runMicrocompactStability(reqCtx) {
     stats.diagnostic_records_written = 1;
   }
 
+  // Normalization runs AFTER dump. Only Mode A matches are eligible.
   if (isNormalizeEnabled()) {
     const canonicalText = getCanonicalText();      // env-overridable
-    for (const m of matches) {
+    for (const m of exact_matches) {
       stats.bytes_original += m.text.length;
       normalizeToolResultContent(reqCtx.body.messages[m.msg_idx].content[m.block_idx], canonicalText);
       stats.bytes_normalized += canonicalText.length;
@@ -284,6 +291,7 @@ async function runMicrocompactStability(reqCtx) {
     }
     stats.bytes_saved = stats.bytes_original - stats.bytes_normalized;
   }
+  // Mode B (partial_matches) is NEVER mutated, regardless of normalize state.
 
   return stats;
 }
@@ -314,7 +322,7 @@ async function runMicrocompactStability(reqCtx) {
 ### Diagnostic dump
 9. `CACHE_FIX_DUMP_MICROCOMPACT=/tmp/dump.jsonl` set, sentinel match present → JSONL line appended with the documented schema. session_id is hashed (no plaintext).
 10. `CACHE_FIX_DUMP_MICROCOMPACT` unset → no file is created, no fs writes attempted.
-11. Multiple matches in one request → ONE JSONL line with all matches in `matched_sentinels` array.
+11. Multiple matches in one request → ONE JSONL line with all matches split across `exact_matches[]` and `partial_matches[]` arrays per the Mode A/B classification.
 
 ### Normalization
 12. `CACHE_FIX_NORMALIZE_MICROCOMPACT=1`, default canonical → matched sentinel replaced with `[Old tool result content cleared]`. Other block fields (tool_use_id, type) preserved.
@@ -326,7 +334,7 @@ async function runMicrocompactStability(reqCtx) {
 16. Both env vars unset → extension fires but exits early. No telemetry, no mutation, no fs activity.
 17. Only diagnostic enabled → telemetry present, JSONL written, no mutation.
 18. Only normalize enabled → telemetry present, mutation happens, no JSONL.
-19. Both enabled → telemetry, mutation, AND JSONL all happen (diagnostic captures the post-normalization state).
+19. Both enabled → telemetry, mutation, AND JSONL all happen. Diagnostic captures the **raw pre-normalization** sentinel text (per the Mode A/B contract); the request body is then mutated. To additionally record the post-normalization form, set `CACHE_FIX_DUMP_MICROCOMPACT_INCLUDE_NORMALIZED=1` — adds a `normalized_text` field alongside (not replacing) the raw `sentinel_text` on Mode A records.
 
 ### Telemetry shape
 20. `ctx.meta.microcompactStats` contains every documented field after a sentinel-bearing request.
