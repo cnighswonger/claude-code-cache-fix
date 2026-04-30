@@ -326,6 +326,7 @@ function initStats() {
     resize_succeeded: 0,
     resize_failed: 0,
     library_missing: false,
+    images_stripped_pass1: 0,
     images_dropped_for_size: 0,
     images_dropped_for_count_cap: 0,
 
@@ -415,6 +416,7 @@ function runPass1RejectionCapStrip(reqCtx, stats, opts) {
         type: "text",
         text: oversizedPlaceholder(cap, dims.width, dims.height),
       });
+      stats.images_stripped_pass1++;
     }
   }
 }
@@ -469,6 +471,15 @@ function runImageCountCap(reqCtx, stats) {
     });
     stats.images_dropped_for_count_cap++;
     stats.image_bytes_dropped += droppedBytes;
+  }
+  // Recompute request_bytes_after after count-cap evictions so the final
+  // telemetry reflects the post-pipeline body. Without this, count-cap-only
+  // requests would report unchanged byte totals (Codex review note).
+  if (toDrop > 0) {
+    const budget = getRequestSizeMax();
+    const after = Buffer.byteLength(JSON.stringify(reqCtx.body));
+    stats.request_bytes_after = after;
+    stats.request_bytes_headroom = budget - after;
   }
 }
 
@@ -658,6 +669,7 @@ export default {
 
     // Emit summary only if the pipeline actually did anything observable.
     const didSomething =
+      stats.images_stripped_pass1 > 0 ||
       stats.images_dropped_for_size > 0 ||
       stats.images_dropped_for_count_cap > 0 ||
       stats.resize_attempted > 0 ||
@@ -669,6 +681,7 @@ export default {
       if (stats.resize_succeeded > 0) parts.push(`resized=${stats.resize_succeeded}`);
       if (stats.resize_failed > 0) parts.push(`resize_failed=${stats.resize_failed}`);
       if (stats.library_missing) parts.push("sharp=missing");
+      if (stats.images_stripped_pass1 > 0) parts.push(`stripped=${stats.images_stripped_pass1}`);
       if (stats.images_dropped_for_size > 0) parts.push(`evicted=${stats.images_dropped_for_size}`);
       if (stats.images_dropped_for_count_cap > 0) {
         parts.push(`count_capped=${stats.images_dropped_for_count_cap}`);
@@ -676,6 +689,7 @@ export default {
       if (stats.unsupported_format_count > 0) parts.push(`unsupported=${stats.unsupported_format_count}`);
       const summary = parts.join(" ") || "ran";
       const finalImages = stats.total_images
+        - stats.images_stripped_pass1
         - stats.images_dropped_for_size
         - stats.images_dropped_for_count_cap;
       process.stderr.write(

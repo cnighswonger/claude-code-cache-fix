@@ -389,16 +389,16 @@ If `sharp` is missing, Pass 3 skips cleanly (telemetry records `library_missing:
 
 | Env var combination | Behavior |
 |---|---|
-| Nothing set | No image processing. |
-| `KEEP_LAST=N` only | Legacy v3.2.1: count cap on tool_result images in user messages. |
-| `MAX_DIM=N` only | Legacy v3.2.1: hard size cap, strip-only. |
-| `KEEP_LAST=N` + `MAX_DIM=N` | Legacy two-step: KEEP_LAST first, then MAX_DIM on survivors. |
-| `IMAGE_GUARD=1` | Pipeline: Pass 1 (conditional cap) + Pass 2 (request-size guard) + count cap. |
-| `IMAGE_GUARD=1` + `MAX_DIM=N` | `MAX_DIM` overrides Pass 1's conditional cap; Pass 2 still runs. |
-| `IMAGE_GUARD=1` + `PRESERVE_DETAIL=1` | Adds Pass 3 (Lanczos resize). Falls back to strip if `sharp` is unavailable. |
-| `IMAGE_GUARD=1` + `KEEP_LAST=N` | KEEP_LAST runs first as Pass 0, pipeline runs on remainder. |
-| `IMAGE_GUARD=1` + `KEEP_LAST=N` + `MAX_DIM=N` | Three-way: Pass 0 first, pipeline next, MAX_DIM overrides Pass 1. |
-| `PRESERVE_DETAIL=1` only | No-op + warning. |
+| Nothing set | No image processing (back-compat default; the extension short-circuits). |
+| `KEEP_LAST=N` only | Existing v3.2.1: count cap on tool_result images in user messages, runs first. No pipeline. |
+| `MAX_DIM=N` only | Existing v3.2.1: hard size cap, strip-only. No pipeline. |
+| `KEEP_LAST=N` + `MAX_DIM=N` | Existing v3.2.1 composition: `KEEP_LAST` runs first (drops count), then `MAX_DIM` runs on survivors (caps size). No pipeline, no Pass 2, no Pass 3. |
+| `IMAGE_GUARD=1` | New pipeline: Pass 1 (conditional cap) + Pass 2 (request-size guard) + image-count cap. |
+| `IMAGE_GUARD=1` + `MAX_DIM=N` | `MAX_DIM` overrides Pass 1's conditional cap (acts as the cap value); Pass 2 still runs. |
+| `IMAGE_GUARD=1` + `PRESERVE_DETAIL=1` | Adds Pass 3 (Lanczos resize via `sharp`). When `sharp` unavailable, falls back to strip behavior. |
+| `IMAGE_GUARD=1` + `KEEP_LAST=N` | `KEEP_LAST` runs first as count cap (Pass 0); pipeline runs on remainder. |
+| `IMAGE_GUARD=1` + `KEEP_LAST=N` + `MAX_DIM=N` | Three-way: `KEEP_LAST` runs first; pipeline runs on remainder, but `MAX_DIM` overrides Pass 1's conditional cap; Pass 2 still runs. |
+| `PRESERVE_DETAIL=1` without `IMAGE_GUARD=1` | Logs warning, treats as no-op. `PRESERVE_DETAIL` is meaningless without the pipeline running. |
 
 #### Tunables
 

@@ -833,6 +833,54 @@ test("[T33] imageGuardStats has every documented field after a pipeline-active r
   );
 });
 
+test("[T34a] Pass 1-only stripping emits stderr summary (Codex review fix)", async () => {
+  resetState();
+  const origWrite = process.stderr.write.bind(process.stderr);
+  let captured = "";
+  process.stderr.write = (chunk) => { captured += chunk.toString(); return true; };
+  try {
+    await withEnvAsync(
+      { CACHE_FIX_IMAGE_GUARD: "1", CACHE_FIX_IMAGE_PRESERVE_DETAIL: undefined, CACHE_FIX_IMAGE_MAX_DIM: undefined, CACHE_FIX_IMAGE_KEEP_LAST: undefined },
+      async () => {
+        const body = makeBody(
+          [userMsgWithDirectImages(imageBlock(pngB64(9000, 9000)))],
+          "claude-3-5-sonnet-20241022"
+        );
+        const ctx = makeCtx(body);
+        await ext.onRequest(ctx);
+        // Pass 1 stripped one image — stderr summary should be emitted.
+        assert.match(captured, /\[image-guard\]/);
+        assert.match(captured, /stripped=1/, "Pass 1 strips should appear in summary");
+      }
+    );
+  } finally {
+    process.stderr.write = origWrite;
+  }
+});
+
+test("[T34b] count-cap-only request reports updated request_bytes_after (Codex review fix)", async () => {
+  resetState();
+  await withEnvAsync(
+    { CACHE_FIX_IMAGE_GUARD: "1", CACHE_FIX_IMAGE_COUNT_MAX: undefined, CACHE_FIX_IMAGE_PRESERVE_DETAIL: undefined, CACHE_FIX_IMAGE_MAX_DIM: undefined, CACHE_FIX_IMAGE_KEEP_LAST: undefined },
+    async () => {
+      // 105 small images → trimmed to 100 by count cap. Pass 2 won't fire (well under 30 MB).
+      const blocks = [];
+      for (let i = 0; i < 105; i++) blocks.push(imageBlock(pngB64(500, 500, 1000)));
+      const body = makeBody([userMsgWithDirectImages(...blocks)], "claude-opus-4-7-20260101");
+      const ctx = makeCtx(body);
+      await ext.onRequest(ctx);
+      const stats = ctx.meta.imageGuardStats;
+      assert.equal(stats.images_dropped_for_count_cap, 5);
+      // request_bytes_after must reflect the post-count-cap body, not the pre-trim size.
+      const actualBytes = Buffer.byteLength(JSON.stringify(body));
+      assert.equal(stats.request_bytes_after, actualBytes,
+        "request_bytes_after should equal the post-pipeline body size");
+      assert.ok(stats.request_bytes_after < stats.request_bytes_before,
+        "post-trim bytes should be less than pre-trim");
+    }
+  );
+});
+
 test("[T34] stderr summary line conditional on actual work", async () => {
   resetState();
   const origWrite = process.stderr.write.bind(process.stderr);
