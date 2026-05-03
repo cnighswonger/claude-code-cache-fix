@@ -169,6 +169,8 @@ These tests lock in the rewire by exercising the **real extension order** via `l
 
 21. **Env override precedence.** Set `CACHE_FIX_TTL_MAIN=none`. Build a payload that would otherwise produce `_ttlTier === "5m"`. After the pipeline runs, assert `ctx.meta._ttlTier === "5m"` (detection still fires) **and** no `ttl` field has been injected on any ephemeral marker (env "none" suppresses injection). Locks in env-override precedence under the real pipeline.
 
+22. **Auto-upgrade case (lead-flagged gap):** Set `CACHE_FIX_TTL_MAIN=1h` (the default — explicit) and build a payload that produces `_ttlTier === "5m"`. After the pipeline runs, assert every injected `ephemeral` marker carries `ttl: "5m"`, **not** `1h`. This is the case the bug actually breaks — explicit-1h-env on a conversation that has already shown 5m markers — and it's the most important place to lock in the formula `ttlValue === "5m" || detectedTier === "5m" ? "5m" : "1h"`. Without this test, a regression that silently fell back to `ttlValue` (ignoring `detectedTier`) would pass the rest of the suite.
+
 ## Out of scope
 
 - Quota-header subscription / cross-request state. Defer to a v2 PR if v1 leaves a real gap.
@@ -183,7 +185,7 @@ These tests lock in the rewire by exercising the **real extension order** via `l
 - `proxy/extensions/ttl-tier-detect.mjs` exists, runs at order 75, sets `ctx.meta._ttlTier`, mutates nothing.
 - `proxy/extensions/ttl-management.mjs` reads `ctx.meta._ttlTier` and respects the upgrade-only rule.
 - `proxy/extensions.json` registers `ttl-tier-detect`.
-- Pipeline-level integration tests (#18–#21) verify the rewire works end-to-end against the real extension order, including the `fresh-session-sort` relocatable-block path.
+- Pipeline-level integration tests (#18–#22) verify the rewire works end-to-end against the real extension order, including the `fresh-session-sort` relocatable-block path and the env=`1h`-but-detected-5m auto-upgrade case.
 - Codex re-review with no blocking findings.
 
 — Proxy Builder
