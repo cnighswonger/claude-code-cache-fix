@@ -2,11 +2,11 @@
 
 **Issue:** #97
 **Branch:** `feature/proxy-ttl-tier-detection`
-**Stage:** directive
+**Stage:** directive (revised after Codex review — see `docs/code-reviews/pr-100-ttl-tier-detection-directive-review-2026-05-03.md`)
 
 ## Goal
 
-Make `proxy/extensions/ttl-management.mjs` adapt its injected TTL marker when the request payload itself shows the conversation has already moved to the 5m tier. Mirrors the in-payload detection that `preload.mjs` performs at lines 1815–1828, which proxy users currently lose.
+Make the proxy adapt its injected TTL marker when the request payload itself shows the conversation has already moved to the 5m tier. Mirrors the in-payload detection that `preload.mjs` performs at lines 1815–1828, which proxy users currently lose.
 
 ## Why
 
@@ -14,55 +14,85 @@ When a user saturates their Q5h quota, Anthropic's serving layer downgrades cach
 
 `preload.mjs` solves this with a simple rule: if any block in the *incoming* payload already carries `ttl: "5m"`, all injected markers must use 5m too. Users on the preload do not see this bug; users on proxy mode (everyone post-CC-2.1.113) do.
 
-## Design rationale: why in-payload detection (not quota-header subscription)
+## Pipeline-order constraint (from Codex review)
 
-Issue #97's body suggests subscribing to `cache-telemetry`'s quota signal — i.e., reading response headers (`anthropic-ratelimit-unified-5h-utilization ≥ 1.0`) and switching tier on cross-request state. That is a *more powerful* signal but a *more complex* one, and it is not what preload does.
+The first draft of this directive proposed adding `detectExistingTier(body)` directly inside `ttl-management.onRequest`. Codex flagged this as blocking: `cache-control-normalize` runs at order **400** and strips every `cache_control` block from user messages (`proxy/extensions/cache-control-normalize.mjs:34–45`, proven by `test/cacheControlNormalize.test.mjs:30–43`). `ttl-management` runs at order **500** — by then any `ttl: "5m"` marker that lived on a user-message block has already been wiped. The detection would only see `body.system` markers, missing half of what preload inspects.
 
-The in-payload approach is sufficient because the CC client itself adapts on Q5h saturation: once the server has downgraded any single response, the client begins emitting `ttl: "5m"` markers in subsequent requests. The proxy needs only to respect what the client is asking for. This is the mechanism that has worked in production for preload users since v1.9.0.
+Three repair directions are possible:
 
-A quota-header-driven approach would help only in the narrow window where:
-1. The server has downgraded.
-2. The CC client has not yet adapted (still emitting unmarked `cache_control` blocks).
-3. The proxy has seen at least one response carrying the saturation header.
+1. **Detect before normalization runs** (separate early extension; this directive adopts).
+2. **Preserve `ttl` through normalization** (modify `cache-control-normalize` to retain the field while stripping the placement marker — invasive, changes the normalize contract).
+3. **Reorder the two extensions** (move `ttl-management` before `cache-control-normalize` — breaks the existing semantics where ttl-management injects onto canonicalized markers).
 
-That window is small and uncertain; reproducing the failure would require contradicting preload's success record. **Defer quota-signal augmentation to a v2 PR if real-world telemetry shows v1 leaves a gap.** This directive ships v1 only.
+Option 1 is the cleanest: detection becomes a small standalone extension whose only job is to read the original payload, with no behavioural coupling to normalize or ttl-management. The other two options conflate concerns or risk regressions in unrelated code paths.
 
-## Adaptation from preload behavior
+## Design
 
-Two functional changes vs the existing proxy extension:
+Two extensions, single responsibility each:
 
-1. **Detect** — at the top of `onRequest`, scan `body.system` and every `block` inside `body.messages[*].content` for any `cache_control.ttl === "5m"`. Set a per-request flag. (Module-scope state is not appropriate here because each request must be evaluated independently — a 5m signal in one request must not leak into the next.)
+### New: `proxy/extensions/ttl-tier-detect.mjs`
 
-2. **Inject** — when computing `ttlParam`, the rule becomes:
+- `name`: `"ttl-tier-detect"`
+- `description`: `"Detect existing TTL tier from incoming payload before cache_control normalization"`
+- `enabled`: `true` (module default)
+- `order`: `350` — sits between `identity-normalization` (300) and `cache-control-normalize` (400). At this point no upstream extension has touched `cache_control`, so the original markers are still present.
+- Hook: `onRequest(ctx)` only. Pure detection. Sets `ctx.meta._ttlTier = "5m" | "1h"`. **Does not mutate `ctx.body`.**
 
-   ```js
-   const ttlParam =
-     ttlValue === "5m" || detectedTier === "5m"
-       ? "5m"
-       : "1h";
-   ```
+Algorithm — port of `preload.mjs:1815–1828`:
 
-   matching `preload.mjs:2457`.
+```js
+function detectExistingTier(body) {
+  const blocks = [
+    ...(Array.isArray(body?.system) ? body.system : []),
+    ...(Array.isArray(body?.messages)
+      ? body.messages.flatMap(m => Array.isArray(m?.content) ? m.content : [])
+      : []),
+  ];
+  for (const block of blocks) {
+    if (block?.cache_control?.ttl === "5m") return "5m";
+  }
+  return "1h";
+}
+```
 
-The `CACHE_FIX_TTL_MAIN` / `CACHE_FIX_TTL_SUBAGENT` env vars retain their existing semantics (`"1h"`, `"5m"`, `"none"`). Auto-detection only *upgrades* an effective `1h` to `5m` — never the reverse — and never overrides an explicit `"none"`.
+Exported alongside `default` so unit tests can call it without driving the full extension.
 
-## Extension contract
+### Modified: `proxy/extensions/ttl-management.mjs`
 
-Existing file: `proxy/extensions/ttl-management.mjs`. No new files in `proxy/extensions/`.
+- Reads `ctx.meta._ttlTier` (default `"1h"` if undefined — graceful degradation when `ttl-tier-detect` is disabled).
+- Computes `ttlParam` per `preload.mjs:2457`:
 
-- Add a `detectExistingTier(body)` helper, exported alongside the default object so it can be unit-tested.
-  - Returns `"5m"` if any block in `body.system` (when array) or `body.messages[*].content[*]` carries `cache_control?.ttl === "5m"`. Returns `"1h"` otherwise.
-  - Pure function, no I/O, no module state.
-- Modify `onRequest` to call `detectExistingTier(body)` once and feed it into the `ttlParam` decision.
-- Keep `injectTtl(block, ttlParam)`, `detectRequestType(system)`, and the `CACHE_FIX_TTL_*` env-var reads as-is.
+  ```js
+  const detectedTier = ctx.meta?._ttlTier || "1h";
+  const ttlParam =
+    ttlValue === "5m" || detectedTier === "5m" ? "5m" : "1h";
+  ```
 
-No changes to `proxy/extensions.json`, `pipeline.mjs`, `server.mjs`, or `cache-telemetry.mjs`.
+- `CACHE_FIX_TTL_MAIN` / `CACHE_FIX_TTL_SUBAGENT` semantics unchanged (`"1h"`, `"5m"`, `"none"`).
+- Auto-detection only **upgrades** an effective `1h` to `5m`. Never the reverse, never overrides explicit `"none"`.
+- No new exports; no signature changes.
 
-## Tests (in `test/proxy-ttl-management.test.mjs`)
+### Modified: `proxy/extensions.json`
 
-Add to the existing test file. Mirror the spirit of `test/normalizeSessionStartText.test.mjs` style — small, focused cases.
+Add one entry:
 
-Unit on `detectExistingTier`:
+```json
+"ttl-tier-detect": { "enabled": true, "order": 350 },
+```
+
+## Why not put detection in cache-control-normalize?
+
+Tempting (one fewer file), but normalize is already doing two things — strip and canonical-pin — and adding "tier detection" would entangle three concerns in one extension. Keeping detection separate also means it survives untouched if normalize is later modified or disabled by config; the detection contract has zero coupling to normalize's internals. The cost is a single small file in a directory that already has eight extensions.
+
+## Why a per-request flag, not module state
+
+Each request must be evaluated independently — a `ttl: "5m"` signal in one request must not leak into the next. Module-scope state would also misbehave under hot-reload (the existing extension reload pattern would either reset state or carry it stale). `ctx.meta` is request-scoped by construction.
+
+## Tests
+
+### Unit: `test/proxy-ttl-tier-detect.test.mjs` (new file)
+
+On the exported `detectExistingTier(body)`:
 
 1. Empty body → `"1h"`.
 2. `body.system` is array, no `cache_control` blocks → `"1h"`.
@@ -73,28 +103,50 @@ Unit on `detectExistingTier`:
 7. `body.system` is non-array (string) → `"1h"` (no scan).
 8. `body.messages` missing → `"1h"`.
 
-Integration on `onRequest` (drives the full extension):
+On the extension `default.onRequest`:
 
-9. Mixed payload with one `5m` marker in messages → all unmarked `ephemeral` blocks (system + messages) get `ttl: "5m"`, none get `1h`.
-10. Pure-1h payload (no existing 5m markers) under default env → all unmarked `ephemeral` blocks get `ttl: "1h"`.
-11. `CACHE_FIX_TTL_MAIN=5m` env override + no existing 5m markers → all blocks get `5m` (env wins, same as today).
-12. `CACHE_FIX_TTL_MAIN=none` env override + existing 5m marker → no injection (env "none" suppresses, including over auto-detection).
-13. Subagent path (system contains `AGENT_SDK_PREFIX`): `CACHE_FIX_TTL_SUBAGENT=1h` + existing 5m marker → all blocks get `5m` (auto-detection upgrades the subagent path too).
-14. Existing markers that already carry `ttl: "5m"` are not overwritten (the `!block.cache_control.ttl` guard in `injectTtl` already enforces this; assert it explicitly).
-15. Auto-detection does not downgrade: env `CACHE_FIX_TTL_MAIN=1h` + payload with existing 5m markers → blocks injected as 5m. (Restated from #9 to lock in the "upgrade-only" rule.)
+9. Sets `ctx.meta._ttlTier` to detected value.
+10. Does not mutate `ctx.body` (deep structural equality before/after).
+11. Idempotent: running twice on the same `ctx` yields the same `_ttlTier`.
+
+### Unit (extending `test/proxy-ttl-management.test.mjs` if present, else new)
+
+12. `ctx.meta._ttlTier === "5m"` + default env → all unmarked `ephemeral` blocks (system + messages) get `ttl: "5m"`.
+13. `ctx.meta._ttlTier === "1h"` (or undefined) + default env → all unmarked `ephemeral` blocks get `ttl: "1h"`.
+14. `CACHE_FIX_TTL_MAIN=5m` env override + `_ttlTier === "1h"` → all blocks get `5m` (env wins, behaviour unchanged from today).
+15. `CACHE_FIX_TTL_MAIN=none` env override + `_ttlTier === "5m"` → no injection (env "none" suppresses, including over auto-detection).
+16. Subagent path: `CACHE_FIX_TTL_SUBAGENT=1h` + `_ttlTier === "5m"` → blocks get `5m` (auto-detection upgrades subagent path too).
+17. Existing markers that already carry `ttl: "5m"` are not overwritten (the `!block.cache_control.ttl` guard in `injectTtl` already enforces this; assert it explicitly).
+
+### Pipeline-level integration: `test/proxy-ttl-tier-pipeline.test.mjs` (new file, addresses Codex's non-blocking note)
+
+This is the test the first directive draft was missing. It locks in the rewire by exercising the **real extension order**, not isolated `onRequest` calls.
+
+18. Load the full pipeline via `loadExtensions(extensionsDir, extensionsConfig)` against the real `proxy/extensions/` directory and `proxy/extensions.json`. Construct a `ctx.body` whose only `ttl: "5m"` marker is on a user-message block that `cache-control-normalize` will strip. Run `runOnRequest(ctx, snapshot)`. Assert:
+    - `cache-control-normalize` ran (the original user-message marker was stripped, replaced by canonical `{ type: "ephemeral" }` at the last block of the last user message).
+    - `ttl-tier-detect` ran first and set `ctx.meta._ttlTier === "5m"`.
+    - `ttl-management` ran after and injected `ttl: "5m"` (not `"1h"`) on the canonical marker.
+    - System-block markers also receive `ttl: "5m"`.
+
+19. Same harness, payload with no `5m` markers anywhere → `_ttlTier === "1h"` and all injected blocks use `1h`. (Negative case proving auto-detection didn't trigger.)
+
+20. Same harness, `_ttlTier` would be `5m` but `CACHE_FIX_TTL_MAIN=none` → no injection at all, env wins. (Locks in the env-override precedence under the real pipeline.)
 
 ## Out of scope
 
 - Quota-header subscription / cross-request state. Defer to a v2 PR if v1 leaves a real gap.
 - Reading `~/.claude/quota-status.json`. Same.
 - Bootstrapping tier from disk on proxy startup. Same.
-- README changes. The existing TTL section already covers `CACHE_FIX_TTL_*`; no user-visible config knob is added by this directive.
+- Modifying `cache-control-normalize` to preserve `ttl`. Rejected per `Pipeline-order constraint` above — the standalone-detection approach has zero coupling.
+- README changes. The existing TTL section already covers `CACHE_FIX_TTL_*`; no user-visible config knob is added.
 
 ## Acceptance
 
 - All new tests pass; full proxy test suite green.
-- `proxy/extensions/ttl-management.mjs` contains an exported `detectExistingTier` and the `onRequest` body-injection respects it.
-- Manual verification: a payload with one `cache_control: { type: "ephemeral", ttl: "5m" }` marker injected upstream of the extension causes every unmarked `ephemeral` block downstream to also receive `ttl: "5m"`.
-- Codex review with no blocking findings.
+- `proxy/extensions/ttl-tier-detect.mjs` exists, runs at order 350, sets `ctx.meta._ttlTier`, mutates nothing.
+- `proxy/extensions/ttl-management.mjs` reads `ctx.meta._ttlTier` and respects the upgrade-only rule.
+- `proxy/extensions.json` registers `ttl-tier-detect`.
+- Pipeline-level integration test (#18) verifies the rewire works end-to-end against the real extension order.
+- Codex re-review with no blocking findings.
 
 — Proxy Builder
