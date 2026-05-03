@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 
 const _pinnedBlocks = new Map();
 
-const SESSION_START_RESUME_MARKER = /SessionStart:startup hook success:/g;
+const SESSION_START_RESUME_MARKER = /SessionStart:resume hook success:/g;
 const SESSION_START_ID_TAG = /\n?<session-id>[^<]*<\/session-id>/g;
 const SESSION_START_LAST_ACTIVE_LINE = /\nLast active:[^\n]*/g;
 const CONTINUE_TRAILER_TEXT = "Continue from where you left off.";

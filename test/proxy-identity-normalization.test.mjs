@@ -60,6 +60,40 @@ test("normalizeSessionStartText: no-op without SessionStart marker", () => {
   assert.equal(count, 0);
 });
 
+test("normalizeSessionStartText: rewrites SessionStart:resume → :startup", () => {
+  const input = "<system-reminder>\nSessionStart:resume hook success: [hook-reload] ok\n</system-reminder>";
+  const [out, count] = normalizeSessionStartText(input);
+  assert.ok(out.includes("SessionStart:startup hook success:"));
+  assert.ok(!out.includes("SessionStart:resume"));
+  assert.ok(count >= 1);
+});
+
+test("normalizeSessionStartText: startup marker is unchanged (no mutation)", () => {
+  const input = "<system-reminder>\nSessionStart:startup hook success: [hook-reload] ok\n</system-reminder>";
+  const [out, count] = normalizeSessionStartText(input);
+  assert.equal(out, input);
+  assert.equal(count, 0);
+});
+
+test("normalizeSessionStartText: resume + session-id + Last-active normalized together", () => {
+  const input =
+    "<system-reminder>\nSessionStart:resume hook success: [hook-reload] ok\n<session-id>xyz-999</session-id>\nLast active: 2026-04-17T10:00:00Z\n[hook-reload] done\n</system-reminder>";
+  const [out] = normalizeSessionStartText(input);
+  assert.ok(out.includes("SessionStart:startup hook success:"));
+  assert.ok(!out.includes("SessionStart:resume"));
+  assert.ok(!out.includes("<session-id>"));
+  assert.ok(!out.includes("xyz-999"));
+  assert.ok(!/Last active: \d{4}/.test(out));
+});
+
+test("normalizeSessionStartText: idempotent (running twice equals running once)", () => {
+  const input =
+    "<system-reminder>\nSessionStart:resume hook success:\nLast active: 2026-04-17T10:00:00Z\n[hook-reload] running\n</system-reminder>";
+  const [once] = normalizeSessionStartText(input);
+  const [twice] = normalizeSessionStartText(once);
+  assert.equal(twice, once);
+});
+
 // --- Unit tests: pinBlockContent ---
 
 test("pinBlockContent: normalizes trailing whitespace", () => {
@@ -155,6 +189,33 @@ test("onRequest: normalizes SessionStart text in message content", async () => {
 
   await ext.onRequest(ctx);
   assert.ok(!ctx.body.messages[0].content[0].text.includes("session-id"), "session-id should be stripped from message content");
+});
+
+test("onRequest: rewrites SessionStart:resume → :startup in message content", async () => {
+  const ctx = {
+    body: {
+      system: [],
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: "<system-reminder>\nSessionStart:resume hook success: [hook-reload] ok\n<session-id>abc-123</session-id>\n</system-reminder>",
+            },
+          ],
+        },
+      ],
+    },
+    headers: {},
+    meta: {},
+  };
+
+  await ext.onRequest(ctx);
+  const out = ctx.body.messages[0].content[0].text;
+  assert.ok(out.includes("SessionStart:startup hook success:"), "resume marker should be rewritten to startup");
+  assert.ok(!out.includes("SessionStart:resume"), "resume marker should be gone");
+  assert.ok(!out.includes("<session-id>"), "session-id tag should be stripped");
 });
 
 test("onRequest: handles empty messages array", async () => {
