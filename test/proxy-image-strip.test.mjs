@@ -346,3 +346,57 @@ test("oversizedPlaceholder formats as documented", () => {
     "[image stripped — exceeded 2000px max dimension (was 3000x1500px)]",
   );
 });
+
+// --- Legacy [image-strip] stderr gating (#98) ---
+
+async function withLegacyStderrCapture(envOverrides, fn) {
+  const origDebug = process.env.CACHE_FIX_DEBUG;
+  const origWrite = process.stderr.write.bind(process.stderr);
+  let captured = "";
+  process.stderr.write = (chunk) => { captured += chunk.toString(); return true; };
+  try {
+    if (envOverrides.CACHE_FIX_DEBUG === undefined) delete process.env.CACHE_FIX_DEBUG;
+    else process.env.CACHE_FIX_DEBUG = envOverrides.CACHE_FIX_DEBUG;
+    await fn(() => captured);
+  } finally {
+    process.stderr.write = origWrite;
+    if (origDebug === undefined) delete process.env.CACHE_FIX_DEBUG;
+    else process.env.CACHE_FIX_DEBUG = origDebug;
+  }
+}
+
+function legacyKeepLastCtx() {
+  return {
+    body: {
+      messages: [
+        userMsg([toolResultWithImage("t1", "X".repeat(800))]),
+        assistantMsg("r1"),
+        userMsg([toolResultWithImage("t2", "Y".repeat(800))]),
+        assistantMsg("r2"),
+        userMsg([{ type: "text", text: "current prompt" }]),
+      ],
+    },
+    headers: {},
+    meta: { imageKeepLast: 1 },
+  };
+}
+
+test("legacy path: [image-strip] summary emitted with CACHE_FIX_DEBUG=1", async () => {
+  await withLegacyStderrCapture({ CACHE_FIX_DEBUG: "1" }, async (getCaptured) => {
+    const ctx = legacyKeepLastCtx();
+    await ext.onRequest(ctx);
+    // Sanity: legacy path actually ran and stripped images.
+    assert.equal(ctx.meta.imageStripStats.strippedCount, 2);
+    assert.match(getCaptured(), /\[image-strip\] keep_last:/);
+  });
+});
+
+test("legacy path: [image-strip] summary suppressed without CACHE_FIX_DEBUG (#98)", async () => {
+  await withLegacyStderrCapture({ CACHE_FIX_DEBUG: undefined }, async (getCaptured) => {
+    const ctx = legacyKeepLastCtx();
+    await ext.onRequest(ctx);
+    // Work still happens — only the stderr line is gated.
+    assert.equal(ctx.meta.imageStripStats.strippedCount, 2, "legacy path still mutates messages");
+    assert.ok(!getCaptured().includes("[image-strip]"), "summary must be silent without CACHE_FIX_DEBUG");
+  });
+});
