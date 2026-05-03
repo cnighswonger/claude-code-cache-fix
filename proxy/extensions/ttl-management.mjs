@@ -33,7 +33,8 @@ export default {
 
     if (ttlValue === "none") return;
 
-    const ttlParam = ttlValue === "5m" ? "5m" : "1h";
+    const detectedTier = ctx.meta?._ttlTier || "1h";
+    const ttlParam = ttlValue === "5m" || detectedTier === "5m" ? "5m" : "1h";
 
     if (Array.isArray(body.system)) {
       body.system = body.system.map((block) => injectTtl(block, ttlParam));

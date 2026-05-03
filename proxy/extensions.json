@@ -1,4 +1,5 @@
 {
+  "ttl-tier-detect": { "enabled": true, "order": 75 },
   "fingerprint-strip": { "enabled": true, "order": 100 },
   "image-strip": { "enabled": true, "order": 150 },
   "sort-stabilization": { "enabled": true, "order": 200 },
