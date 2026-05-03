@@ -48,6 +48,9 @@ function getRequestSizeMax() {
   const v = parseInt(process.env.CACHE_FIX_IMAGE_REQUEST_SIZE_MAX || "31457280", 10);
   return v > 0 ? v : 31457280;
 }
+function isDebug() {
+  return process.env.CACHE_FIX_DEBUG === "1";
+}
 function getImageCountMax() {
   // Default 100 — single cap covering the only model family in active CC use.
   // Users on legacy Claude 1/2.x/Instant who genuinely need 600 can override.
@@ -649,7 +652,9 @@ export default {
 
       if (logParts.length > 0) {
         ctx.body.messages = messages;
-        process.stderr.write(`[image-strip] ${logParts.join("; ")}\n`);
+        if (isDebug()) {
+          process.stderr.write(`[image-strip] ${logParts.join("; ")}\n`);
+        }
       }
       return;
     }
@@ -676,7 +681,7 @@ export default {
       stats.resize_succeeded > 0 ||
       stats.unsupported_format_count > 0 ||
       stats.dimension_probe_fail_count > 0;
-    if (didSomething) {
+    if (didSomething && isDebug()) {
       const parts = [];
       if (stats.resize_succeeded > 0) parts.push(`resized=${stats.resize_succeeded}`);
       if (stats.resize_failed > 0) parts.push(`resize_failed=${stats.resize_failed}`);

@@ -840,7 +840,7 @@ test("[T34a] Pass 1-only stripping emits stderr summary (Codex review fix)", asy
   process.stderr.write = (chunk) => { captured += chunk.toString(); return true; };
   try {
     await withEnvAsync(
-      { CACHE_FIX_IMAGE_GUARD: "1", CACHE_FIX_IMAGE_PRESERVE_DETAIL: undefined, CACHE_FIX_IMAGE_MAX_DIM: undefined, CACHE_FIX_IMAGE_KEEP_LAST: undefined },
+      { CACHE_FIX_IMAGE_GUARD: "1", CACHE_FIX_IMAGE_PRESERVE_DETAIL: undefined, CACHE_FIX_IMAGE_MAX_DIM: undefined, CACHE_FIX_IMAGE_KEEP_LAST: undefined, CACHE_FIX_DEBUG: "1" },
       async () => {
         const body = makeBody(
           [userMsgWithDirectImages(imageBlock(pngB64(9000, 9000)))],
@@ -889,7 +889,7 @@ test("[T34] stderr summary line conditional on actual work", async () => {
   try {
     _setSharpForTests(makeFakeSharp());
     await withEnvAsync(
-      { CACHE_FIX_IMAGE_GUARD: "1", CACHE_FIX_IMAGE_PRESERVE_DETAIL: "1", CACHE_FIX_IMAGE_MAX_DIM: undefined, CACHE_FIX_IMAGE_KEEP_LAST: undefined },
+      { CACHE_FIX_IMAGE_GUARD: "1", CACHE_FIX_IMAGE_PRESERVE_DETAIL: "1", CACHE_FIX_IMAGE_MAX_DIM: undefined, CACHE_FIX_IMAGE_KEEP_LAST: undefined, CACHE_FIX_DEBUG: "1" },
       async () => {
         const body = makeBody(
           [userMsgWithDirectImages(imageBlock(pngB64(3000, 3000)))],
@@ -899,6 +899,31 @@ test("[T34] stderr summary line conditional on actual work", async () => {
         await ext.onRequest(ctx);
         assert.match(captured, /\[image-guard\]/);
         assert.match(captured, /resized=1/, "should report resized count");
+      }
+    );
+  } finally {
+    process.stderr.write = origWrite;
+  }
+});
+
+test("[T34c] stderr summary suppressed when CACHE_FIX_DEBUG is not set (#98)", async () => {
+  resetState();
+  const origWrite = process.stderr.write.bind(process.stderr);
+  let captured = "";
+  process.stderr.write = (chunk) => { captured += chunk.toString(); return true; };
+  try {
+    await withEnvAsync(
+      { CACHE_FIX_IMAGE_GUARD: "1", CACHE_FIX_IMAGE_PRESERVE_DETAIL: undefined, CACHE_FIX_IMAGE_MAX_DIM: undefined, CACHE_FIX_IMAGE_KEEP_LAST: undefined, CACHE_FIX_DEBUG: undefined },
+      async () => {
+        const body = makeBody(
+          [userMsgWithDirectImages(imageBlock(pngB64(9000, 9000)))],
+          "claude-3-5-sonnet-20241022"
+        );
+        const ctx = makeCtx(body);
+        await ext.onRequest(ctx);
+        // Pass 1 still strips the image — but the summary line must not appear.
+        assert.equal(ctx.meta.imageGuardStats.images_stripped_pass1, 1, "work still happens");
+        assert.ok(!captured.includes("[image-guard]"), "summary must be silent without CACHE_FIX_DEBUG");
       }
     );
   } finally {
