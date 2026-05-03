@@ -17,7 +17,7 @@ Findings:
 - `SESSION_START_RESUME_MARKER` has no other proxy call sites beyond `normalizeSessionStartText()` (`proxy/extensions/identity-normalization.mjs:41-43`), so this fix is tightly scoped and does not create secondary behavior changes elsewhere in the proxy.
 - The `#98` debug gating is implemented in the right place. In `proxy/extensions/image-strip.mjs:684-695`, `parts` is only summary-string construction; moving the guard to `if (didSomething && isDebug())` does not suppress any mutation or telemetry side effect.
 - Leaving the `PRESERVE_DETAIL`-without-`GUARD` warning unconditional is defensible. Those writes at `proxy/extensions/image-strip.mjs:529-535` and `:609-615` are configuration-error warnings, not per-request operational summaries, and they remain one-time-per-process.
-- Full branch validation passed: `npm test` completed with `674/674` passing on this PR branch.
+- Full branch validation passed: `npm test` completed with `674/674` passing on this PR branch, and no other test in the suite appears to depend on the now-suppressed per-request image summary writes.
 
 ## Blockers
 
