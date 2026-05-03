@@ -24,30 +24,33 @@ This third revision moves detection to order **75** — before *every* extension
 
 ### Audit: extensions that touch `cache_control` or rebuild user-message blocks
 
-| Extension | Order | Touches `cache_control`? | Pre/post 75 | Notes |
-|-----------|-------|--------------------------|-------------|-------|
-| `upstream-change-detection` | 50 | reads only (counts/positions for stats) | pre-75 | observability hook; no `ctx.body.*` writes verified by grep |
-| `output-efficiency-rewrite` | 90 | no | post-75 | rewrites `body.system` text only |
-| `fingerprint-strip` | 100 | no | post-75 | rewrites `cc_version` in billing header system block |
-| `image-strip` | 150 | no | post-75 | strips/resizes images inside tool_result content; doesn't touch top-level cache_control |
-| `sort-stabilization` | 200 | no | post-75 | sorts skills/tools blocks; preserves block identity |
-| `fresh-session-sort` | 250 | **strips** on relocatable blocks | post-75 | `:140`, `:164` — destructures `cache_control` and discards |
-| `tool-input-normalize` | 280 | no | post-75 | normalizes tool_use input field shapes |
-| `identity-normalization` | 300 | no | post-75 | strips session_knowledge, normalizes SessionStart text |
-| `smoosh-split` | 320 | no | post-75 | splits smooshed reminder blocks; doesn't touch cache_control |
-| `microcompact-stability` | 350 | no | post-75 | content-based, no cache_control touch |
-| `content-strip` | 350 | no | post-75 | strips content blocks (not cache_control) |
-| `deferred-tools-restore` | 350 | no | post-75 | restores deferred-tools blocks; doesn't touch cache_control |
-| `cache-control-normalize` | 400 | **strips** all user-message cache_control | post-75 | `:34–45` |
-| `messages-cache-breakpoint` | 410 | injects breakpoint #3 (5m default) | post-75 | adds new marker but doesn't read existing tier |
-| `ttl-management` | 500 | injects ttl on existing ephemeral markers | post-75 | this directive's consumer |
-| `cache-telemetry` | 600 | no | post-75 | response-side observability |
-| `overage-warning` | 610 | no | post-75 | response-side advisory |
-| `usage-log` | 650 | no | post-75 | response-side log |
-| `prefix-diff` | 680 | reads only (stripped in snapshot copy) | post-75 | snapshot-and-diff observability; live ctx.body untouched |
-| `request-log` | 700 | no | post-75 | timing log |
+Effective load order is governed by `proxy/extensions.json` (overrides) with `.mjs` `enabled`/`order` defaults as fallback per `proxy/pipeline.mjs:23–25`. Orders below reflect the *effective* load order with the current `extensions.json`.
 
-Order **75** sits between `upstream-change-detection` (50, read-only) and `output-efficiency-rewrite` (90). Any future extension added between 50 and 75 must explicitly preserve `cache_control` if it mutates user-message blocks; the directive's regression coverage (test #18 below) provides a guardrail.
+| Extension | Effective order | Source | Default enabled | Touches `cache_control`? | Notes |
+|-----------|-----------------|--------|-----------------|--------------------------|-------|
+| `upstream-change-detection` | 50 | `.mjs` default | yes | reads only (counts/positions for stats) | observability hook; no `ctx.body.*` writes verified by grep |
+| **`ttl-tier-detect` (proposed)** | **75** | `extensions.json` | yes | reads only (per-request scan) | this directive's new extension |
+| `output-efficiency-rewrite` | 90 | `.mjs` default | **no** (opt-in) | no | rewrites `body.system` text only when enabled |
+| `fingerprint-strip` | 100 | `extensions.json` | yes | no | rewrites `cc_version` in billing header system block |
+| `image-strip` | 150 | `extensions.json` | yes | no | strips/resizes images inside tool_result content; doesn't touch top-level `cache_control` |
+| `sort-stabilization` | 200 | `extensions.json` | yes | no | sorts skills/tools blocks; preserves block identity |
+| `fresh-session-sort` | 250 | `extensions.json` | yes | **strips** on relocatable blocks | `:140`, `:164` — destructures `cache_control` and discards |
+| `identity-normalization` | 300 | `extensions.json` | yes | no | strips session_knowledge, normalizes SessionStart text |
+| `smoosh-split` | 320 | `extensions.json` | yes | no | splits smooshed reminder blocks; preserves block identity |
+| `content-strip` | 330 | `extensions.json` | yes | no | strips content blocks; not cache_control |
+| `tool-input-normalize` | 340 | `extensions.json` | yes | no | normalizes `tool_use.input` field shapes |
+| `microcompact-stability` | 350 | `extensions.json` | yes | no | text-content based, no `cache_control` touch |
+| `deferred-tools-restore` | 350 | `.mjs` default | yes | no | restores deferred-tools attachment block; doesn't touch `cache_control` |
+| `cache-control-normalize` | 400 | `extensions.json` | yes | **strips** all user-message `cache_control` | `:34–45` |
+| `messages-cache-breakpoint` | 410 | `extensions.json` | yes | injects new breakpoint #3 marker | doesn't read existing tier |
+| `ttl-management` | 500 | `extensions.json` | yes | injects `ttl` on existing ephemeral markers | this directive's consumer |
+| `cache-telemetry` | 600 | `extensions.json` | yes | no | response-side observability |
+| `overage-warning` | 610 | `extensions.json` | yes | no | response-side advisory |
+| `usage-log` | 650 | `.mjs` default | **no** (opt-in) | no | response-side log when enabled |
+| `prefix-diff` | 680 | `.mjs` default | yes (env-gated at runtime) | reads only (stripped in snapshot copy) | live `ctx.body` untouched |
+| `request-log` | 700 | `extensions.json` | **no** (disabled in config) | no | timing log when enabled |
+
+Order **75** is provably pre-mutation by every extension that reads or writes `cache_control` (the only pre-75 extension is `upstream-change-detection`, which is read-only). Any future extension inserted between 50 and 75 that mutates user-message `cache_control` would invalidate the rewire; the directive's regression tests (#18–#21 below) provide the guardrail to surface that.
 
 Three other repair directions were considered:
 
@@ -160,7 +163,7 @@ These tests lock in the rewire by exercising the **real extension order** via `l
 19. **Fresh-session-sort regression case (relocatable block carrying `ttl: "5m"`).** Construct `ctx.body` whose only `ttl: "5m"` marker is on a relocatable user block (e.g. a `<skills>` block on a non-first user message that `fresh-session-sort` will strip and relocate, per `proxy/extensions/fresh-session-sort.mjs:140`/`:164`). After the full pipeline runs, assert:
     - `ctx.meta._ttlTier === "5m"` (detection captured the signal before fresh-session-sort discarded it).
     - The canonical `cache-control-normalize` marker carries `ttl: "5m"`.
-    - The relocated block exists at the canonical position (proving fresh-session-sort did run and dropped the original `cache_control`).
+    - After the pipeline, the relocated block exists at the canonical position with **no `cache_control` field on it** (i.e., the original marker was dropped somewhere in the pipeline; that the loss was caused by `fresh-session-sort` specifically is established by static reading of `proxy/extensions/fresh-session-sort.mjs:140`/`:164`, not by this test). What this test asserts is that detection at order 75 captured the signal *before* whichever later stage strips it.
 
 20. **Negative case: pure-1h payload.** No `5m` markers anywhere. After the pipeline runs, assert `ctx.meta._ttlTier === "1h"` and every injected `ephemeral` marker carries `ttl: "1h"`.
 
@@ -177,7 +180,7 @@ These tests lock in the rewire by exercising the **real extension order** via `l
 ## Acceptance
 
 - All new tests pass; full proxy test suite green.
-- `proxy/extensions/ttl-tier-detect.mjs` exists, runs at order 350, sets `ctx.meta._ttlTier`, mutates nothing.
+- `proxy/extensions/ttl-tier-detect.mjs` exists, runs at order 75, sets `ctx.meta._ttlTier`, mutates nothing.
 - `proxy/extensions/ttl-management.mjs` reads `ctx.meta._ttlTier` and respects the upgrade-only rule.
 - `proxy/extensions.json` registers `ttl-tier-detect`.
 - Pipeline-level integration tests (#18–#21) verify the rewire works end-to-end against the real extension order, including the `fresh-session-sort` relocatable-block path.
