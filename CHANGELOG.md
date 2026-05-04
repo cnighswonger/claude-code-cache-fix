@@ -1,5 +1,35 @@
 # Changelog
 
+## [Unreleased]
+
+## [3.4.0] - 2026-05-04
+
+### Added
+
+- New extension `messages-cache-breakpoint` (order 410, opt-in via `CACHE_FIX_INJECT_MESSAGES_BREAKPOINT=1`) — injects the missing breakpoint #3 `cache_control` marker at the boundary between Claude Code's auto-injected `messages[0]` blocks (hooks, skills, project CLAUDE.md, deferred-tools, MCP server descriptions) and the first real user content. Anthropic's prompt cache supports up to 4 markers per request; CC currently uses 3, leaving the auto-injected span uncached. Conservative: skips on 0 markers (non-CC baseline) and refuses at 4 markers (would 400 the request). Five-kind boundary detection with fail-open classification. Adds `CACHE_FIX_DUMP_MESSAGES_HEAD=<path>` diagnostic dump for fixture sourcing. (#90, closes #12; @wadabum's 4-breakpoint analysis at anthropics/claude-code#47098)
+- New extension `microcompact-stability` (order 350) — Phase 1 of a two-phase fix for the cache-prefix invalidation observed when CC's `time_based_microcompact` writes a sentinel string that differs byte-wise between firings. Phase 1 ships diagnostic capture (`CACHE_FIX_DUMP_MICROCOMPACT=<path>`) and opt-in normalization (`CACHE_FIX_NORMALIZE_MICROCOMPACT=1`); both default off pending production data. Default canonical form `[Old tool result content cleared]` overridable via `CACHE_FIX_MICROCOMPACT_NORMALIZED=<text>` / `CACHE_FIX_MICROCOMPACT_SENTINEL_PATTERN=<regex>`. Phase 2 (snapshot-and-restore) deferred to a future release. (#91, closes #36)
+- New extension `ttl-tier-detect` (order 75, default-enabled, no env var required) — detects `cache_control.ttl="5m"` markers in the incoming payload before downstream extensions strip them, recording the result on `ctx.meta._ttlTier`. Pure detection, no mutation. Ports the in-payload tier-detection from `preload.mjs:1815-1828`. (#100, closes #97; @vmfarms surfaced this)
+
+### Changed
+
+- `ttl-management` now consumes `ctx.meta._ttlTier` and auto-upgrades injected TTL: when the incoming payload carries any `ttl="5m"` marker, all injected `cache_control` blocks get `ttl="5m"`, even if `CACHE_FIX_TTL_MAIN` / `CACHE_FIX_TTL_SUBAGENT` is set to `1h`. Env value `none` still suppresses injection entirely. (#100)
+
+### Fixed
+
+- `identity-normalization`: the `SessionStart:resume → :startup` rewrite was a silent no-op — the marker constant matched the post-rewrite output instead of the input, so users on proxy mode silently lost the resume-block stabilization that preload mode performs correctly. Single-character fix; new tests mirror preload-side coverage. (#99, closes #96; @vmfarms surfaced this)
+- `image-strip`: legacy `[image-strip]` and v3.3.0 `[image-guard]` operational stderr summaries fired on every request that did observable work, regardless of `CACHE_FIX_DEBUG`. Both now require `CACHE_FIX_DEBUG=1`. The `PRESERVE_DETAIL`-without-`GUARD` misconfiguration warning stays unconditional. (#99, closes #98; @vmfarms surfaced this)
+
+### Other
+
+- Author info and blog-link references migrated to vsits.co. (#95)
+- New canonical release procedure documented at `docs/release-workflow.md`. (#101)
+
+### Tests
+
+597 → 698 (+101): new extension tests for `messages-cache-breakpoint`, `microcompact-stability`, `ttl-tier-detect`, plus pipeline-level integration tests for tier-detection and new tests for the two `identity-normalization` and `image-strip` bug fixes.
+
+---
+
 ## 3.3.0 (2026-04-30)
 
 **`image-guard` pipeline** (#87, closes design discussion in #87 thread):
