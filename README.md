@@ -493,6 +493,7 @@ We monitor 30+ upstream Claude Code issues related to cache, quota, and context 
 ## Used in production
 
 - **[Crunchloop DAP](https://dap.crunchloop.ai)** — Agent SDK / DAP development environment. First production team to merge the interceptor to trunk for team-wide deployment (2026-04-10). Identified two distinct cache regression patterns through real-world testing — tool ordering jitter and the fresh-session sort gap — and contributed debug traces that drove the v1.5.1 and v1.6.2 fixes.
+- **[VM Farms](https://vmfarms.com)** ([@vmfarms](https://github.com/vmfarms)) — Agent development environment running concurrent multi-runner workloads with `--resume --fork-session`. Surfaced three cache-fix proxy-mode bugs: the resume-marker regex no-op (#96), TTL tier detection gap vs preload mode (#97), and image-strip stderr leak past `CACHE_FIX_DEBUG` (#98) — all addressed in the v3.4.0 release.
 
 ## Contributors
 
@@ -509,6 +510,7 @@ We monitor 30+ upstream Claude Code issues related to cache, quota, and context 
 - **[@JEONG-JIWOO](https://github.com/JEONG-JIWOO)** — VS Code extension investigation: discovered `claudeCode.claudeProcessWrapper` as the working integration path, wrote the C wrapper for Windows (#16)
 - **[@X-15](https://github.com/X-15)** — VS Code extension validation, per-fix health status analysis confirming safety check behavior on v2.1.105 (#16)
 - **[@deafsquad](https://github.com/deafsquad)** — Universal smoosh_split un-smoosh fix (PR #26), source-level function attribution of resume scatter bug (anthropics/claude-code#43657), OTEL telemetry discovery, proposed and built proxy architecture for v3.0.0
+- **[@vmfarms](https://github.com/vmfarms)** — Concurrent multi-runner production validation, surfaced proxy-mode resume-marker regex no-op (#96), TTL tier detection gap (#97), and image-strip stderr leak (#98)
 
 If you contributed to the community effort on these issues and aren't listed here, please open an issue or PR — we want to credit everyone properly.
 
