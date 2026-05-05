@@ -1,25 +1,76 @@
 #!/bin/bash
-# Status line: show quota % and burn rate from quota-status.json
+# Status line: show quota % and burn rate from per-session quota-status files.
 # Written by cache-fix proxy's cache-telemetry extension on every API call.
+#
+# Layout (post-v3.5.0):
+#   ~/.claude/quota-status/account.json            — global quota fields (5h/7d, status, overage)
+#   ~/.claude/quota-status/sessions/<filename>.json — per-session cache fields (ttl_tier, hit_rate)
+#
+# CC pipes hook input as JSON on stdin including `session_id`, which we map to
+# the per-session filename via the canonical rule (matches the writer in
+# proxy/extensions/cache-telemetry.mjs:sessionFilename).
 
 input=$(cat)
 
-QS="$HOME/.claude/quota-status.json"
+ACCOUNT="$HOME/.claude/quota-status/account.json"
+SESSIONS_DIR="$HOME/.claude/quota-status/sessions"
 
-if [ -f "$QS" ]; then
-  result=$(python3 -c "
-import sys, json, os
+# Show quota even if no per-session file exists yet (fresh session, first
+# request hasn't fired). Per-session block just gets blank.
+if [ ! -f "$ACCOUNT" ]; then
+  exit 0
+fi
+
+result=$(python3 -c "
+import sys, json, os, re, hashlib
 from datetime import datetime, timezone, timedelta
 
-qs = json.load(open(os.path.expanduser('~/.claude/quota-status.json')))
+home = os.path.expanduser('~')
+account_path = os.path.join(home, '.claude', 'quota-status', 'account.json')
+sessions_dir = os.path.join(home, '.claude', 'quota-status', 'sessions')
 
-q5h = qs.get('five_hour', {}).get('pct', 0)
-q7d = qs.get('seven_day', {}).get('pct', 0)
-q5h_reset = qs.get('five_hour', {}).get('resets_at', 0)
-q7d_reset = qs.get('seven_day', {}).get('resets_at', 0)
-status = qs.get('status', '')
-overage = qs.get('overage_status', '')
-ts = qs.get('timestamp', '')
+# Parse stdin JSON (CC hook input) for session_id.
+try:
+    stdin_data = json.loads('''$input''') if '''$input''' else {}
+except Exception:
+    stdin_data = {}
+sess_id = stdin_data.get('session_id') or ''
+
+# Canonical filename derivation — must match cache-telemetry.mjs:sessionFilename.
+# Allowlist: [A-Za-z0-9_-]{1,128}; else inv-<sha256(s)[:16]>; empty/null -> 'unknown'.
+SAFE = re.compile(r'^[A-Za-z0-9_-]{1,128}\$')
+def session_filename(raw):
+    if raw is None:
+        return 'unknown'
+    s = str(raw).strip()
+    if not s:
+        return 'unknown'
+    if SAFE.match(s):
+        return s
+    return 'inv-' + hashlib.sha256(s.encode('utf-8')).hexdigest()[:16]
+
+# Read account.json (account-global fields).
+try:
+    acc = json.load(open(account_path))
+except Exception:
+    sys.exit(0)
+
+# Read this session's per-session file (cache fields). If missing or session_id
+# missing, statusline still shows quota % — just no TTL/hit-rate block.
+sess = {}
+if sess_id:
+    try:
+        sess = json.load(open(os.path.join(sessions_dir, session_filename(sess_id) + '.json')))
+    except Exception:
+        sess = {}
+
+q5h = acc.get('five_hour', {}).get('pct', 0)
+q7d = acc.get('seven_day', {}).get('pct', 0)
+q5h_reset = acc.get('five_hour', {}).get('resets_at', 0)
+q7d_reset = acc.get('seven_day', {}).get('resets_at', 0)
+status = acc.get('status', '')
+overage = acc.get('overage_status', '')
+ts = sess.get('timestamp') or acc.get('timestamp', '')
 
 now = datetime.fromisoformat(ts.replace('Z', '+00:00')) if ts else datetime.now(timezone.utc)
 
@@ -48,9 +99,9 @@ if rate7:
 if overage == 'active':
     label += ' | OVERAGE'
 
-# TTL and cache stats
-ttl = qs.get('cache', {}).get('ttl_tier', '')
-hit = qs.get('cache', {}).get('hit_rate', '')
+# Per-session TTL and cache stats
+ttl = sess.get('cache', {}).get('ttl_tier', '')
+hit = sess.get('cache', {}).get('hit_rate', '')
 if ttl:
     if ttl == '5m':
         label += ' | \033[31mTTL:5m\033[0m'
@@ -59,12 +110,11 @@ if ttl:
 if hit and hit != 'N/A':
     label += ' ' + hit + '%'
 
-peak = qs.get('peak_hour', False)
+peak = acc.get('peak_hour', False)
 if peak:
     label += ' | \033[33mPEAK\033[0m'
 
 print(label)
 " 2>/dev/null)
 
-  [ -n "$result" ] && echo "$result"
-fi
+[ -n "$result" ] && echo "$result"

@@ -19,7 +19,9 @@ set -euo pipefail
 
 CLAUDE_CLI="$HOME/.npm-global/lib/node_modules/@anthropic-ai/claude-code/cli.js"
 PRELOAD="$HOME/.claude/cache-fix-preload.mjs"
-QUOTA_FILE="$HOME/.claude/quota-status.json"
+QUOTA_DIR="$HOME/.claude/quota-status"
+ACCOUNT_FILE="$QUOTA_DIR/account.json"
+SESSIONS_DIR="$QUOTA_DIR/sessions"
 USAGE_LOG="$HOME/.claude/usage.jsonl"
 DEBUG_LOG="$HOME/.claude/cache-fix-debug.log"
 REPORT_DIR="/tmp/cache-test-$(date +%Y%m%d_%H%M%S)"
@@ -54,21 +56,27 @@ echo ""
 
 mkdir -p "$REPORT_DIR"
 
-# Helper: snapshot cache state from quota-status.json
+# Helper: snapshot cache state from the most-recent per-session quota-status
+# file. Each one-shot CC invocation generates its own session, so the latest
+# sessions/<filename>.json corresponds to the call we just made.
 snapshot_cache() {
   local label="$1"
   local outfile="$REPORT_DIR/${label}.json"
-  if [ -f "$QUOTA_FILE" ]; then
-    cp "$QUOTA_FILE" "$outfile"
-    local tier=$(python3 -c "import json; d=json.load(open('$QUOTA_FILE')); print(d.get('cache',{}).get('ttl_tier','?'))" 2>/dev/null || echo "?")
-    local create=$(python3 -c "import json; d=json.load(open('$QUOTA_FILE')); print(d.get('cache',{}).get('cache_creation',0))" 2>/dev/null || echo "?")
-    local read=$(python3 -c "import json; d=json.load(open('$QUOTA_FILE')); print(d.get('cache',{}).get('cache_read',0))" 2>/dev/null || echo "?")
-    local e1h=$(python3 -c "import json; d=json.load(open('$QUOTA_FILE')); print(d.get('cache',{}).get('ephemeral_1h',0))" 2>/dev/null || echo "?")
-    local e5m=$(python3 -c "import json; d=json.load(open('$QUOTA_FILE')); print(d.get('cache',{}).get('ephemeral_5m',0))" 2>/dev/null || echo "?")
-    local hit=$(python3 -c "import json; d=json.load(open('$QUOTA_FILE')); print(d.get('cache',{}).get('hit_rate','?'))" 2>/dev/null || echo "?")
+  local sess_file=""
+  if [ -d "$SESSIONS_DIR" ]; then
+    sess_file=$(ls -t "$SESSIONS_DIR"/*.json 2>/dev/null | head -1)
+  fi
+  if [ -n "$sess_file" ] && [ -f "$sess_file" ]; then
+    cp "$sess_file" "$outfile"
+    local tier=$(python3 -c "import json; d=json.load(open('$sess_file')); print(d.get('cache',{}).get('ttl_tier','?'))" 2>/dev/null || echo "?")
+    local create=$(python3 -c "import json; d=json.load(open('$sess_file')); print(d.get('cache',{}).get('cache_creation',0))" 2>/dev/null || echo "?")
+    local read=$(python3 -c "import json; d=json.load(open('$sess_file')); print(d.get('cache',{}).get('cache_read',0))" 2>/dev/null || echo "?")
+    local e1h=$(python3 -c "import json; d=json.load(open('$sess_file')); print(d.get('cache',{}).get('ephemeral_1h',0))" 2>/dev/null || echo "?")
+    local e5m=$(python3 -c "import json; d=json.load(open('$sess_file')); print(d.get('cache',{}).get('ephemeral_5m',0))" 2>/dev/null || echo "?")
+    local hit=$(python3 -c "import json; d=json.load(open('$sess_file')); print(d.get('cache',{}).get('hit_rate','?'))" 2>/dev/null || echo "?")
     echo "  [$label] TTL=$tier  create=$create  read=$read  1h=$e1h  5m=$e5m  hit=$hit%"
   else
-    echo "  [$label] No quota-status.json found"
+    echo "  [$label] No per-session quota-status file found in $SESSIONS_DIR"
   fi
 }
 

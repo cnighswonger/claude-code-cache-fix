@@ -101,7 +101,7 @@ done
 Q5H=$(python3 -c "
 import json
 try:
-    q = json.load(open('$HOME/.claude/quota-status.json'))
+    q = json.load(open('$HOME/.claude/quota-status/account.json'))
     print(q['five_hour']['pct'])
 except Exception:
     print(0)
@@ -116,7 +116,7 @@ echo "Preflight OK: Q5h at ${Q5H}%, 4 versions installed, launcher present." | t
 echo "" | tee -a "$SUMMARY"
 
 # Snapshot quota state at start
-cp "$HOME/.claude/quota-status.json" "$OUTPUT_DIR/raw-quota-status-start.json" 2>/dev/null || true
+cp "$HOME/.claude/quota-status/account.json" "$OUTPUT_DIR/raw-quota-status-start.json" 2>/dev/null || true
 
 # ─── Phase A: steady-state per version ─────────────────────────────────────
 
@@ -189,7 +189,7 @@ if [[ "$INCLUDE_IDLE" -eq 1 ]]; then
 fi
 
 # Snapshot quota state at end
-cp "$HOME/.claude/quota-status.json" "$OUTPUT_DIR/raw-quota-status-end.json" 2>/dev/null || true
+cp "$HOME/.claude/quota-status/account.json" "$OUTPUT_DIR/raw-quota-status-end.json" 2>/dev/null || true
 
 # ─── Analysis ──────────────────────────────────────────────────────────────
 
@@ -295,7 +295,7 @@ if [[ "$Q5H" -lt 50 ]]; then
     NEW_Q5H=$(python3 -c "
 import json
 try:
-    print(json.load(open('$HOME/.claude/quota-status.json'))['five_hour']['pct'])
+    print(json.load(open('$HOME/.claude/quota-status/account.json'))['five_hour']['pct'])
 except Exception:
     print('?')
 " 2>/dev/null)
