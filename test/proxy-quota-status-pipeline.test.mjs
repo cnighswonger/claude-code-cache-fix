@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { mkdtempSync, rmSync, readFileSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { loadExtensions, runOnResponseStart, runOnStreamEvent } from "../proxy/pipeline.mjs";
+import { loadExtensions, runOnRequest, runOnResponseStart, runOnStreamEvent } from "../proxy/pipeline.mjs";
 import cacheTelemetry from "../proxy/extensions/cache-telemetry.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -42,8 +42,17 @@ function setupHome() {
 }
 
 async function driveFullResponse(extSnapshot, headers, { cacheRead = 0, cacheCreation = 100 } = {}) {
+  // Real proxy puts request and response headers on different ctx objects;
+  // session-id headers come from the request, quota fields from the response.
+  // For these synthetic tests we drive the same `headers` map through both
+  // hooks since the helper is purely about exercising the per-session file
+  // write path end-to-end.
   const meta = {};
   const telemetry = {};
+  // body required by some upstream-of-cache-telemetry extensions (e.g.
+  // ttl-tier-detect at order 75 walks body.system / body.messages).
+  const minimalBody = { system: [], messages: [] };
+  await runOnRequest({ body: minimalBody, headers, meta }, extSnapshot);
   await runOnResponseStart({ headers, meta }, extSnapshot);
   await runOnStreamEvent(
     {

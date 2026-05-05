@@ -32,7 +32,14 @@ function setupTmpHome() {
   };
 }
 
-async function driveResponse({ headers = {}, cacheRead = 0, cacheCreation = 100, env = {} } = {}) {
+async function driveResponse({ requestHeaders = {}, responseHeaders = QUOTA_HEADERS, headers, cacheRead = 0, cacheCreation = 100, env = {} } = {}) {
+  // Back-compat for tests written before the request/response split: if a
+  // single `headers` is passed, treat it as carrying both quota (response
+  // shape) and session-id (request shape) — emulating the previous
+  // single-ctx flow.
+  const reqH = headers ? { ...headers } : { ...requestHeaders };
+  const resH = headers ? { ...QUOTA_HEADERS, ...headers } : { ...responseHeaders };
+
   const meta = {};
   const telemetry = {};
   const oldEnv = {};
@@ -41,8 +48,8 @@ async function driveResponse({ headers = {}, cacheRead = 0, cacheCreation = 100,
     process.env[k] = env[k];
   }
   try {
-    const fullHeaders = { ...QUOTA_HEADERS, ...headers };
-    await ext.onResponseStart({ headers: fullHeaders, meta });
+    await ext.onRequest({ headers: reqH, meta });
+    await ext.onResponseStart({ headers: resH, meta });
     await ext.onStreamEvent({
       event: { type: "message_start", message: { usage: { cache_read_input_tokens: cacheRead, cache_creation_input_tokens: cacheCreation, input_tokens: 5 } } },
       telemetry,
@@ -229,6 +236,46 @@ test("11i. sessionFilename: reserved-name passthrough (account, unknown)", () =>
 });
 
 // --- File-write tests (#1-#7) ---
+
+// --- Regression for v3.5.0 production bug: session-id is a REQUEST header ---
+
+test("0a. session-id captured from REQUEST headers, not response (regression for v3.5.0 bug)", async () => {
+  // The bug: cache-telemetry.mjs's onResponseStart read x-claude-code-session-id
+  // from ctx.headers, but onResponseStart's ctx.headers is RESPONSE headers.
+  // Anthropic doesn't echo session-id headers back. Result in production:
+  // every per-session file landed at sessions/unknown.json with session_id: null.
+  //
+  // Fix: capture in onRequest where ctx.headers is request headers; stash on
+  // ctx.meta; onStreamEvent reads from meta.
+  const env = setupTmpHome();
+  try {
+    await driveResponse({
+      requestHeaders: { "x-claude-code-session-id": "real-session-from-request" },
+      responseHeaders: QUOTA_HEADERS, // no session-id headers on the response side
+    });
+    const sessFile = join(env.home, ".claude", "quota-status", "sessions", "real-session-from-request.json");
+    const unknownFile = join(env.home, ".claude", "quota-status", "sessions", "unknown.json");
+    assert.ok(existsSync(sessFile), "per-session file must use the id from REQUEST headers");
+    assert.ok(!existsSync(unknownFile), "must NOT fall through to unknown.json when request has the id");
+    const sess = JSON.parse(readFileSync(sessFile, "utf8"));
+    assert.equal(sess.session_id, "real-session-from-request");
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("0b. session-id absent on request → falls back to unknown (sanity for the actual fallback path)", async () => {
+  const env = setupTmpHome();
+  try {
+    await driveResponse({
+      requestHeaders: {}, // no session-id headers
+      responseHeaders: QUOTA_HEADERS,
+    });
+    assert.ok(existsSync(join(env.home, ".claude", "quota-status", "sessions", "unknown.json")));
+  } finally {
+    env.cleanup();
+  }
+});
 
 test("1. happy path: real session_id writes account + sessions/<uuid>.json", async () => {
   const env = setupTmpHome();

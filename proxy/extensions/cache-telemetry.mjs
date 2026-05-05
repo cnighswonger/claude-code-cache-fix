@@ -151,6 +151,17 @@ export default {
   description: "Extract cache stats from response stream, persist quota state to ~/.claude/quota-status/{account.json,sessions/<filename>.json}",
   order: 600,
 
+  async onRequest(ctx) {
+    // Session-id headers (x-claude-code-session-id, etc.) live on the
+    // REQUEST, not the response — Anthropic doesn't echo them back. So we
+    // capture them here, in the request-side hook, and stash on ctx.meta
+    // for onStreamEvent to use when it writes the per-session file. The
+    // proxy server passes the same `meta` object through onRequest →
+    // onResponseStart → onStreamEvent, so this works end-to-end.
+    if (!ctx.headers) return;
+    ctx.meta._sessionId = resolveSessionId(ctx.headers);
+  },
+
   async onResponseStart(ctx) {
     if (!ctx.headers) return;
 
@@ -158,7 +169,6 @@ export default {
     if (!quota) return;
 
     ctx.meta._quotaData = quota;
-    ctx.meta._sessionId = resolveSessionId(ctx.headers);
   },
 
   async onStreamEvent(ctx) {

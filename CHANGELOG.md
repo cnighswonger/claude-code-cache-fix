@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [3.5.1] - 2026-05-05
+
+### Fixed
+
+- `cache-telemetry`: session-id headers (`x-claude-code-session-id` and the legacy fallbacks) live on the **request**, not the response. The v3.5.0 implementation read them from `ctx.headers` in `onResponseStart` — but that ctx carries response headers, and Anthropic doesn't echo session-id back. Net effect on multi-agent hosts running v3.5.0: every per-session file landed at `sessions/unknown.json` with `session_id: null`, defeating the whole point of the per-session split. Captured production failure on visits-01 immediately after v3.5.0 rollout. Fix moves session-id resolution into a new `onRequest` hook (request headers); `onStreamEvent` reads from `ctx.meta._sessionId` as before. The proxy server passes the same `meta` object through `onRequest → onResponseStart → onStreamEvent`, so the threading works end-to-end. Adds two regression tests that drive request and response headers separately to prevent recurrence.
+
+### Tests
+
+733 → 735 (+2): regression coverage for the request-vs-response ctx split (capture from request, fallback when absent).
+
 ## [3.5.0] - 2026-05-05
 
 ### Changed
