@@ -20,7 +20,7 @@ Single-agent users are unaffected today and remain so under the fix — for them
 
 ## Session attribution
 
-CC sends `x-claude-code-session-id` on every request. Lead corroborated this against llm-relay's production extraction (`proxy/proxy.py:338,379,400,606` per Lead's #104 comment) and a same-day query of llm-relay's `requests` table; the column carries full CC session UUIDs whose values match the names of `~/.claude/projects/<project>/<session-id>.jsonl` files exactly. The `~/.claude/projects/<project>/<session-id>.jsonl` correspondence is locally verifiable — `ls ~/.claude/projects/<project>/` on any active CC install shows UUID-named transcripts, and a packet capture of a request out of a CC instance confirms the header is sent. The header is stable across a session's lifetime, unique per session, populated by CC itself.
+CC sends `x-claude-code-session-id` on every request. Verified against llm-relay's production extraction at `src/llm_relay/proxy/proxy.py:338,379,400,606` (canonical path on `cnighswonger/llm-relay`, confirmed by Codex's directive re-review with read access to that repo) and a same-day query of llm-relay's `requests` table; the column carries full CC session UUIDs whose values match the names of `~/.claude/projects/<project>/<session-id>.jsonl` files exactly. The `~/.claude/projects/<project>/<session-id>.jsonl` correspondence is locally verifiable — `ls ~/.claude/projects/<project>/` on any active CC install shows UUID-named transcripts, and a packet capture of a request out of a CC instance confirms the header is sent. The header is stable across a session's lifetime, unique per session, populated by CC itself.
 
 Bonus: `proxy/extensions/microcompact-stability.mjs:234–242` has a fallback chain that reads `x-session-id` and `x-anthropic-session-id` but **NOT** `x-claude-code-session-id` — so it currently returns null for most CC requests. Same scope, same header — fold the addition in here.
 
@@ -183,7 +183,7 @@ Pure tests on the file-write logic. Exercise via the extension interface (`ext.o
 - `sessionFilename("../etc/passwd")` matches `/^inv-[0-9a-f]{16}$/`.
 - `sessionFilename("a/b")` matches the same pattern.
 - `sessionFilename("normal.uuid.with.dots")` matches the same pattern (dots disallowed).
-- `sessionFilename("with nul")` matches the same pattern.
+- `sessionFilename("with\0nul")` matches the same pattern.
 
 11e. **Determinism.** `sessionFilename("malformed input")` returns the same value across multiple invocations (verifies the hash isn't seeded with anything random).
 
