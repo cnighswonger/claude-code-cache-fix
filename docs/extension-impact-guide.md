@@ -81,7 +81,7 @@ All measurements unless noted are from our production telemetry: 24,667 calls (A
 
 ### 7. `cache-telemetry` (order 600)
 
-**What it fixes:** Nothing — this is monitoring, not a fix. Extracts cache statistics from response headers and writes them to `~/.claude/quota-status.json` on every API call.
+**What it fixes:** Nothing — this is monitoring, not a fix. Extracts cache statistics from response headers and writes them to `~/.claude/quota-status/account.json` (account-global) and `~/.claude/quota-status/sessions/<filename>.json` (per-session) on every API call.
 
 **ON:** Status bar shows live Q5h/Q7d utilization, TTL tier, cache hit rate, peak hour detection.
 
