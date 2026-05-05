@@ -39,7 +39,7 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:9801 claude
 | `identity-normalization` | 规范化消息身份字段以保持前缀稳定性 |
 | `fresh-session-sort` | 修复首次轮次的非确定性排序 |
 | `cache-control-normalize` | 规范化消息间的 cache_control 标记 |
-| `cache-telemetry` | 从响应头提取缓存统计 → `~/.claude/quota-status.json` |
+| `cache-telemetry` | 从响应头提取缓存统计 → `~/.claude/quota-status/{account.json,sessions/<id>.json}` |
 
 扩展支持热重载 — 在 `proxy/extensions/` 中添加、删除或修改 `.mjs` 文件，更改将在下一次请求时生效，无需重启。配置在 `proxy/extensions.json` 中。
 
@@ -167,7 +167,7 @@ NODE_OPTIONS="--import claude-code-cache-fix" claude
 
 ## 状态栏 — 实时配额警告
 
-代理和预加载模式都会在每次 API 调用时将配额状态写入 `~/.claude/quota-status.json`。内置的 `tools/quota-statusline.sh` 脚本显示实时状态栏：
+两种模式在每次 API 调用时都会写入配额状态。代理模式（v3.5.0+）拆分为 `~/.claude/quota-status/account.json`（账户级：Q5h/Q7d、状态、超额）和 `~/.claude/quota-status/sessions/<id>.json`（每会话：TTL 层级、命中率）。预加载模式保留旧版 `~/.claude/quota-status.json`（按构造为单会话）。内置的 `tools/quota-statusline.sh` 脚本显示实时状态栏：
 
 - **Q5h %** 及消耗速率（%/分钟）
 - **Q7d %** 及消耗速率（%/小时）
@@ -200,7 +200,7 @@ export CACHE_FIX_IMAGE_KEEP_LAST=3
 
 ## 监控与诊断
 
-预加载拦截器包含对微压缩降级、虚假速率限制器、GrowthBook 标志状态、使用量遥测和成本报告的监控。配额追踪在代理和预加载模式下均通过 `~/.claude/quota-status.json` 工作。
+预加载拦截器包含对微压缩降级、虚假速率限制器、GrowthBook 标志状态、使用量遥测和成本报告的监控。配额追踪通过 `~/.claude/quota-status/`（代理：按会话拆分）或 `~/.claude/quota-status.json`（预加载：单会话旧路径）工作。
 
 完整详情、调试模式、前缀差异对比、环境变量和内置配额分析工具请参见 [docs/monitoring.md](docs/monitoring.md)。
 

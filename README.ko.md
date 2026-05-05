@@ -39,7 +39,7 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:9801 claude
 | `identity-normalization` | 접두사 안정성을 위해 메시지 ID 필드를 정규화합니다 |
 | `fresh-session-sort` | 첫 번째 턴의 비결정적 순서를 수정합니다 |
 | `cache-control-normalize` | 메시지 간 cache_control 마커를 정규화합니다 |
-| `cache-telemetry` | 응답 헤더에서 캐시 통계를 추출하여 `~/.claude/quota-status.json`에 기록합니다 |
+| `cache-telemetry` | 응답 헤더에서 캐시 통계를 추출하여 `~/.claude/quota-status/{account.json,sessions/<id>.json}`에 기록합니다 |
 
 확장은 핫리로드됩니다 — `proxy/extensions/`에서 `.mjs` 파일을 추가, 제거 또는 수정하면 프록시 재시작 없이 다음 요청부터 적용됩니다. 설정은 `proxy/extensions.json`에 있습니다.
 
@@ -202,7 +202,7 @@ Fixes are disabled — consider re-enabling to recover cache performance.
 
 ## 상태 표시줄 — 실시간 쿼터 경고
 
-프록시와 프리로드 모드 모두 매 API 호출마다 `~/.claude/quota-status.json`에 쿼터 상태를 기록합니다. 포함된 `tools/quota-statusline.sh` 스크립트로 실시간 상태를 표시할 수 있습니다:
+두 모드 모두 매 API 호출마다 쿼터 상태를 기록합니다. 프록시 모드(v3.5.0+)는 `~/.claude/quota-status/account.json`(계정 전역: Q5h/Q7d, 상태, 초과)과 `~/.claude/quota-status/sessions/<id>.json`(세션별: TTL 계층, 적중률)로 분리됩니다. 프리로드 모드는 기존 `~/.claude/quota-status.json`(구조상 단일 세션)을 유지합니다. 포함된 `tools/quota-statusline.sh` 스크립트로 실시간 상태를 표시할 수 있습니다:
 
 - **Q5h %** (소진율, %/분)
 - **Q7d %** (소진율, %/시간)
@@ -292,7 +292,7 @@ npm install sharp
 
 ## 모니터링 & 진단
 
-프리로드 인터셉터에는 마이크로컴팩트 열화, 가상 속도 제한기, GrowthBook 플래그 상태, 사용량 텔레메트리, 비용 리포트에 대한 모니터링이 포함됩니다. 쿼터 추적은 프록시와 프리로드 모드 모두에서 `~/.claude/quota-status.json`을 통해 동작합니다.
+프리로드 인터셉터에는 마이크로컴팩트 열화, 가상 속도 제한기, GrowthBook 플래그 상태, 사용량 텔레메트리, 비용 리포트에 대한 모니터링이 포함됩니다. 쿼터 추적은 `~/.claude/quota-status/`(프록시: 세션별 분리) 또는 `~/.claude/quota-status.json`(프리로드: 단일 세션 레거시 경로)을 통해 동작합니다.
 
 전체 상세, 디버그 모드, 접두사 비교, 환경 변수, 내장 쿼터 분석 도구는 [docs/monitoring.md](docs/monitoring.md)를 참조하십시오.
 

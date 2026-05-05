@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking (path change):** `~/.claude/quota-status.json` (single global file) replaced with `~/.claude/quota-status/account.json` (account-global quota fields: Q5h/Q7d, status, overage) plus `~/.claude/quota-status/sessions/<filename>.json` (per-session cache fields: TTL tier, hit rate, cache_creation/read). `<filename>` is derived from the request's `x-claude-code-session-id` header via a deterministic safe-name rule (UUIDs and similar safe ids pass through; malformed inputs are mapped to `inv-<sha256-prefix>`). Multi-agent users no longer see cross-session contamination — each session's cache state is attributed correctly. Custom statusline scripts that read the old global path must update to the new layout; the shipped `tools/quota-statusline.sh` has been migrated. The legacy file is auto-deleted on first request after upgrade. Per-session files older than `CACHE_FIX_QUOTA_STATUS_TTL_DAYS` (default `7`) are swept on write. (#104)
+
+### Fixed
+
+- `microcompact-stability`: session-id fallback chain now includes `x-claude-code-session-id` (the canonical CC header). Was previously checking only `meta.session_id`, `x-session-id`, and `x-anthropic-session-id`, returning null hashed-session-id for most CC requests in the wild and weakening per-session attribution in microcompact diagnostics. (#104)
+
+### Tests
+
+698 → 732 (+34): new tests for the `sessionFilename` rule, file-write happy paths and fallbacks, atomic write contract, legacy-file cleanup (one-shot per process), TTL sweep behavior + throttling + env-override, microcompact session-id fallback chain precedence, and pipeline integration covering happy path, two-session interleaving, and path-traversal safety. Plus T1–T5 statusline smoke tests covering UUID happy path, missing session_id, warming-state, all-files-missing clean exit, and malformed session_id reading the hashed filename.
+
 ## [3.4.0] - 2026-05-04
 
 ### Added

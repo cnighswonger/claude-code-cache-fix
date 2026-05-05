@@ -39,7 +39,7 @@ On every `/v1/messages` request, 7 extensions run in order:
 | `identity-normalization` | Normalizes message identity fields for prefix stability |
 | `fresh-session-sort` | Fixes non-deterministic ordering on first turn |
 | `cache-control-normalize` | Normalizes cache_control markers across messages |
-| `cache-telemetry` | Extracts cache stats from response headers → `~/.claude/quota-status.json` |
+| `cache-telemetry` | Extracts cache stats from response headers → `~/.claude/quota-status/{account.json,sessions/<id>.json}` |
 
 Extensions are hot-reloadable — add, remove, or modify `.mjs` files in `proxy/extensions/` and changes apply to the next request without restarting. Configuration in `proxy/extensions.json`.
 
@@ -280,7 +280,7 @@ The interceptor can only *help* or *do nothing*. It cannot make things worse.
 
 ## Status line — quota warnings in real time
 
-Both proxy and preload modes write quota state to `~/.claude/quota-status.json` on every API call. The included `tools/quota-statusline.sh` script displays a live status line showing:
+Both modes write quota state on every API call. Proxy mode (v3.5.0+) splits into `~/.claude/quota-status/account.json` (account-global fields: Q5h/Q7d, status, overage) plus `~/.claude/quota-status/sessions/<id>.json` (per-session cache fields: TTL tier, hit rate). Preload mode keeps the legacy `~/.claude/quota-status.json` (single-session by construction). The included `tools/quota-statusline.sh` script displays a live status line showing:
 
 - **Q5h %** with burn rate (%/min)
 - **Q7d %** with burn rate (%/hr)
@@ -468,7 +468,7 @@ The interceptor can rewrite Claude Code's `# Output efficiency` system-prompt se
 
 ## Monitoring & diagnostics
 
-The preload interceptor includes monitoring for microcompact degradation, false rate limiters, GrowthBook flag state, usage telemetry, and cost reporting. Quota tracking works in both proxy and preload modes via `~/.claude/quota-status.json`.
+The preload interceptor includes monitoring for microcompact degradation, false rate limiters, GrowthBook flag state, usage telemetry, and cost reporting. Quota tracking works in both proxy and preload modes via `~/.claude/quota-status/` (proxy: per-session split) or `~/.claude/quota-status.json` (preload: single-session legacy path).
 
 See [docs/monitoring.md](docs/monitoring.md) for full details, debug mode, prefix diffing, environment variables, and the bundled quota analysis tool.
 
