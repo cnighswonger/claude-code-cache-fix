@@ -122,11 +122,11 @@ Every reader must apply the same filename derivation rule defined in the **Per-s
 
 ### CHANGELOG
 
-This is a breaking change for anyone running `tools/quota-statusline.sh` or any custom tool that reads `~/.claude/quota-status.json` directly. The file moves to `~/.claude/quota-status/account.json` (global facts) plus per-session files at `~/.claude/quota-status/<session-id>.json`.
+This is a breaking change for anyone running `tools/quota-statusline.sh` or any custom tool that reads `~/.claude/quota-status.json` directly. The file moves to `~/.claude/quota-status/account.json` (global facts) plus per-session files at `~/.claude/quota-status/sessions/<filename>.json`, where `<filename>` is derived from the canonical filename rule (above).
 
 CHANGELOG entry under `### Changed` for the next minor release (likely v3.5.0):
 
-> **Breaking (path change):** `~/.claude/quota-status.json` replaced with `~/.claude/quota-status/account.json` (global quota fields) plus per-session `~/.claude/quota-status/<session-id>.json` (cache fields). Multi-agent users no longer see cross-session contamination. Custom statusline scripts that read the old path must update; the shipped `tools/quota-statusline.sh` has been migrated. Per-session files older than `CACHE_FIX_QUOTA_STATUS_TTL_DAYS` (default 7) are swept on write.
+> **Breaking (path change):** `~/.claude/quota-status.json` replaced with `~/.claude/quota-status/account.json` (global quota fields) plus per-session files under `~/.claude/quota-status/sessions/<filename>.json` (cache fields), where `<filename>` is derived from the request's `x-claude-code-session-id` header via a deterministic safe-name rule (UUIDs and similar safe ids pass through; malformed inputs are mapped to `inv-<sha256-prefix>`). Multi-agent users no longer see cross-session contamination. Custom statusline scripts that read the old path must update; the shipped `tools/quota-statusline.sh` has been migrated. Per-session files older than `CACHE_FIX_QUOTA_STATUS_TTL_DAYS` (default 7) are swept on write.
 
 A separate `### Fixed` entry for the microcompact session-id fix:
 
@@ -140,16 +140,16 @@ Pure tests on the file-write logic. Exercise via the extension interface (`ext.o
 
 1. **Happy path, real session_id.** Headers carry `x-claude-code-session-id: <uuid>`. After running the response/stream sequence, assert:
    - `~/.claude/quota-status/account.json` exists, parses, carries the quota fields and `timestamp`.
-   - `~/.claude/quota-status/<uuid>.json` exists, parses, carries the `cache` block, `timestamp`, and `session_id: "<uuid>"`.
+   - `~/.claude/quota-status/sessions/<uuid>.json` exists, parses, carries the `cache` block, `timestamp`, and `session_id: "<uuid>"`.
    - Neither file is empty mid-write (atomic rename verified by reading file content immediately after).
 
-2. **Fallback to `x-session-id`.** Only `x-session-id` set. Per-session file lands at `<x-session-id>.json`. Assertion symmetric to (1).
+2. **Fallback to `x-session-id`.** Only `x-session-id` set. Per-session file lands at `~/.claude/quota-status/sessions/<x-session-id>.json` (assuming the value passes the filename allowlist). Assertion symmetric to (1).
 
-3. **Fallback to `x-anthropic-session-id`.** Same shape as (2).
+3. **Fallback to `x-anthropic-session-id`.** Same shape as (2), at `~/.claude/quota-status/sessions/<x-anthropic-session-id>.json`.
 
-4. **All three headers missing.** Per-session file lands at `unknown.json`. Account file still written.
+4. **All three headers missing.** Per-session file lands at `~/.claude/quota-status/sessions/unknown.json`. Account file still written at `~/.claude/quota-status/account.json`.
 
-5. **Two responses, different sessions.** Run extension twice with different `x-claude-code-session-id`. Assert two distinct per-session files exist, each carrying its own `cache` block; `account.json` reflects the second response's quota fields.
+5. **Two responses, different sessions.** Run extension twice with different `x-claude-code-session-id`. Assert two distinct per-session files exist under `~/.claude/quota-status/sessions/`, each carrying its own `cache` block; `account.json` (at the parent directory) reflects the second response's quota fields.
 
 6. **Quota-only write skipped.** When `parseHeaders()` returns `null` (no quota headers in response), no files are written. (Mirrors today's `if (!quota) return null;` behaviour.)
 
@@ -161,15 +161,15 @@ Pure tests on the file-write logic. Exercise via the extension interface (`ext.o
 
 ### Unit: TTL sweep behaviour (same test file)
 
-8. **Sweep runs on first call, deletes stale files.** Pre-create three stub files in `~/.claude/quota-status/`: `<old>.json` (mtime 8 days ago), `<recent>.json` (mtime 1 day ago), `account.json` (mtime 30 days ago). Drive a real response. Assert:
-   - `<old>.json` is gone.
-   - `<recent>.json` and `account.json` survive.
+8. **Sweep runs on first call, deletes stale files.** Pre-create three stub files: `~/.claude/quota-status/sessions/<old>.json` (mtime 8 days ago), `~/.claude/quota-status/sessions/<recent>.json` (mtime 1 day ago), and `~/.claude/quota-status/account.json` (mtime 30 days ago, lives at the parent dir, not in `sessions/`). Drive a real response. Assert:
+   - `sessions/<old>.json` is gone.
+   - `sessions/<recent>.json` and `account.json` (parent dir) survive — `account.json` because the sweep doesn't traverse outside `sessions/`.
 
-9. **Sweep throttled to 60s.** Reset module state, run two responses back-to-back with a stale stub file pre-existing. After response #1 the stub is deleted (sweep ran). Re-create the stub between calls. After response #2, the stub still exists (throttle prevented a second sweep within 60s). Mock `Date.now()` rather than `sleep`.
+9. **Sweep throttled to 60s.** Reset module state, run two responses back-to-back with a stale stub pre-existing in `sessions/`. After response #1 the stub is deleted (sweep ran). Re-create the stub between calls. After response #2, the stub still exists (throttle prevented a second sweep within 60s). Mock `Date.now()` rather than `sleep`.
 
-10. **`CACHE_FIX_QUOTA_STATUS_TTL_DAYS` env override.** Set env to `0` (effectively "expire everything but `account.json`"). Stub a 30-second-old file. Drive a response. Assert the stub is gone.
+10. **`CACHE_FIX_QUOTA_STATUS_TTL_DAYS` env override.** Set env to `0` (effectively "expire every per-session file"). Stub a 30-second-old file in `sessions/`. Drive a response. Assert the stub is gone, and `~/.claude/quota-status/account.json` is unaffected.
 
-11. **Sweep failure isolation.** Make `unlinkSync` throw on one file (e.g. permission error). Assert the response still completes, the throw doesn't propagate, and other deletable stub files in the same sweep are still deleted.
+11. **Sweep failure isolation.** Make `unlinkSync` throw on one file in `sessions/` (e.g. permission error). Assert the response still completes, the throw doesn't propagate, and other deletable stub files in the same sweep are still deleted.
 
 ### Unit: filename derivation rule (same test file or new `test/proxy-session-filename.test.mjs`)
 
@@ -200,7 +200,8 @@ Pure tests on the file-write logic. Exercise via the extension interface (`ext.o
 11j. **Malformed session-id ends up in a hashed file.** Drive a response with `x-claude-code-session-id: ../../../etc/passwd`. Assert:
 - A file matching `~/.claude/quota-status/sessions/inv-[0-9a-f]{16}.json` is created.
 - The JSON payload's `session_id` field carries the raw string `"../../../etc/passwd"` (preserved for attribution).
-- No file is created at `~/.claude/quota-status.json`, `~/.claude/quota-status/account.json` (relative to the dir, but yes account.json *is* written), `~/.claude/etc/passwd`, or any other path-traversal target.
+- `~/.claude/quota-status/account.json` is written normally — that's the global file and is expected on every response.
+- No file is created at `~/.claude/quota-status.json` (the legacy global path is gone post-cleanup), `~/.claude/etc/passwd`, `~/.claude/quota-status/etc/passwd`, or any other path-traversal target outside `~/.claude/quota-status/sessions/`.
 
 ### Unit: `proxy/extensions/microcompact-stability.test.mjs` (extend existing)
 
@@ -249,7 +250,7 @@ The Python heredoc inside the shell script implements the same filename derivati
 
 ## Acceptance
 
-- `proxy/extensions/cache-telemetry.mjs` writes `~/.claude/quota-status/account.json` and `~/.claude/quota-status/<session-id>.json` per the design above, atomically, with the TTL sweep throttled and configurable.
+- `proxy/extensions/cache-telemetry.mjs` writes `~/.claude/quota-status/account.json` and `~/.claude/quota-status/sessions/<filename>.json` (filename derived per the canonical rule) per the design above, atomically, with the TTL sweep throttled and configurable.
 - Legacy `~/.claude/quota-status.json` is removed on the first invocation per proxy process and not recreated.
 - `proxy/extensions/microcompact-stability.mjs` recognises `x-claude-code-session-id` in its fallback chain.
 - `tools/quota-statusline.sh`, `tools/cache-test.sh`, `tools/cross-version-cache-test.sh` updated to the new paths.
