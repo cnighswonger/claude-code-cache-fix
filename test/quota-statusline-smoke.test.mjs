@@ -71,10 +71,12 @@ test("T1. UUID session, both files present → label has quota and TTL", () => {
   }
 });
 
-test("T2. session_id missing from stdin → quota shown, no TTL block", () => {
+test("T2. session_id missing from stdin → quota shown, no TTL block (sessions/unknown.json absent)", () => {
   const env = setupHome();
   try {
     writeFileSync(env.account, ACCOUNT_JSON);
+    // No sessions/unknown.json on disk → reader applies rule, attempts read,
+    // file missing, falls back to account-only.
     const r = runScript(env.home, "{}");
     assert.equal(r.status, 0);
     assert.match(r.stdout, /Q5h: 42%/);
@@ -82,6 +84,32 @@ test("T2. session_id missing from stdin → quota shown, no TTL block", () => {
     assert.doesNotMatch(r.stdout, /TTL:/);
   } finally {
     env.cleanup();
+  }
+});
+
+test("T2a. session_id null/empty/whitespace → all read sessions/unknown.json (rule applied identically)", () => {
+  // The writer maps null, "", and whitespace-only ids to "unknown" via
+  // sessionFilename. The reader must do the same so the contract is
+  // identical end-to-end. Verify by populating sessions/unknown.json and
+  // confirming each null-ish input picks it up.
+  for (const raw of [null, "", "   ", "\t\n"]) {
+    const env = setupHome();
+    try {
+      writeFileSync(env.account, ACCOUNT_JSON);
+      const unknownPayload = JSON.stringify({
+        cache: { ttl_tier: "1h", cache_creation: 0, cache_read: 100, hit_rate: "50.0", timestamp: "2026-05-05T12:00:00.000Z" },
+        timestamp: "2026-05-05T12:00:00.000Z",
+        session_id: null,
+      });
+      writeFileSync(join(env.sessionsDir, "unknown.json"), unknownPayload);
+      const r = runScript(env.home, JSON.stringify({ session_id: raw }));
+      assert.equal(r.status, 0, `failed for raw=${JSON.stringify(raw)}: ${r.stderr}`);
+      assert.match(r.stdout, /Q5h: 42%/);
+      assert.match(r.stdout, /TTL:1h/, `expected TTL:1h for raw=${JSON.stringify(raw)}, got: ${r.stdout}`);
+      assert.match(r.stdout, /50\.0%/);
+    } finally {
+      env.cleanup();
+    }
   }
 });
 

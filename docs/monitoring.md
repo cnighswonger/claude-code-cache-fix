@@ -18,11 +18,11 @@ On the first API call, the interceptor reads `~/.claude.json` and logs the curre
 
 ## Quota tracking
 
-Response headers are parsed for `anthropic-ratelimit-unified-5h-utilization` and `7d-utilization`, saved to `~/.claude/quota-status.json` for consumption by status line hooks or other tools. This works in both proxy mode (via `cache-telemetry` extension) and preload mode.
+Response headers are parsed for `anthropic-ratelimit-unified-5h-utilization` and `7d-utilization`, saved for consumption by status line hooks or other tools. Proxy mode (v3.5.0+, via `cache-telemetry` extension) splits state into `~/.claude/quota-status/account.json` (account-global facts) plus `~/.claude/quota-status/sessions/<filename>.json` (per-session cache facts), so multi-agent users no longer see cross-session contamination. Preload mode keeps the legacy single-file `~/.claude/quota-status.json` (single-session by construction).
 
 ## Peak hour detection
 
-Anthropic applies elevated quota drain rates during weekday peak hours (13:00–19:00 UTC, Mon–Fri). The interceptor detects peak windows and writes `peak_hour: true/false` to `quota-status.json`. See `docs/peak-hours-reference.md` for sources and details.
+Anthropic applies elevated quota drain rates during weekday peak hours (13:00–19:00 UTC, Mon–Fri). The interceptor detects peak windows and writes `peak_hour: true/false` to the quota-status payload (`account.json` in proxy mode, `quota-status.json` in preload mode). See `docs/peak-hours-reference.md` for sources and details.
 
 ## Usage telemetry and cost reporting
 

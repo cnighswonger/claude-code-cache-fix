@@ -77,8 +77,10 @@ cat ~/.claude/cache-fix-debug.log
 # Ver estatísticas por fix
 cat ~/.claude/cache-fix-stats.json
 
-# Ver cota atual (5h e 7d)
-cat ~/.claude/quota-status.json
+# Ver cota atual (5h e 7d) — modo proxy (v3.5.0+)
+cat ~/.claude/quota-status/account.json
+# Modo preload (legado, sessão única)
+cat ~/.claude/quota-status.json 2>/dev/null
 ```
 
 ## Variáveis de ambiente

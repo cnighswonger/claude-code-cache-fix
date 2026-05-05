@@ -29,15 +29,18 @@ home = os.path.expanduser('~')
 account_path = os.path.join(home, '.claude', 'quota-status', 'account.json')
 sessions_dir = os.path.join(home, '.claude', 'quota-status', 'sessions')
 
-# Parse stdin JSON (CC hook input) for session_id.
+# Parse stdin JSON (CC hook input) for session_id. Pass the raw value
+# (including null / "" / whitespace) through session_filename so the
+# canonical rule decides — the writer maps all those to 'unknown',
+# the reader must do the same to keep the contract identical.
 try:
     stdin_data = json.loads('''$input''') if '''$input''' else {}
 except Exception:
     stdin_data = {}
-sess_id = stdin_data.get('session_id') or ''
+sess_id_raw = stdin_data.get('session_id')
 
 # Canonical filename derivation — must match cache-telemetry.mjs:sessionFilename.
-# Allowlist: [A-Za-z0-9_-]{1,128}; else inv-<sha256(s)[:16]>; empty/null -> 'unknown'.
+# Allowlist: [A-Za-z0-9_-]{1,128}; else inv-<sha256(s)[:16]>; null/empty/whitespace -> 'unknown'.
 SAFE = re.compile(r'^[A-Za-z0-9_-]{1,128}\$')
 def session_filename(raw):
     if raw is None:
@@ -55,14 +58,17 @@ try:
 except Exception:
     sys.exit(0)
 
-# Read this session's per-session file (cache fields). If missing or session_id
-# missing, statusline still shows quota % — just no TTL/hit-rate block.
-sess = {}
-if sess_id:
-    try:
-        sess = json.load(open(os.path.join(sessions_dir, session_filename(sess_id) + '.json')))
-    except Exception:
-        sess = {}
+# Read this session's per-session file (cache fields). Apply the rule
+# unconditionally — null/empty/whitespace land at sessions/unknown.json,
+# matching where the writer would have placed them. If the file doesn't
+# exist (e.g. unknown.json never written, or this is a fresh session
+# whose first request hasn't fired), statusline still shows quota % —
+# just no TTL/hit-rate block.
+sess_filename = session_filename(sess_id_raw)
+try:
+    sess = json.load(open(os.path.join(sessions_dir, sess_filename + '.json')))
+except Exception:
+    sess = {}
 
 q5h = acc.get('five_hour', {}).get('pct', 0)
 q7d = acc.get('seven_day', {}).get('pct', 0)
