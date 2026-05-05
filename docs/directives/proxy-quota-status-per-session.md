@@ -20,7 +20,7 @@ Single-agent users are unaffected today and remain so under the fix — for them
 
 ## Session attribution
 
-CC sends `x-claude-code-session-id` on every request. Verified against llm-relay's production extraction (`proxy/proxy.py:338,379,400,606`) and a same-day query of llm-relay's `requests` table — the column carries full CC session UUIDs that match the names of `~/.claude/projects/<project>/<session-id>.jsonl` files exactly. Stable across a session's lifetime, unique per session, populated by CC itself.
+CC sends `x-claude-code-session-id` on every request. Lead corroborated this against llm-relay's production extraction (`proxy/proxy.py:338,379,400,606` per Lead's #104 comment) and a same-day query of llm-relay's `requests` table; the column carries full CC session UUIDs whose values match the names of `~/.claude/projects/<project>/<session-id>.jsonl` files exactly. The `~/.claude/projects/<project>/<session-id>.jsonl` correspondence is locally verifiable — `ls ~/.claude/projects/<project>/` on any active CC install shows UUID-named transcripts, and a packet capture of a request out of a CC instance confirms the header is sent. The header is stable across a session's lifetime, unique per session, populated by CC itself.
 
 Bonus: `proxy/extensions/microcompact-stability.mjs:234–242` has a fallback chain that reads `x-session-id` and `x-anthropic-session-id` but **NOT** `x-claude-code-session-id` — so it currently returns null for most CC requests. Same scope, same header — fold the addition in here.
 
@@ -42,14 +42,37 @@ This directive adopts **(b)**.
 
 ### Modified: `proxy/extensions/cache-telemetry.mjs`
 
-- Read `x-claude-code-session-id` from `ctx.headers` in `onResponseStart`. Fall back to `x-session-id` then `x-anthropic-session-id` for parity with microcompact (and to keep the extension working in non-CC test fixtures); if all three are absent, fall back to `"unknown"` with a single stderr warning gated on `CACHE_FIX_DEBUG`.
-- Stash the resolved id on `ctx.meta._sessionId` (string).
-- In the `message_delta` branch where the file is currently written, write **two** files:
-  - `~/.claude/quota-status/account.json` — payload `{ ...quota, timestamp }` (every quota field except the `cache` block).
-  - `~/.claude/quota-status/<session-id>.json` — payload `{ cache: {...}, timestamp, session_id }`. The `session_id` field is included in the body so a consumer who has the file but lost its filename context can still attribute it.
+- Read `x-claude-code-session-id` from `ctx.headers` in `onResponseStart`. Fall back to `x-session-id` then `x-anthropic-session-id` for parity with microcompact (and to keep the extension working in non-CC test fixtures); if all three are absent, fall back to `null` (treated as "unknown" by the filename rule below) with a single stderr warning gated on `CACHE_FIX_DEBUG`.
+- Stash the **raw** resolved id on `ctx.meta._sessionId` (string or null). Filename derivation (below) is a separate step from id resolution; the JSON payload writes the raw id so consumers can confirm attribution even if the filename was sanitized.
+- File layout:
+  - `~/.claude/quota-status/account.json` — global file at the directory root.
+  - `~/.claude/quota-status/sessions/<filename>.json` — per-session files in a dedicated subdirectory. The subdirectory split is structural: it makes a stray session id of `account` (or any other reserved name) physically unable to collide with the global file, and gives sweep + readers a single directory to scan.
+- **Per-session filename derivation rule (canonical writer/reader contract).** Both the writer (cache-telemetry) and every reader (`tools/quota-statusline.sh`, `tools/cache-test.sh`, `tools/cross-version-cache-test.sh`, `/coffee`, visits-01 hooks) must apply this rule identically:
+
+  ```
+  function sessionFilename(rawId):
+    if rawId is null/undefined or trim(rawId) is empty: return "unknown"
+    let s = trim(rawId)
+    if s matches /^[A-Za-z0-9_-]{1,128}$/: return s
+    return "inv-" + sha256(s).hexSlice(0, 16)
+  ```
+
+  Properties:
+  - **Path-traversal safe.** Allowlist excludes `/`, `\`, `.`, NUL, and every other path-significant character. No input can produce nested paths or `..` segments.
+  - **Length-bounded.** Upper bound 128 is well under `NAME_MAX` (255 on Linux/macOS). The `inv-` fallback is always exactly 20 chars.
+  - **Deterministic.** Same input → same filename, on writer and reader. A reader can compute the filename from stdin `session_id` without coordinating with the writer.
+  - **Collision-resistant on hash fallback.** Sha256 truncated to 16 hex chars (64 bits) — collision probability negligible for the cardinality of session ids one host produces.
+  - **Reserved-name safe.** The `sessions/` subdirectory means filenames `account` or `unknown` are not special at the path level. They can appear as legitimate per-session filenames if some client genuinely sends those strings, without colliding with the global file.
+  - **Original id preserved.** The JSON payload writes `session_id: <rawId>` so a consumer staring at an `inv-…json` file can attribute it. (For the empty-id case, payload writes `session_id: null`.)
+
+  Implementation note: implement once as `proxy/extensions/_session-filename.mjs` (or inline as a small exported helper in cache-telemetry) and import it into the watcher/sweeper. The shell readers (`tools/quota-statusline.sh` etc.) implement the same rule in their stdin Python heredoc — the rule is short enough to inline reliably.
+
+- In the `message_delta` branch where the file is currently written, write **two** files using the layout above. Payloads:
+  - `account.json` — `{ ...quota, timestamp }` (every quota field except the `cache` block).
+  - `sessions/<filename>.json` — `{ cache: {...}, timestamp, session_id: <rawId or null> }`.
 - Both writes are wrapped in `try/catch{}` (matches today's behaviour). Failures must not break the response stream.
 - Use atomic writes (`writeFileSync(tmp, ...); renameSync(tmp, final)`) to eliminate partial-read races on consumers polling tightly. Tmp suffix shape: `<final>.tmp.<pid>.<crypto.randomBytes(4).toString('hex')>` — collision-resistant if a future change ever runs multiple writers (today's proxy is single-process; the cost is negligible and the property is free).
-- `mkdirSync(join(homedir(), ".claude", "quota-status"), { recursive: true })` once per write call (idempotent, cheap).
+- `mkdirSync(join(homedir(), ".claude", "quota-status", "sessions"), { recursive: true })` once per write call (idempotent, cheap; creates both `quota-status/` and `quota-status/sessions/` in one call).
 - **Legacy file cleanup.** On first invocation per process, attempt `unlinkSync(join(homedir(), ".claude", "quota-status.json"))` wrapped in try/catch (no-op if missing). Tracked via a module-scoped `legacyCleanupDone = false` flag so the cost is exactly one syscall per proxy start. This removes the stale-artifact footgun where post-upgrade consumers that haven't been migrated would silently read state frozen at the moment of upgrade.
 
 ### Modified: `proxy/extensions/microcompact-stability.mjs:234–242`
@@ -75,20 +98,24 @@ Order matters: `meta.session_id` first (in case a future extension explicitly se
 
 Per-session files accumulate forever otherwise. Sweep on write, throttled, configurable.
 
-- TTL: env var `CACHE_FIX_QUOTA_STATUS_TTL_DAYS`, default `7`. Anything in `~/.claude/quota-status/` (excluding `account.json`) with `mtime` older than `now - TTL_DAYS * 86400` is `unlinkSync`'d.
+- TTL: env var `CACHE_FIX_QUOTA_STATUS_TTL_DAYS`, default `7`. Anything in `~/.claude/quota-status/sessions/` with `mtime` older than `now - TTL_DAYS * 86400` is `unlinkSync`'d.
 - Throttle: track a module-scoped `lastSweepMs`. Skip the sweep entirely if `Date.now() - lastSweepMs < 60_000`. Update `lastSweepMs` after a sweep runs (whether or not anything was deleted).
 - Sweep failures (e.g. `unlinkSync` race against a consumer reading) are caught and ignored — same try/catch envelope as the writes.
-- Sweep does **not** delete `account.json` even if it's older than the TTL — it's the always-current global snapshot.
+- Sweep operates only on `sessions/`. `account.json` lives in the parent directory and is never touched by the sweep.
 
 This is intentionally simple: O(n) directory scan once a minute. For visits-01-class hosts (n ~ 6–12 per day, files retained 7 days → ~50–80 entries) this is sub-millisecond. A more expensive design (separate cron, persistent index, etc.) buys nothing measurable.
 
-### Migration: shipped statusline + visits-01 hook + tests
+### Migration: shipped statusline + visits-01 hook + tests + docs
+
+Every reader must apply the same filename derivation rule defined in the **Per-session filename derivation rule** section above.
 
 | Consumer | Action |
 |---|---|
-| `tools/quota-statusline.sh` | Update to read CC stdin JSON's `session_id`, then read both `~/.claude/quota-status/account.json` and `~/.claude/quota-status/<session-id>.json`, merging fields. Add fallbacks: file-missing → blank; session_id missing from stdin → fall back to `<account.json>` only (statusline still shows quota %, just no per-session cache hit rate). |
-| `tools/cross-version-cache-test.sh` | Update path: `~/.claude/quota-status/account.json` for the global pct read. The test's global facts read still works against the new path. |
-| `tools/cache-test.sh` | Update `QUOTA_FILE` to `account.json`. Same reasoning. |
+| `tools/quota-statusline.sh` | Update to read CC stdin JSON's `session_id`, derive filename via the canonical rule, then read both `~/.claude/quota-status/account.json` and `~/.claude/quota-status/sessions/<filename>.json`, merging fields. Fallbacks: file-missing → blank; session_id missing from stdin → fall back to `account.json` only (statusline still shows quota %, just no per-session cache hit rate). |
+| `tools/cross-version-cache-test.sh` | Update path: `~/.claude/quota-status/account.json` for the global pct read. |
+| `tools/cache-test.sh` | Update `QUOTA_FILE` to `~/.claude/quota-status/account.json`. |
+| `README.md` (and translated copies `README.zh.md`, `README.ko.md`, `README.pt-br.md`) | Sweep references to `~/.claude/quota-status.json` and update to the new layout. Don't introduce migration-instruction prose into the README itself — point at CHANGELOG. |
+| `docs/TRACKED_ISSUES.md`, in-tree code-review docs that reference the path | Same sweep. References that describe past behaviour (changelog-style historical notes) may stay; references that describe present behaviour update. |
 | `~/.claude/skills/coffee/SKILL.md` (visits-01) | Out of scope for this directive — handled at coffee#1. |
 | `~/.claude/hooks/quota-statusline.sh` (visits-01) | Out of scope for this directive — visits-01-only artifact, updated by Lead/AI-Team-Lead alongside the merge. |
 | `preload.mjs:2651,2758,2776` | Leave as-is. Preload-mode is single-session by construction (one CC instance imports `preload.mjs`), so the global path semantically matches; preload users don't see the bug, and the path is shrinking. |
@@ -144,6 +171,37 @@ Pure tests on the file-write logic. Exercise via the extension interface (`ext.o
 
 11. **Sweep failure isolation.** Make `unlinkSync` throw on one file (e.g. permission error). Assert the response still completes, the throw doesn't propagate, and other deletable stub files in the same sweep are still deleted.
 
+### Unit: filename derivation rule (same test file or new `test/proxy-session-filename.test.mjs`)
+
+11a. **UUID input → raw filename.** `sessionFilename("b16c607d-d484-4935-840e-e3f7ee78eb08")` → `"b16c607d-d484-4935-840e-e3f7ee78eb08"`.
+
+11b. **Alphanumeric/underscore/dash inputs → raw filename.** `"abc123"`, `"with_underscore"`, `"with-dash"`, `"A1_b2-C3"` all return as-is.
+
+11c. **Empty / whitespace / null / undefined → `"unknown"`.** `sessionFilename(null)`, `sessionFilename(undefined)`, `sessionFilename("")`, `sessionFilename("   ")` all return `"unknown"`.
+
+11d. **Path-traversal characters → hashed `inv-` prefix.** Inputs containing `/`, `\`, `..`, `.`, NUL byte, `:`, control characters all yield `inv-<16 hex chars>`. Sample assertions:
+- `sessionFilename("../etc/passwd")` matches `/^inv-[0-9a-f]{16}$/`.
+- `sessionFilename("a/b")` matches the same pattern.
+- `sessionFilename("normal.uuid.with.dots")` matches the same pattern (dots disallowed).
+- `sessionFilename("with nul")` matches the same pattern.
+
+11e. **Determinism.** `sessionFilename("malformed input")` returns the same value across multiple invocations (verifies the hash isn't seeded with anything random).
+
+11f. **Length cap.** `sessionFilename("x".repeat(129))` returns `inv-<16 hex>` (length-128 boundary fails the allowlist; 129 chars trigger the fallback).
+
+11g. **Length cap exact.** `sessionFilename("x".repeat(128))` returns the raw 128-char string (boundary case included).
+
+11h. **Hash output is filesystem-safe.** Across a sample of 100 random malformed inputs, all returned filenames match `/^[A-Za-z0-9_-]+$/` and are `<= 128` chars. Smoke check that the rule is closed under its own allowlist.
+
+11i. **Reserved-name passthrough.** `sessionFilename("account")` and `sessionFilename("unknown")` return `"account"` and `"unknown"` respectively (no special-casing — the `sessions/` subdirectory provides the structural separation from `account.json` at the path level).
+
+### Pipeline-level test for filename rule integration
+
+11j. **Malformed session-id ends up in a hashed file.** Drive a response with `x-claude-code-session-id: ../../../etc/passwd`. Assert:
+- A file matching `~/.claude/quota-status/sessions/inv-[0-9a-f]{16}.json` is created.
+- The JSON payload's `session_id` field carries the raw string `"../../../etc/passwd"` (preserved for attribution).
+- No file is created at `~/.claude/quota-status.json`, `~/.claude/quota-status/account.json` (relative to the dir, but yes account.json *is* written), `~/.claude/etc/passwd`, or any other path-traversal target.
+
 ### Unit: `proxy/extensions/microcompact-stability.test.mjs` (extend existing)
 
 12. **`hashSessionId` reads `x-claude-code-session-id`.** Build `reqCtx` with only that header. Assert the function returns a non-null 8-char hash equal to the first 8 chars of `sha256(<session-id>)`.
@@ -162,9 +220,23 @@ These exercise the real extension order via `loadExtensions` against the real `p
 
 17. **Two-session interleaving.** Drive two responses back-to-back with different session IDs (truly-concurrent execution isn't reliably testable on a single-threaded JS runtime without workers; the back-to-back shape exercises the same invariant deterministically). Assert per-session files don't overwrite each other; `account.json` reflects whichever response wrote last; both per-session files retain their own `cache` blocks.
 
-### Tooling test (light): `tools/quota-statusline.sh`
+### Tooling smoke test: `test/quota-statusline-smoke.test.mjs` (new file)
 
-The shell script's complexity is mostly Python in a heredoc, so a node-based test isn't a clean fit. Verify manually post-merge: feed the script a stdin JSON with `session_id`, populate the new files, run it, confirm the displayed label still parses. Not in CI, but called out in the PR's manual-verification checklist.
+Codex flagged that the shipped statusline is the consumer most exposed to the new filename contract; a lightweight smoke test reduces regression risk on the migration.
+
+The test runs `tools/quota-statusline.sh` as a subprocess (`spawnSync` with stdin/stdout pipes) under a tmpdir-based `HOME` so it doesn't touch the developer's real `~/.claude/`:
+
+T1. **UUID session, both files present.** Pre-populate `$HOME/.claude/quota-status/account.json` (quota fields) and `$HOME/.claude/quota-status/sessions/<uuid>.json` (cache fields). Pipe stdin JSON `{"session_id": "<uuid>"}`. Assert stdout label parses and contains both quota-percent and TTL strings.
+
+T2. **session_id missing from stdin.** Pre-populate only `account.json`. Pipe stdin JSON without `session_id`. Assert stdout label parses and contains quota-percent (no TTL).
+
+T3. **per-session file missing (warming).** Pre-populate `account.json` only. Pipe stdin with a UUID. Assert stdout label parses and contains quota-percent (per-session block absent or shows blank — does not error).
+
+T4. **Both files missing.** Pipe stdin with a UUID. Assert script exits cleanly (no stderr, exit 0) and emits no output.
+
+T5. **Malformed session-id from stdin.** Pipe stdin with `{"session_id": "../foo"}`. Pre-populate the corresponding `inv-<hash>.json`. Assert stdout reads the hashed file (proves the script's filename rule matches the writer's).
+
+The Python heredoc inside the shell script implements the same filename derivation rule as the writer; T5 specifically locks in the contract.
 
 ## Out of scope
 
@@ -181,7 +253,9 @@ The shell script's complexity is mostly Python in a heredoc, so a node-based tes
 - Legacy `~/.claude/quota-status.json` is removed on the first invocation per proxy process and not recreated.
 - `proxy/extensions/microcompact-stability.mjs` recognises `x-claude-code-session-id` in its fallback chain.
 - `tools/quota-statusline.sh`, `tools/cache-test.sh`, `tools/cross-version-cache-test.sh` updated to the new paths.
-- All new tests pass (#1–#17); full proxy test suite green.
+- All new tests pass (#1–#17 plus #11a–#11j filename-rule tests and the `T1–T5` statusline smoke tests); full proxy test suite green.
+- Per-session filename derivation rule is documented in this directive, implemented identically by both writer (cache-telemetry) and shipped readers (`tools/quota-statusline.sh`, `tools/cache-test.sh`, `tools/cross-version-cache-test.sh`), and locked in by tests.
+- README / docs path references updated to the new layout.
 - CHANGELOG entries drafted for `### Changed` (path migration) and `### Fixed` (microcompact session-id fix).
 - Codex review with no blocking findings before merge.
 
