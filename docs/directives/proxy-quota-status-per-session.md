@@ -48,8 +48,9 @@ This directive adopts **(b)**.
   - `~/.claude/quota-status/account.json` — payload `{ ...quota, timestamp }` (every quota field except the `cache` block).
   - `~/.claude/quota-status/<session-id>.json` — payload `{ cache: {...}, timestamp, session_id }`. The `session_id` field is included in the body so a consumer who has the file but lost its filename context can still attribute it.
 - Both writes are wrapped in `try/catch{}` (matches today's behaviour). Failures must not break the response stream.
-- Use atomic writes (`writeFileSync(tmp + '.tmp', ...); renameSync(tmp + '.tmp', final)`) to eliminate partial-read races on consumers polling tightly. Use a per-target tmp suffix (e.g. `<final>.tmp.<pid>.<random>`) to avoid two concurrent writes clobbering each other's tmp file when the proxy is multi-process; today's proxy is single-process but the cost is one `Math.random()` and the safety is free.
+- Use atomic writes (`writeFileSync(tmp, ...); renameSync(tmp, final)`) to eliminate partial-read races on consumers polling tightly. Tmp suffix shape: `<final>.tmp.<pid>.<crypto.randomBytes(4).toString('hex')>` — collision-resistant if a future change ever runs multiple writers (today's proxy is single-process; the cost is negligible and the property is free).
 - `mkdirSync(join(homedir(), ".claude", "quota-status"), { recursive: true })` once per write call (idempotent, cheap).
+- **Legacy file cleanup.** On first invocation per process, attempt `unlinkSync(join(homedir(), ".claude", "quota-status.json"))` wrapped in try/catch (no-op if missing). Tracked via a module-scoped `legacyCleanupDone = false` flag so the cost is exactly one syscall per proxy start. This removes the stale-artifact footgun where post-upgrade consumers that haven't been migrated would silently read state frozen at the moment of upgrade.
 
 ### Modified: `proxy/extensions/microcompact-stability.mjs:234–242`
 
@@ -127,6 +128,10 @@ Pure tests on the file-write logic. Exercise via the extension interface (`ext.o
 
 7. **Atomic write contract.** Spy on or temporarily replace `writeFileSync` to assert the write target ends with a `.tmp.*` suffix and a subsequent `renameSync` moves it to the final path. Catches any future regression that drops the atomic-write step.
 
+7a. **Legacy file cleanup on first invocation.** Pre-create `~/.claude/quota-status.json` (the old global path). Reset module state so `legacyCleanupDone = false`. Drive a response. Assert the legacy file is gone. Drive a second response and assert the cleanup syscall is not re-issued (e.g. by stubbing `unlinkSync` and counting calls — should be exactly 1 for the legacy path across multiple responses in the same process).
+
+7b. **Legacy cleanup absence is silent.** Ensure `~/.claude/quota-status.json` does not exist. Reset module state. Drive a response. Assert no error is thrown and the response writes complete normally.
+
 ### Unit: TTL sweep behaviour (same test file)
 
 8. **Sweep runs on first call, deletes stale files.** Pre-create three stub files in `~/.claude/quota-status/`: `<old>.json` (mtime 8 days ago), `<recent>.json` (mtime 1 day ago), `account.json` (mtime 30 days ago). Drive a real response. Assert:
@@ -155,7 +160,7 @@ These exercise the real extension order via `loadExtensions` against the real `p
 
 16. **End-to-end happy path.** A response with `x-claude-code-session-id` and a full quota header set. After the pipeline runs, both files exist on disk at the canonical paths and carry the expected fields. Locks in that no other extension's `onResponseStart`/`onStreamEvent` interferes.
 
-17. **Two-session interleaving.** Drive two responses concurrently (or back-to-back with different session IDs). Assert per-session files don't overwrite each other; `account.json` reflects whichever response wrote last; both per-session files retain their own `cache` blocks.
+17. **Two-session interleaving.** Drive two responses back-to-back with different session IDs (truly-concurrent execution isn't reliably testable on a single-threaded JS runtime without workers; the back-to-back shape exercises the same invariant deterministically). Assert per-session files don't overwrite each other; `account.json` reflects whichever response wrote last; both per-session files retain their own `cache` blocks.
 
 ### Tooling test (light): `tools/quota-statusline.sh`
 
@@ -173,6 +178,7 @@ The shell script's complexity is mostly Python in a heredoc, so a node-based tes
 ## Acceptance
 
 - `proxy/extensions/cache-telemetry.mjs` writes `~/.claude/quota-status/account.json` and `~/.claude/quota-status/<session-id>.json` per the design above, atomically, with the TTL sweep throttled and configurable.
+- Legacy `~/.claude/quota-status.json` is removed on the first invocation per proxy process and not recreated.
 - `proxy/extensions/microcompact-stability.mjs` recognises `x-claude-code-session-id` in its fallback chain.
 - `tools/quota-statusline.sh`, `tools/cache-test.sh`, `tools/cross-version-cache-test.sh` updated to the new paths.
 - All new tests pass (#1–#17); full proxy test suite green.
