@@ -234,6 +234,7 @@ export function normalizeToolResultContent(messages, match, canonicalText) {
 function hashSessionId(reqCtx) {
   const sid =
     reqCtx?.meta?.session_id ||
+    reqCtx?.headers?.["x-claude-code-session-id"] ||
     reqCtx?.headers?.["x-session-id"] ||
     reqCtx?.headers?.["x-anthropic-session-id"] ||
     null;

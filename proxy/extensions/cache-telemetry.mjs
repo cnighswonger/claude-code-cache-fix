@@ -1,8 +1,63 @@
-import { writeFileSync, mkdirSync } from "node:fs";
+import {
+  writeFileSync,
+  renameSync,
+  unlinkSync,
+  mkdirSync,
+  readdirSync,
+  statSync,
+} from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { createHash, randomBytes } from "node:crypto";
 
-const QUOTA_PATH = join(homedir(), ".claude", "quota-status.json");
+// Paths are resolved per call (not cached at module load) so tests can swap
+// $HOME between cases. The homedir() call is essentially free.
+function paths() {
+  const home = homedir();
+  const quotaDir = join(home, ".claude", "quota-status");
+  return {
+    quotaDir,
+    accountPath: join(quotaDir, "account.json"),
+    sessionsDir: join(quotaDir, "sessions"),
+    legacyPath: join(home, ".claude", "quota-status.json"),
+  };
+}
+
+const SAFE_NAME_RE = /^[A-Za-z0-9_-]{1,128}$/;
+const SWEEP_THROTTLE_MS = 60_000;
+const DEFAULT_TTL_DAYS = 7;
+
+// --- Module-scope state ---
+let legacyCleanupDone = false;
+let lastSweepMs = 0;
+
+// Per directive `proxy-quota-status-per-session.md` — derive a filesystem-safe
+// filename from a raw session id. Both writer (this extension) and readers
+// (tools/quota-statusline.sh, etc.) must apply the same rule.
+//
+// Rules:
+//   - null/undefined/empty/whitespace → "unknown"
+//   - matches /^[A-Za-z0-9_-]{1,128}$/ → raw passthrough
+//   - else → "inv-" + sha256(raw)[:16]
+//
+// Exported for unit testing and for the directive's writer/reader contract.
+export function sessionFilename(rawId) {
+  if (rawId === null || rawId === undefined) return "unknown";
+  const s = String(rawId).trim();
+  if (s.length === 0) return "unknown";
+  if (SAFE_NAME_RE.test(s)) return s;
+  return "inv-" + createHash("sha256").update(s).digest("hex").slice(0, 16);
+}
+
+function resolveSessionId(headers) {
+  if (!headers) return null;
+  const sid =
+    headers["x-claude-code-session-id"] ||
+    headers["x-session-id"] ||
+    headers["x-anthropic-session-id"] ||
+    null;
+  return sid || null;
+}
 
 function parseHeaders(headers) {
   const get = (key) => headers[key] || "";
@@ -44,9 +99,56 @@ function parseHeaders(headers) {
   };
 }
 
+function atomicWrite(finalPath, content) {
+  const tmp = `${finalPath}.tmp.${process.pid}.${randomBytes(4).toString("hex")}`;
+  writeFileSync(tmp, content);
+  renameSync(tmp, finalPath);
+}
+
+function cleanupLegacyOnce() {
+  if (legacyCleanupDone) return;
+  legacyCleanupDone = true;
+  try {
+    unlinkSync(paths().legacyPath);
+  } catch {}
+}
+
+function sweepStaleSessions(ttlDays) {
+  const now = Date.now();
+  if (now - lastSweepMs < SWEEP_THROTTLE_MS) return;
+  lastSweepMs = now;
+
+  const cutoffMs = now - ttlDays * 86_400_000;
+  const { sessionsDir } = paths();
+  let entries;
+  try {
+    entries = readdirSync(sessionsDir);
+  } catch {
+    return;
+  }
+  for (const name of entries) {
+    const p = join(sessionsDir, name);
+    try {
+      const st = statSync(p);
+      if (st.mtimeMs < cutoffMs) {
+        try {
+          unlinkSync(p);
+        } catch {}
+      }
+    } catch {}
+  }
+}
+
+function getTtlDays() {
+  const raw = process.env.CACHE_FIX_QUOTA_STATUS_TTL_DAYS;
+  if (raw === undefined || raw === "") return DEFAULT_TTL_DAYS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_TTL_DAYS;
+}
+
 export default {
   name: "cache-telemetry",
-  description: "Extract cache stats from response stream, persist quota state to ~/.claude/quota-status.json",
+  description: "Extract cache stats from response stream, persist quota state to ~/.claude/quota-status/{account.json,sessions/<filename>.json}",
   order: 600,
 
   async onResponseStart(ctx) {
@@ -56,6 +158,7 @@ export default {
     if (!quota) return;
 
     ctx.meta._quotaData = quota;
+    ctx.meta._sessionId = resolveSessionId(ctx.headers);
   },
 
   async onStreamEvent(ctx) {
@@ -89,24 +192,43 @@ export default {
 
       const ttl = cr > 0 ? "1h" : (cc > 0 ? "5m" : "unknown");
 
-      const output = {
-        cache: {
-          ttl_tier: ttl,
-          cache_creation: cc,
-          cache_read: cr,
-          ephemeral_1h: ephemeral1h,
-          ephemeral_5m: ephemeral5m,
-          hit_rate: hitRate,
-          timestamp: new Date().toISOString(),
+      const timestamp = new Date().toISOString();
+      const rawSid = ctx.meta._sessionId;
+      const filename = sessionFilename(rawSid);
+
+      const accountPayload = JSON.stringify({ ...quota, timestamp }, null, 2);
+      const sessionPayload = JSON.stringify(
+        {
+          cache: {
+            ttl_tier: ttl,
+            cache_creation: cc,
+            cache_read: cr,
+            ephemeral_1h: ephemeral1h,
+            ephemeral_5m: ephemeral5m,
+            hit_rate: hitRate,
+            timestamp,
+          },
+          timestamp,
+          session_id: rawSid,
         },
-        timestamp: new Date().toISOString(),
-        ...quota,
-      };
+        null,
+        2,
+      );
 
       try {
-        mkdirSync(join(homedir(), ".claude"), { recursive: true });
-        writeFileSync(QUOTA_PATH, JSON.stringify(output, null, 2));
+        cleanupLegacyOnce();
+        const { sessionsDir, accountPath } = paths();
+        mkdirSync(sessionsDir, { recursive: true });
+        atomicWrite(accountPath, accountPayload);
+        atomicWrite(join(sessionsDir, `${filename}.json`), sessionPayload);
+        sweepStaleSessions(getTtlDays());
       } catch {}
     }
+  },
+
+  // Test-only: reset module state between tests.
+  __resetForTests() {
+    legacyCleanupDone = false;
+    lastSweepMs = 0;
   },
 };

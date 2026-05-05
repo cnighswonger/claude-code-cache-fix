@@ -727,3 +727,48 @@ test("buildDiagnosticRecord captures total_messages and total_tool_results", () 
   assert.equal(rec.exact_matches.length, 0);
   assert.equal(rec.partial_matches.length, 0);
 });
+
+// --- session_id fallback chain (#12-#15 from per-session quota-status directive) ---
+
+import { createHash as _createHash } from "node:crypto";
+function _hash8(s) {
+  return _createHash("sha256").update(String(s)).digest("hex").slice(0, 8);
+}
+
+test("12. hashSessionId reads x-claude-code-session-id (the canonical CC header)", () => {
+  const sid = "b16c607d-d484-4935-840e-e3f7ee78eb08";
+  const reqCtx = {
+    body: { messages: [] },
+    headers: { "x-claude-code-session-id": sid },
+  };
+  const rec = buildDiagnosticRecord(reqCtx, [], [], 0, { ts: "t" });
+  assert.equal(rec.session_id_hash, _hash8(sid));
+});
+
+test("13. precedence: meta.session_id wins over canonical header", () => {
+  const reqCtx = {
+    body: { messages: [] },
+    meta: { session_id: "from-meta" },
+    headers: { "x-claude-code-session-id": "from-canonical-header" },
+  };
+  const rec = buildDiagnosticRecord(reqCtx, [], [], 0, { ts: "t" });
+  assert.equal(rec.session_id_hash, _hash8("from-meta"));
+});
+
+test("14. precedence: canonical header wins over legacy x-session-id", () => {
+  const reqCtx = {
+    body: { messages: [] },
+    headers: {
+      "x-claude-code-session-id": "canonical",
+      "x-session-id": "legacy",
+    },
+  };
+  const rec = buildDiagnosticRecord(reqCtx, [], [], 0, { ts: "t" });
+  assert.equal(rec.session_id_hash, _hash8("canonical"));
+});
+
+test("15. all sources missing → null", () => {
+  const reqCtx = { body: { messages: [] } };
+  const rec = buildDiagnosticRecord(reqCtx, [], [], 0, { ts: "t" });
+  assert.equal(rec.session_id_hash, null);
+});
