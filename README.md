@@ -350,11 +350,27 @@ QS_DIR="$HOME/.claude/quota-status"
 ACCOUNT="$QS_DIR/account.json"
 LEGACY="$HOME/.claude/quota-status.json"
 
+# Canonical filename rule — must mirror proxy/extensions/cache-telemetry.mjs
+# sessionFilename(): trim, then "" → unknown, safe regex passthrough, else
+# inv-<sha256-prefix>. Without this, malformed or whitespace ids miss the
+# per-session file even though the writer created one under the canonical name.
+session_filename() {
+  local trimmed
+  trimmed="$(printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  if [ -z "$trimmed" ]; then echo unknown; return; fi
+  if printf '%s' "$trimmed" | grep -qE '^[A-Za-z0-9_-]{1,128}$'; then
+    printf '%s' "$trimmed"
+  else
+    printf 'inv-%s' "$(printf '%s' "$trimmed" | sha256sum | cut -c1-16)"
+  fi
+}
+
 # session id: prefer CC stdin, fall back to most-recent jsonl
 sid="$(jq -r '.session_id // empty' 2>/dev/null < /dev/stdin || true)"
 if [ -z "$sid" ]; then
   sid="$(ls -t "$HOME"/.claude/projects/*/*.jsonl 2>/dev/null | head -1 | xargs -I{} basename {} .jsonl)"
 fi
+filename="$(session_filename "$sid")"
 
 # quota: account.json (v3.5.0+) → fall back to legacy
 if [ -f "$ACCOUNT" ]; then
@@ -363,9 +379,9 @@ elif [ -f "$LEGACY" ]; then
   quota_json="$(cat "$LEGACY")"
 fi
 
-# cache: sessions/<sid>.json (v3.5.0+) → fall back to legacy
-if [ -n "$sid" ] && [ -f "$QS_DIR/sessions/$sid.json" ]; then
-  cache_json="$(cat "$QS_DIR/sessions/$sid.json")"
+# cache: sessions/<filename>.json (v3.5.0+) → fall back to legacy
+if [ -f "$QS_DIR/sessions/$filename.json" ]; then
+  cache_json="$(cat "$QS_DIR/sessions/$filename.json")"
 elif [ -f "$LEGACY" ]; then
   cache_json="$(cat "$LEGACY")"
 fi
@@ -376,10 +392,23 @@ fi
 import { readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 
 const home = homedir();
 const accountPath = join(home, ".claude", "quota-status", "account.json");
 const legacyPath = join(home, ".claude", "quota-status.json");
+
+const SAFE_NAME_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+// Mirror of cache-telemetry.mjs sessionFilename(). Reader-side rule must match
+// writer-side rule; otherwise malformed/whitespace ids miss their per-session file.
+function sessionFilename(rawId) {
+  if (rawId === null || rawId === undefined) return "unknown";
+  const s = String(rawId).trim();
+  if (s.length === 0) return "unknown";
+  if (SAFE_NAME_RE.test(s)) return s;
+  return "inv-" + createHash("sha256").update(s).digest("hex").slice(0, 16);
+}
 
 function readQuotaJson() {
   if (existsSync(accountPath)) return JSON.parse(readFileSync(accountPath, "utf8"));
@@ -388,10 +417,9 @@ function readQuotaJson() {
 }
 
 function readCacheJson(sessionId) {
-  if (sessionId) {
-    const p = join(home, ".claude", "quota-status", "sessions", `${sessionId}.json`);
-    if (existsSync(p)) return JSON.parse(readFileSync(p, "utf8"));
-  }
+  const filename = sessionFilename(sessionId);
+  const p = join(home, ".claude", "quota-status", "sessions", `${filename}.json`);
+  if (existsSync(p)) return JSON.parse(readFileSync(p, "utf8"));
   if (existsSync(legacyPath)) return JSON.parse(readFileSync(legacyPath, "utf8"));
   return null;
 }

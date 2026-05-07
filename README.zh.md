@@ -212,11 +212,27 @@ QS_DIR="$HOME/.claude/quota-status"
 ACCOUNT="$QS_DIR/account.json"
 LEGACY="$HOME/.claude/quota-status.json"
 
+# 文件名规范化规则 —— 必须与 proxy/extensions/cache-telemetry.mjs 中的
+# sessionFilename() 保持一致：先 trim；空 → unknown；匹配安全正则 → 直接通过；
+# 否则 → inv-<sha256-prefix>。否则空白/格式异常的 id 会读不到写入端按规范名
+# 创建的文件。
+session_filename() {
+  local trimmed
+  trimmed="$(printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  if [ -z "$trimmed" ]; then echo unknown; return; fi
+  if printf '%s' "$trimmed" | grep -qE '^[A-Za-z0-9_-]{1,128}$'; then
+    printf '%s' "$trimmed"
+  else
+    printf 'inv-%s' "$(printf '%s' "$trimmed" | sha256sum | cut -c1-16)"
+  fi
+}
+
 # 会话 id：优先 CC stdin，回退最近的 jsonl
 sid="$(jq -r '.session_id // empty' 2>/dev/null < /dev/stdin || true)"
 if [ -z "$sid" ]; then
   sid="$(ls -t "$HOME"/.claude/projects/*/*.jsonl 2>/dev/null | head -1 | xargs -I{} basename {} .jsonl)"
 fi
+filename="$(session_filename "$sid")"
 
 # 配额：account.json（v3.5.0+）→ 回退旧路径
 if [ -f "$ACCOUNT" ]; then
@@ -225,9 +241,9 @@ elif [ -f "$LEGACY" ]; then
   quota_json="$(cat "$LEGACY")"
 fi
 
-# 缓存：sessions/<sid>.json（v3.5.0+）→ 回退旧路径
-if [ -n "$sid" ] && [ -f "$QS_DIR/sessions/$sid.json" ]; then
-  cache_json="$(cat "$QS_DIR/sessions/$sid.json")"
+# 缓存：sessions/<filename>.json（v3.5.0+）→ 回退旧路径
+if [ -f "$QS_DIR/sessions/$filename.json" ]; then
+  cache_json="$(cat "$QS_DIR/sessions/$filename.json")"
 elif [ -f "$LEGACY" ]; then
   cache_json="$(cat "$LEGACY")"
 fi
@@ -238,10 +254,23 @@ fi
 import { readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 
 const home = homedir();
 const accountPath = join(home, ".claude", "quota-status", "account.json");
 const legacyPath = join(home, ".claude", "quota-status.json");
+
+const SAFE_NAME_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+// 与 cache-telemetry.mjs 的 sessionFilename() 保持一致。读取端规则必须与写入端
+// 一致；否则空白/格式异常的 id 会找不到对应的会话文件。
+function sessionFilename(rawId) {
+  if (rawId === null || rawId === undefined) return "unknown";
+  const s = String(rawId).trim();
+  if (s.length === 0) return "unknown";
+  if (SAFE_NAME_RE.test(s)) return s;
+  return "inv-" + createHash("sha256").update(s).digest("hex").slice(0, 16);
+}
 
 function readQuotaJson() {
   if (existsSync(accountPath)) return JSON.parse(readFileSync(accountPath, "utf8"));
@@ -250,10 +279,9 @@ function readQuotaJson() {
 }
 
 function readCacheJson(sessionId) {
-  if (sessionId) {
-    const p = join(home, ".claude", "quota-status", "sessions", `${sessionId}.json`);
-    if (existsSync(p)) return JSON.parse(readFileSync(p, "utf8"));
-  }
+  const filename = sessionFilename(sessionId);
+  const p = join(home, ".claude", "quota-status", "sessions", `${filename}.json`);
+  if (existsSync(p)) return JSON.parse(readFileSync(p, "utf8"));
   if (existsSync(legacyPath)) return JSON.parse(readFileSync(legacyPath, "utf8"));
   return null;
 }
