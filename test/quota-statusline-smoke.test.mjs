@@ -5,7 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -157,6 +157,77 @@ test("T5. malformed session_id → reads hashed filename matching the writer's r
     assert.equal(r.status, 0);
     // Should display the hashed file's contents — proves filename rule matches writer.
     assert.match(r.stdout, /TTL:5m/);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("T6 (security #108). triple-quote injection payload does NOT execute — heredoc isolation intact", () => {
+  // Regression for cnighswonger/claude-code-cache-fix#108: pre-v3.5.2,
+  // tools/quota-statusline.sh interpolated stdin into a Python triple-quoted
+  // literal (`json.loads('''$input''')`). A `'''` byte sequence in any
+  // user-controlled field — session_id, cwd, workspace.current_dir, etc. —
+  // closes the literal early and lets the following bytes execute as Python
+  // in the user's CC process. The fix moves stdin into a single-quoted
+  // bash heredoc + env var so the bytes are inert at every layer.
+  //
+  // This test pipes a payload that, on the vulnerable script, creates a
+  // sentinel file via __import__('os').system. After the script runs, the
+  // sentinel must NOT exist.
+  const env = setupHome();
+  // Sentinel must live under the test's tmpdir-rooted HOME so we never
+  // touch real /tmp state and the assertion can't false-pass against a
+  // pre-existing file the developer happens to have.
+  const sentinel = join(env.home, "PWNED_SHOULD_NOT_EXIST");
+  try {
+    writeFileSync(env.account, ACCOUNT_JSON);
+    // Build the malicious session_id. Triple-single-quote closes the literal,
+    // then arbitrary Python runs, then we re-open with `+'''` so the original
+    // syntax of the vulnerable line stays balanced (otherwise json.loads
+    // raises before reaching the dangerous code, masking the test).
+    const malicious = `abc'''+__import__('os').system(${JSON.stringify(`touch ${sentinel}`)})+'''def`;
+    const stdinPayload = JSON.stringify({ session_id: malicious });
+    const r = runScript(env.home, stdinPayload);
+    assert.equal(r.status, 0, `script must exit clean even with hostile payload; stderr=${r.stderr}`);
+    // The script should still render a normal quota line — the hostile
+    // payload is just a weird session_id string from the parser's perspective.
+    assert.match(r.stdout, /Q5h: 42%/);
+    // The critical assertion: no execution.
+    assert.equal(
+      existsSync(sentinel),
+      false,
+      `SECURITY REGRESSION: triple-quote injection payload created ${sentinel} — heredoc isolation has broken. See cache-fix issue #108.`,
+    );
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("T7 (security #108). injection in non-session_id fields is also inert", () => {
+  // The brief flagged that CC's hook payload has multiple user-controlled
+  // string fields (cwd, workspace.current_dir, workspace.project_dir,
+  // transcript_path). Even though the current script only consumes
+  // session_id from the parsed JSON, a future change might surface other
+  // fields. Belt-and-suspenders: confirm the heredoc isolation holds when
+  // the malicious bytes appear elsewhere in the JSON object.
+  const env = setupHome();
+  const sentinel = join(env.home, "PWNED_VIA_CWD_SHOULD_NOT_EXIST");
+  try {
+    writeFileSync(env.account, ACCOUNT_JSON);
+    const malicious = `/tmp/foo'''+__import__('os').system(${JSON.stringify(`touch ${sentinel}`)})+'''bar`;
+    const stdinPayload = JSON.stringify({
+      cwd: malicious,
+      workspace: { current_dir: malicious, project_dir: malicious },
+      transcript_path: malicious,
+      session_id: "valid-session-id-passes-canonical-rule",
+    });
+    const r = runScript(env.home, stdinPayload);
+    assert.equal(r.status, 0);
+    assert.equal(
+      existsSync(sentinel),
+      false,
+      `SECURITY REGRESSION via non-session_id field: ${sentinel} created. See cache-fix issue #108.`,
+    );
   } finally {
     env.cleanup();
   }

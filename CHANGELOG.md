@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [3.5.2] - 2026-05-07
+
+### Security
+
+- **`tools/quota-statusline.sh`: shell injection via Python triple-quoted literal (#108).** The v3.5.0 statusline rewrite interpolated CC's hook stdin payload directly into a Python triple-quoted string (`json.loads('''$input''')`). A `'''` byte sequence anywhere in the payload closed the literal early and let the following bytes execute as Python in the user's CC process. Because CC's hook payload reflects user-controlled paths (`cwd`, `workspace.current_dir`, `workspace.project_dir`, `transcript_path`) and apostrophes are legal in filesystem paths, a hostile directory name on disk (planted via `git clone`, archive extraction, npm package, etc.) could trigger arbitrary local code execution at the user's privilege every time CC redrew the statusline. **Severity: local code execution, persistent re-fire on every statusline tick, no user interaction beyond `cd`-ing into the hostile path.** Fix: capture stdin in bash, `export CC_INPUT`, and pipe the Python source through a single-quoted heredoc (`<<'PYEOF'`) which disables ALL bash interpolation in the body. Python now reads the JSON via `os.environ.get('CC_INPUT')`, where the bytes are inert at every layer. Adds T6 + T7 regression tests that drive the exact `'''+__import__('os').system(...)+'''` pattern against the script under a tmpdir-rooted `HOME` and assert the sentinel file is never created. Reported by [@schuay (Jakob Linke)](https://github.com/schuay) in [#108](https://github.com/cnighswonger/claude-code-cache-fix/issues/108) — thank you for the responsible disclosure.
+
+### Tests
+
+735 → 737 (+2): T6 and T7 regression coverage for the #108 injection vector — payload in `session_id` and in non-`session_id` user-controlled fields (`cwd`, `workspace.current_dir`, `transcript_path`).
+
 ## [3.5.1] - 2026-05-05
 
 ### Fixed

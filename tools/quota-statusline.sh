@@ -9,11 +9,24 @@
 # CC pipes hook input as JSON on stdin including `session_id`, which we map to
 # the per-session filename via the canonical rule (matches the writer in
 # proxy/extensions/cache-telemetry.mjs:sessionFilename).
+#
+# Security (v3.5.2, #108): the previous version interpolated stdin into a
+# Python triple-quoted literal via "''$input''", which lets a `'''` byte
+# sequence in the payload close the literal early and execute arbitrary
+# Python. CC's hook payload reflects user-controlled paths (cwd,
+# workspace.current_dir, transcript_path), and apostrophes are legal in
+# filenames, so a hostile directory name on disk could trigger code
+# execution on every CC statusline redraw. We capture stdin in bash, export
+# it to the env, and pass the python source through a single-quoted heredoc
+# (`<<'PYEOF'`) which disables ALL bash interpolation in the body. Python
+# reads the JSON via os.environ.get('CC_INPUT'), where the bytes are inert.
 
-input=$(cat)
+# Capture stdin in bash before the python heredoc consumes the stdin slot,
+# then export so the python child sees it.
+CC_INPUT=$(cat)
+export CC_INPUT
 
 ACCOUNT="$HOME/.claude/quota-status/account.json"
-SESSIONS_DIR="$HOME/.claude/quota-status/sessions"
 
 # Show quota even if no per-session file exists yet (fresh session, first
 # request hasn't fired). Per-session block just gets blank.
@@ -21,7 +34,12 @@ if [ ! -f "$ACCOUNT" ]; then
   exit 0
 fi
 
-result=$(python3 -c "
+# IMPORTANT: the heredoc tag is single-quoted (`<<'PYEOF'`). This disables
+# all bash interpolation inside the heredoc body. Do NOT change to `<<PYEOF`
+# without a matching audit — that would re-introduce the injection vector
+# the v3.5.2 hotfix closed. The python source must reference CC_INPUT only
+# through os.environ, never via a shell-substituted string.
+result=$(python3 <<'PYEOF' 2>/dev/null
 import sys, json, os, re, hashlib
 from datetime import datetime, timezone, timedelta
 
@@ -34,14 +52,14 @@ sessions_dir = os.path.join(home, '.claude', 'quota-status', 'sessions')
 # canonical rule decides — the writer maps all those to 'unknown',
 # the reader must do the same to keep the contract identical.
 try:
-    stdin_data = json.loads('''$input''') if '''$input''' else {}
+    stdin_data = json.loads(os.environ.get('CC_INPUT') or '{}')
 except Exception:
     stdin_data = {}
 sess_id_raw = stdin_data.get('session_id')
 
 # Canonical filename derivation — must match cache-telemetry.mjs:sessionFilename.
 # Allowlist: [A-Za-z0-9_-]{1,128}; else inv-<sha256(s)[:16]>; null/empty/whitespace -> 'unknown'.
-SAFE = re.compile(r'^[A-Za-z0-9_-]{1,128}\$')
+SAFE = re.compile(r'^[A-Za-z0-9_-]{1,128}$')
 def session_filename(raw):
     if raw is None:
         return 'unknown'
@@ -121,6 +139,7 @@ if peak:
     label += ' | \033[33mPEAK\033[0m'
 
 print(label)
-" 2>/dev/null)
+PYEOF
+)
 
 [ -n "$result" ] && echo "$result"
