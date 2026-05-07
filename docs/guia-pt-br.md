@@ -83,6 +83,8 @@ cat ~/.claude/quota-status/account.json
 cat ~/.claude/quota-status.json 2>/dev/null
 ```
 
+> **Migrando scripts de v3.4.x para v3.5.0+:** se você escreveu um statusline ou script de monitoramento que lia `~/.claude/quota-status.json` diretamente, consulte a seção ["Migration: v3.4.x → v3.5.0+" no README em inglês](../README.md#migration-v34x--v350) para o padrão de migração (tente o novo caminho, recue para o legado). Tradução em português é bem-vinda via PR.
+
 ## Variáveis de ambiente
 
 | Variável | Default | O que faz |

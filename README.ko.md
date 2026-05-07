@@ -244,6 +244,12 @@ export CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1
 
 또는 `~/.claude/settings.json`에 `"includeGitInstructions": false`를 추가하십시오. Claude Code는 컨텍스트가 필요할 때 Bash 도구를 통해 `git status`를 직접 실행할 수 있습니다. [@wadabum](https://github.com/cnighswonger/claude-code-cache-fix/issues/11)이 커뮤니티 검증: git 상태 변경 시 캐시 생성 18토큰(이 플래그 없이는 수천 토큰).
 
+## 마이그레이션: v3.4.x → v3.5.0+
+
+> **번역 필요 / Translation needed.** 이 섹션은 아직 영어로만 작성되어 있습니다. 사용자 정의 상태 표시줄, 모니터링 스크립트 또는 `~/.claude/quota-status.json`을 직접 읽는 다른 도구를 작성한 경우, v3.5.0 프록시 모드 분할 및 소비자 측 마이그레이션 패턴(새 경로 시도 → 레거시 경로로 폴백)에 대한 자세한 내용은 [영어 README의 "Migration: v3.4.x → v3.5.0+"](README.md#migration-v34x--v350) 섹션을 참조하십시오.
+>
+> 한국어 번역에 기여하시겠습니까? PR을 환영합니다.
+
 ## 이미지 제거 (프리로드 모드)
 
 Read 도구로 읽은 이미지는 base64로 인코딩되어 대화 기록에 저장되며, 이후 모든 API 호출에 함께 전송됩니다. 500KB 이미지 하나가 Opus 4.6에서 턴당 약 62,500 토큰, **Opus 4.7에서는 새 토크나이저로 인해 약 85,000+ 토큰**의 추가 비용을 발생시킵니다. 4.7에서는 이미지 제거를 강력히 권장합니다.

@@ -324,6 +324,85 @@ Or add `"includeGitInstructions": false` to `~/.claude/settings.json`. Claude Co
 
 **Why we don't ship a proxy extension for this:** the proxy intercepts requests after Claude Code has already composed the system prompt — by then the volatile `git status` text is already part of the prefix that the model conditioned on in the previous turn, and stripping it post-hoc would itself bust the cache. The fix has to happen at the source. `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1` prevents the injection before the prompt is composed, which is why the native flag is the right tool. Stripping post-hoc would also remove model-visible context that an explicit Bash call can recover, and would risk false-positive matches against assistant-written text.
 
+## Migration: v3.4.x → v3.5.0+
+
+If you wrote a custom statusline, monitoring script, or anything else that reads `~/.claude/quota-status.json` directly, this section is for you. v3.5.0 split that file in proxy mode; preload mode is unchanged.
+
+### What changed
+
+| | v3.4.x and earlier (proxy + preload) | v3.5.0+ proxy mode | v3.5.0+ preload mode |
+|---|---|---|---|
+| Quota fields (Q5h, Q7d, status, overage) | `~/.claude/quota-status.json` | `~/.claude/quota-status/account.json` | `~/.claude/quota-status.json` (legacy path) |
+| Cache fields (TTL tier, hit rate, cache_creation/read) | same file as above | `~/.claude/quota-status/sessions/<filename>.json` | same file as above |
+| Multi-session attribution | none — last writer wins | per-session files | preload is single-session by construction |
+
+`<filename>` is derived from the request's `x-claude-code-session-id` header via a deterministic safe-name rule: UUIDs and other ids matching `[A-Za-z0-9_-]{1,128}` pass through; null/empty/whitespace become `unknown`; anything else is mapped to `inv-<sha256-prefix>`. Full rule is documented at [`docs/directives/proxy-quota-status-per-session.md`](docs/directives/proxy-quota-status-per-session.md).
+
+The legacy `~/.claude/quota-status.json` is auto-deleted on the first proxy-mode write after upgrade. Per-session files older than `CACHE_FIX_QUOTA_STATUS_TTL_DAYS` (default `7`) are swept on write.
+
+### Consumer-side migration pattern
+
+Your script should try the v3.5.0+ proxy paths first and fall back to the legacy path if not present. That way it works in both modes (and on hosts mid-upgrade). The session id usually comes from Claude Code's stdin when it invokes a statusline hook; for other consumers, capture it from the most-recently-modified `~/.claude/projects/*/*.jsonl` filename.
+
+**Bash (statusline-style):**
+```bash
+QS_DIR="$HOME/.claude/quota-status"
+ACCOUNT="$QS_DIR/account.json"
+LEGACY="$HOME/.claude/quota-status.json"
+
+# session id: prefer CC stdin, fall back to most-recent jsonl
+sid="$(jq -r '.session_id // empty' 2>/dev/null < /dev/stdin || true)"
+if [ -z "$sid" ]; then
+  sid="$(ls -t "$HOME"/.claude/projects/*/*.jsonl 2>/dev/null | head -1 | xargs -I{} basename {} .jsonl)"
+fi
+
+# quota: account.json (v3.5.0+) → fall back to legacy
+if [ -f "$ACCOUNT" ]; then
+  quota_json="$(cat "$ACCOUNT")"
+elif [ -f "$LEGACY" ]; then
+  quota_json="$(cat "$LEGACY")"
+fi
+
+# cache: sessions/<sid>.json (v3.5.0+) → fall back to legacy
+if [ -n "$sid" ] && [ -f "$QS_DIR/sessions/$sid.json" ]; then
+  cache_json="$(cat "$QS_DIR/sessions/$sid.json")"
+elif [ -f "$LEGACY" ]; then
+  cache_json="$(cat "$LEGACY")"
+fi
+```
+
+**Node:**
+```js
+import { readFileSync, existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+const home = homedir();
+const accountPath = join(home, ".claude", "quota-status", "account.json");
+const legacyPath = join(home, ".claude", "quota-status.json");
+
+function readQuotaJson() {
+  if (existsSync(accountPath)) return JSON.parse(readFileSync(accountPath, "utf8"));
+  if (existsSync(legacyPath)) return JSON.parse(readFileSync(legacyPath, "utf8"));
+  return null;
+}
+
+function readCacheJson(sessionId) {
+  if (sessionId) {
+    const p = join(home, ".claude", "quota-status", "sessions", `${sessionId}.json`);
+    if (existsSync(p)) return JSON.parse(readFileSync(p, "utf8"));
+  }
+  if (existsSync(legacyPath)) return JSON.parse(readFileSync(legacyPath, "utf8"));
+  return null;
+}
+```
+
+The shipped [`tools/quota-statusline.sh`](tools/quota-statusline.sh) is the reference implementation for the bash version. The [`/coffee` skill](https://github.com/cnighswonger/claude-code-coffee) v1.4.0 is the reference for the per-session warmth gate.
+
+### Why per-session
+
+On multi-agent hosts (multiple Claude Code sessions sharing one proxy), the pre-v3.5.0 single global file caused every session to overwrite the others' cache stats with each response. A statusline reading from session A would show session B's TTL tier whenever B sent a request more recently. Per-session files plus an account-global quota file resolve this without losing the easy account-wide view. See [#104](https://github.com/cnighswonger/claude-code-cache-fix/issues/104) for the original report.
+
 ## Image stripping (preload mode)
 
 Images read via the Read tool persist as base64 in conversation history, riding along on every subsequent API call. A single 500KB image costs ~62,500 tokens per turn on Opus 4.6, and **~85,000+ on Opus 4.7** due to the new tokenizer. Image stripping is strongly recommended on 4.7.

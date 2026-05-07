@@ -49,7 +49,7 @@ Weekends are entirely unaffected.
 ## Interceptor integration
 
 The interceptor detects peak hours and:
-- Sets `peak_hour: true/false` in `~/.claude/quota-status.json`
+- Sets `peak_hour: true/false` in the quota-status payload (proxy mode v3.5.0+: `~/.claude/quota-status/account.json`; preload mode: `~/.claude/quota-status.json`)
 - Logs `PEAK HOUR: weekday 13:00-19:00 UTC` in the debug log when `CACHE_FIX_DEBUG=1`
 - Enables the status line to display `PEAK` (yellow) during peak windows
 
