@@ -361,7 +361,14 @@ session_filename() {
   if printf '%s' "$trimmed" | grep -qE '^[A-Za-z0-9_-]{1,128}$'; then
     printf '%s' "$trimmed"
   else
-    printf 'inv-%s' "$(printf '%s' "$trimmed" | sha256sum | cut -c1-16)"
+    # sha256sum on Linux; shasum -a 256 on macOS. Both emit "<hex>  -".
+    local hash
+    if command -v sha256sum >/dev/null 2>&1; then
+      hash="$(printf '%s' "$trimmed" | sha256sum)"
+    else
+      hash="$(printf '%s' "$trimmed" | shasum -a 256)"
+    fi
+    printf 'inv-%s' "$(printf '%s' "$hash" | cut -c1-16)"
   fi
 }
 
