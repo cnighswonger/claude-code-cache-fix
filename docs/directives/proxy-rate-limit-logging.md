@@ -95,18 +95,30 @@ isRateLimitResponse(ctx) =
 
 Header signals (`x-should-retry`, `request-id`) are recorded in the JSONL row but not used as detection gates — Anthropic could change them independently of the body, and the body schema is the canonical contract.
 
-## Scope: this is a SUPERSET of burst-limit events
+## Scope: this is a SUPERSET of `rate_limit_error` events
 
-Per Anthropic's public docs, the `rate_limit_error` envelope is shared across multiple 429 classes:
+Per Anthropic's public docs and the 2026-05-08 capture + post-incident analysis, the `rate_limit_error` envelope can be triggered by multiple underlying mechanisms. Lead's 2026-05-08 hypothesis revision (see "Hypothesis revision" below) shows the picture is more complicated than a single account-wide concurrent-stream cap:
 
 | Class | Notes |
 |---|---|
-| **Burst/concurrency limit** | Account-wide concurrent-stream cap. The community-tracked failure mode (anthropics/claude-code#53922). The 2026-05-08 88-event burst was almost certainly this class. |
-| **RPM (requests-per-minute)** | Classic per-key rate limit. Documented but rarely surfaced in CC traffic. |
+| **Per-connection / per-process limit** | New leading candidate for OUR observed phenomenon (post-incident reframe). Limiter appears keyed on process / TCP / HTTP keep-alive pool state — only the actively-bursting agent saw 429s; `claude --continue` cleared it without restarting the host or rotating IP. |
+| **Account-wide concurrency** | Manuel's #53922 bulk-spawn-fresh-sessions hypothesis. Still plausible for cases other than ours; not our specific incident shape. |
+| **RPM (requests-per-minute)** | Classic per-key rate limit. Documented; same envelope. |
 | **ITPM / OTPM (input/output tokens-per-minute)** | Classic per-key rate limit. Same envelope. |
-| **Auto-mode classifier overflow** | Per Lead's 2026-05-08 follow-up: CC's auto-mode runs a separate Opus-4-7 safety classifier API call before each Edit. These calls share the account-wide concurrency limiter, so when it saturates, the classifier 429s alongside main-inference traffic. Effectively doubles the API-call rate per visible Edit turn. Sessions on Sonnet are still gated by Opus 4.7 quota via this path. |
+| **Auto-mode classifier overflow** | Per Lead's 2026-05-08 follow-up: CC's auto-mode runs a separate Opus-4-7 safety classifier API call before each Edit. These calls share whatever limiter is active, so when it saturates the classifier 429s alongside main-inference traffic. Effectively doubles the API-call rate per visible Edit turn. Sessions on Sonnet are still gated by Opus 4.7 quota via this path. |
 
 The response itself carries no field that distinguishes these classes — `error.message` is literally the string `"Error"`. So we **deliberately log the superset** and let post-analysis split.
+
+### Hypothesis revision (post-incident, 2026-05-08)
+
+Lead's analysis after the 88-event capture flipped the underlying-mechanism story:
+
+- **Only the actively-bursting agent was affected.** Lead, Sim Agent, Web Manager, Proxy Builder all ran concurrently on the same account during the burst window without 429s.
+- **`claude --continue` cleared it.** That preserves session UUID, account, IP, model, conversation history — but resets process / TCP / HTTP keep-alive pool / in-process retry queue.
+
+Net: the limiter is **not literally account-wide** in the way Manuel's #53922 framing suggests. It is keyed on something process/connection-specific. This changes the burst-handling design space (Candidate B per-account token bucket is probably wrong for this phenomenon; new Candidate C — per-connection retry absorption with connection-recycle escape hatch — is the most plausible architectural fit). All deferred to follow-up work; not in scope here.
+
+**What this means for the LOGGING extension:** the contract is unchanged — we still log every `rate_limit_error` 429. But the JSONL alone is **not sufficient** to disambiguate process/connection-keyed (H3) from client-side queue saturation (H4). Lead's verification suggestion is to capture upstream connection identity at each 429: if 429s correlate with one specific upstream connection ID, H3 is confirmed. That's a small follow-up enrichment to this extension; flagged in "Out of scope" below.
 
 ## Post-analysis playbook
 
@@ -177,6 +189,7 @@ From Lead's 2026-05-08 analysis (`cache-fix-429-burst-data-2026-05-08.md`):
 | H2 — bursts triggered by wake-from-idle activity (multiple agents reconnecting) | **Confirmed.** Burst happened during simultaneous Code Agent + Lead session re-engagement after idle. |
 | Latent — CC silently retries with exponential backoff before surfacing the user-visible error | **Confirmed and observable.** First sub-burst showed clean 0.86s → 1.38s → 2.22s → 3.78s spacing. Means the user-visible "Rate limited" error represents an exhausted retry budget, not a single API call. Worth folding into community framing. |
 | Classifier-doubles-rate (added 2026-05-08) | **Confirmed via separate error path.** CC's auto-mode runs an Opus-4-7 safety classifier per Edit, so the effective API-call rate is roughly 2x the visible turn rate. Classifier traffic shares the same concurrency limiter and shows up in the 429 stream. |
+| Account-wide concurrency limiter (Manuel's #53922 framing for OUR phenomenon) | **REVISED 2026-05-08 (post-incident).** Only the actively-bursting agent was affected; `claude --continue` cleared it. Limiter is process/connection-keyed for our incident shape, not literally account-wide. Manuel's bulk-spawn scenario may still be a different (genuine account-wide) phenomenon. |
 
 `peak_hour_old_schedule` is still emitted on every record — it's now observational data rather than a primary hypothesis test, but cheap to compute and useful for future analysis.
 
@@ -192,8 +205,9 @@ From Lead's 2026-05-08 analysis (`cache-fix-429-burst-data-2026-05-08.md`):
 
 These are flagged as separate work in Lead's 2026-05-08 brief, not addressed here:
 
-- **Burst handling** (Candidate A — reactive retry; Candidate B — proactive token bucket). Logging is a prerequisite to deciding which approach pays off; the data this extension collects will inform that decision. Both candidates must include classifier-path traffic; that's tracked separately.
-- **Streaming-side detection.** Not needed against current capture; will be added if/when Anthropic shifts the response shape.
-- **Server-side request-class detection.** As long as Anthropic returns `error.message: "Error"` with no class hint, splitting burst-vs-RPM/TPM and classifier-vs-main is a post-analysis problem on the JSONL. If Anthropic ever adds a discriminator field (e.g., `error.subtype` or a `representative_claim` header), the extractor in this extension is the natural place to land it.
+- **Burst handling.** Candidates A (reactive retry — reframed post-revision: prevent CC's retry queue from inflating in the affected process), B (per-account token bucket — probably wrong for this phenomenon), and C (per-connection retry absorption with connection-recycle escape hatch — new leading candidate). Logging is a prerequisite for deciding which approach pays off; this PR doesn't pre-commit any of them. Whichever lands must include classifier-path traffic.
+- **Connection-pool / process state at each 429** (H3-vs-H4 verification per Lead's 2026-05-08 suggestion). The current schema records `concurrent_sessions_estimate` from the per-session quota-status files but does NOT capture which upstream HTTP connection the 429 came back on — that's the signal needed to distinguish per-connection limiting from client-queue saturation. Small follow-up enrichment: thread upstream connection identity (or pool index) through `ctx.meta` from the upstream layer (`proxy/upstream.mjs`) into the record. Schema additive (`schema_version` already in place to support migration); does not invalidate existing rows.
+- **Streaming-side detection.** Not needed against current capture; will be added if Anthropic shifts the response shape.
+- **Server-side request-class detection.** As long as Anthropic returns `error.message: "Error"` with no class hint, splitting burst-vs-RPM/TPM and classifier-vs-main is a post-analysis problem on the JSONL. If Anthropic adds a discriminator field, the extractor in this extension is the natural landing site.
 
 — Proxy Builder
