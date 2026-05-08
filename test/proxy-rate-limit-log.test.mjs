@@ -384,7 +384,7 @@ test("[#25] extension: 429 with non-rate_limit_error body writes zero rows (pred
       body: { type: "error", error: { type: "overloaded_error", message: "..." } },
       meta: {},
     });
-    assert.equal(existsSync(env.logPath), false, "non-burst-limit 429s should not be logged by this extension");
+    assert.equal(existsSync(env.logPath), false, "429s with non-rate_limit_error body shapes should not be logged by this extension");
   } finally {
     env.cleanup();
   }

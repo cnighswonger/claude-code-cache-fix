@@ -48,10 +48,10 @@ Field semantics:
 | `session_id` | `ctx.meta._sessionId` (set by `cache-telemetry.onRequest`) | raw value, NOT canonical filename — avoids re-hashing for human inspection |
 | `request_path` | `ctx.request_path` (proxy is `/v1/messages` only today, but record it) | future-proofing |
 | `request_size_tokens` | computed in `onRequest` from `ctx.body` (chars / 4 heuristic over messages + system) | approximate by design |
-| `response_status` | `ctx.status` | typically 429; record actual value so 5xx-shaped burst-limits are also captured |
+| `response_status` | `ctx.status` | always 429 today; field exists so future shape changes don't require a schema migration |
 | `response_body_excerpt` | first 256 chars of stringified `ctx.body` | bounded so a hostile error body can't bloat the log |
 | `concurrent_sessions_estimate` | count of files in `~/.claude/quota-status/sessions/` modified within last 5 minutes | cheap proxy for "how many sessions were active when this fired" |
-| `q5h_pct_at_event` | read `~/.claude/quota-status/account.json` `.five_hour.pct` synchronously at event time | file was just written by `cache-telemetry` on the prior response, so it's fresh |
+| `q5h_pct_at_event` | read `~/.claude/quota-status/account.json` `.five_hour.pct` synchronously at event time | latest cached snapshot — written by `cache-telemetry` on the prior 200 response. NOT necessarily contemporaneous with the 429: error responses strip the `anthropic-ratelimit-*` headers, so we can't read live state. The value is "Q5h state shortly before the 429" and may be stale by tens of seconds in a sustained burst. |
 | `peak_hour_old_schedule` | computed: `dayOfWeek ∈ Mon-Fri AND hourUTC ∈ {13..18}` | matches the manual tracker's column |
 
 ## Hook placement
@@ -67,7 +67,7 @@ The proxy already supports four hooks on the pipeline:
 
 **`onResponse` is the primary detection hook for this directive.** It fires after the proxy has buffered the full non-streamed response body and successfully `JSON.parse`d it (server.mjs:78–104). 429 responses with a JSON error body will land here.
 
-**Resolved by capture (2026-05-08):** all 88 captured burst-limit responses had `content-type: application/json` — non-streamed JSON. The `onResponse` hook is sufficient; no `onStreamEvent` branch needed. (If Anthropic ever changes this and returns a 429 over SSE, we'll see it as a missing-row symptom and add the streaming branch as a follow-up.)
+**Resolved by capture (2026-05-08):** all 88 captured `rate_limit_error` responses had `content-type: application/json` — non-streamed JSON. The `onResponse` hook is sufficient; no `onStreamEvent` branch needed. (If Anthropic ever changes this and returns a 429 over SSE, we'll see it as a missing-row symptom and add the streaming branch as a follow-up.)
 
 ## Detection condition (grounded in capture)
 
@@ -159,7 +159,7 @@ No env var enable flag (matches Lead's brief: "Append to a separate file ... so 
 |---|---|
 | isRateLimitResponse: 429 → true | scaffolded |
 | isRateLimitResponse: 200 → false | scaffolded |
-| isRateLimitResponse: 500 → false (v0 predicate); will revisit when burst-limit shape is captured | scaffolded |
+| isRateLimitResponse: 500 → false (predicate gates on 429 specifically) | covered |
 | onResponse: 429 → JSONL row written with all fields | scaffolded; payload shape will be tightened with real bytes |
 | onResponse: 200 → no row written | scaffolded |
 | Field accuracy: peak_hour_old_schedule computed correctly across boundaries | scaffolded |
