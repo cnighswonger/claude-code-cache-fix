@@ -26,16 +26,21 @@ Per Lead's brief, every detected rate-limit response gets one JSONL row appended
 
 ```json
 {
+  "schema_version": 1,
   "ts": "2026-05-07T11:55:32.490Z",
   "type": "rate_limit",
   "session_id": "b16c607d-...",
+  "requested_model": "claude-opus-4-7",
   "request_path": "/v1/messages",
   "request_size_tokens": 50,
   "response_status": 429,
-  "response_body_excerpt": "Server is temporarily limiting requests...",
+  "response_body_excerpt": "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",...",
   "concurrent_sessions_estimate": 5,
   "q5h_pct_at_event": 12,
-  "peak_hour_old_schedule": false
+  "peak_hour_old_schedule": false,
+  "upstream_request_id": "req_011Cap...",
+  "x_should_retry": "true",
+  "upstream_connection_id": "cn-7"
 }
 ```
 
@@ -43,16 +48,21 @@ Field semantics:
 
 | Field | Source | Notes |
 |---|---|---|
+| `schema_version` | const `1` | bumped on backwards-incompatible changes; additive fields don't bump |
 | `ts` | `new Date().toISOString()` at event time | UTC, millisecond precision |
 | `type` | const `"rate_limit"` | reserved for future event types in same file |
 | `session_id` | `ctx.meta._sessionId` (set by `cache-telemetry.onRequest`) | raw value, NOT canonical filename — avoids re-hashing for human inspection |
-| `request_path` | `ctx.request_path` (proxy is `/v1/messages` only today, but record it) | future-proofing |
+| `requested_model` | `body.model` captured in `onRequest` | distinguishes auto-mode classifier (Opus 4.7) from main-inference (any model) |
+| `request_path` | proxy is `/v1/messages` only today | future-proofing |
 | `request_size_tokens` | computed in `onRequest` from `ctx.body` (chars / 4 heuristic over messages + system) | approximate by design |
 | `response_status` | `ctx.status` | always 429 today; field exists so future shape changes don't require a schema migration |
 | `response_body_excerpt` | first 256 chars of stringified `ctx.body` | bounded so a hostile error body can't bloat the log |
 | `concurrent_sessions_estimate` | count of files in `~/.claude/quota-status/sessions/` modified within last 5 minutes | cheap proxy for "how many sessions were active when this fired" |
 | `q5h_pct_at_event` | read `~/.claude/quota-status/account.json` `.five_hour.pct` synchronously at event time | latest cached snapshot — written by `cache-telemetry` on the prior 200 response. NOT necessarily contemporaneous with the 429: error responses strip the `anthropic-ratelimit-*` headers, so we can't read live state. The value is "Q5h state shortly before the 429" and may be stale by tens of seconds in a sustained burst. |
-| `peak_hour_old_schedule` | computed: `dayOfWeek ∈ Mon-Fri AND hourUTC ∈ {13..18}` | matches the manual tracker's column |
+| `peak_hour_old_schedule` | computed: `dayOfWeek ∈ Mon-Fri AND hourUTC ∈ {13..18}` | observational; H1 (peak schedule) refuted by the 2026-05-08 capture |
+| `upstream_request_id` | Anthropic's `request_id` from body (preferred) or `request-id` response header | traceability; lets users correlate with Anthropic support escalations |
+| `x_should_retry` | response header `x-should-retry` | recorded but not used as detection gate |
+| `upstream_connection_id` | stable `cn-<int>` assigned in `proxy/upstream.mjs` per TCP socket via WeakMap | persists across keep-alive reuse, recycles on socket close. Distribution across rows distinguishes per-connection limiting (H3) from client-queue saturation (H4). See post-analysis playbook below. |
 
 ## Hook placement
 
@@ -131,6 +141,7 @@ To distinguish the classes from the JSONL stream, use:
 | Inter-arrival timing across rows | Exponential pattern (0.86s → 1.38s → 2.22s → ...) ⇒ a single CC session retrying. Compressed parallel spacing ⇒ multi-agent burst. The 2026-05-08 wave/quiet/wave structure showed both within one 15-min window. |
 | `concurrent_sessions_estimate` | Higher count alongside a 429 ⇒ multi-agent contention more likely. |
 | `session_id` distribution | Multiple distinct ids in a tight time window ⇒ burst/concurrency. Same id repeating ⇒ single-session retry. |
+| `upstream_connection_id` distribution | **H3-vs-H4 verification.** If 429s cluster on a single id (one upstream socket carrying many failures while others succeed) ⇒ per-connection / per-process limiter (H3). If 429s are spread across many ids ⇒ client-side queue saturation (H4) is more likely. The `claude --continue` clearing effect from Lead's 2026-05-08 incident is consistent with H3 at the proxy layer too — closing+reopening a hot socket would mimic that recovery without a full session restart. |
 
 This is exactly the analysis Lead used to identify the wave/quiet/wave structure post-capture. The extension's job is to write the rows; the classification is downstream.
 
@@ -206,7 +217,7 @@ From Lead's 2026-05-08 analysis (`cache-fix-429-burst-data-2026-05-08.md`):
 These are flagged as separate work in Lead's 2026-05-08 brief, not addressed here:
 
 - **Burst handling.** Candidates A (reactive retry — reframed post-revision: prevent CC's retry queue from inflating in the affected process), B (per-account token bucket — probably wrong for this phenomenon), and C (per-connection retry absorption with connection-recycle escape hatch — new leading candidate). Logging is a prerequisite for deciding which approach pays off; this PR doesn't pre-commit any of them. Whichever lands must include classifier-path traffic.
-- **Connection-pool / process state at each 429** (H3-vs-H4 verification per Lead's 2026-05-08 suggestion). The current schema records `concurrent_sessions_estimate` from the per-session quota-status files but does NOT capture which upstream HTTP connection the 429 came back on — that's the signal needed to distinguish per-connection limiting from client-queue saturation. Small follow-up enrichment: thread upstream connection identity (or pool index) through `ctx.meta` from the upstream layer (`proxy/upstream.mjs`) into the record. Schema additive (`schema_version` already in place to support migration); does not invalidate existing rows.
+- ~~Connection-pool / process state at each 429~~ — **shipped** in the follow-up to PR #111. `proxy/upstream.mjs` assigns each upstream TCP socket a stable `cn-<int>` id via WeakMap, threaded through `forwardRequest` → `ctx.meta._upstreamConnectionId` → `upstream_connection_id` field on each JSONL row. Persists across keep-alive reuse, recycles on socket close. See "Post-analysis playbook" above for the H3-vs-H4 distribution test.
 - **Streaming-side detection.** Not needed against current capture; will be added if Anthropic shifts the response shape.
 - **Server-side request-class detection.** As long as Anthropic returns `error.message: "Error"` with no class hint, splitting burst-vs-RPM/TPM and classifier-vs-main is a post-analysis problem on the JSONL. If Anthropic adds a discriminator field, the extractor in this extension is the natural landing site.
 

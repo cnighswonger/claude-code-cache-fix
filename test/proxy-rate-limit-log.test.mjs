@@ -209,6 +209,7 @@ test("[#20] buildRecord: full happy path with all fields populated", () => {
       _requestSizeTokens: 50,
       _requestPath: "/v1/messages",
       _requestedModel: "claude-opus-4-7",
+      _upstreamConnectionId: "cn-7",
     },
   };
   const now = new Date(Date.UTC(2026, 4, 7, 14, 30, 45, 123)); // Thu 14:30:45.123 UTC — peak
@@ -223,6 +224,7 @@ test("[#20] buildRecord: full happy path with all fields populated", () => {
   assert.equal(record.response_status, 429);
   assert.match(record.response_body_excerpt, /Server is temporarily limiting requests/);
   assert.equal(record.peak_hour_old_schedule, true);
+  assert.equal(record.upstream_connection_id, "cn-7");
   // concurrent_sessions_estimate and q5h_pct_at_event depend on host filesystem;
   // tested separately via countActiveSessions / readQ5hPctAtEvent.
   assert.equal(typeof record.concurrent_sessions_estimate, "number");
@@ -238,6 +240,7 @@ test("[#21] buildRecord: missing meta fields → null/zero defaults, no throw", 
   assert.equal(record.requested_model, null);
   assert.equal(record.request_size_tokens, 0);
   assert.equal(record.request_path, "/v1/messages");
+  assert.equal(record.upstream_connection_id, null);
 });
 
 // ---------------------------------------------------------------------------
@@ -316,6 +319,35 @@ test("[#23] extension: captured-shape 429 → exactly one JSONL row written", as
     assert.equal(row.upstream_request_id, CAPTURED_429_BODY.request_id);
     // q5h read from the seeded account.json
     assert.equal(row.q5h_pct_at_event, 17);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("[#23b] extension: upstream_connection_id flows from meta to JSONL row (H3-vs-H4 verification)", async () => {
+  // The end-to-end signal that lets post-analysis distinguish per-connection
+  // limiting from client-side queue saturation: each row carries the stable
+  // id of the upstream socket that produced the 429.
+  const env = setupHome();
+  try {
+    // Two events on the same connection (cn-1) followed by one on a fresh
+    // connection (cn-2). Models the H3 pattern: limiter clusters on a
+    // specific connection.
+    for (const [sid, connId] of [["session-A", "cn-1"], ["session-A", "cn-1"], ["session-B", "cn-2"]]) {
+      await rateLimitLog.onResponse(makeCapturedCtx({
+        meta: { _sessionId: sid, _upstreamConnectionId: connId },
+      }));
+    }
+    const lines = readFileSync(env.logPath, "utf8").trim().split("\n");
+    assert.equal(lines.length, 3);
+    const rows = lines.map((l) => JSON.parse(l));
+    assert.deepEqual(
+      rows.map((r) => r.upstream_connection_id),
+      ["cn-1", "cn-1", "cn-2"],
+    );
+    // Sanity for analysis: 2-of-3 events on cn-1 → that connection looks
+    // hot. (The actual analysis lives downstream; this just proves the
+    // signal is recorded.)
   } finally {
     env.cleanup();
   }

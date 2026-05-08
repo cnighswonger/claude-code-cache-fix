@@ -53,10 +53,10 @@ async function handleMessages(clientReq, clientRes) {
 
   const requestedModel = parsed?.model || null;
 
-  let upstreamRes, responseHeaders, statusCode;
+  let upstreamRes, responseHeaders, statusCode, upstreamConnectionId;
 
   try {
-    ({ upstreamRes, responseHeaders, statusCode } = await forwardRequest(
+    ({ upstreamRes, responseHeaders, statusCode, upstreamConnectionId } = await forwardRequest(
       clientReq,
       forwardBody,
       abortController.signal
@@ -67,6 +67,11 @@ async function handleMessages(clientReq, clientRes) {
     clientRes.end(JSON.stringify({ error: "upstream_error", message: err.message }));
     return;
   }
+
+  // Stash upstream connection id on meta so downstream extensions
+  // (rate-limit-log, future per-connection diagnostics) can record which
+  // socket carried the request without each one re-instrumenting upstream.
+  meta._upstreamConnectionId = upstreamConnectionId ?? null;
 
   if (extSnapshot.length > 0) {
     const resCtx = { status: statusCode, headers: responseHeaders, meta };

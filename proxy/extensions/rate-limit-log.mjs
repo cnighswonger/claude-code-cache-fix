@@ -177,6 +177,15 @@ export function buildRecord({ ctx, now = new Date() }) {
     peak_hour_old_schedule: isPeakHourOldSchedule(now),
     upstream_request_id: bodyReqId || headerReqId,
     x_should_retry: xShouldRetry,
+    // Stable id of the underlying TCP socket that carried this request,
+    // assigned in proxy/upstream.mjs via WeakMap<Socket, id>. Persists across
+    // keep-alive reuse, recycles on socket close. Null if upstream errored
+    // before a socket was assigned. Populated by server.mjs after
+    // forwardRequest resolves. Use for H3-vs-H4 verification per Lead's
+    // 2026-05-08 brief: if 429s cluster on one connection id, the limiter
+    // is per-connection (H3); if they spread across many, client-side
+    // queue saturation (H4) is more likely.
+    upstream_connection_id: ctx?.meta?._upstreamConnectionId ?? null,
   };
 }
 

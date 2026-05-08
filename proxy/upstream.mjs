@@ -54,6 +54,42 @@ const _agents = new Map();        // cache key → Agent | null
 const _loggedProxies = new Set(); // dedupe stderr "using proxy" lines per (url, isHTTPS)
 let _warnedTlsDisabled = false;
 
+// --- Upstream connection identity ---
+//
+// Each underlying TCP socket gets a stable id the first time we see it. The
+// id persists across keep-alive reuses of the same socket (WeakMap by socket
+// reference) and dies when the socket is GC'd. New sockets — including
+// reconnects after a closed connection — get fresh ids.
+//
+// This lets the rate-limit-log extension (and any future per-connection
+// diagnostic) record which upstream connection a response came back on, so
+// post-analysis can distinguish per-connection limiter behavior (Lead's H3,
+// 2026-05-08 brief) from client-side queue saturation (H4) or genuinely
+// account-wide limiting.
+//
+// Format: "cn-<int>" — opaque to consumers; only the equality and cardinality
+// matter for analysis.
+
+let _connectionIdCounter = 0;
+const _socketIds = new WeakMap();
+
+export function getOrAssignConnectionId(socket) {
+  if (!socket) return null;
+  let id = _socketIds.get(socket);
+  if (id === undefined) {
+    id = `cn-${++_connectionIdCounter}`;
+    _socketIds.set(socket, id);
+  }
+  return id;
+}
+
+// Test-only: reset the monotonic counter. The WeakMap entries die with their
+// sockets so we don't need to clear them; we just need a predictable start
+// for assertions on id values across cases.
+export function __resetConnectionIdsForTests() {
+  _connectionIdCounter = 0;
+}
+
 function shouldBypassProxy(hostname) {
   if (!config.noProxy) return false;
   const list = config.noProxy.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
@@ -170,10 +206,25 @@ export function forwardRequest(clientReq, body, signal) {
       agent: getAgent(isHTTPS, upstreamUrl.hostname),
     };
 
+    let upstreamConnectionId = null;
+    // The 'socket' event fires when a socket is assigned to this request,
+    // synchronously after transport.request() returns for both new and
+    // pooled-keep-alive sockets. By the time the response callback runs we
+    // already know which connection carried the request.
+    const captureSocket = (sock) => {
+      upstreamConnectionId = getOrAssignConnectionId(sock);
+    };
+
     const upstreamReq = transport.request(options, (upstreamRes) => {
       const responseHeaders = filterResponseHeaders(upstreamRes.headers);
-      resolve({ upstreamRes, responseHeaders, statusCode: upstreamRes.statusCode });
+      resolve({
+        upstreamRes,
+        responseHeaders,
+        statusCode: upstreamRes.statusCode,
+        upstreamConnectionId,
+      });
     });
+    upstreamReq.on("socket", captureSocket);
 
     upstreamReq.on("error", reject);
     upstreamReq.on("timeout", () => {
