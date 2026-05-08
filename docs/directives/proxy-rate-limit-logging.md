@@ -1,8 +1,11 @@
 # Directive: rate-limit event logging in the proxy
 
-**Status:** scaffolded; detection branch BLOCKED on a captured upstream 429 response.
-**Author:** Proxy Builder, codifying AI Team Lead's 2026-05-07 brief
-**Reference:** `~/git_repos/claude/docs/issues/cache-fix-rate-limit-logging-2026-05-07.md` (lead workspace)
+**Status:** detection grounded in 88-event burst capture (2026-05-08); ready for review.
+**Author:** Proxy Builder
+**References:**
+- `~/git_repos/claude/docs/issues/cache-fix-rate-limit-logging-2026-05-07.md` (original brief)
+- `~/git_repos/claude/docs/issues/cache-fix-429-burst-data-2026-05-08.md` (capture + analysis)
+- Anonymized fixture: `test/fixtures/burst-limit-429.json`
 
 ## Problem statement
 
@@ -64,19 +67,37 @@ The proxy already supports four hooks on the pipeline:
 
 **`onResponse` is the primary detection hook for this directive.** It fires after the proxy has buffered the full non-streamed response body and successfully `JSON.parse`d it (server.mjs:78–104). 429 responses with a JSON error body will land here.
 
-**Open question (BLOCKED on captured 429):** if upstream returns a 429 with `content-type: text/event-stream` — i.e., the SSE stream opens, then upstream emits a single error event and closes — our `onResponse` hook won't fire. We'd need a parallel detection branch in `onStreamEvent` keyed off an SSE error event type. Until we have a real captured response, we don't know which path Anthropic uses for burst-limit 429s. The interim tee/socat capture Lead is running will tell us.
+**Resolved by capture (2026-05-08):** all 88 captured burst-limit responses had `content-type: application/json` — non-streamed JSON. The `onResponse` hook is sufficient; no `onStreamEvent` branch needed. (If Anthropic ever changes this and returns a 429 over SSE, we'll see it as a missing-row symptom and add the streaming branch as a follow-up.)
 
-## Detection condition (BLOCKED on captured 429)
+## Detection condition (grounded in capture)
 
-The captured response will pin down:
+From the 2026-05-08 88-event burst (15 min, single account, full HTTP fidelity), every burst-limit response had:
 
-1. Is it `status === 429` only, or also some 5xx?
-2. Does the body include `error.type === "rate_limit_error"` (or similar)?
-3. Is there a discriminating response header (`anthropic-error-type`, `cf-ray` patterns, etc.)?
-4. What's the actual body string format — do we match on a substring or on the JSON shape?
-5. Is the response streamed or non-streamed?
+| Field | Value |
+|---|---|
+| `status` | `429` (88/88) |
+| `content-type` | `application/json` (88/88) |
+| `body.type` | `"error"` (88/88) |
+| `body.error.type` | `"rate_limit_error"` (88/88) |
+| `body.error.message` | `"Error"` (88/88 — Anthropic gives no useful sub-classification) |
+| `x-should-retry` header | `"true"` (88/88) |
+| `Retry-After` header | absent (0/88 — caller must infer backoff) |
+| `anthropic-ratelimit-*` headers | absent (0/88 — error responses strip them) |
 
-**Until then, scaffold uses a conservative v0 predicate: `status === 429`.** That over-triggers (will catch classic RPM/TPM 429s that aren't the burst-limit), but for the hypothesis test we'd rather have superset data we can filter than miss the targeted events. Once the captured response is in hand, we tighten the predicate and update the directive.
+Predicate:
+
+```js
+isRateLimitResponse(ctx) =
+  ctx.status === 429 &&
+  ctx.body?.type === "error" &&
+  ctx.body?.error?.type === "rate_limit_error"
+```
+
+Header signals (`x-should-retry`, `request-id`) are recorded in the JSONL row but not used as detection gates — Anthropic could change them independently of the body, and the body schema is the canonical contract.
+
+**Why not also gate on `x-should-retry: "true"`:** the dataset is consistent on that signal, but adding it to the gate makes the predicate sensitive to a header Anthropic could reasonably tweak. We log it; we don't predicate on it.
+
+**What we deliberately won't catch with this predicate:** classic RPM/TPM 429s (if they have a different `error.type`) and any future error class Anthropic might add. That's intentional — the directive is specifically about the burst/concurrency limiter.
 
 ## Pipeline integration
 
@@ -123,18 +144,32 @@ No env var enable flag (matches Lead's brief: "Append to a separate file ... so 
 | Concurrent sessions estimate: counts session files modified within last 5 min | scaffolded |
 | Streamed-429 path | DEFERRED — depends on captured response path |
 
-## What ships in this PR vs. what waits for captured 429
+## Hypothesis findings (post-capture)
 
-**Ships (groundwork, this PR):**
+From Lead's 2026-05-08 analysis (`cache-fix-429-burst-data-2026-05-08.md`):
+
+| Hypothesis | Result |
+|---|---|
+| H1 — burst limiter still operates on old peak schedule (13-19 UTC weekday) | **Refuted.** Capture window 00:06-00:21 UTC, far outside any peak window. |
+| H2 — bursts triggered by wake-from-idle activity (multiple agents reconnecting) | **Confirmed.** Burst happened during simultaneous Code Agent + Lead session re-engagement after idle. |
+| Latent — CC silently retries with exponential backoff before surfacing the user-visible error | **Confirmed and observable.** First sub-burst showed clean 0.86s → 1.38s → 2.22s → 3.78s spacing. Means the user-visible "Rate limited" error represents an exhausted retry budget, not a single API call. Worth folding into community framing. |
+
+`peak_hour_old_schedule` is still emitted on every record — it's now observational data rather than a primary hypothesis test, but cheap to compute and useful for future analysis.
+
+## What ships in this PR
+
 - Directive doc (this file)
-- `proxy/extensions/rate-limit-log.mjs` skeleton with v0 detection predicate
-- Test scaffold with above tests, marked `t.todo` where they need real capture data
-- No `extensions.json` activation (default-off)
+- `proxy/extensions/rate-limit-log.mjs` — full extension with capture-grounded predicate; default `enabled: false` (opt-in via `extensions.json`)
+- `test/proxy-rate-limit-log.test.mjs` — 27 tests covering predicate (positive on captured fixture, negative on `overloaded_error` / `invalid_request_error` / no body), field extractors (peak-hour boundaries, body excerpt bounding, mtime-window session counting), and end-to-end pipeline integration on a tmpdir-rooted HOME
+- `test/fixtures/burst-limit-429.json` — anonymized response payload from the captured burst
+- No `extensions.json` activation (extension defaults off; users opt in)
 
-**Waits for captured 429 (follow-up PR):**
-- Tighten `isRateLimitResponse()` to match the actual body/header signature
-- Add streamed-detection branch if Anthropic returns 429-as-SSE
-- Replace `t.todo` markers with real assertions against captured-bytes fixture
-- Document the captured response shape in this directive
+## Out of scope for this PR
+
+These are flagged as separate work in Lead's 2026-05-08 brief, not addressed here:
+
+- **Burst handling** (Candidate A — reactive retry; Candidate B — proactive token bucket). Logging is a prerequisite to deciding which approach pays off; the data this extension collects will inform that decision.
+- **Streaming-side detection.** Not needed against current capture; will be added if/when Anthropic shifts the response shape.
+- **Tighter sub-classification of 429s.** The predicate gates on `error.type === "rate_limit_error"` only. If Anthropic ever distinguishes burst-limit from RPM/TPM with separate `error.type` values, this will need refining.
 
 — Proxy Builder

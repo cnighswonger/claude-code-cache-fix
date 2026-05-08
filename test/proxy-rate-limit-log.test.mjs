@@ -1,16 +1,16 @@
 // Tests for proxy/extensions/rate-limit-log.mjs.
 //
-// Scaffolded ahead of a captured 429 response — the detection predicate is
-// the conservative v0 (status === 429). t.todo markers below indicate
-// assertions that need to be tightened against real captured bytes once
-// AI Team Lead's interim socat/tee tee surfaces the actual upstream shape.
-// See docs/directives/proxy-rate-limit-logging.md for the full design.
+// Detection predicate is grounded in the 2026-05-08 88-event burst capture —
+// see docs/directives/proxy-rate-limit-logging.md. Fixture at
+// test/fixtures/burst-limit-429.json (anonymized from the raw capture at
+// ~/.local/share/cache-fix-rate-limit-capture/log.jsonl).
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   isRateLimitResponse,
   estimateRequestSizeTokens,
@@ -22,23 +22,36 @@ import {
   writeRecord,
 } from "../proxy/extensions/rate-limit-log.mjs";
 
+const __dirname = dirname(fileURLToPath(import.meta.url));
+// Anonymized capture from the 2026-05-08 88-event burst.
+const CAPTURED_429 = JSON.parse(readFileSync(join(__dirname, "fixtures", "burst-limit-429.json"), "utf8"));
+const CAPTURED_429_BODY = JSON.parse(CAPTURED_429.body);
+
+function makeCapturedCtx(overrides = {}) {
+  return {
+    status: CAPTURED_429.status,
+    headers: { ...CAPTURED_429.headers },
+    body: { ...CAPTURED_429_BODY },
+    meta: {},
+    ...overrides,
+  };
+}
+
 // ---------------------------------------------------------------------------
-// isRateLimitResponse — v0 predicate (status === 429)
+// isRateLimitResponse — status + body-shape predicate, grounded in capture
 // ---------------------------------------------------------------------------
 
-test("[#1] isRateLimitResponse: 429 status → true", () => {
-  assert.equal(isRateLimitResponse({ status: 429 }), true);
+test("[#1] isRateLimitResponse: real captured 429 fixture → true", () => {
+  // Drives the actual response shape from the 2026-05-08 burst capture.
+  assert.equal(isRateLimitResponse(makeCapturedCtx()), true);
 });
 
 test("[#2] isRateLimitResponse: 200 status → false", () => {
-  assert.equal(isRateLimitResponse({ status: 200 }), false);
+  assert.equal(isRateLimitResponse({ status: 200, body: {} }), false);
 });
 
-test("[#3] isRateLimitResponse: 500 status → false (v0 only fires on 429)", () => {
-  // TODO(captured-429): if the burst-limit ever surfaces as 5xx with a
-  // distinguishing body shape, broaden this predicate. Until we have a real
-  // capture, 5xx stays out of scope.
-  assert.equal(isRateLimitResponse({ status: 500 }), false);
+test("[#3] isRateLimitResponse: 500 status → false (predicate gates on 429 specifically)", () => {
+  assert.equal(isRateLimitResponse({ status: 500, body: { type: "error", error: { type: "rate_limit_error" } } }), false);
 });
 
 test("[#4] isRateLimitResponse: undefined ctx → false (defensive)", () => {
@@ -47,9 +60,25 @@ test("[#4] isRateLimitResponse: undefined ctx → false (defensive)", () => {
   assert.equal(isRateLimitResponse({}), false);
 });
 
-test.todo(
-  "[#5] isRateLimitResponse: tighten to match captured 429 body/header signature — distinguish burst-limit from RPM/TPM 429",
-);
+test("[#5] isRateLimitResponse: 429 with non-rate_limit_error body → false", () => {
+  // Status alone is not enough — the predicate also requires the canonical
+  // rate_limit_error body shape. This is what distinguishes the burst-limit
+  // hits from other 429-class errors that may exist (auth quota, etc.).
+  assert.equal(
+    isRateLimitResponse({ status: 429, body: { type: "error", error: { type: "overloaded_error" } } }),
+    false,
+  );
+  assert.equal(
+    isRateLimitResponse({ status: 429, body: { type: "error", error: { type: "invalid_request_error" } } }),
+    false,
+  );
+});
+
+test("[#5a] isRateLimitResponse: 429 with no body / non-object body → false", () => {
+  assert.equal(isRateLimitResponse({ status: 429 }), false);
+  assert.equal(isRateLimitResponse({ status: 429, body: null }), false);
+  assert.equal(isRateLimitResponse({ status: 429, body: "Error" }), false);
+});
 
 // ---------------------------------------------------------------------------
 // Field extractors
@@ -225,15 +254,102 @@ test("[#22] writeRecord: appends one JSON line per call, parsable", async () => 
 });
 
 // ---------------------------------------------------------------------------
-// Pipeline-level integration deferred to a follow-up PR after captured-429
-// fixture lands. The follow-up will:
-//   - drive a synthetic 429 (matching captured shape) through runOnRequest +
-//     runOnResponse and assert a row appears at the configured log path
-//   - drive a 200 SSE response and assert NO row appears
-//   - if the captured response turns out to be SSE-shaped, add an
-//     onStreamEvent detection branch + corresponding pipeline test
+// Extension-level integration: drive captured-shape 429 through onRequest +
+// onResponse on a tmpdir-rooted HOME and verify one JSONL row lands.
 // ---------------------------------------------------------------------------
 
-test.todo("[#23] pipeline: 429 response writes one JSONL row to ~/.claude/usage-log/rate-limit-events.jsonl");
-test.todo("[#24] pipeline: 200 response writes zero rows");
-test.todo("[#25] pipeline: SSE-shaped 429 (if upstream uses that path) writes one row via onStreamEvent");
+import rateLimitLog from "../proxy/extensions/rate-limit-log.mjs";
+
+function setupHome() {
+  const home = mkdtempSync(join(tmpdir(), "rll-home-"));
+  mkdirSync(join(home, ".claude", "quota-status", "sessions"), { recursive: true });
+  // Seed account.json so q5h_pct_at_event has a concrete value to assert on.
+  writeFileSync(
+    join(home, ".claude", "quota-status", "account.json"),
+    JSON.stringify({ five_hour: { pct: 17 } }),
+  );
+  const oldHome = process.env.HOME;
+  process.env.HOME = home;
+  return {
+    home,
+    logPath: join(home, ".claude", "usage-log", "rate-limit-events.jsonl"),
+    cleanup: () => {
+      process.env.HOME = oldHome;
+      rmSync(home, { recursive: true, force: true });
+    },
+  };
+}
+
+test("[#23] extension: captured-shape 429 → exactly one JSONL row written", async () => {
+  const env = setupHome();
+  try {
+    const ctx = makeCapturedCtx({ meta: { _sessionId: "session-A", _requestPath: "/v1/messages" } });
+    // Simulate the request-side hook so meta._requestSizeTokens is populated.
+    await rateLimitLog.onRequest({ body: { messages: [{ content: "x".repeat(40) }] }, headers: {}, meta: ctx.meta });
+    await rateLimitLog.onResponse(ctx);
+
+    assert.ok(existsSync(env.logPath), "JSONL file must exist at ~/.claude/usage-log/rate-limit-events.jsonl");
+    const lines = readFileSync(env.logPath, "utf8").trim().split("\n");
+    assert.equal(lines.length, 1, "exactly one row written");
+
+    const row = JSON.parse(lines[0]);
+    assert.equal(row.type, "rate_limit");
+    assert.equal(row.response_status, 429);
+    assert.equal(row.session_id, "session-A");
+    assert.equal(row.request_size_tokens, 10);
+    assert.match(row.response_body_excerpt, /"rate_limit_error"/);
+    // Captured fields from the real response.
+    assert.equal(row.x_should_retry, "true");
+    assert.equal(row.upstream_request_id, CAPTURED_429_BODY.request_id);
+    // q5h read from the seeded account.json
+    assert.equal(row.q5h_pct_at_event, 17);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("[#24] extension: 200 response writes zero rows", async () => {
+  const env = setupHome();
+  try {
+    await rateLimitLog.onResponse({
+      status: 200,
+      headers: {},
+      body: { type: "message", content: [{ type: "text", text: "hello" }] },
+      meta: {},
+    });
+    assert.equal(existsSync(env.logPath), false, "no JSONL file should be written for 200 responses");
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("[#25] extension: 429 with non-rate_limit_error body writes zero rows (predicate gating)", async () => {
+  const env = setupHome();
+  try {
+    await rateLimitLog.onResponse({
+      status: 429,
+      headers: {},
+      body: { type: "error", error: { type: "overloaded_error", message: "..." } },
+      meta: {},
+    });
+    assert.equal(existsSync(env.logPath), false, "non-burst-limit 429s should not be logged by this extension");
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("[#26] extension: two captured 429s in sequence write two JSONL rows", async () => {
+  // Mirrors the burst capture (88 events in 15 min). Each one stands as its
+  // own incident — append-only, no dedup.
+  const env = setupHome();
+  try {
+    await rateLimitLog.onResponse(makeCapturedCtx({ meta: { _sessionId: "session-A" } }));
+    await rateLimitLog.onResponse(makeCapturedCtx({ meta: { _sessionId: "session-B" } }));
+    const lines = readFileSync(env.logPath, "utf8").trim().split("\n");
+    assert.equal(lines.length, 2);
+    assert.equal(JSON.parse(lines[0]).session_id, "session-A");
+    assert.equal(JSON.parse(lines[1]).session_id, "session-B");
+  } finally {
+    env.cleanup();
+  }
+});

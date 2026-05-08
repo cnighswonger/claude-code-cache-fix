@@ -1,0 +1,22 @@
+{
+    "status": 429,
+    "headers": {
+        "date": "Fri, 08 May 2026 00:06:32 GMT, Fri, 08 May 2026 00:06:33 GMT",
+        "server": "uvicorn",
+        "content-type": "application/json",
+        "connection": "keep-alive",
+        "x-should-retry": "true",
+        "request-id": "REDACTED",
+        "strict-transport-security": "max-age=31536000; includeSubDomains; preload",
+        "anthropic-organization-id": "REDACTED",
+        "traceresponse": "REDACTED",
+        "x-envoy-upstream-service-time": "91",
+        "content-security-policy": "default-src 'none'; frame-ancestors 'none'",
+        "vary": "Accept-Encoding",
+        "cf-cache-status": "DYNAMIC",
+        "x-robots-tag": "none",
+        "cf-ray": "REDACTED",
+        "content-length": "114"
+    },
+    "body": "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Error\"},\"request_id\":\"req_011Cap8HR35JaWR1UN2Aop9G\"}"
+}
