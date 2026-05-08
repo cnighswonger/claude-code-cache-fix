@@ -147,9 +147,19 @@ plus the visualization layer from his dashboard, with no coordination needed.
  * Translate one claude-code-cache-fix usage.jsonl record into a
  * fgrosswig-dashboard-compatible NDJSON record. Returns null if the
  * record doesn't have enough fields to be usable.
+ *
+ * Accepts both schemas:
+ *   - Preload-era: `entry.timestamp`, `entry.q5h_pct` / `entry.q7d_pct` (int 0-100)
+ *   - Proxy v:1 (MeterRowSchema, written by `usage-log` extension v3.2.0+):
+ *     `entry.ts`, `entry.q5h` / `entry.q7d` (float 0-1)
+ *
+ * Both forms are handled via fallback so this translator continues to work
+ * across the schema evolution. Tracking issue: #112.
  */
-function translateRecord(entry) {
-  if (!entry || !entry.timestamp || !entry.model) return null;
+export function translateRecord(entry) {
+  // Entry guard — accept both formats. Drop only when neither timestamp form
+  // is present, or model is missing.
+  if (!entry || !(entry.timestamp || entry.ts) || !entry.model) return null;
 
   const inTok = entry.input_tokens || 0;
   const outTok = entry.output_tokens || 0;
@@ -167,19 +177,28 @@ function translateRecord(entry) {
   }
 
   // Reconstruct a minimal response_anthropic_headers blob from the quota
-  // pct fields we captured. Not byte-identical to what the proxy would see
-  // on the wire, but structurally compatible for the dashboard's consumers.
+  // fields we captured. Two schema flavors:
+  //   preload: q5h_pct / q7d_pct as int 0-100 (divide by 100 to get utilization)
+  //   v:1:     q5h / q7d as float 0-1 (already in utilization form)
+  // Not byte-identical to what the proxy would see on the wire, but
+  // structurally compatible for the dashboard's consumers.
   const responseHeaders = {};
   if (entry.q5h_pct != null) {
     responseHeaders['anthropic-ratelimit-unified-5h-utilization'] = String(entry.q5h_pct / 100);
+  } else if (entry.q5h != null) {
+    responseHeaders['anthropic-ratelimit-unified-5h-utilization'] = String(entry.q5h);
   }
   if (entry.q7d_pct != null) {
     responseHeaders['anthropic-ratelimit-unified-7d-utilization'] = String(entry.q7d_pct / 100);
+  } else if (entry.q7d != null) {
+    responseHeaders['anthropic-ratelimit-unified-7d-utilization'] = String(entry.q7d);
   }
 
+  const entryTs = entry.timestamp || entry.ts;
+
   const rec = {
-    ts_start: entry.timestamp,
-    ts_end: entry.timestamp,
+    ts_start: entryTs,
+    ts_end: entryTs,
     duration_ms: null,
     method: 'POST',
     path: '/v1/messages',
@@ -207,7 +226,7 @@ function translateRecord(entry) {
 
   // Synthesize a stable pseudo-request-id from timestamp + model for dedup
   // at the dashboard layer. Not a real request ID — just a deterministic key.
-  rec.req_id = 'ccf_' + entry.timestamp.replace(/[^0-9]/g, '') + '_' + entry.model.slice(-6);
+  rec.req_id = 'ccf_' + entryTs.replace(/[^0-9]/g, '') + '_' + entry.model.slice(-6);
 
   return rec;
 }
@@ -339,14 +358,19 @@ function runFollow(opts) {
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
-const opts = parseArgs();
-if (opts.help) {
-  printUsage();
-  process.exit(0);
-}
+// Guard CLI execution so tests can `import { translateRecord }` without
+// auto-running the batch/follow flow.
+const _isMain = import.meta.url === `file://${process.argv[1]}`;
+if (_isMain) {
+  const opts = parseArgs();
+  if (opts.help) {
+    printUsage();
+    process.exit(0);
+  }
 
-if (opts.follow) {
-  runFollow(opts);
-} else {
-  runBatch(opts);
+  if (opts.follow) {
+    runFollow(opts);
+  } else {
+    runBatch(opts);
+  }
 }

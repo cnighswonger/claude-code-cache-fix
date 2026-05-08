@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [3.5.3] - 2026-05-08
+
+### Fixed
+
+- **`tools/usage-to-dashboard-ndjson.mjs`: documented dashboard-integration bridge silently dropped every v:1 usage row (#112).** The translator was written for the preload-era `usage.jsonl` schema (`entry.timestamp`, `entry.q5h_pct` / `entry.q7d_pct` as int 0-100). The proxy `usage-log` extension introduced in v3.2.0 writes MeterRowSchema v:1 with three field renames (`entry.ts`, `entry.q5h` / `entry.q7d` as float 0-1). The translator's entry guard `if (!entry.timestamp) return null` silently dropped every v:1 row, so external dashboards consuming the bridge received zero data from proxy-mode sessions. The integration is documented in our README's Companion Tools section and `docs/dashboard-integration.md` — this was a documented-feature regression. Fix: entry guard, quota-header reconstruction, `ts_start`/`ts_end` mapping, and `req_id` generation now accept both schemas via fallback (preload-era field if present, else v:1 field). Backwards-compatible — both formats work, no migration required. Adds 16 regression tests covering both schemas plus parity (`req_id` is identical for the same logical request expressed in either schema, so dashboards that dedup on `req_id` won't see duplicates from a user upgrading preload→proxy). Reported by [@TomTheMenace](https://github.com/TomTheMenace) with a tested patch already in the issue body — thank you.
+
+### Tests
+
+772 → 788 (+16): regression coverage for the dashboard-integration translator (#112) — preload-era and v:1 entry guard, ts_start/ts_end mapping, quota-header reconstruction with the legacy-takes-precedence rule, deterministic req_id, and full record parity between schemas.
+
 ## [3.5.2] - 2026-05-07
 
 ### Security
