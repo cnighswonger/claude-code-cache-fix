@@ -1,7 +1,11 @@
 // rate-limit-log — append per-event record to ~/.claude/usage-log/rate-limit-events.jsonl
-// when an upstream response looks like a burst/concurrency rate-limit hit.
+// when an upstream response carries the canonical Anthropic rate-limit error
+// envelope. This is a SUPERSET of burst/concurrency events: the same
+// envelope is returned for RPM/ITPM/OTPM and auto-mode classifier overflow.
+// Splitting the classes is a post-analysis problem on the JSONL stream.
 //
-// See docs/directives/proxy-rate-limit-logging.md for the full design.
+// See docs/directives/proxy-rate-limit-logging.md for the full design and
+// the post-analysis playbook.
 //
 // Activation: enabled:false in the export default. Users opt in via
 //   "rate-limit-log": { "enabled": true, "order": 660 }

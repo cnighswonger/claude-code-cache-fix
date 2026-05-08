@@ -62,8 +62,9 @@ test("[#4] isRateLimitResponse: undefined ctx → false (defensive)", () => {
 
 test("[#5] isRateLimitResponse: 429 with non-rate_limit_error body → false", () => {
   // Status alone is not enough — the predicate also requires the canonical
-  // rate_limit_error body shape. This is what distinguishes the burst-limit
-  // hits from other 429-class errors that may exist (auth quota, etc.).
+  // rate_limit_error body shape. This is what distinguishes the rate-limit
+  // class (any rate_limit_error 429: burst/RPM/TPM/classifier) from other
+  // 429-shaped errors (auth quota, overloaded_error, etc.).
   assert.equal(
     isRateLimitResponse({ status: 429, body: { type: "error", error: { type: "overloaded_error" } } }),
     false,
