@@ -1,10 +1,10 @@
 # Directive: rate-limit event logging in the proxy
 
-**Status:** detection grounded in 88-event burst capture (2026-05-08); ready for review.
+**Status:** detection grounded in 88-event burst capture (2026-05-08); reframed in response to Codex review #111 to log all `rate_limit_error` 429s rather than claiming burst-only semantics.
 **Author:** Proxy Builder
 **References:**
 - `~/git_repos/claude/docs/issues/cache-fix-rate-limit-logging-2026-05-07.md` (original brief)
-- `~/git_repos/claude/docs/issues/cache-fix-429-burst-data-2026-05-08.md` (capture + analysis)
+- `~/git_repos/claude/docs/issues/cache-fix-429-burst-data-2026-05-08.md` (capture + analysis, including auto-mode classifier finding)
 - Anonymized fixture: `test/fixtures/burst-limit-429.json`
 
 ## Problem statement
@@ -71,7 +71,7 @@ The proxy already supports four hooks on the pipeline:
 
 ## Detection condition (grounded in capture)
 
-From the 2026-05-08 88-event burst (15 min, single account, full HTTP fidelity), every burst-limit response had:
+From the 2026-05-08 88-event burst (15 min, single account, full HTTP fidelity), every captured response had:
 
 | Field | Value |
 |---|---|
@@ -95,9 +95,32 @@ isRateLimitResponse(ctx) =
 
 Header signals (`x-should-retry`, `request-id`) are recorded in the JSONL row but not used as detection gates — Anthropic could change them independently of the body, and the body schema is the canonical contract.
 
-**Why not also gate on `x-should-retry: "true"`:** the dataset is consistent on that signal, but adding it to the gate makes the predicate sensitive to a header Anthropic could reasonably tweak. We log it; we don't predicate on it.
+## Scope: this is a SUPERSET of burst-limit events
 
-**What we deliberately won't catch with this predicate:** classic RPM/TPM 429s (if they have a different `error.type`) and any future error class Anthropic might add. That's intentional — the directive is specifically about the burst/concurrency limiter.
+Per Anthropic's public docs, the `rate_limit_error` envelope is shared across multiple 429 classes:
+
+| Class | Notes |
+|---|---|
+| **Burst/concurrency limit** | Account-wide concurrent-stream cap. The community-tracked failure mode (anthropics/claude-code#53922). The 2026-05-08 88-event burst was almost certainly this class. |
+| **RPM (requests-per-minute)** | Classic per-key rate limit. Documented but rarely surfaced in CC traffic. |
+| **ITPM / OTPM (input/output tokens-per-minute)** | Classic per-key rate limit. Same envelope. |
+| **Auto-mode classifier overflow** | Per Lead's 2026-05-08 follow-up: CC's auto-mode runs a separate Opus-4-7 safety classifier API call before each Edit. These calls share the account-wide concurrency limiter, so when it saturates, the classifier 429s alongside main-inference traffic. Effectively doubles the API-call rate per visible Edit turn. Sessions on Sonnet are still gated by Opus 4.7 quota via this path. |
+
+The response itself carries no field that distinguishes these classes — `error.message` is literally the string `"Error"`. So we **deliberately log the superset** and let post-analysis split.
+
+## Post-analysis playbook
+
+To distinguish the classes from the JSONL stream, use:
+
+| Signal | What it tells you |
+|---|---|
+| `requested_model` | Opus 4.7 with small `request_size_tokens` ⇒ likely classifier traffic (Lead's finding). Larger size at any model ⇒ likely main-inference. |
+| `request_size_tokens` | Tiny (~50-200) suggests classifier; larger suggests main-inference. |
+| Inter-arrival timing across rows | Exponential pattern (0.86s → 1.38s → 2.22s → ...) ⇒ a single CC session retrying. Compressed parallel spacing ⇒ multi-agent burst. The 2026-05-08 wave/quiet/wave structure showed both within one 15-min window. |
+| `concurrent_sessions_estimate` | Higher count alongside a 429 ⇒ multi-agent contention more likely. |
+| `session_id` distribution | Multiple distinct ids in a tight time window ⇒ burst/concurrency. Same id repeating ⇒ single-session retry. |
+
+This is exactly the analysis Lead used to identify the wave/quiet/wave structure post-capture. The extension's job is to write the rows; the classification is downstream.
 
 ## Pipeline integration
 
@@ -153,6 +176,7 @@ From Lead's 2026-05-08 analysis (`cache-fix-429-burst-data-2026-05-08.md`):
 | H1 — burst limiter still operates on old peak schedule (13-19 UTC weekday) | **Refuted.** Capture window 00:06-00:21 UTC, far outside any peak window. |
 | H2 — bursts triggered by wake-from-idle activity (multiple agents reconnecting) | **Confirmed.** Burst happened during simultaneous Code Agent + Lead session re-engagement after idle. |
 | Latent — CC silently retries with exponential backoff before surfacing the user-visible error | **Confirmed and observable.** First sub-burst showed clean 0.86s → 1.38s → 2.22s → 3.78s spacing. Means the user-visible "Rate limited" error represents an exhausted retry budget, not a single API call. Worth folding into community framing. |
+| Classifier-doubles-rate (added 2026-05-08) | **Confirmed via separate error path.** CC's auto-mode runs an Opus-4-7 safety classifier per Edit, so the effective API-call rate is roughly 2x the visible turn rate. Classifier traffic shares the same concurrency limiter and shows up in the 429 stream. |
 
 `peak_hour_old_schedule` is still emitted on every record — it's now observational data rather than a primary hypothesis test, but cheap to compute and useful for future analysis.
 
@@ -168,8 +192,8 @@ From Lead's 2026-05-08 analysis (`cache-fix-429-burst-data-2026-05-08.md`):
 
 These are flagged as separate work in Lead's 2026-05-08 brief, not addressed here:
 
-- **Burst handling** (Candidate A — reactive retry; Candidate B — proactive token bucket). Logging is a prerequisite to deciding which approach pays off; the data this extension collects will inform that decision.
+- **Burst handling** (Candidate A — reactive retry; Candidate B — proactive token bucket). Logging is a prerequisite to deciding which approach pays off; the data this extension collects will inform that decision. Both candidates must include classifier-path traffic; that's tracked separately.
 - **Streaming-side detection.** Not needed against current capture; will be added if/when Anthropic shifts the response shape.
-- **Tighter sub-classification of 429s.** The predicate gates on `error.type === "rate_limit_error"` only. If Anthropic ever distinguishes burst-limit from RPM/TPM with separate `error.type` values, this will need refining.
+- **Server-side request-class detection.** As long as Anthropic returns `error.message: "Error"` with no class hint, splitting burst-vs-RPM/TPM and classifier-vs-main is a post-analysis problem on the JSONL. If Anthropic ever adds a discriminator field (e.g., `error.subtype` or a `representative_claim` header), the extractor in this extension is the natural place to land it.
 
 — Proxy Builder

@@ -15,6 +15,17 @@
 // body.type === "error", body.error.type === "rate_limit_error",
 // x-should-retry: "true". No Retry-After. No anthropic-ratelimit-* headers.
 // Anthropic's `error.message` is literally "Error" — no class hint.
+//
+// SCOPE NOTE: this extension logs ALL `rate_limit_error` 429s. Per
+// Anthropic's public docs, that error type is shared across the
+// burst/concurrency limiter, classic RPM/ITPM/OTPM limiters, and (per
+// Lead's 2026-05-08 follow-up) auto-mode classifier traffic on Opus 4.7.
+// The response itself carries no signal that distinguishes those classes —
+// `error.message` is literally "Error". Splitting burst-vs-RPM/TPM and
+// classifier-vs-main-inference happens in post-analysis, using the
+// recorded `requested_model`, `request_path`, inter-arrival timing, and
+// `request_size_tokens` fields on each row. Do NOT treat this file as
+// burst-limit-only evidence; it's a superset.
 
 import { mkdir, appendFile } from "node:fs/promises";
 import { readdirSync, statSync, readFileSync } from "node:fs";
@@ -37,16 +48,19 @@ const ACTIVE_SESSION_WINDOW_MS = 5 * 60 * 1000;
 
 // --- Detection predicate ---
 //
-// Grounded in the 2026-05-08 88-event burst capture: every burst-limit 429
-// has body shape {"type":"error","error":{"type":"rate_limit_error",...}}.
-// We require both the HTTP status AND the body shape — status alone would
-// also catch classic RPM/TPM 429s, which may have a different error.type
-// (we don't have a captured non-burst 429 to compare yet, but the brief flags
-// this as the desired distinction).
+// Matches the canonical Anthropic rate-limit error envelope:
+//   { "type": "error", "error": { "type": "rate_limit_error", ... } } at 429
 //
-// Header-only signals (x-should-retry: "true") are reported in the record but
-// not used as detection gates — Anthropic could change those independently of
-// the body, and the body schema is the canonical contract.
+// Per Anthropic's public docs and the 2026-05-08 capture, this envelope is
+// returned for every flavor of 429 — burst/concurrency, RPM, ITPM, OTPM,
+// and auto-mode classifier overflow. The response itself carries no
+// discriminator. Distinguishing the classes is a post-analysis problem
+// over the JSONL using inter-arrival timing, `requested_model`, and
+// `request_size_tokens`. See directive for the analysis playbook.
+//
+// Header signals (x-should-retry, request-id) are recorded in the row but
+// NOT used as detection gates — Anthropic could change them independently
+// of the body, and the body schema is the canonical contract.
 export function isRateLimitResponse(ctx) {
   if (!ctx || typeof ctx.status !== "number") return false;
   if (ctx.status !== 429) return false;
@@ -80,11 +94,21 @@ export function estimateRequestSizeTokens(body) {
   return Math.ceil(chars / 4);
 }
 
+// Bounds the persisted excerpt length, NOT the temporary serialization
+// allocation. JSON.stringify still materializes the full body string before
+// the slice. In practice this is fine — Anthropic's 429 bodies are ~120
+// bytes per the 2026-05-08 capture, and the proxy already buffers the full
+// body upstream of this extension (server.mjs:79-82). For string inputs the
+// length is capped pre-stringify, so a hostile pre-rendered string can't
+// blow up here. If a future call site ever passes a giant pre-built object
+// graph, the upstream-buffering and per-extension try/catch isolate the
+// allocation cost from the rest of the pipeline.
 export function bodyExcerpt(body) {
   if (body === undefined || body === null) return "";
+  if (typeof body === "string") return body.slice(0, BODY_EXCERPT_MAX);
   let s;
   try {
-    s = typeof body === "string" ? body : JSON.stringify(body);
+    s = JSON.stringify(body);
   } catch {
     s = String(body);
   }
@@ -135,9 +159,11 @@ export function buildRecord({ ctx, now = new Date() }) {
   const xShouldRetry = ctx?.headers?.["x-should-retry"] || null;
 
   return {
+    schema_version: 1,
     ts: now.toISOString(),
     type: "rate_limit",
     session_id: ctx?.meta?._sessionId ?? null,
+    requested_model: ctx?.meta?._requestedModel ?? null,
     request_path: ctx?.meta?._requestPath || "/v1/messages",
     request_size_tokens: ctx?.meta?._requestSizeTokens ?? 0,
     response_status: ctx?.status ?? null,
@@ -181,6 +207,17 @@ export default {
     try {
       ctx.meta = ctx.meta || {};
       ctx.meta._requestSizeTokens = estimateRequestSizeTokens(ctx.body);
+      // Capture the requested model so post-analysis can distinguish
+      // auto-mode classifier traffic (Opus 4.7) from main-inference (any
+      // model). Per Lead's 2026-05-08 finding, CC's auto-mode safety
+      // classifier runs a separate Opus-4-7 API call before each Edit, and
+      // those classifier calls share the same account-wide concurrency
+      // limiter — so the rate-limit JSONL is naturally a mix of both
+      // traffic types. requested_model + request_size_tokens together let
+      // post-analysis split them.
+      if (typeof ctx.body.model === "string") {
+        ctx.meta._requestedModel = ctx.body.model;
+      }
       // Future-proof: when the proxy gains other paths beyond /v1/messages,
       // pass the path through ctx so we can record it. Until then default in
       // buildRecord. We don't have ctx.path today, so this is a no-op.

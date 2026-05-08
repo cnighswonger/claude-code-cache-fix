@@ -207,13 +207,16 @@ test("[#20] buildRecord: full happy path with all fields populated", () => {
       _sessionId: "b16c607d-d484-4935-840e-e3f7ee78eb08",
       _requestSizeTokens: 50,
       _requestPath: "/v1/messages",
+      _requestedModel: "claude-opus-4-7",
     },
   };
   const now = new Date(Date.UTC(2026, 4, 7, 14, 30, 45, 123)); // Thu 14:30:45.123 UTC — peak
   const record = buildRecord({ ctx, now });
+  assert.equal(record.schema_version, 1);
   assert.equal(record.ts, "2026-05-07T14:30:45.123Z");
   assert.equal(record.type, "rate_limit");
   assert.equal(record.session_id, "b16c607d-d484-4935-840e-e3f7ee78eb08");
+  assert.equal(record.requested_model, "claude-opus-4-7");
   assert.equal(record.request_path, "/v1/messages");
   assert.equal(record.request_size_tokens, 50);
   assert.equal(record.response_status, 429);
@@ -229,7 +232,9 @@ test("[#20] buildRecord: full happy path with all fields populated", () => {
 test("[#21] buildRecord: missing meta fields → null/zero defaults, no throw", () => {
   const ctx = { status: 429, body: { error: "x" }, meta: {} };
   const record = buildRecord({ ctx });
+  assert.equal(record.schema_version, 1);
   assert.equal(record.session_id, null);
+  assert.equal(record.requested_model, null);
   assert.equal(record.request_size_tokens, 0);
   assert.equal(record.request_path, "/v1/messages");
 });
@@ -284,8 +289,13 @@ test("[#23] extension: captured-shape 429 → exactly one JSONL row written", as
   const env = setupHome();
   try {
     const ctx = makeCapturedCtx({ meta: { _sessionId: "session-A", _requestPath: "/v1/messages" } });
-    // Simulate the request-side hook so meta._requestSizeTokens is populated.
-    await rateLimitLog.onRequest({ body: { messages: [{ content: "x".repeat(40) }] }, headers: {}, meta: ctx.meta });
+    // Simulate the request-side hook so meta._requestSizeTokens AND
+    // meta._requestedModel are populated.
+    await rateLimitLog.onRequest({
+      body: { model: "claude-opus-4-7", messages: [{ content: "x".repeat(40) }] },
+      headers: {},
+      meta: ctx.meta,
+    });
     await rateLimitLog.onResponse(ctx);
 
     assert.ok(existsSync(env.logPath), "JSONL file must exist at ~/.claude/usage-log/rate-limit-events.jsonl");
@@ -293,9 +303,11 @@ test("[#23] extension: captured-shape 429 → exactly one JSONL row written", as
     assert.equal(lines.length, 1, "exactly one row written");
 
     const row = JSON.parse(lines[0]);
+    assert.equal(row.schema_version, 1);
     assert.equal(row.type, "rate_limit");
     assert.equal(row.response_status, 429);
     assert.equal(row.session_id, "session-A");
+    assert.equal(row.requested_model, "claude-opus-4-7");
     assert.equal(row.request_size_tokens, 10);
     assert.match(row.response_body_excerpt, /"rate_limit_error"/);
     // Captured fields from the real response.
@@ -303,6 +315,45 @@ test("[#23] extension: captured-shape 429 → exactly one JSONL row written", as
     assert.equal(row.upstream_request_id, CAPTURED_429_BODY.request_id);
     // q5h read from the seeded account.json
     assert.equal(row.q5h_pct_at_event, 17);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("[#23a] extension: classifier (Opus 4.7) vs main-inference (other model) recorded distinctly", async () => {
+  // Lead's 2026-05-08 finding: auto-mode runs a separate Opus-4-7 classifier
+  // call per Edit. Both flavors hit /v1/messages and produce the same 429
+  // body shape; requested_model is what lets post-analysis split them.
+  const env = setupHome();
+  try {
+    // Classifier-shaped request (Opus 4.7)
+    {
+      const meta = { _sessionId: "session-classifier" };
+      await rateLimitLog.onRequest({
+        body: { model: "claude-opus-4-7", messages: [{ content: "small classifier prompt" }] },
+        headers: {},
+        meta,
+      });
+      await rateLimitLog.onResponse(makeCapturedCtx({ meta }));
+    }
+    // Main-inference-shaped request (Sonnet — still gated by Opus quota per Lead's note)
+    {
+      const meta = { _sessionId: "session-main" };
+      await rateLimitLog.onRequest({
+        body: { model: "claude-sonnet-4-6", messages: [{ content: "x".repeat(2000) }] },
+        headers: {},
+        meta,
+      });
+      await rateLimitLog.onResponse(makeCapturedCtx({ meta }));
+    }
+    const lines = readFileSync(env.logPath, "utf8").trim().split("\n");
+    assert.equal(lines.length, 2);
+    const a = JSON.parse(lines[0]);
+    const b = JSON.parse(lines[1]);
+    assert.equal(a.requested_model, "claude-opus-4-7");
+    assert.equal(b.requested_model, "claude-sonnet-4-6");
+    // Sonnet request should have a larger token estimate than the classifier one.
+    assert.ok(b.request_size_tokens > a.request_size_tokens);
   } finally {
     env.cleanup();
   }
