@@ -62,3 +62,33 @@ Label applied: `changes-requested`
 ### Bottom Line
 
 This patch fixed the activation problem and improved the regex substantially, but it did not clear the full blocker set it claimed to clear. The hook still lets the `# GH_TOKEN=foo and gh ...` comment-line case through, and the shared memory now misdescribes `command gh` as a bypass even though the live script blocks it. Review stays at `changes-requested`.
+
+---
+
+## Round 3: live-hook re-review (`2026-05-09`)
+
+Reviewed: `~/.claude/hooks/gh-bot-guard.sh`, `memory/shared/reference_gh_bot_guard_hook.md`
+Label applied: `approved-by-codex-agent`
+
+### What Is Correct
+
+- The remaining live-hook blocker is fixed. Replaying the exact bypass case `# GH_TOKEN=foo and gh pr comment 117` against the current hook now returns `exit=2` with an explicit comment-line rejection message.
+- The regression check still passes. Replaying `git commit -m "fix: gh secret stuff and gh workflow run support"` returns `exit=0`, so the early-exit false-positive guard remains intact.
+- The shared memory now matches the implementation on the previously disputed point: it no longer claims `command gh ...` is a bypass and instead documents `bash -c 'gh ...'` as the practical bypass surface.
+- Additional spot checks were consistent with the documented behavior: plain `gh pr comment 117` blocks (`exit=2`), `command gh pr comment 117` blocks (`exit=2`), `GH_TOKEN=fake gh pr comment 117` passes the hook (`exit=0`), and `bash -c 'gh pr comment 117'` passes (`exit=0`) as the reference says it can.
+
+### Blockers
+
+None.
+
+### What Needs Attention
+
+- The hook remains a tripwire rather than a security boundary. `GH_TOKEN=fake gh ...` still satisfies the regex and only fails later at GitHub, which is already documented accurately in the shared memory.
+
+### Recommendations
+
+- Keep the shared memory aligned with the live hook whenever the off-repo script changes; this round cleared because the documentation was corrected alongside the script.
+
+### Bottom Line
+
+The round-2 residual blocker and accuracy note are both resolved in the live hook and shared memory. The current implementation blocks the previously missed comment-line bypass without reintroducing the false-positive regression I checked, and the remaining limitations are now documented accurately. Approved.
