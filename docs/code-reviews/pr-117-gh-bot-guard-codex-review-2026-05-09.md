@@ -36,3 +36,29 @@ The direction is correct, but the current package is not reviewable as "enforced
 ## Verdict
 
 REQUEST CHANGES
+
+---
+
+## Re-review: head `edb8c86` (`2026-05-09`)
+
+Reviewed: `git diff f63ac56..edb8c86`, `.claude/github-app`, `.claude/agent-name`, `.gitignore`, `CLAUDE.md`, `~/.claude/hooks/gh-bot-guard.sh`, `memory/shared/reference_gh_bot_guard_hook.md`
+Label applied: `changes-requested`
+
+### What Changed Since The Prior Review
+
+- **Blocker 1 is fixed.** `.claude/github-app` and `.claude/agent-name` are now tracked on the branch, `.gitignore` ignores other `.claude/*` content while unignoring those two routing files, and this checkout now activates the hook as documented. `git ls-files` includes both marker files, and replaying the hook with `cwd=/home/manager/git_repos/claude-code-cache-fix_codex` now blocks plain `gh pr comment ...` with `exit=2`.
+- The new early-exit guard does avoid the intended false positives in the cases I exercised. `git commit -m "docs mention gh secret set"` and `printf "%s" "gh pr comment ..."` both return `exit=0`, while `true && gh pr comment ...` still blocks.
+- `CLAUDE.md` is materially closer to the real behavior than before. It now names the tracked activation marker and includes the explicit "tripwire, not a security control" disclaimer.
+
+### Remaining Blockers
+
+- **Blocker 2 is not fully fixed.** The updated regex now rejects the empty-assignment and `--body "GH_TOKEN=foo"` cases, but it still accepts a shell comment containing both substrings: `# GH_TOKEN=foo and gh pr comment 117 --body test` returns `exit=0`, not `exit=2`. That directly contradicts the claimed test matrix in the PR thread and means the pass/fail story is still overstated for exactly one of the three bypass shapes raised in the prior review. Because this re-review was specifically asked to verify that all three now reject, this remains blocking.
+
+### What Needs Attention
+
+- The shared memory is no longer precise about bypasses. It says `command gh ...` can evade the regex, but the current hook blocks both `command gh pr comment ...` and `GH_TOKEN=$TOKEN command gh pr comment ...` with `exit=2`. The memory should either describe `command gh` as blocked or the script should be changed to match the documented limitation.
+- `CLAUDE.md` does not mention the same nuance, so its "not a security control" language is directionally right, but the canonical shared reference still mismatches the implementation on an important detail.
+
+### Bottom Line
+
+This patch fixed the activation problem and improved the regex substantially, but it did not clear the full blocker set it claimed to clear. The hook still lets the `# GH_TOKEN=foo and gh ...` comment-line case through, and the shared memory now misdescribes `command gh` as a bypass even though the live script blocks it. Review stays at `changes-requested`.
