@@ -15,7 +15,8 @@
     "claude-fixed.bat",
     "proxy/",
     "bin/",
-    "templates/"
+    "templates/",
+    "THIRD_PARTY_LICENSES"
   ],
   "engines": {
     "node": ">=18"
