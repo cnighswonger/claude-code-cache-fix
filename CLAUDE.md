@@ -10,6 +10,18 @@
 - Commit messages: lead with what changed and why, not how.
 - Multi-phase issues: use `Ref #N` (not `Closes #N`) until the final phase PR.
 
+## GitHub Bot Identity
+
+All `gh` writes from this repo run under the `vsits-proxy-builder[bot]` App identity, never under the operator's personal PAT. This keeps the audit trail clean and is enforced by the `gh-bot-guard.sh` PreToolUse hook (which blocks writes lacking `GH_TOKEN=`).
+
+- **Writes** (`gh issue|pr comment|create|edit|review|close|reopen|merge`, `gh release create|edit|delete|upload`, `gh api -X POST|PATCH|PUT|DELETE`):
+  ```bash
+  TOKEN=$(~/.claude/github-apps/generate-token.sh proxy-builder) && \
+    GH_TOKEN=$TOKEN gh <command> <args...>
+  ```
+- **Reads** (`gh pr view`, `gh issue view`, `gh api ... GET`, etc.): plain `gh` is fine.
+- The bot ID is stored in `.claude/github-app` (`proxy-builder`) — that file is what the guard hook reads to decide which token to demand.
+
 ## Review Workflow
 
 - For PR review work: findings first, approval only if there are no blocking issues.
