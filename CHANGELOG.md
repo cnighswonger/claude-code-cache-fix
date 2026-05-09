@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [3.5.4] - 2026-05-09
+
+### Added
+
+- **`THIRD_PARTY_LICENSES`: Apache 2.0 attribution for the NDJSON proxy log schema (#116, closes #115).** The schema used by `tools/usage-to-dashboard-ndjson.mjs` (field names, structure, `proxy-YYYY-MM-DD.ndjson` file naming convention, `cache_health` semantics, and `cost_factor` methodology) originates from [@fgrosswig](https://github.com/fgrosswig)'s [claude-usage-dashboard](https://github.com/fgrosswig/claude-usage-dashboard) (Apache License 2.0). This release adds the formal Section 4 attribution as a `THIRD_PARTY_LICENSES` file and ensures it ships in the npm tarball via the `package.json` `files` array. cache-fix overall remains MIT-licensed; only the NDJSON schema portion is governed by Apache 2.0. Reported and authored by [@fgrosswig](https://github.com/fgrosswig); the `package.json` packaging fix was pushed to his branch via maintainer-edits. Thank you, Falk.
+
+### Changed
+
+- `tools/usage-to-dashboard-ndjson.mjs`: file header acknowledges the Apache 2.0 origin of the NDJSON schema portion (the rest of the file remains under cache-fix's MIT license per the repo `LICENSE`).
+
 ## [3.5.3] - 2026-05-08
 
 ### Fixed
