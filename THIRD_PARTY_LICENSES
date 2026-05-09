@@ -1,0 +1,15 @@
+Third-Party Licenses
+====================
+
+1. claude-usage-dashboard — NDJSON proxy log schema
+
+   Source:  https://github.com/fgrosswig/claude-usage-dashboard
+   Author:  Falk Grosswig (@fgrosswig)
+   License: Apache License 2.0
+
+   The proxy NDJSON log schema used by tools/usage-to-dashboard-ndjson.mjs
+   (field names, structure, file naming convention, cache_health semantics,
+   and cost_factor methodology) originates from the claude-usage-dashboard.
+
+   Used under the Apache License, Version 2.0.
+   https://www.apache.org/licenses/LICENSE-2.0

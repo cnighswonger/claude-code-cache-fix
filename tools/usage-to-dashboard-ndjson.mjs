@@ -82,8 +82,13 @@
  *   ANTHROPIC_PROXY_LOG_DIR  Override output directory (matches fgrosswig's
  *                            dashboard env var so both tools stay in sync).
  *
- * Part of claude-code-cache-fix. MIT licensed.
+ * Part of claude-code-cache-fix.
  *   https://github.com/cnighswonger/claude-code-cache-fix
+ *
+ * The NDJSON proxy log schema (field names, structure, file naming convention,
+ * cache_health semantics) originates from fgrosswig/claude-usage-dashboard
+ * and is used under the Apache License 2.0.
+ *   https://github.com/fgrosswig/claude-usage-dashboard
  */
 
 import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, statSync, watch } from 'node:fs';
