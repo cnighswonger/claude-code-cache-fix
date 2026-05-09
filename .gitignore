@@ -1,3 +1,9 @@
 node_modules/
 .DS_Store
 *.log
+
+# .claude/ holds a mix of repo-routing identity and per-developer local state.
+# Track only the routing files; ignore everything else.
+.claude/*
+!.claude/agent-name
+!.claude/github-app

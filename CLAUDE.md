@@ -12,15 +12,17 @@
 
 ## GitHub Bot Identity
 
-All `gh` writes from this repo run under the `vsits-proxy-builder[bot]` App identity, never under the operator's personal PAT. This keeps the audit trail clean and is enforced by the `gh-bot-guard.sh` PreToolUse hook (which blocks writes lacking `GH_TOKEN=`).
+All `gh` writes from this repo run under the `vsits-proxy-builder[bot]` App identity, never under the operator's personal PAT. This keeps the audit trail clean. The `gh-bot-guard.sh` PreToolUse hook (in `~/.claude/hooks/`) provides best-effort enforcement — when its activation marker is present, it blocks `gh` write subcommands that aren't preceded by a non-empty `GH_TOKEN=<value>` environment-variable assignment.
 
-- **Writes** (`gh issue|pr comment|create|edit|review|close|reopen|merge`, `gh release create|edit|delete|upload`, `gh api -X POST|PATCH|PUT|DELETE`):
+- **Writes** — required pattern:
   ```bash
   TOKEN=$(~/.claude/github-apps/generate-token.sh proxy-builder) && \
     GH_TOKEN=$TOKEN gh <command> <args...>
   ```
-- **Reads** (`gh pr view`, `gh issue view`, `gh api ... GET`, etc.): plain `gh` is fine.
-- The bot ID is stored in `.claude/github-app` (`proxy-builder`) — that file is what the guard hook reads to decide which token to demand.
+- **Currently enforced subcommands** (the hook blocks these without a real `GH_TOKEN=<value>` prefix): `gh issue|pr` (`comment|create|edit|review|close|reopen|merge|ready|lock|unlock|delete|transfer|pin|unpin`), `gh release` (`create|edit|delete|upload`), `gh api -X (POST|PATCH|PUT|DELETE)`, `gh secret|variable` (`set|delete|remove`), `gh workflow` (`run|enable|disable|delete`), `gh repo` (`create|delete|edit|fork|rename|archive|unarchive|set-default`), `gh label|project|gist|ruleset` (`create|edit|delete|clone`), `gh run` (`rerun|cancel|delete`).
+- **Reads** (`gh pr view`, `gh issue view`, `gh api ... GET`, `gh ... list`, etc.) pass through unchanged.
+- **Activation marker**: the hook keys off `.claude/github-app` in the project tree. That file is tracked in this repo (content: `proxy-builder`) so a fresh clone gets the marker automatically; the hook walks up from `cwd` to find it.
+- **What the hook does NOT guarantee**: it cannot tell a real bot token from a syntactically-valid placeholder, and it does not catch `gh` subcommands outside the list above. Treat it as a tripwire that catches accidental plain-`gh` writes, not a security control.
 
 ## Review Workflow
 
