@@ -362,6 +362,44 @@ test("6. quota-only write skipped when no quota headers", async () => {
   }
 });
 
+test("6a. overage-billing account: writes files when only unified/overage-reset headers present", async () => {
+  // Accounts on overage billing return anthropic-ratelimit-unified-reset and
+  // anthropic-ratelimit-unified-overage-reset instead of the 5h/7d-reset headers.
+  // cache-telemetry must still write quota-status files for these accounts.
+  const env = setupTmpHome();
+  try {
+    const overageOnlyHeaders = {
+      "anthropic-ratelimit-unified-status": "allowed",
+      "anthropic-ratelimit-unified-overage-status": "allowed",
+      "anthropic-ratelimit-unified-overage-reset": "1780272000",
+      "anthropic-ratelimit-unified-overage-utilization": "0.52",
+      "anthropic-ratelimit-unified-reset": "1780272000",
+      "anthropic-ratelimit-unified-representative-claim": "overage",
+      "anthropic-ratelimit-unified-fallback-percentage": "0.5",
+    };
+    await driveResponse({
+      requestHeaders: { "x-claude-code-session-id": "overage-sess" },
+      responseHeaders: overageOnlyHeaders,
+      cacheRead: 500,
+      cacheCreation: 100,
+    });
+    const accountPath = join(env.home, ".claude", "quota-status", "account.json");
+    const sessPath = join(env.home, ".claude", "quota-status", "sessions", "overage-sess.json");
+    assert.ok(existsSync(accountPath), "account.json written for overage-billing account");
+    assert.ok(existsSync(sessPath), "session file written for overage-billing account");
+    const acc = JSON.parse(readFileSync(accountPath, "utf8"));
+    assert.strictEqual(acc.five_hour.pct, 0, "five_hour.pct is 0 (no 5h quota for this account)");
+    assert.strictEqual(acc.seven_day.pct, 0, "seven_day.pct is 0 (no 7d quota for this account)");
+    assert.strictEqual(acc.status, "allowed");
+    assert.strictEqual(acc.overage_status, "allowed");
+    const sess = JSON.parse(readFileSync(sessPath, "utf8"));
+    assert.strictEqual(sess.cache.ttl_tier, "1h", "1h TTL when cache_read > 0");
+    assert.ok(parseFloat(sess.cache.hit_rate) > 0, "hit_rate populated");
+  } finally {
+    env.cleanup();
+  }
+});
+
 test("7. atomic write: tmp file gone after rename, final exists", async () => {
   const env = setupTmpHome();
   try {

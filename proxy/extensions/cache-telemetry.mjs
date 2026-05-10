@@ -71,11 +71,15 @@ function parseHeaders(headers) {
   const overage_status = get("anthropic-ratelimit-unified-overage-status");
   const overage_util = num("anthropic-ratelimit-unified-overage-utilization");
   const overage_reset = parseInt(get("anthropic-ratelimit-unified-overage-reset")) || 0;
+  const unified_reset = parseInt(get("anthropic-ratelimit-unified-reset")) || 0;
   const fallback_pct = get("anthropic-ratelimit-unified-fallback-percentage");
   const representative = get("anthropic-ratelimit-unified-representative-claim");
   const surpassed = get("anthropic-ratelimit-unified-7d-surpassed-threshold");
 
-  if (!q5h_reset && !q7d_reset) return null;
+  // Accept any reset timestamp — accounts without 5h/7d quota windows (overage
+  // billing) return anthropic-ratelimit-unified-reset and/or
+  // anthropic-ratelimit-unified-overage-reset instead.
+  if (!q5h_reset && !q7d_reset && !unified_reset && !overage_reset) return null;
 
   const now = new Date();
   const hour = now.getUTCHours();
