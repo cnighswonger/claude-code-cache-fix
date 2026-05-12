@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [3.5.5] - 2026-05-12
+
+### Fixed
+
+- **`cache-telemetry`: overage-billing accounts had silent statusline (#121).** Accounts on Anthropic overage billing return `anthropic-ratelimit-unified-reset` and `anthropic-ratelimit-unified-overage-reset` instead of the 5h/7d-specific reset headers. The `parseHeaders` guard required `q5h_reset || q7d_reset` and returned `null` for every request on these accounts, so `cache-telemetry` wrote no `account.json` or session file and the statusline had no TTL/hit-rate data. Fix: parse `unified_reset` and widen the guard to accept any reset timestamp. Adds test 6a (overage-only header set → account/session files written, `five_hour.pct`/`seven_day.pct` correctly 0). Reported and fixed by [@TemaThe](https://github.com/TemaThe) — thank you.
+
+### Tests
+
+788 → 789 (+1): test 6a covers the overage-billing header shape end-to-end through `onResponseStart` and `onStreamEvent`.
+
 ## [3.5.4] - 2026-05-09
 
 ### Added
