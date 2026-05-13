@@ -1,4 +1,5 @@
 import http from "node:http";
+import { pathToFileURL } from "node:url";
 import config from "./config.mjs";
 import { forwardRequest } from "./upstream.mjs";
 import { streamResponse, createTelemetryRecord } from "./stream.mjs";
@@ -138,36 +139,102 @@ function handleNotFound(_req, res) {
   res.end(JSON.stringify({ error: "not_found" }));
 }
 
-const server = http.createServer((req, res) => {
-  if (req.method === "GET" && req.url === "/health") {
-    return handleHealth(req, res);
-  }
-  if (req.method === "POST" && req.url?.startsWith("/v1/messages")) {
-    return handleMessages(req, res);
-  }
-  handleNotFound(req, res);
-});
-
-function shutdown() {
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(1), 5000);
-}
-
-process.on("SIGTERM", shutdown);
-process.on("SIGINT", shutdown);
-
-async function initPipeline() {
-  try {
-    await loadExtensions(config.extensionsDir, config.extensionsConfig);
-    startWatcher(config.extensionsDir, config.extensionsConfig);
-  } catch {}
-}
-
-initPipeline().then(() => {
-  server.listen(config.port, config.bind, () => {
-    const addr = server.address();
-    process.stdout.write(`proxy listening on ${addr.address}:${addr.port}\n`);
+/**
+ * Builds an http.Server with the proxy's request handler wired in. The
+ * returned server is **not** listening and the extension pipeline has not
+ * been initialized — callers wanting a one-call setup should use
+ * `startProxy()` instead.
+ *
+ * Exposed so callers can embed the proxy in their own process (e.g.
+ * Bun-compiled binaries, test harnesses) without forking a child or
+ * shelling out to the `cache-fix-proxy` bin.
+ */
+export function createProxyServer() {
+  return http.createServer((req, res) => {
+    if (req.method === "GET" && req.url === "/health") {
+      return handleHealth(req, res);
+    }
+    if (req.method === "POST" && req.url?.startsWith("/v1/messages")) {
+      return handleMessages(req, res);
+    }
+    handleNotFound(req, res);
   });
-});
+}
 
-export { server };
+/**
+ * Builds the server, loads the extension pipeline, optionally starts the
+ * extensions-config file watcher, and starts listening. Returns a handle
+ * with the bound port (resolved when port 0 is requested) and a `close`
+ * function for graceful shutdown.
+ *
+ * All options fall back to the same env vars / defaults used by the CLI
+ * entrypoint, so existing deployments behave identically.
+ *
+ *   await startProxy()                               // env-driven, CLI parity
+ *   await startProxy({ port: 0 })                    // OS-assigned port
+ *   await startProxy({ port: 0, watch: false })      // embedded, no fs.watch
+ */
+export async function startProxy(options = {}) {
+  const port = options.port ?? config.port;
+  const bind = options.bind ?? config.bind;
+  const extensionsDir = options.extensionsDir ?? config.extensionsDir;
+  const extensionsConfig = options.extensionsConfig ?? config.extensionsConfig;
+  const watch = options.watch !== false;
+
+  try {
+    await loadExtensions(extensionsDir, extensionsConfig);
+    if (watch) startWatcher(extensionsDir, extensionsConfig);
+  } catch {}
+
+  const server = createProxyServer();
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, bind, () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+
+  const addr = server.address();
+  return {
+    server,
+    port: addr.port,
+    address: addr.address,
+    close: () =>
+      new Promise((resolve, reject) => {
+        server.close((err) => (err ? reject(err) : resolve()));
+      }),
+  };
+}
+
+// CLI entrypoint — preserves the v3.x behavior of `node proxy/server.mjs`
+// (used by `cache-fix-proxy server` and by `fork(SERVER_PATH)` in the
+// wrapper). When this module is imported as a library, none of this runs.
+const invokedAsScript =
+  typeof process !== "undefined" &&
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (invokedAsScript) {
+  let active;
+  startProxy()
+    .then((handle) => {
+      active = handle;
+      process.stdout.write(`proxy listening on ${handle.address}:${handle.port}\n`);
+    })
+    .catch((err) => {
+      process.stderr.write(`proxy failed to start: ${err.message}\n`);
+      process.exit(1);
+    });
+
+  const shutdown = () => {
+    if (!active) {
+      process.exit(0);
+      return;
+    }
+    active.close().finally(() => process.exit(0));
+    setTimeout(() => process.exit(1), 5000).unref();
+  };
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
+}

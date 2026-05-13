@@ -1,22 +1,10 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import { startProxy } from "../proxy/server.mjs";
 
-let server;
+let handle;
 let proxyPort;
-
-async function startProxy() {
-  const testPort = 19801 + Math.floor(Math.random() * 1000);
-  process.env.CACHE_FIX_PROXY_PORT = String(testPort);
-  process.env.CACHE_FIX_PROXY_BIND = "127.0.0.1";
-  const mod = await import("../proxy/server.mjs");
-  server = mod.server;
-  await new Promise((resolve) => {
-    if (server.listening) resolve();
-    else server.on("listening", resolve);
-  });
-  proxyPort = server.address().port;
-}
 
 function request(method, path, body) {
   return new Promise((resolve, reject) => {
@@ -38,11 +26,15 @@ function request(method, path, body) {
 
 describe("proxy server", () => {
   before(async () => {
-    await startProxy();
+    // Port 0 → OS-assigned ephemeral port. Avoids the prior random-port
+    // collision risk on parallel test runs and exercises the new factory's
+    // resolved-port plumbing.
+    handle = await startProxy({ port: 0, watch: false });
+    proxyPort = handle.port;
   });
 
-  after((_, done) => {
-    server.close(done);
+  after(async () => {
+    await handle.close();
   });
 
   it("GET /health returns 200 with status ok", async () => {

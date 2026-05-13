@@ -3,7 +3,10 @@
   "version": "3.5.5",
   "description": "Cache optimization proxy and interceptor for Claude Code. Fixes prompt cache bugs, stabilizes prefix, reduces quota burn.",
   "type": "module",
-  "exports": "./preload.mjs",
+  "exports": {
+    ".": "./preload.mjs",
+    "./proxy/server": "./proxy/server.mjs"
+  },
   "main": "./preload.mjs",
   "bin": {
     "cache-fix-proxy": "./bin/claude-via-proxy.mjs"
