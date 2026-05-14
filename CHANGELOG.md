@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [3.6.0] - 2026-05-14
+
 ### Added
 
 - **Embeddable proxy factory: `createProxyServer()` + `startProxy(options)` exported from `claude-code-cache-fix/proxy/server` (#123).** Lets Node/Bun hosts run the cache-fix proxy in-process instead of forking a child via the `cache-fix-proxy` bin. The CLI entrypoint (`node proxy/server.mjs`, `cache-fix-proxy server`, and the wrapper's child-fork path) is preserved — auto-listen and SIGTERM/SIGINT handlers are now gated behind an `import.meta.url === pathToFileURL(process.argv[1]).href` main-module check, so library imports have no side effects. `package.json` `exports` adds a `./proxy/server` subpath; the root entry (`./preload.mjs`) is unchanged. Adds 4 embeddable tests (factory shape, OS-assigned port, two instances coexisting, port reuse after close). README section added documenting the new API and the "one extension registry per process" constraint. Contributed by [@bilby91](https://github.com/bilby91) (Crunchloop DAP) — thank you, Martín.
