@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Embeddable proxy factory: `createProxyServer()` + `startProxy(options)` exported from `claude-code-cache-fix/proxy/server` (#123).** Lets Node/Bun hosts run the cache-fix proxy in-process instead of forking a child via the `cache-fix-proxy` bin. The CLI entrypoint (`node proxy/server.mjs`, `cache-fix-proxy server`, and the wrapper's child-fork path) is preserved — auto-listen and SIGTERM/SIGINT handlers are now gated behind an `import.meta.url === pathToFileURL(process.argv[1]).href` main-module check, so library imports have no side effects. `package.json` `exports` adds a `./proxy/server` subpath; the root entry (`./preload.mjs`) is unchanged. Adds 4 embeddable tests (factory shape, OS-assigned port, two instances coexisting, port reuse after close). README section added documenting the new API and the "one extension registry per process" constraint. Contributed by [@bilby91](https://github.com/bilby91) (Crunchloop DAP) — thank you, Martín.
+
+### Fixed
+
+- **`startProxy().close()` now also closes the file watcher.** The initial implementation in #123 captured the http server but discarded the handle returned by `startWatcher()`. Embedded hosts with `watch: true` (the default) that started/stopped the proxy across lifecycle iterations leaked two `fs.watch` handles per cycle. No regression test ships with this fix — verifying that `startProxy().close()` invokes the underlying watcher's `close()` requires either dependency injection on the production API or invasive module-scope inspection of `pipeline.mjs` state. The fix itself is a four-line capture+close in `proxy/server.mjs:startProxy()` and is verifiable by code review.
+
 ## [3.5.5] - 2026-05-12
 
 ### Fixed

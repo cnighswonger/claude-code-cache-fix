@@ -167,6 +167,43 @@ node "$(npm root -g)\claude-code-cache-fix\proxy\server.mjs"
 
 Stderr will print `[upstream] using proxy http://proxy.corp.example:8080 ...` on first request when the agent is wired correctly. With no proxy/CA env vars set, behavior is unchanged from earlier versions (Node default agent, system trust store).
 
+### Embedding the proxy in your own process
+
+If you ship a Node or Bun binary that wants the cache-fix proxy in-process (e.g. a Bun-compiled agent that avoids forking a Node child), import the factory from `claude-code-cache-fix/proxy/server`:
+
+```js
+import { startProxy } from "claude-code-cache-fix/proxy/server";
+
+const handle = await startProxy({
+  port: 0,        // OS-assigned ephemeral port; pass a number to pin
+  bind: "127.0.0.1",
+  watch: false,   // skip fs.watch — recommended for compiled binaries
+});
+
+console.log(`proxy listening on ${handle.address}:${handle.port}`);
+
+// ...later...
+await handle.close();
+```
+
+**`createProxyServer()` → `http.Server`** builds the request handler wired into an `http.Server`. The returned server is *not* listening and the extension pipeline has not been loaded — use this when you want to manage the lifecycle yourself.
+
+**`startProxy(options?)` → `Promise<{ server, port, address, close }>`** loads the extension pipeline, optionally starts the file watcher, and starts listening. Returns a handle with the bound port (resolved when `port: 0` is requested) and a `close()` that releases the server and the watcher.
+
+Options (all optional; all fall back to the same env vars used by the CLI):
+
+| Option | Default | Effect |
+|--------|---------|--------|
+| `port` | `CACHE_FIX_PROXY_PORT` env, else `9801` | Listen port. Pass `0` for an OS-assigned ephemeral port. |
+| `bind` | `CACHE_FIX_PROXY_BIND` env, else `127.0.0.1` | Bind address. |
+| `extensionsDir` | package `proxy/extensions/` | Directory to load `.mjs` extensions from. |
+| `extensionsConfig` | package `proxy/extensions.json` | Path to extension config. |
+| `watch` | `true` | Whether to start `fs.watch` on the extensions config. Set `false` for embedded / compiled-binary use. |
+
+**One extension registry per process.** The pipeline maintains a single shared extension registry at module scope. Hosting two `startProxy()` instances in the same process is supported (different ports, different bind addresses), but they share that registry — a subsequent `loadExtensions` call replaces it for both. If you need divergent extension configs per instance, run them in separate processes.
+
+**CLI invocation is unchanged.** `node proxy/server.mjs`, `cache-fix-proxy server`, and the wrapper's child-fork path all auto-listen and install SIGTERM/SIGINT handlers as before. Library imports never trigger that behavior — the auto-listen is gated behind a main-module check.
+
 ## Quick Start: Preload (CC v2.1.112 and earlier)
 
 If you're on a Node.js-based CC version (v2.1.112 or earlier), the preload interceptor works without a proxy:

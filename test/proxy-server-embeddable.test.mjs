@@ -63,4 +63,5 @@ describe("embeddable proxy", () => {
       await second.close();
     }
   });
+
 });

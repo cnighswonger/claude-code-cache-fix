@@ -181,9 +181,10 @@ export async function startProxy(options = {}) {
   const extensionsConfig = options.extensionsConfig ?? config.extensionsConfig;
   const watch = options.watch !== false;
 
+  let watcher = null;
   try {
     await loadExtensions(extensionsDir, extensionsConfig);
-    if (watch) startWatcher(extensionsDir, extensionsConfig);
+    if (watch) watcher = startWatcher(extensionsDir, extensionsConfig);
   } catch {}
 
   const server = createProxyServer();
@@ -202,6 +203,9 @@ export async function startProxy(options = {}) {
     address: addr.address,
     close: () =>
       new Promise((resolve, reject) => {
+        try {
+          if (watcher) watcher.close();
+        } catch {}
         server.close((err) => (err ? reject(err) : resolve()));
       }),
   };
