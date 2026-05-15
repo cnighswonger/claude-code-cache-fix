@@ -204,6 +204,8 @@ Options (all optional; all fall back to the same env vars used by the CLI):
 
 **CLI invocation is unchanged.** `node proxy/server.mjs`, `cache-fix-proxy server`, and the wrapper's child-fork path all auto-listen and install SIGTERM/SIGINT handlers as before. Library imports never trigger that behavior — the auto-listen is gated behind a main-module check.
 
+*The embeddable factory was contributed by [@bilby91](https://github.com/bilby91) at [Crunchloop DAP](https://dap.crunchloop.ai) — see [PR #123](https://github.com/cnighswonger/claude-code-cache-fix/pull/123).*
+
 ## Quick Start: Preload (CC v2.1.112 and earlier)
 
 If you're on a Node.js-based CC version (v2.1.112 or earlier), the preload interceptor works without a proxy:
@@ -643,13 +645,13 @@ We monitor 30+ upstream Claude Code issues related to cache, quota, and context 
 
 ## Used in production
 
-- **[Crunchloop DAP](https://dap.crunchloop.ai)** — Agent SDK / DAP development environment. First production team to merge the interceptor to trunk for team-wide deployment (2026-04-10). Identified two distinct cache regression patterns through real-world testing — tool ordering jitter and the fresh-session sort gap — and contributed debug traces that drove the v1.5.1 and v1.6.2 fixes.
+- **[Crunchloop DAP](https://dap.crunchloop.ai)** — Agent SDK / DAP development environment. First production team to merge the interceptor to trunk for team-wide deployment (2026-04-10). Identified two distinct cache regression patterns through real-world testing — tool ordering jitter and the fresh-session sort gap — and contributed debug traces that drove the v1.5.1 and v1.6.2 fixes. Contributed the embeddable proxy factory (v3.6.0) that lets the proxy run in-process inside Bun-compiled and DAP-style agent binaries without forking a Node child.
 - **[VM Farms](https://vmfarms.com)** ([@vmfarms](https://github.com/vmfarms)) — Agent development environment running concurrent multi-runner workloads with `--resume --fork-session`. Surfaced three cache-fix proxy-mode bugs: the resume-marker regex no-op (#96), TTL tier detection gap vs preload mode (#97), and image-strip stderr leak past `CACHE_FIX_DEBUG` (#98) — all addressed in the v3.4.0 release.
 
 ## Contributors
 
 - **[@VictorSun92](https://github.com/VictorSun92)** — Original monkey-patch fix for v2.1.88, identified partial scatter on v2.1.90, contributed forward-scan detection, correct block ordering, tighter block matchers, and the optional output-efficiency rewrite hook
-- **[@bilby91](https://github.com/bilby91)** ([Crunchloop DAP](https://dap.crunchloop.ai)) — Agent SDK / DAP production environment validation, 1h cache TTL confirmation, tool ordering jitter discovery via debug trace (fixed in v1.5.1), fresh-session sort bug discovery via SKILLS SORT diagnostic (fixed in v1.6.2). First production team to roll the interceptor to trunk.
+- **[@bilby91](https://github.com/bilby91)** ([Crunchloop DAP](https://dap.crunchloop.ai)) — Agent SDK / DAP production environment validation, 1h cache TTL confirmation, tool ordering jitter discovery via debug trace (fixed in v1.5.1), fresh-session sort bug discovery via SKILLS SORT diagnostic (fixed in v1.6.2). First production team to roll the interceptor to trunk. Designed and contributed the embeddable proxy factory (`startProxy()` / `createProxyServer()`) shipped in v3.6.0 (PR #123).
 - **[@jmarianski](https://github.com/jmarianski)** — Root cause analysis via MITM proxy capture and Ghidra reverse engineering, multi-mode cache test script
 - **[@cnighswonger](https://github.com/cnighswonger)** — Fingerprint stabilization, tool ordering fix, image stripping, monitoring features, overage TTL downgrade discovery, proxy architecture, package maintainer
 - **[@ArkNill](https://github.com/ArkNill)** — Microcompact mechanism analysis, GrowthBook flag documentation, false rate limiter identification, fingerprint verification fix for CC v2.1.108+ (PR #21), Korean README (PR #22), [claude-code-hidden-problem-analysis](https://github.com/ArkNill/claude-code-hidden-problem-analysis) research
