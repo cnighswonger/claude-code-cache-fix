@@ -2,15 +2,27 @@ name: Publish npm package
 
 # Triggers on operator-pushed semver tags. Runs the canonical pre-publish
 # verification (full test suite) then publishes to npm with sigstore
-# provenance attestation enabled.
+# provenance attestation enabled, authenticated via npm Trusted Publishing
+# (OIDC) — no long-lived NPM_TOKEN secret required.
 #
 # Operator workflow (per docs/release-workflow.md) is unchanged through
 # step 7 (tag + push). This workflow replaces the manual step 8
 # (`npm publish` from a local box). Steps 9+ (GitHub Release, notifications)
 # remain operator-driven.
 #
-# See issue #133 for background and design rationale (Option A: workflow
-# runs npm publish only, operator owns everything else).
+# See issue #133 for background and design rationale. The first iteration
+# used a long-lived NPM_TOKEN secret; the npm Trusted Publishing path
+# (https://docs.npmjs.com/trusted-publishers) is strictly better — no
+# secret to rotate, short-lived OIDC credentials per workflow run, and
+# provenance attestation comes for free.
+#
+# One-time npm-side setup (operator):
+#   https://www.npmjs.com/package/claude-code-cache-fix/access → Trusted
+#   Publishers → Add → GitHub Actions →
+#     Organization or user: cnighswonger
+#     Repository:           claude-code-cache-fix
+#     Workflow filename:    release.yml
+#     Environment name:     npm-publish
 
 on:
   push:
@@ -20,12 +32,16 @@ on:
 permissions:
   contents: read
   # id-token: write is required by npm CLI to mint a sigstore-backed
-  # provenance attestation from the workflow run's OIDC identity.
+  # provenance attestation AND to authenticate via Trusted Publishing.
   id-token: write
 
 jobs:
   publish:
     runs-on: ubuntu-latest
+    # Environment name must match what's configured on the npm
+    # Trusted Publishers form. If you rename here, rename there too —
+    # auth fails silently otherwise.
+    environment: npm-publish
     steps:
       - name: Checkout tagged commit
         uses: actions/checkout@v4
@@ -33,14 +49,25 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
           registry-url: 'https://registry.npmjs.org'
+
+      - name: Ensure npm CLI >= 11.5.1 (Trusted Publishing minimum)
+        # Node 24 ships with npm 11.x but pin to a known-good version
+        # to defend against the runner image lagging. Trusted Publishing
+        # requires npm >= 11.5.1.
+        run: npm install -g npm@latest
+
+      - name: Print toolchain versions for audit
+        run: |
+          node --version
+          npm --version
 
       - name: Install dependencies
         run: npm install --no-audit --no-fund
 
       - name: Pre-publish gate — full test suite
-        # Mirrors the test.yml content. Tests must pass on the exact tagged
+        # Mirrors test.yml content. Tests must pass on the exact tagged
         # commit before publish. Per release-safety rule in CLAUDE.md:
         # "Never tag or publish without running the full test suite on the
         #  exact commit being released."
@@ -51,7 +78,10 @@ jobs:
         # so a maintainer reviewing the run can sanity-check what shipped.
         run: npm pack --dry-run
 
-      - name: Publish to npm with provenance
+      - name: Publish to npm via Trusted Publishing
+        # No NODE_AUTH_TOKEN needed — npm CLI exchanges this workflow's
+        # OIDC token (minted via id-token: write) for a short-lived
+        # publish credential. --provenance is satisfied by the same OIDC
+        # identity, producing a sigstore attestation linked to this
+        # workflow run.
         run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
