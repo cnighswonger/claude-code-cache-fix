@@ -27,7 +27,11 @@ name: Publish npm package
 on:
   push:
     tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
+      # GitHub uses globs here, NOT regex — `+` is literal, character
+      # classes don't repeat. Filter broadly on v*.*.* (matches v1.0.0,
+      # v3.10.0, etc.) and enforce strict semver shape inside the job
+      # via the "Verify tag matches strict semver" step below.
+      - 'v*.*.*'
 
 permissions:
   contents: read
@@ -43,6 +47,17 @@ jobs:
     # auth fails silently otherwise.
     environment: npm-publish
     steps:
+      - name: Verify tag matches strict semver
+        # Belt-and-suspenders to the glob filter above. If a tag like
+        # `v3.6.2-rc1` or `vfoo.bar.baz` somehow lands here (the glob
+        # `v*.*.*` matches both), refuse to publish. Strict semver only.
+        run: |
+          if [[ ! "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag '${GITHUB_REF_NAME}' does not match strict semver vX.Y.Z. Refusing to publish."
+            exit 1
+          fi
+          echo "Tag '${GITHUB_REF_NAME}' validated."
+
       - name: Checkout tagged commit
         uses: actions/checkout@v4
 
@@ -52,11 +67,16 @@ jobs:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
 
-      - name: Ensure npm CLI >= 11.5.1 (Trusted Publishing minimum)
-        # Node 24 ships with npm 11.x but pin to a known-good version
-        # to defend against the runner image lagging. Trusted Publishing
-        # requires npm >= 11.5.1.
-        run: npm install -g npm@latest
+      - name: Pin npm CLI to known-good 11.x (Trusted Publishing floor)
+        # Trusted Publishing requires npm >= 11.5.1. Pin to the 11.x
+        # major to get patches and minor updates within npm 11 (Trusted
+        # Publishing's documented support line) without auto-jumping to
+        # a future npm 12 that could change auth, provenance, or the
+        # Node floor on the day a release ships.
+        #
+        # Move this pin deliberately when bumping to npm 12+ after
+        # verifying the workflow still works on the new major.
+        run: npm install -g npm@11
 
       - name: Print toolchain versions for audit
         run: |
