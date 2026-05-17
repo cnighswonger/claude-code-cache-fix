@@ -89,21 +89,30 @@ git push origin vX.Y.Z
 
 Annotated tags only (`-a`), not lightweight tags. The tag message can mirror the CHANGELOG section heading.
 
-### 8. npm publish
+### 8. npm publish (automated via `.github/workflows/release.yml`)
+
+**Do NOT run `npm publish` from a local box.** Pushing the `vX.Y.Z` tag in step 7 triggers `.github/workflows/release.yml`, which runs the full test suite on the tagged commit and then publishes to npm with **sigstore provenance attestation** enabled.
+
+Verify the workflow run:
 
 ```bash
-npm publish
+gh run list --repo cnighswonger/claude-code-cache-fix --workflow=release.yml --limit 1
+gh run watch --repo cnighswonger/claude-code-cache-fix  # tail the most recent run
 ```
 
-The npm token lives at `~/.claude/.npm/.npmrc` for the `vsitsllc` org (see `~/.claude/memory/shared/reference_npm_token.md` for current expiry — token rotates roughly every 90 days). If publish fails on auth, the token may have expired; ask Chris to rotate before retrying.
+The workflow uses the `NPM_TOKEN` repository secret (Automation token for the `vsitsllc` org — separate from the local `~/.claude/.npm/.npmrc` token used historically). If the workflow fails on auth, the secret may have expired; ask Chris to rotate via the npm token memory entry, then re-run the failed job from the GitHub UI.
 
-Verify the publish landed:
+Verify the publish landed AND has provenance:
 
 ```bash
 npm view claude-code-cache-fix version
+# Should return the new version within ~30 seconds.
+
+npm view claude-code-cache-fix@<new-version> dist.attestations
+# Should return a non-empty array citing the GitHub Actions workflow run.
 ```
 
-Should return the new version within ~30 seconds.
+**Local-publish fallback (emergency only).** If the workflow is broken or GitHub Actions is down and the release truly cannot wait, the operator can still publish locally: `npm publish` (without `--provenance` — local publish has no OIDC source). This drops the attestation for that release; document the gap in CHANGELOG. Per #133, this should be a rare exception, not the default.
 
 ### 9. GitHub Release
 
