@@ -65,6 +65,8 @@ Policy:
 - `ready-for-merge` requires `approved-by-codex-agent` and `approved-by-lead`. Must not coexist with `changes-requested`.
 - Each agent owns only their own review and approval labels. No agent may add or remove another agent's labels.
 - Codex should communicate desired shared-label changes in the review comment unless the user explicitly asks Codex to apply them.
+- **Approval labels are bound to the commit at which the approval was granted.** If new commits land on a PR after an approval label was applied, the label becomes stale relative to the new HEAD and re-approval is required. This applies to `approved-by-codex-agent`, `approved-by-code-agent`, `approved-by-lead`, and `ready-for-merge` (since the latter depends on the underlying approvals being current). Before treating any approval label as authoritative for the current HEAD, pull its timestamp via `gh api repos/<o>/<r>/issues/<n>/timeline --jq '.[] | select(.event=="labeled") | "\(.created_at)  \(.label.name)"'` and compare against the timestamps of commits since.
+- **When refreshing approval after new commits, remove and reapply the label** rather than leaving the original in place. The reapply updates the timestamp on the GitHub timeline so the label's freshness can be verified at a glance. A label whose timestamp predates the current HEAD's most recent material commit is, by definition, stale — even if the labeler intended their approval to cover the newer commits, the timeline doesn't reflect that.
 
 ## Agent Roles
 
