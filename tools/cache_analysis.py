@@ -150,8 +150,15 @@ def read_quota_status():
       - v3.5.0+ (proxy mode, per-session split): ~/.claude/quota-status/account.json
       - v3.4.x and earlier (or preload mode): ~/.claude/quota-status.json (flat)
 
-    Tries the v3.5.0+ path first, falls back to the legacy flat path.
-    Returns dict with five_hour/seven_day pct, or None if unavailable.
+    Tries the v3.5.0+ path first, falls back to the legacy flat path. A
+    candidate file whose JSON parses but isn't a dict (e.g. a partial write
+    that lands as ``[]`` or ``null``) is skipped so the next candidate gets
+    a chance — and so callers never receive a non-dict and break on
+    ``status.get(...)`` accessors downstream.
+
+    Returns dict with five_hour/seven_day pct (and other fields written by
+    cache-fix's response-header capture), or None if no candidate yields a
+    dict-shaped payload.
     """
     import os
     for quota_file in (
@@ -160,9 +167,12 @@ def read_quota_status():
     ):
         try:
             with open(quota_file) as f:
-                return json.load(f)
+                data = json.load(f)
         except (OSError, json.JSONDecodeError):
             continue
+        if isinstance(data, dict):
+            return data
+        # Valid JSON but wrong shape — try the next candidate.
     return None
 
 
