@@ -81,6 +81,28 @@ Significant implementation plans and code go to the Codex Review Agent before me
 
 Never post publicly without Chris's approval. Draft and wait for go-ahead.
 
+## Public-Repo Information Hygiene
+
+This repository is public. Anything committed becomes part of public git history immediately and cannot be retracted by editing or deleting the file later. Before any commit, scan for origin-server-identifying information and replace it with placeholders + a pointer to internal deployment notes.
+
+**Never put in tracked files:**
+
+- **Origin IPs** — literal IPv4/IPv6 addresses pointing at production hosts (droplets, load balancers, VPS, etc.)
+- **SSH targets** — `ssh root@<ip>` lines, hostname-port pairs that reach origin
+- **Internal service ports** that aren't surfaced through the public reverse-proxy / CDN
+- **Stack fingerprinting** — server hostnames combined with "what's running" details (e.g. `host-01, Node 20 + Caddy + systemd, port 3847`). Fingerprinting narrows the attack surface even after an IP rotation.
+
+**Why this is non-negotiable:** Cloudflare's WAF / DDoS protection only protects traffic that actually flows through Cloudflare. If the origin IP is in a public repo, an attacker can bypass Cloudflare entirely and hit the origin directly. The remediation path for an IP that has already been leaked to git history is rotating the IP itself (snapshot + recreate, or floating-IP reassignment) — there is no in-place "scrub" because git history is immutable.
+
+**Acceptable patterns in public docs and runbooks:**
+
+- `<droplet>` or `<DROPLET_IP>` placeholder in place of literal IPs
+- `ssh root@<droplet>` rather than `ssh root@<literal-ip>`
+- One-line pointer: "(host details in internal deployment notes)" or similar. Keeps the runbook useful for someone with proper access without leaking the value.
+- Generic deployment shape descriptions are fine: "single DigitalOcean droplet behind Cloudflare-proxied DNS" gives readers the shape without enabling bypass.
+
+**Scope:** This applies to ALL tracked files: source code, comments, `README.md`, `CHANGELOG.md`, `SESSION_STATE.md`, handoff docs under `docs/`, commit messages, PR descriptions, issue comments. Scan for literal IPs (v4/v6), SSH lines, and hostname-port-stack tuples before any `git commit`, `git push`, or `gh` write operation. Precedent: `cnighswonger/claude-code-meter#19` (2026-05-20) — an origin IP had leaked into `SESSION_STATE.md` via a prior rebrand commit; remediation required destroying and recreating the droplet because git history could not be scrubbed.
+
 ## Release Safety Rules
 
 Production systems depend on this package. These rules are non-negotiable.
