@@ -186,45 +186,46 @@ function formatAccount({ q5hPct, q5hOffsetSec, q7dPct, q7dOffsetSec }) {
   return JSON.stringify(acc);
 }
 
-test("T8 (format). under-pace: tick lands in empty region past the fill", () => {
+test("T8 (format). under-pace: tick past fill; `exhaust` and `reset` both shown", () => {
   const env = setupHome();
   try {
-    // 5h: 30% used; reset in 3h → 2h elapsed of 5h = 40%, tick at idx 4.
-    // 7d: 53% used; reset in 3d → 4d elapsed of 7d ≈ 57%, tick at idx 5.
+    // 5h: 30% used, 2h elapsed of 5h = 40% elapsed (tick at idx 4).
+    //     exhaust = 70 * 7200 / 30 = 16800s = 4h40m; reset = 3h00m.
+    // 7d: 53% used, 4d elapsed of 7d ≈ 57% elapsed (tick at idx 5).
+    //     exhaust = 47 * 345600 / 53 ≈ 306475s = 3d 13h; reset = 3d 0h.
     writeFileSync(env.account, formatAccount({
       q5hPct: 30, q5hOffsetSec: 3 * 3600,
       q7dPct: 53, q7dOffsetSec: 3 * 86400,
     }));
     const r = runScript(env.home, '{"session_id":"x"}');
     assert.equal(r.status, 0, r.stderr);
-    assert.match(r.stdout, /Q5h \[███░┃░░░░░\] 30%/);
-    assert.match(r.stdout, /Q7d \[█████┃░░░░\] 53%/);
-    assert.match(r.stdout, /3h00m left/);
-    assert.match(r.stdout, /3d 0h left/);
+    assert.match(r.stdout, /Q5h \[███░┃░░░░░\] 30% \(exhaust 4h40m, reset 3h00m\)/);
+    assert.match(r.stdout, /Q7d \[█████┃░░░░\] 53% \(exhaust 3d 13h, reset 3d 0h\)/);
   } finally {
     env.cleanup();
   }
 });
 
-test("T9 (format). over-pace: tick lands inside the filled run", () => {
+test("T9 (format). over-pace: tick inside fill; exhaust < reset (the actionable signal)", () => {
   const env = setupHome();
   try {
-    // 5h: 50% used; reset in 3.5h → 1.5h elapsed of 5h = 30%, tick at idx 3.
-    // 50% fill → 5 cells placed around the tick (3 before, 2 after).
+    // 5h: 50% used at 1.5h elapsed = 30% elapsed (tick at idx 3).
+    //     exhaust = 50 * 5400 / 50 = 5400s = 1h30m; reset = 3h30m.
+    // exhaust < reset is the visible warning: at current pace we run out
+    // before the window resets.
     writeFileSync(env.account, formatAccount({
       q5hPct: 50, q5hOffsetSec: Math.floor(3.5 * 3600),
       q7dPct: 0, q7dOffsetSec: 7 * 86400,
     }));
     const r = runScript(env.home, '{"session_id":"x"}');
     assert.equal(r.status, 0, r.stderr);
-    assert.match(r.stdout, /Q5h \[███┃██░░░░\] 50%/);
-    assert.match(r.stdout, /3h30m left/);
+    assert.match(r.stdout, /Q5h \[███┃██░░░░\] 50% \(exhaust 1h30m, reset 3h30m\)/);
   } finally {
     env.cleanup();
   }
 });
 
-test("T10 (format). missing resets_at: bar without tick, no time-left, no rate", () => {
+test("T10 (format). missing resets_at: bar without tick, no exhaust, no reset", () => {
   const env = setupHome();
   try {
     writeFileSync(env.account, formatAccount({ q5hPct: 30, q7dPct: 53 }));
@@ -232,15 +233,14 @@ test("T10 (format). missing resets_at: bar without tick, no time-left, no rate",
     assert.equal(r.status, 0, r.stderr);
     assert.match(r.stdout, /Q5h \[███░░░░░░░\] 30%/);
     assert.match(r.stdout, /Q7d \[█████░░░░░\] 53%/);
-    assert.doesNotMatch(r.stdout, /\bleft\b/);
-    assert.doesNotMatch(r.stdout, /%\/m\b/);
-    assert.doesNotMatch(r.stdout, /%\/hr\b/);
+    assert.doesNotMatch(r.stdout, /\bexhaust\b/);
+    assert.doesNotMatch(r.stdout, /\breset\b/);
   } finally {
     env.cleanup();
   }
 });
 
-test("T11 (format). stale window (reset_at in the past): tick clamps to last cell, no time-left", () => {
+test("T11 (format). stale window (reset_at in the past): no exhaust, no reset", () => {
   const env = setupHome();
   try {
     writeFileSync(env.account, formatAccount({
@@ -251,7 +251,60 @@ test("T11 (format). stale window (reset_at in the past): tick clamps to last cel
     assert.equal(r.status, 0, r.stderr);
     assert.match(r.stdout, /Q5h \[████░░░░░┃\] 42%/);
     assert.match(r.stdout, /Q7d \[██░░░░░░░┃\] 15%/);
-    assert.doesNotMatch(r.stdout, /\bleft\b/);
+    assert.doesNotMatch(r.stdout, /\bexhaust\b/);
+    assert.doesNotMatch(r.stdout, /\breset\b/);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("T12 (format). quota at 0% (fresh window): exhaust dropped, reset shown", () => {
+  const env = setupHome();
+  try {
+    writeFileSync(env.account, formatAccount({
+      q5hPct: 0, q5hOffsetSec: 5 * 3600,
+      q7dPct: 0, q7dOffsetSec: 7 * 86400,
+    }));
+    const r = runScript(env.home, '{"session_id":"x"}');
+    assert.equal(r.status, 0, r.stderr);
+    assert.doesNotMatch(r.stdout, /\bexhaust\b/);
+    assert.match(r.stdout, /Q5h \[┃░░░░░░░░░\] 0% \(reset 5h00m\)/);
+    assert.match(r.stdout, /Q7d \[┃░░░░░░░░░\] 0% \(reset 7d 0h\)/);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("T13 (format). elapsed below min: exhaust dropped (noisy projection), reset shown", () => {
+  const env = setupHome();
+  try {
+    // Q5h elapsed = 30s (below 60s gate). Q7d elapsed = 120s (below 360s gate).
+    writeFileSync(env.account, formatAccount({
+      q5hPct: 2, q5hOffsetSec: 5 * 3600 - 30,
+      q7dPct: 1, q7dOffsetSec: 7 * 86400 - 120,
+    }));
+    const r = runScript(env.home, '{"session_id":"x"}');
+    assert.equal(r.status, 0, r.stderr);
+    assert.doesNotMatch(r.stdout, /\bexhaust\b/);
+    assert.match(r.stdout, /Q5h \[.{10}\] 2% \(reset 4h59m\)/);
+    assert.match(r.stdout, /Q7d \[.{10}\] 1% \(reset 6d 23h\)/);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("T14 (format). quota at 100% (already exhausted): exhaust dropped, reset shown", () => {
+  const env = setupHome();
+  try {
+    writeFileSync(env.account, formatAccount({
+      q5hPct: 100, q5hOffsetSec: 3600,
+      q7dPct: 100, q7dOffsetSec: 86400,
+    }));
+    const r = runScript(env.home, '{"session_id":"x"}');
+    assert.equal(r.status, 0, r.stderr);
+    assert.doesNotMatch(r.stdout, /\bexhaust\b/);
+    assert.match(r.stdout, /Q5h \[.{10}\] 100% \(reset 1h00m\)/);
+    assert.match(r.stdout, /Q7d \[.{10}\] 100% \(reset 1d 0h\)/);
   } finally {
     env.cleanup();
   }

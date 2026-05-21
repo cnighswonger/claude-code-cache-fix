@@ -323,8 +323,8 @@ The interceptor can only *help* or *do nothing*. It cannot make things worse.
 
 Both modes write quota state on every API call. Proxy mode (v3.5.0+) splits into `~/.claude/quota-status/account.json` (account-global fields: Q5h/Q7d, status, overage) plus `~/.claude/quota-status/sessions/<id>.json` (per-session cache fields: TTL tier, hit rate). Preload mode keeps the legacy `~/.claude/quota-status.json` (single-session by construction). The included `tools/quota-statusline.sh` script displays a live status line showing:
 
-- **Q5h** quota bar `[███░┃░░░░░]` + percent + burn rate (%/min) + time-to-reset (`2h54m left`). Filled cells are consumed quota; the heavy-vertical tick is wall-clock elapsed position in the window. Tick to the right of the fill = under pace; tick inside the fill = burning faster than time (over pace).
-- **Q7d** same shape with day-scale time-to-reset (`2d 7h left`) and burn rate (%/hr).
+- **Q5h** quota bar `[███░┃░░░░░]` + percent + `(exhaust X, reset Y)`. Filled cells are consumed quota; the heavy-vertical tick is wall-clock elapsed position in the window. Tick to the right of the fill = under pace; tick inside the fill = burning faster than time (over pace). `exhaust` is the projected time-to-100% at the current burn rate; `reset` is the wall-clock time until the window rolls over. When `exhaust < reset`, you will hit 100% before the window resets — back off.
+- **Q7d** same shape with day-scale durations (e.g. `(exhaust 3d 13h, reset 3d 0h)`).
 - **TTL tier** — `TTL:1h` when healthy, **`TTL:5m` in red when the server has downgraded you** (typically at Q5h ≥ 100%)
 - **PEAK** in yellow during weekday peak hours (13:00–19:00 UTC)
 - **Cache hit rate %**
@@ -333,8 +333,10 @@ Both modes write quota state on every API call. Proxy mode (v3.5.0+) splits into
 Example line (mid-window, healthy state):
 
 ```
-Q5h [███░┃░░░░░] 30% (+0.2%/m, 3h00m left) | Q7d [█████┃░░░░] 53% (+0.6%/hr, 3d 0h left) | TTL:1h 98.3%
+Q5h [███░┃░░░░░] 30% (exhaust 4h40m, reset 3h00m) | Q7d [█████┃░░░░] 53% (exhaust 3d 13h, reset 3d 0h) | TTL:1h 98.3%
 ```
+
+The `(exhaust …, reset …)` suffix is dropped piecewise when projection isn't meaningful: at 0% (fresh window) and 100% (already exhausted) only `reset` is shown; in the first minute (Q5h) or six minutes (Q7d) after window start the burn rate isn't stable enough to project, so `exhaust` is held back until then; a stale `resets_at` (the server-reported value sits in the past, before the next API call refreshes it) drops both.
 
 The bar uses Unicode block characters (`█┃░`) — most modern terminals render these correctly. If your terminal substitutes boxes or replacement glyphs, configure a Unicode-capable font (any DejaVu, Fira, Iosevka, JetBrains Mono, etc.).
 

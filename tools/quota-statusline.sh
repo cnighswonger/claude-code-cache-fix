@@ -41,7 +41,7 @@ fi
 # through os.environ, never via a shell-substituted string.
 result=$(python3 <<'PYEOF' 2>/dev/null
 import sys, json, os, re, hashlib
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 home = os.path.expanduser('~')
 account_path = os.path.join(home, '.claude', 'quota-status', 'account.json')
@@ -141,28 +141,33 @@ def window_view(reset_ts, window_secs):
     window_start = datetime.fromtimestamp(reset_ts - window_secs, tz=timezone.utc)
     return (now - window_start).total_seconds(), reset_ts - now.timestamp()
 
-def burn_rate(q, elapsed_sec, divisor_sec, min_elapsed_sec):
-    if elapsed_sec is None or q <= 0 or elapsed_sec <= min_elapsed_sec:
-        return ''
-    return '{:+.1f}'.format(q / (elapsed_sec / divisor_sec))
+def time_to_exhaust_sec(pct, elapsed_sec, min_elapsed_sec):
+    # (100 - pct) divided by current burn rate (pct / elapsed_sec). Gated on
+    # min_elapsed_sec so very-fresh windows don't project off noise.
+    if elapsed_sec is None or elapsed_sec <= min_elapsed_sec:
+        return None
+    if pct <= 0 or pct >= 100:
+        return None
+    return (100 - pct) * elapsed_sec / pct
 
-def format_window(name, pct, elapsed_sec, window_secs, rate, rate_unit, left_text):
+def format_window(name, pct, elapsed_sec, window_secs, secs_left, fmt_time, min_elapsed_sec):
     ep = None if elapsed_sec is None or elapsed_sec < 0 else elapsed_sec / window_secs * 100
     extras = []
-    if rate:
-        extras.append('{}%/{}'.format(rate, rate_unit))
-    if left_text:
-        extras.append('{} left'.format(left_text))
+    stale = secs_left is not None and secs_left <= 0
+    if not stale:
+        exhaust = time_to_exhaust_sec(pct, elapsed_sec, min_elapsed_sec)
+        if exhaust is not None:
+            extras.append('exhaust ' + fmt_time(exhaust))
+        if secs_left is not None and secs_left > 0:
+            extras.append('reset ' + fmt_time(secs_left))
     tail = ' (' + ', '.join(extras) + ')' if extras else ''
     return '{} {} {}%{}'.format(name, draw_bar(pct, ep), pct, tail)
 
 elapsed_5h, left_5h = window_view(q5h_reset, 5 * 3600)
 elapsed_7d, left_7d = window_view(q7d_reset, 7 * 86400)
 
-label = format_window('Q5h', q5h, elapsed_5h, 5 * 3600,
-                      burn_rate(q5h, elapsed_5h, 60, 60), 'm', fmt_hm(left_5h))
-label += ' | ' + format_window('Q7d', q7d, elapsed_7d, 7 * 86400,
-                               burn_rate(q7d, elapsed_7d, 3600, 360), 'hr', fmt_dh(left_7d))
+label = format_window('Q5h', q5h, elapsed_5h, 5 * 3600, left_5h, fmt_hm, 60)
+label += ' | ' + format_window('Q7d', q7d, elapsed_7d, 7 * 86400, left_7d, fmt_dh, 360)
 if overage == 'active':
     label += ' | OVERAGE'
 
