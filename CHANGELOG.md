@@ -10,6 +10,10 @@
 
 824 → 831 (+7): seven new format-contract tests (`T8`-`T14`) pin bar content and the `(exhaust X, reset Y)` wording for under-pace, over-pace, missing-`resets_at`, stale-window, fresh-window (`pct=0`), pre-warmup, and at-cap (`pct=100`) cases. Anchored against a fixed `now` via `account.json.timestamp` so timestamps are deterministic across CI runs.
 
+### Added
+
+- **README: "Recommended CC operational config" section.** Documents three `~/.claude/settings.json` env vars (`CLAUDE_CODE_DISABLE_LEGACY_MODEL_REMAP=1`, `ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`) that solve adjacent CC problems the proxy can't reach — silent model swap on update, ambiguous model fallback. Plus a caveat on `autoCompactWindow=1M` (only works on 1M-eligible models) and a footnote on `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` (strips tool fields outside the canonical four). Findings sourced from [@fgrosswig](https://github.com/fgrosswig)'s binary analysis of CC v2.1.91 — public methodology (PowerShell + ASCII string extraction), privately shared punch list. Thank you, @fgrosswig.
+
 ## [3.6.1] - 2026-05-17
 
 ### Added
