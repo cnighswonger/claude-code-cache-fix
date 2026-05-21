@@ -62,8 +62,8 @@ test("T1. UUID session, both files present → label has quota and TTL", () => {
     writeFileSync(join(env.sessionsDir, "b16c607d-d484-4935-840e-e3f7ee78eb08.json"), SESSION_JSON);
     const r = runScript(env.home, '{"session_id": "b16c607d-d484-4935-840e-e3f7ee78eb08"}');
     assert.equal(r.status, 0);
-    assert.match(r.stdout, /Q5h: 42%/);
-    assert.match(r.stdout, /Q7d: 15%/);
+    assert.match(r.stdout, /Q5h \[.{10}\] 42%/);
+    assert.match(r.stdout, /Q7d \[.{10}\] 15%/);
     assert.match(r.stdout, /TTL:1h/);
     assert.match(r.stdout, /92\.5%/);
   } finally {
@@ -79,8 +79,8 @@ test("T2. session_id missing from stdin → quota shown, no TTL block (sessions/
     // file missing, falls back to account-only.
     const r = runScript(env.home, "{}");
     assert.equal(r.status, 0);
-    assert.match(r.stdout, /Q5h: 42%/);
-    assert.match(r.stdout, /Q7d: 15%/);
+    assert.match(r.stdout, /Q5h \[.{10}\] 42%/);
+    assert.match(r.stdout, /Q7d \[.{10}\] 15%/);
     assert.doesNotMatch(r.stdout, /TTL:/);
   } finally {
     env.cleanup();
@@ -104,7 +104,7 @@ test("T2a. session_id null/empty/whitespace → all read sessions/unknown.json (
       writeFileSync(join(env.sessionsDir, "unknown.json"), unknownPayload);
       const r = runScript(env.home, JSON.stringify({ session_id: raw }));
       assert.equal(r.status, 0, `failed for raw=${JSON.stringify(raw)}: ${r.stderr}`);
-      assert.match(r.stdout, /Q5h: 42%/);
+      assert.match(r.stdout, /Q5h \[.{10}\] 42%/);
       assert.match(r.stdout, /TTL:1h/, `expected TTL:1h for raw=${JSON.stringify(raw)}, got: ${r.stdout}`);
       assert.match(r.stdout, /50\.0%/);
     } finally {
@@ -120,7 +120,7 @@ test("T3. per-session file missing (fresh/warming session) → quota shown, no T
     // No file in sessions/ yet.
     const r = runScript(env.home, '{"session_id": "fresh-session-no-file-yet"}');
     assert.equal(r.status, 0);
-    assert.match(r.stdout, /Q5h: 42%/);
+    assert.match(r.stdout, /Q5h \[.{10}\] 42%/);
     assert.doesNotMatch(r.stdout, /TTL:/);
   } finally {
     env.cleanup();
@@ -162,6 +162,101 @@ test("T5. malformed session_id → reads hashed filename matching the writer's r
   }
 });
 
+// Format-contract tests. The statusline output is public surface: docs,
+// READMEs, screenshots, downstream tools that grep it. Pin the bar content
+// and time-left wording explicitly so a format regression is caught here,
+// not in the field.
+
+// Anchor used by the format tests: timestamp present in account.json fixes
+// `now` inside the script, so resets_at offsets render deterministically.
+const FORMAT_NOW_EPOCH = 1777982400; // 2026-05-05T12:00:00.000Z
+const FORMAT_NOW_ISO = "2026-05-05T12:00:00.000Z";
+
+function formatAccount({ q5hPct, q5hOffsetSec, q7dPct, q7dOffsetSec }) {
+  const acc = {
+    status: "allowed",
+    overage_status: "allowed",
+    peak_hour: false,
+    timestamp: FORMAT_NOW_ISO,
+    five_hour: { pct: q5hPct },
+    seven_day: { pct: q7dPct },
+  };
+  if (q5hOffsetSec !== undefined) acc.five_hour.resets_at = FORMAT_NOW_EPOCH + q5hOffsetSec;
+  if (q7dOffsetSec !== undefined) acc.seven_day.resets_at = FORMAT_NOW_EPOCH + q7dOffsetSec;
+  return JSON.stringify(acc);
+}
+
+test("T8 (format). under-pace: tick lands in empty region past the fill", () => {
+  const env = setupHome();
+  try {
+    // 5h: 30% used; reset in 3h → 2h elapsed of 5h = 40%, tick at idx 4.
+    // 7d: 53% used; reset in 3d → 4d elapsed of 7d ≈ 57%, tick at idx 5.
+    writeFileSync(env.account, formatAccount({
+      q5hPct: 30, q5hOffsetSec: 3 * 3600,
+      q7dPct: 53, q7dOffsetSec: 3 * 86400,
+    }));
+    const r = runScript(env.home, '{"session_id":"x"}');
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /Q5h \[███░┃░░░░░\] 30%/);
+    assert.match(r.stdout, /Q7d \[█████┃░░░░\] 53%/);
+    assert.match(r.stdout, /3h00m left/);
+    assert.match(r.stdout, /3d 0h left/);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("T9 (format). over-pace: tick lands inside the filled run", () => {
+  const env = setupHome();
+  try {
+    // 5h: 50% used; reset in 3.5h → 1.5h elapsed of 5h = 30%, tick at idx 3.
+    // 50% fill → 5 cells placed around the tick (3 before, 2 after).
+    writeFileSync(env.account, formatAccount({
+      q5hPct: 50, q5hOffsetSec: Math.floor(3.5 * 3600),
+      q7dPct: 0, q7dOffsetSec: 7 * 86400,
+    }));
+    const r = runScript(env.home, '{"session_id":"x"}');
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /Q5h \[███┃██░░░░\] 50%/);
+    assert.match(r.stdout, /3h30m left/);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("T10 (format). missing resets_at: bar without tick, no time-left, no rate", () => {
+  const env = setupHome();
+  try {
+    writeFileSync(env.account, formatAccount({ q5hPct: 30, q7dPct: 53 }));
+    const r = runScript(env.home, '{"session_id":"x"}');
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /Q5h \[███░░░░░░░\] 30%/);
+    assert.match(r.stdout, /Q7d \[█████░░░░░\] 53%/);
+    assert.doesNotMatch(r.stdout, /\bleft\b/);
+    assert.doesNotMatch(r.stdout, /%\/m\b/);
+    assert.doesNotMatch(r.stdout, /%\/hr\b/);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("T11 (format). stale window (reset_at in the past): tick clamps to last cell, no time-left", () => {
+  const env = setupHome();
+  try {
+    writeFileSync(env.account, formatAccount({
+      q5hPct: 42, q5hOffsetSec: -3600,
+      q7dPct: 15, q7dOffsetSec: -86400,
+    }));
+    const r = runScript(env.home, '{"session_id":"x"}');
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /Q5h \[████░░░░░┃\] 42%/);
+    assert.match(r.stdout, /Q7d \[██░░░░░░░┃\] 15%/);
+    assert.doesNotMatch(r.stdout, /\bleft\b/);
+  } finally {
+    env.cleanup();
+  }
+});
+
 test("T6 (security #108). triple-quote injection payload does NOT execute — heredoc isolation intact", () => {
   // Regression for cnighswonger/claude-code-cache-fix#108: pre-v3.5.2,
   // tools/quota-statusline.sh interpolated stdin into a Python triple-quoted
@@ -191,7 +286,7 @@ test("T6 (security #108). triple-quote injection payload does NOT execute — he
     assert.equal(r.status, 0, `script must exit clean even with hostile payload; stderr=${r.stderr}`);
     // The script should still render a normal quota line — the hostile
     // payload is just a weird session_id string from the parser's perspective.
-    assert.match(r.stdout, /Q5h: 42%/);
+    assert.match(r.stdout, /Q5h \[.{10}\] 42%/);
     // The critical assertion: no execution.
     assert.equal(
       existsSync(sentinel),

@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **`tools/quota-statusline.sh`: Q5h/Q7d render as a quota bar with an elapsed-time tick, plus absolute time-to-reset.** Each window now shows a 10-cell bar `[███░┃░░░░░]` where filled cells are consumed quota and the heavy-vertical tick is the wall-clock elapsed position. Tick in the empty region = under pace; tick inside the fill = burning faster than time. The suffix `(rate, Xh YYm left)` adds the absolute time until window reset alongside the existing burn rate. Output line shape changed from `Q5h: 42% (+0.4%/m)` to `Q5h [████░░░░░┃] 42% (+0.4%/m, 2h54m left)` — downstream consumers that grep the old `Q5h: N%` form need to switch to `Q5h [.{10}] N%`. The bar uses standard Unicode block characters (`█┃░`); terminals without Unicode font coverage will need a Unicode-capable monospace font. The TTL/hit-rate/PEAK/OVERAGE suffix segments are unchanged.
+
+### Tests
+
+824 → 828 (+4): four new format-contract tests (`T8`-`T11`) pin the exact bar content and time-left wording for under-pace, over-pace, missing-`resets_at`, and stale-window cases. Anchored against a fixed `now` via `account.json.timestamp` so timestamps are deterministic across CI runs.
+
 ## [3.6.1] - 2026-05-17
 
 ### Added

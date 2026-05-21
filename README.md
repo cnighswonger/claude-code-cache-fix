@@ -323,12 +323,20 @@ The interceptor can only *help* or *do nothing*. It cannot make things worse.
 
 Both modes write quota state on every API call. Proxy mode (v3.5.0+) splits into `~/.claude/quota-status/account.json` (account-global fields: Q5h/Q7d, status, overage) plus `~/.claude/quota-status/sessions/<id>.json` (per-session cache fields: TTL tier, hit rate). Preload mode keeps the legacy `~/.claude/quota-status.json` (single-session by construction). The included `tools/quota-statusline.sh` script displays a live status line showing:
 
-- **Q5h %** with burn rate (%/min)
-- **Q7d %** with burn rate (%/hr)
+- **Q5h** quota bar `[███░┃░░░░░]` + percent + burn rate (%/min) + time-to-reset (`2h54m left`). Filled cells are consumed quota; the heavy-vertical tick is wall-clock elapsed position in the window. Tick to the right of the fill = under pace; tick inside the fill = burning faster than time (over pace).
+- **Q7d** same shape with day-scale time-to-reset (`2d 7h left`) and burn rate (%/hr).
 - **TTL tier** — `TTL:1h` when healthy, **`TTL:5m` in red when the server has downgraded you** (typically at Q5h ≥ 100%)
 - **PEAK** in yellow during weekday peak hours (13:00–19:00 UTC)
 - **Cache hit rate %**
 - **OVERAGE** flag when active
+
+Example line (mid-window, healthy state):
+
+```
+Q5h [███░┃░░░░░] 30% (+0.2%/m, 3h00m left) | Q7d [█████┃░░░░] 53% (+0.6%/hr, 3d 0h left) | TTL:1h 98.3%
+```
+
+The bar uses Unicode block characters (`█┃░`) — most modern terminals render these correctly. If your terminal substitutes boxes or replacement glyphs, configure a Unicode-capable font (any DejaVu, Fira, Iosevka, JetBrains Mono, etc.).
 
 ### Setup
 

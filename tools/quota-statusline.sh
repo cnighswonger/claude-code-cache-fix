@@ -98,28 +98,71 @@ ts = sess.get('timestamp') or acc.get('timestamp', '')
 
 now = datetime.fromisoformat(ts.replace('Z', '+00:00')) if ts else datetime.now(timezone.utc)
 
-# Q5h burn rate
-rate5 = ''
-if q5h_reset > 0 and q5h > 0:
-    window_start = datetime.fromtimestamp(q5h_reset, tz=timezone.utc) - timedelta(hours=5)
-    elapsed_min = (now - window_start).total_seconds() / 60
-    if elapsed_min > 1:
-        rate5 = '{:+.1f}'.format(q5h / elapsed_min)
+BAR_WIDTH = 10
 
-# Q7d burn rate
-rate7 = ''
-if q7d_reset > 0 and q7d > 0:
-    window_start_7d = datetime.fromtimestamp(q7d_reset, tz=timezone.utc) - timedelta(days=7)
-    elapsed_hr = (now - window_start_7d).total_seconds() / 3600
-    if elapsed_hr > 0.1:
-        rate7 = '{:+.1f}'.format(q7d / elapsed_hr)
+def draw_bar(consumed_pct, elapsed_pct, width=BAR_WIDTH):
+    # Tick overlays a fill cell when consumed > elapsed, keeping bar width
+    # constant — that's what makes the over-pace state legible (┃ inside the
+    # filled run) rather than just pushing fill cells around.
+    fill = int(round(max(0, min(100, consumed_pct)) / 100 * width))
+    if elapsed_pct is None:
+        tick = -1
+    else:
+        tick = min(int(max(0, min(100, elapsed_pct)) / 100 * width), width - 1)
+    cells = []
+    remaining = fill
+    for i in range(width):
+        if i == tick:
+            cells.append('┃')
+        elif remaining > 0:
+            cells.append('█')
+            remaining -= 1
+        else:
+            cells.append('░')
+    return '[' + ''.join(cells) + ']'
 
-label = 'Q5h: {}%'.format(q5h)
-if rate5:
-    label += ' ({}%/m)'.format(rate5)
-label += ' | Q7d: {}%'.format(q7d)
-if rate7:
-    label += ' ({}%/hr)'.format(rate7)
+def fmt_hm(secs):
+    if secs is None or secs <= 0:
+        return ''
+    return '{}h{:02d}m'.format(int(secs // 3600), int((secs % 3600) // 60))
+
+def fmt_dh(secs):
+    if secs is None or secs <= 0:
+        return ''
+    return '{}d {}h'.format(int(secs // 86400), int((secs % 86400) // 3600))
+
+def window_view(reset_ts, window_secs):
+    # Returns (elapsed_sec, secs_left). elapsed_sec may be negative (server
+    # gave us a reset_at past the window head — invalid) or exceed window_secs
+    # (stale reset_at not yet refreshed by the next API call). Callers handle
+    # both; downstream rendering clamps the tick to the bar edges.
+    if reset_ts <= 0:
+        return None, None
+    window_start = datetime.fromtimestamp(reset_ts - window_secs, tz=timezone.utc)
+    return (now - window_start).total_seconds(), reset_ts - now.timestamp()
+
+def burn_rate(q, elapsed_sec, divisor_sec, min_elapsed_sec):
+    if elapsed_sec is None or q <= 0 or elapsed_sec <= min_elapsed_sec:
+        return ''
+    return '{:+.1f}'.format(q / (elapsed_sec / divisor_sec))
+
+def format_window(name, pct, elapsed_sec, window_secs, rate, rate_unit, left_text):
+    ep = None if elapsed_sec is None or elapsed_sec < 0 else elapsed_sec / window_secs * 100
+    extras = []
+    if rate:
+        extras.append('{}%/{}'.format(rate, rate_unit))
+    if left_text:
+        extras.append('{} left'.format(left_text))
+    tail = ' (' + ', '.join(extras) + ')' if extras else ''
+    return '{} {} {}%{}'.format(name, draw_bar(pct, ep), pct, tail)
+
+elapsed_5h, left_5h = window_view(q5h_reset, 5 * 3600)
+elapsed_7d, left_7d = window_view(q7d_reset, 7 * 86400)
+
+label = format_window('Q5h', q5h, elapsed_5h, 5 * 3600,
+                      burn_rate(q5h, elapsed_5h, 60, 60), 'm', fmt_hm(left_5h))
+label += ' | ' + format_window('Q7d', q7d, elapsed_7d, 7 * 86400,
+                               burn_rate(q7d, elapsed_7d, 3600, 360), 'hr', fmt_dh(left_7d))
 if overage == 'active':
     label += ' | OVERAGE'
 
