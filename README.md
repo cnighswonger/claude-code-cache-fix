@@ -208,6 +208,40 @@ Options (all optional; all fall back to the same env vars used by the CLI):
 
 *The embeddable factory was contributed by [@bilby91](https://github.com/bilby91) at [Crunchloop DAP](https://dap.crunchloop.ai) — see [PR #123](https://github.com/cnighswonger/claude-code-cache-fix/pull/123).*
 
+## Recommended CC operational config
+
+The proxy fixes what it can fix at the request layer. A handful of CC client-side env vars and `~/.claude/settings.json` knobs solve adjacent problems the proxy can't reach — silent model swaps on CC update, ambiguous model fallback, schema-strip side effects. Surfacing these here as a recommendation; users decide their own config.
+
+These findings come from [@fgrosswig](https://github.com/fgrosswig)'s binary analysis of CC v2.1.91. Methodology is public PowerShell + ASCII string extraction; he shared the resulting punch list privately as a courtesy.
+
+### Suggested `~/.claude/settings.json` env block
+
+The model IDs below are illustrative — replace with your preferred main and small-fast models. The point is that pinning *something* explicit beats relying on CC's defaults.
+
+```json
+{
+  "env": {
+    "CLAUDE_CODE_DISABLE_LEGACY_MODEL_REMAP": "1",
+    "ANTHROPIC_MODEL": "claude-opus-4-7",
+    "ANTHROPIC_SMALL_FAST_MODEL": "claude-haiku-4-5-20251001"
+  }
+}
+```
+
+**`CLAUDE_CODE_DISABLE_LEGACY_MODEL_REMAP=1`** — single most impactful flag. CC has a legacy code path that silently remaps your pinned model to a different one after certain version updates. Setting this to `1` disables the remap; the model you pin is the model you get. (If you don't pin, CC's defaults apply as usual.)
+
+**`ANTHROPIC_MODEL`** — pins the primary model. Keeping this explicit means the cache prefix hash stays stable across CC version bumps that would otherwise swap your default. Adjust to whichever model you actually want.
+
+**`ANTHROPIC_SMALL_FAST_MODEL`** — pins the side-channel "fast" model CC uses for short auxiliary calls (e.g., title generation, classification). Without an explicit pin, this can silently fall back to a different family on update.
+
+### `autoCompactWindow=1000000` caveat
+
+If you've seen the `autoCompactWindow: 1000000` setting recommended elsewhere: it only takes effect when the active model qualifies for 1M-context (currently `claude-sonnet-4-6` or `claude-opus-4-6` with the appropriate beta header). Without those preconditions it caps at the hardcoded 200K regardless of what you set.
+
+### `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` schema-strip side effect
+
+If you set this flag, CC strips any tool field outside `["name", "description", "input_schema", "cache_control"]` from outgoing requests. Custom tools relying on `defer_loading` or `eager_input_streaming` will silently lose those fields and behave differently. Worth knowing before turning the flag on.
+
 ## Quick Start: Preload (CC v2.1.112 and earlier)
 
 If you're on a Node.js-based CC version (v2.1.112 or earlier), the preload interceptor works without a proxy:
