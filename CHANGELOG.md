@@ -2,17 +2,23 @@
 
 ## [Unreleased]
 
+## [3.6.2] - 2026-05-22
+
+### Added
+
+- **README: "Recommended CC operational config" section (#139).** Documents three `~/.claude/settings.json` env vars (`CLAUDE_CODE_DISABLE_LEGACY_MODEL_REMAP=1`, `ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`) that solve adjacent CC problems the proxy can't reach — silent model swap on update, ambiguous model fallback. Plus a caveat on `autoCompactWindow=1M` (only works on 1M-eligible models) and a footnote on `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` (strips tool fields outside the canonical four). Findings sourced from [@fgrosswig](https://github.com/fgrosswig)'s binary analysis of CC v2.1.91 — public methodology (PowerShell + ASCII string extraction), privately shared punch list. Thank you, @fgrosswig.
+
+### Fixed
+
+- **README: removed incorrect "npm provenance" claim from the supply-chain paragraph (#134).** Prior README copy stated "npm provenance links each published version to its source commit." Verified against the npm registry: no published release (including v3.6.0 and v3.6.1) carries sigstore provenance attestations — only the default `signatures` field. The claim has never been factual. Corrected to "Published builds carry npm's default registry signatures; sigstore provenance attestation is not currently published — tracked as a follow-up." No package behavior change; doc-accuracy correction only.
+
 ### Changed
 
-- **`tools/quota-statusline.sh`: Q5h/Q7d now render as a quota bar with an elapsed-time tick, plus an exhaust-vs-reset projection.** Each window shows a 10-cell bar `[███░┃░░░░░]` where filled cells are consumed quota and the heavy-vertical tick marks wall-clock elapsed position. Tick in the empty region = under pace; tick inside the fill = burning faster than time. The suffix `(exhaust X, reset Y)` replaces the previous burn-rate display: `exhaust` is projected time-to-100% at the current burn rate, `reset` is wall-clock time until the window rolls over. When `exhaust < reset` the user is on track to hit 100% before the window resets — the comparison is the actionable signal, which the raw `%/min` rate didn't convey without mental math. Output line shape changes from `Q5h: 42% (+0.4%/m)` to `Q5h [████░░░░░┃] 42% (exhaust 0h32m, reset 2h50m)`; downstream consumers that grep `Q5h: N%` need to switch to `Q5h \[.{10}\] N%`. Suffix segments are dropped piecewise when projection isn't meaningful: at `pct == 0` or `pct == 100` only `reset` is shown; during the burn-rate warmup (≤60s for Q5h, ≤360s for Q7d) `exhaust` is held back; a stale `resets_at` drops both. The bar uses standard Unicode block characters (`█┃░`); terminals without Unicode font coverage will need a Unicode-capable monospace font. TTL/hit-rate/PEAK/OVERAGE suffix segments are unchanged.
+- **`tools/quota-statusline.sh`: Q5h/Q7d now render as a quota bar with an elapsed-time tick, plus an exhaust-vs-reset projection (#140).** Each window shows a 10-cell bar `[███░┃░░░░░]` where filled cells are consumed quota and the heavy-vertical tick marks wall-clock elapsed position. Tick in the empty region = under pace; tick inside the fill = burning faster than time. The suffix `(exhaust X, reset Y)` replaces the previous burn-rate display: `exhaust` is projected time-to-100% at the current burn rate, `reset` is wall-clock time until the window rolls over. When `exhaust < reset` the user is on track to hit 100% before the window resets — the comparison is the actionable signal, which the raw `%/min` rate didn't convey without mental math. Output line shape changes from `Q5h: 42% (+0.4%/m)` to `Q5h [████░░░░░┃] 42% (exhaust 0h32m, reset 2h50m)`; downstream consumers that grep `Q5h: N%` need to switch to `Q5h \[.{10}\] N%`. Suffix segments are dropped piecewise when projection isn't meaningful: at `pct == 0` or `pct == 100` only `reset` is shown; during the burn-rate warmup (≤60s for Q5h, ≤360s for Q7d) `exhaust` is held back; a stale `resets_at` drops both. The bar uses standard Unicode block characters (`█┃░`); terminals without Unicode font coverage will need a Unicode-capable monospace font. TTL/hit-rate/PEAK/OVERAGE suffix segments are unchanged. Contributed by [@schuay](https://github.com/schuay) — thank you.
 
 ### Tests
 
 824 → 831 (+7): seven new format-contract tests (`T8`-`T14`) pin bar content and the `(exhaust X, reset Y)` wording for under-pace, over-pace, missing-`resets_at`, stale-window, fresh-window (`pct=0`), pre-warmup, and at-cap (`pct=100`) cases. Anchored against a fixed `now` via `account.json.timestamp` so timestamps are deterministic across CI runs.
-
-### Added
-
-- **README: "Recommended CC operational config" section.** Documents three `~/.claude/settings.json` env vars (`CLAUDE_CODE_DISABLE_LEGACY_MODEL_REMAP=1`, `ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`) that solve adjacent CC problems the proxy can't reach — silent model swap on update, ambiguous model fallback. Plus a caveat on `autoCompactWindow=1M` (only works on 1M-eligible models) and a footnote on `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` (strips tool fields outside the canonical four). Findings sourced from [@fgrosswig](https://github.com/fgrosswig)'s binary analysis of CC v2.1.91 — public methodology (PowerShell + ASCII string extraction), privately shared punch list. Thank you, @fgrosswig.
 
 ## [3.6.1] - 2026-05-17
 

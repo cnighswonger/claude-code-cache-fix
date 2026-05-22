@@ -1,6 +1,7 @@
 node_modules/
 .DS_Store
 *.log
+__pycache__/
 
 # .claude/ holds a mix of repo-routing identity and per-developer local state.
 # Track only the routing files; ignore everything else.
