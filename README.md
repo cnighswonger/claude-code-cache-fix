@@ -242,6 +242,18 @@ If you've seen the `autoCompactWindow: 1000000` setting recommended elsewhere: i
 
 If you set this flag, CC strips any tool field outside `["name", "description", "input_schema", "cache_control"]` from outgoing requests. Custom tools relying on `defer_loading` or `eager_input_streaming` will silently lose those fields and behave differently. Worth knowing before turning the flag on.
 
+## Known CC behaviors that affect cache cost
+
+These aren't bugs cache-fix patches — they're upstream CC behaviors users should be aware of when sizing their session cost.
+
+### Diagnostic slash commands inflate conversation history ([#49335](https://github.com/anthropics/claude-code/issues/49335), [#61907](https://github.com/anthropics/claude-code/issues/61907))
+
+Running `/context`, `/release-notes`, or `/mcp` appends the diagnostic output to conversation history rather than rendering terminal-only. Subsequent turns replay the inflated payload via prompt cache, compounding token cost on a state-inspection action that should be free. Empirically observed at ~3-5K tokens per `/context` invocation (more for `/release-notes`, which defaults to dumping the full changelog).
+
+Worse for diagnosis: the inflated payload that bills against your cache isn't written to the local JSONL transcript, so you can't audit the cost source locally — you can only infer it from `cache_creation_input_tokens` jumps in response usage metadata.
+
+**Workaround until upstream fix:** use these commands sparingly in long sessions. If you need them frequently in a session, consider `/compact` after a diagnostic run to reset the bleed.
+
 ## Quick Start: Preload (CC v2.1.112 and earlier)
 
 If you're on a Node.js-based CC version (v2.1.112 or earlier), the preload interceptor works without a proxy:
