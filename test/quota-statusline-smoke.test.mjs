@@ -192,7 +192,7 @@ test("T8 (format). under-pace: tick past fill; `exhaust` and `reset` both shown"
     // 5h: 30% used, 2h elapsed of 5h = 40% elapsed (tick at idx 4).
     //     exhaust = 70 * 7200 / 30 = 16800s = 4h40m; reset = 3h00m.
     // 7d: 53% used, 4d elapsed of 7d ≈ 57% elapsed (tick at idx 5).
-    //     exhaust = 47 * 345600 / 53 ≈ 306475s = 3d 13h; reset = 3d 0h.
+    //     exhaust = 47 * 345600 / 53 ≈ 306475s = 3d13h; reset = 3d0h.
     writeFileSync(env.account, formatAccount({
       q5hPct: 30, q5hOffsetSec: 3 * 3600,
       q7dPct: 53, q7dOffsetSec: 3 * 86400,
@@ -200,7 +200,7 @@ test("T8 (format). under-pace: tick past fill; `exhaust` and `reset` both shown"
     const r = runScript(env.home, '{"session_id":"x"}');
     assert.equal(r.status, 0, r.stderr);
     assert.match(r.stdout, /Q5h \[███░┃░░░░░\] 30% \(exhaust 4h40m, reset 3h00m\)/);
-    assert.match(r.stdout, /Q7d \[█████┃░░░░\] 53% \(exhaust 3d 13h, reset 3d 0h\)/);
+    assert.match(r.stdout, /Q7d \[█████┃░░░░\] 53% \(exhaust 3d13h, reset 3d0h\)/);
   } finally {
     env.cleanup();
   }
@@ -269,7 +269,7 @@ test("T12 (format). quota at 0% (fresh window): exhaust dropped, reset shown", (
     assert.equal(r.status, 0, r.stderr);
     assert.doesNotMatch(r.stdout, /\bexhaust\b/);
     assert.match(r.stdout, /Q5h \[┃░░░░░░░░░\] 0% \(reset 5h00m\)/);
-    assert.match(r.stdout, /Q7d \[┃░░░░░░░░░\] 0% \(reset 7d 0h\)/);
+    assert.match(r.stdout, /Q7d \[┃░░░░░░░░░\] 0% \(reset 7d0h\)/);
   } finally {
     env.cleanup();
   }
@@ -278,7 +278,7 @@ test("T12 (format). quota at 0% (fresh window): exhaust dropped, reset shown", (
 test("T13 (format). elapsed below min: exhaust dropped (noisy projection), reset shown", () => {
   const env = setupHome();
   try {
-    // Q5h elapsed = 30s (below 60s gate). Q7d elapsed = 120s (below 360s gate).
+    // Q5h elapsed = 30s, Q7d elapsed = 120s — both below the 300s burn-warmup gate.
     writeFileSync(env.account, formatAccount({
       q5hPct: 2, q5hOffsetSec: 5 * 3600 - 30,
       q7dPct: 1, q7dOffsetSec: 7 * 86400 - 120,
@@ -287,7 +287,7 @@ test("T13 (format). elapsed below min: exhaust dropped (noisy projection), reset
     assert.equal(r.status, 0, r.stderr);
     assert.doesNotMatch(r.stdout, /\bexhaust\b/);
     assert.match(r.stdout, /Q5h \[.{10}\] 2% \(reset 4h59m\)/);
-    assert.match(r.stdout, /Q7d \[.{10}\] 1% \(reset 6d 23h\)/);
+    assert.match(r.stdout, /Q7d \[.{10}\] 1% \(reset 6d23h\)/);
   } finally {
     env.cleanup();
   }
@@ -304,7 +304,27 @@ test("T14 (format). quota at 100% (already exhausted): exhaust dropped, reset sh
     assert.equal(r.status, 0, r.stderr);
     assert.doesNotMatch(r.stdout, /\bexhaust\b/);
     assert.match(r.stdout, /Q5h \[.{10}\] 100% \(reset 1h00m\)/);
-    assert.match(r.stdout, /Q7d \[.{10}\] 100% \(reset 1d 0h\)/);
+    assert.match(r.stdout, /Q7d \[.{10}\] 100% \(reset 1d0h\)/);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("T15 (format). Q7d autoselect: durations under a day render as h/m, not 0d Xh", () => {
+  const env = setupHome();
+  try {
+    // Q7d 99% used, reset 30 min away → elapsed ≈ 6d 23h 30m, secs_left = 1800.
+    //   exhaust = 1 * 603000 / 99 ≈ 6091s = 1h41m (days==0 → h/m fallback)
+    //   reset   = 1800s = 0h30m                    (days==0 → h/m fallback)
+    writeFileSync(env.account, formatAccount({
+      q5hPct: 0, q5hOffsetSec: 5 * 3600,
+      q7dPct: 99, q7dOffsetSec: 1800,
+    }));
+    const r = runScript(env.home, '{"session_id":"x"}');
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /Q7d \[.{10}\] 99% \(exhaust 1h41m, reset 0h30m\)/);
+    // Belt and suspenders: no `0d` token should appear when days collapse to 0.
+    assert.doesNotMatch(r.stdout, /0d/);
   } finally {
     env.cleanup();
   }

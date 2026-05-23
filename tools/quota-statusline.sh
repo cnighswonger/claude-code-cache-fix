@@ -98,6 +98,17 @@ ts = sess.get('timestamp') or acc.get('timestamp', '')
 
 now = datetime.fromisoformat(ts.replace('Z', '+00:00')) if ts else datetime.now(timezone.utc)
 
+SECS_PER_MIN = 60
+MINS_PER_HR = 60
+HRS_PER_DAY = 24
+SECS_PER_HR = SECS_PER_MIN * MINS_PER_HR
+SECS_PER_DAY = SECS_PER_HR * HRS_PER_DAY
+
+# Minimum elapsed time in a window before we'll project an exhaust ETA from
+# its burn rate. Below this the rate is dominated by a single early call and
+# the projection is noise.
+BURN_WARMUP_SEC = 5 * SECS_PER_MIN
+
 BAR_WIDTH = 10
 
 def draw_bar(consumed_pct, elapsed_pct, width=BAR_WIDTH):
@@ -121,15 +132,15 @@ def draw_bar(consumed_pct, elapsed_pct, width=BAR_WIDTH):
             cells.append('░')
     return '[' + ''.join(cells) + ']'
 
-def fmt_hm(secs):
+def fmt_time(secs):
+    # Autoselect scale: `{D}d{H}h` for >=1 day, `{H}h{MM}m` below that.
+    # One formatter so the Q5h (always h/m) and Q7d (h/m or d/h depending on
+    # how close to reset) callers don't need to pick.
     if secs is None or secs <= 0:
         return ''
-    return '{}h{:02d}m'.format(int(secs // 3600), int((secs % 3600) // 60))
-
-def fmt_dh(secs):
-    if secs is None or secs <= 0:
-        return ''
-    return '{}d {}h'.format(int(secs // 86400), int((secs % 86400) // 3600))
+    if secs >= SECS_PER_DAY:
+        return '{}d{}h'.format(int(secs // SECS_PER_DAY), int((secs % SECS_PER_DAY) // SECS_PER_HR))
+    return '{}h{:02d}m'.format(int(secs // SECS_PER_HR), int((secs % SECS_PER_HR) // SECS_PER_MIN))
 
 def window_view(reset_ts, window_secs):
     # Returns (elapsed_sec, secs_left). elapsed_sec may be negative (server
@@ -150,7 +161,7 @@ def time_to_exhaust_sec(pct, elapsed_sec, min_elapsed_sec):
         return None
     return (100 - pct) * elapsed_sec / pct
 
-def format_window(name, pct, elapsed_sec, window_secs, secs_left, fmt_time, min_elapsed_sec):
+def format_window(name, pct, elapsed_sec, window_secs, secs_left, min_elapsed_sec):
     ep = None if elapsed_sec is None or elapsed_sec < 0 else elapsed_sec / window_secs * 100
     extras = []
     stale = secs_left is not None and secs_left <= 0
@@ -163,11 +174,11 @@ def format_window(name, pct, elapsed_sec, window_secs, secs_left, fmt_time, min_
     tail = ' (' + ', '.join(extras) + ')' if extras else ''
     return '{} {} {}%{}'.format(name, draw_bar(pct, ep), pct, tail)
 
-elapsed_5h, left_5h = window_view(q5h_reset, 5 * 3600)
-elapsed_7d, left_7d = window_view(q7d_reset, 7 * 86400)
+elapsed_5h, left_5h = window_view(q5h_reset, 5 * SECS_PER_HR)
+elapsed_7d, left_7d = window_view(q7d_reset, 7 * SECS_PER_DAY)
 
-label = format_window('Q5h', q5h, elapsed_5h, 5 * 3600, left_5h, fmt_hm, 60)
-label += ' | ' + format_window('Q7d', q7d, elapsed_7d, 7 * 86400, left_7d, fmt_dh, 360)
+label = format_window('Q5h', q5h, elapsed_5h, 5 * SECS_PER_HR, left_5h, BURN_WARMUP_SEC)
+label += ' | ' + format_window('Q7d', q7d, elapsed_7d, 7 * SECS_PER_DAY, left_7d, BURN_WARMUP_SEC)
 if overage == 'active':
     label += ' | OVERAGE'
 
