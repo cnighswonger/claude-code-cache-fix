@@ -330,6 +330,27 @@ test("T15 (format). Q7d autoselect: durations under a day render as h/m, not 0d 
   }
 });
 
+test("T16 (format). burn-warmup gate: 100s elapsed (between legacy 60s gate and new 300s gate) suppresses exhaust", () => {
+  const env = setupHome();
+  try {
+    // Pins the unified BURN_WARMUP_SEC=300 against the prior per-window asymmetry
+    // (Q5h=60s, Q7d=360s). At 100s elapsed with 20% Q5h used, the legacy 60s gate
+    // would have projected an exhaust; the new 300s gate correctly suppresses.
+    // T13's 30s elapsed passes both old and new gates, so without T16 the gate
+    // value isn't actually contract-tested.
+    writeFileSync(env.account, formatAccount({
+      q5hPct: 20, q5hOffsetSec: 5 * 3600 - 100,   // elapsed = 100s
+      q7dPct: 1,  q7dOffsetSec: 7 * 86400 - 60,   // elapsed = 60s, also below gate
+    }));
+    const r = runScript(env.home, '{"session_id":"x"}');
+    assert.equal(r.status, 0, r.stderr);
+    assert.doesNotMatch(r.stdout, /\bexhaust\b/);
+    assert.match(r.stdout, /Q5h \[.{10}\] 20% \(reset 4h58m\)/);
+  } finally {
+    env.cleanup();
+  }
+});
+
 test("T6 (security #108). triple-quote injection payload does NOT execute — heredoc isolation intact", () => {
   // Regression for cnighswonger/claude-code-cache-fix#108: pre-v3.5.2,
   // tools/quota-statusline.sh interpolated stdin into a Python triple-quoted
