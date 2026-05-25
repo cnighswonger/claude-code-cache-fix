@@ -10,14 +10,15 @@ function envInt(name, fallback) {
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-// Existing fields are read once at module init (preserving prior behavior).
-// New corp-proxy/CA fields are getters so they reflect live env — important
-// for test isolation (see test/proxy-upstream-corp-proxy.test.mjs) and for
-// callers that legitimately want to flip env at runtime.
+// Most fields are read once at module init (preserving prior behavior).
+// Corp-proxy/CA fields and `upstream` are getters so they reflect live env —
+// important for test isolation (see test/proxy-upstream-corp-proxy.test.mjs
+// and test/proxy-server-bootstrap.test.mjs) and for callers that legitimately
+// want to flip env at runtime.
 const config = {
   port: envInt("CACHE_FIX_PROXY_PORT", 9801),
   bind: process.env.CACHE_FIX_PROXY_BIND || "127.0.0.1",
-  upstream: process.env.CACHE_FIX_PROXY_UPSTREAM || "https://api.anthropic.com",
+  get upstream() { return process.env.CACHE_FIX_PROXY_UPSTREAM || "https://api.anthropic.com"; },
   timeout: envInt("CACHE_FIX_PROXY_TIMEOUT", 600_000),
   extensionsDir: process.env.CACHE_FIX_EXTENSIONS_DIR || join(__dirname, "extensions"),
   extensionsConfig: process.env.CACHE_FIX_EXTENSIONS_CONFIG || join(__dirname, "extensions.json"),
