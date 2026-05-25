@@ -24,7 +24,7 @@ These are the lead's prep drafts staged for v3.6.3. Move them into the right des
 
 - The bootstrap-channel paragraph is ~150 words — longer than a first-pass draft — because the v3.6.2-vs-v3.6.3 behavior change needs to be addressable from the README, not just buried in the CHANGELOG. A user landing here from the receipt-page link should be able to understand the choice they're making.
 - Parenthetical "(Note: cache-fix v3.6.2 and earlier..." can move to a footnote or a `> ` blockquote if you prefer to keep the main paragraph flowing. Left inline because the behavior change is load-bearing and footnotes get skipped.
-- If the README has a `Configuration` section that documents `extensions.json` keys, `mode: audit | block` for the bootstrap-defense extension should land there alongside the existing entries; this section just references that mode exists and what it does.
+- Mode toggle is an env var (`CACHE_FIX_BOOTSTRAP_MODE=audit|block`), not an `extensions.json` field — matches existing extension-config convention (extensions.json holds `enabled`/`order` only). If the README has an environment-variables / configuration section that documents proxy env knobs, `CACHE_FIX_BOOTSTRAP_MODE` and `CACHE_FIX_BOOTSTRAP_LOG_PATH` should land there alongside the existing entries; this section just references that the toggle exists and what it does.
 - Relative links are written for the README at repo root (`docs/disclosure/heron-brook-2026-05.md`, `CHANGELOG.md#v363`). They will look broken in the in-PR preview because the draft currently lives in `docs/v3.6.3-prep/` — that is intentional; the paths are correct for the final destination.
 
 ## Notes on disclosure/heron-brook-2026-05.md
