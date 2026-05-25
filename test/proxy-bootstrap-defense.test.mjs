@@ -63,9 +63,17 @@ describe("bootstrap-defense extension", () => {
     it("onResponse writes one JSONL record per bootstrap response", async () => {
       const ctx = {
         status: 200,
-        headers: { "request-id": "req-abc", host: "api.anthropic.com" },
+        // ctx.headers on onResponse is the upstream RESPONSE header map and
+        // does not carry Host or request-id. The extension reads both from
+        // ctx.meta (stashed at forward time by handleBootstrap).
+        headers: { "content-type": "application/json" },
         body: { system_prompt_section: "hello" },
-        meta: { route: "bootstrap", _bootstrapDefenseMode: "audit" },
+        meta: {
+          route: "bootstrap",
+          _bootstrapDefenseMode: "audit",
+          _bootstrapUpstreamHost: "api.anthropic.com",
+          _bootstrapRequestId: "req-abc",
+        },
       };
       await extension.onResponse(ctx);
       const records = readRecords();
@@ -85,9 +93,21 @@ describe("bootstrap-defense extension", () => {
   });
 
   describe("block mode", () => {
-    it("onRequest returns skip with empty 200", async () => {
+    it("onRequest returns skip with empty 200 and records request_blocked with upstream_host", async () => {
+      // Realistic shape: handleBootstrap pre-populates _bootstrapUpstreamHost
+      // and _bootstrapRequestId via the preForward baseMeta param, so even
+      // the block path (which short-circuits in onRequest before forwarding)
+      // gets a fully-populated audit record.
       process.env.CACHE_FIX_BOOTSTRAP_MODE = "block";
-      const ctx = { body: {}, headers: { host: "api.anthropic.com" }, meta: { route: "bootstrap" } };
+      const ctx = {
+        body: {},
+        headers: {},
+        meta: {
+          route: "bootstrap",
+          _bootstrapUpstreamHost: "api.anthropic.com",
+          _bootstrapRequestId: "req-block-1",
+        },
+      };
       const result = await extension.onRequest(ctx);
       assert.deepEqual(result, {
         skip: true,
@@ -99,6 +119,21 @@ describe("bootstrap-defense extension", () => {
       assert.equal(records.length, 1);
       assert.equal(records[0].phase, "request_blocked");
       assert.equal(records[0].mode, "block");
+      assert.equal(records[0].request_id, "req-block-1");
+      assert.equal(records[0].upstream_host, "api.anthropic.com");
+    });
+
+    it("onRequest falls back to ctx.headers when meta lacks request_id (defense in depth)", async () => {
+      process.env.CACHE_FIX_BOOTSTRAP_MODE = "block";
+      const ctx = {
+        body: {},
+        headers: { "request-id": "req-fallback-1" },
+        meta: { route: "bootstrap" },
+      };
+      await extension.onRequest(ctx);
+      const records = readRecords();
+      assert.equal(records.length, 1);
+      assert.equal(records[0].request_id, "req-fallback-1");
     });
 
     it("onResponse no-ops in block mode (response never collected)", async () => {
@@ -139,9 +174,13 @@ describe("bootstrap-defense extension", () => {
           cookie: "session=secret-cookie-value",
           "x-forwarded-for": "10.0.0.42",
         },
-        meta: { route: "bootstrap" },
+        meta: {
+          route: "bootstrap",
+          _bootstrapUpstreamHost: "api.anthropic.com",
+          _bootstrapRequestId: "req-pii-test",
+        },
       };
-      // Drive a full audit record via the block-mode path (which logs request headers).
+      // Drive a full audit record via the block-mode path (which logs synchronously).
       process.env.CACHE_FIX_BOOTSTRAP_MODE = "block";
       await extension.onRequest(ctx);
 
@@ -169,6 +208,8 @@ describe("bootstrap-defense extension", () => {
           _bootstrapDefenseMode: "audit",
           _bootstrapUpstreamError: "ECONNREFUSED 127.0.0.1:1",
           _bootstrapBodyBytes: 0,
+          _bootstrapUpstreamHost: "api.anthropic.com",
+          _bootstrapRequestId: "req-err-1",
         },
       };
       await extension.onResponse(ctx);
@@ -178,6 +219,8 @@ describe("bootstrap-defense extension", () => {
       assert.equal(records[0].status, 502);
       assert.equal(records[0].error, "ECONNREFUSED 127.0.0.1:1");
       assert.equal(records[0].body_bytes, 0);
+      assert.equal(records[0].upstream_host, "api.anthropic.com");
+      assert.equal(records[0].request_id, "req-err-1");
     });
   });
 

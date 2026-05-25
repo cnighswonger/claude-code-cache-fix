@@ -76,20 +76,42 @@ describe("proxy server — /api/claude_cli/bootstrap routing", () => {
   it("default (audit) mode forwards bootstrap to upstream and returns 200 with body", async () => {
     delete process.env.CACHE_FIX_BOOTSTRAP_MODE;
     upstreamResponseFn = null;
+    const { readFileSync } = await import("node:fs");
+    const logPath = process.env.CACHE_FIX_BOOTSTRAP_LOG_PATH;
     const res = await clientRequest("POST", "/api/claude_cli/bootstrap", JSON.stringify({ version: "2.1.150" }));
     assert.equal(res.status, 200);
     assert.equal(lastUpstreamRequest.url, "/api/claude_cli/bootstrap");
     const parsed = JSON.parse(res.body);
     assert.equal(parsed.system_prompt_section, "from-upstream");
+
+    // Verify upstream_host is captured end-to-end (Codex review #149: response
+    // headers don't carry Host, so the field would silently null if the
+    // extension didn't read from ctx.meta).
+    const records = readFileSync(logPath, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+    const latest = records[records.length - 1];
+    assert.equal(latest.phase, "response_audited");
+    assert.equal(latest.upstream_host, "127.0.0.1");
   });
 
-  it("block mode short-circuits with empty 200, never calls upstream", async () => {
+  it("block mode short-circuits with empty 200, never calls upstream, and audits with upstream_host", async () => {
     process.env.CACHE_FIX_BOOTSTRAP_MODE = "block";
     lastUpstreamRequest = null;
+    const { readFileSync } = await import("node:fs");
+    const logPath = process.env.CACHE_FIX_BOOTSTRAP_LOG_PATH;
+    const sizeBefore = readFileSync(logPath, "utf8").split("\n").filter(Boolean).length;
+
     const res = await clientRequest("POST", "/api/claude_cli/bootstrap", JSON.stringify({ version: "2.1.150" }));
     assert.equal(res.status, 200);
     assert.equal(res.body, "{}");
     assert.equal(lastUpstreamRequest, null, "upstream must not be called in block mode");
+
+    // Block path audit record must also carry upstream_host (the destination
+    // that would have been called), captured via the preForward baseMeta.
+    const records = readFileSync(logPath, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+    assert.equal(records.length, sizeBefore + 1);
+    const latest = records[records.length - 1];
+    assert.equal(latest.phase, "request_blocked");
+    assert.equal(latest.upstream_host, "127.0.0.1");
   });
 
   it("non-bootstrap unrouted path still returns 404", async () => {
@@ -98,15 +120,37 @@ describe("proxy server — /api/claude_cli/bootstrap routing", () => {
     assert.equal(res.status, 404);
   });
 
-  it("bootstrap routes through pipeline even with empty body", async () => {
+  it("bootstrap routes through pipeline even with empty body — no message-only extension noise on stderr", async () => {
     delete process.env.CACHE_FIX_BOOTSTRAP_MODE;
     upstreamResponseFn = (_req, res) => {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({}));
     };
-    const res = await clientRequest("POST", "/api/claude_cli/bootstrap");
-    assert.equal(res.status, 200);
-    assert.equal(res.body, "{}");
+
+    // Pipeline route scoping (pipeline.mjs:appliesToRoute) defaults extensions
+    // to messages-only; bootstrap-defense opts in via routes:["bootstrap"].
+    // Capture stderr to assert no message-only extension throws against a
+    // bootstrap-shaped request (Codex review #149 HIGH finding).
+    const originalWrite = process.stderr.write.bind(process.stderr);
+    const captured = [];
+    process.stderr.write = (chunk, ...rest) => {
+      captured.push(typeof chunk === "string" ? chunk : chunk.toString());
+      return originalWrite(chunk, ...rest);
+    };
+    try {
+      const res = await clientRequest("POST", "/api/claude_cli/bootstrap");
+      assert.equal(res.status, 200);
+      assert.equal(res.body, "{}");
+    } finally {
+      process.stderr.write = originalWrite;
+    }
+
+    const pipelineErrors = captured.filter((line) => line.includes("[pipeline]"));
+    assert.deepEqual(
+      pipelineErrors,
+      [],
+      `Expected no pipeline errors on bootstrap empty-body path, got:\n${pipelineErrors.join("")}`,
+    );
   });
 
   it("upstream connection error is audited as anomaly before returning 502", async () => {

@@ -69,11 +69,28 @@ function recordShape({ phase, mode, status, body_bytes, upstream_host, request_i
   };
 }
 
-function extractAuditFields(headers) {
-  if (!headers) return { upstream_host: null, request_id: null };
+// Extract audit-record scalars from the request context. Meta wins over
+// headers so that the canonical request-side fields stashed by the server
+// (handleBootstrap stashes `_bootstrapUpstreamHost` and `_bootstrapRequestId`
+// before the upstream call) are authoritative on the onResponse path, where
+// ctx.headers carries the upstream RESPONSE headers (no Host, no request-id).
+// On the onRequest block path, meta hasn't been populated yet — the helper
+// falls back to ctx.headers (the client request headers) so request_id is
+// still captured. Upstream_host falls back to null on the request path
+// because the resolved upstream isn't known until handleBootstrap runs.
+//
+// Signature is scalar-only by design: callers MUST NOT spread a headers
+// object into recordShape, so a future maintainer can't accidentally widen
+// the log surface to carry Authorization / x-api-key / cookies.
+function extractAuditFields(meta, headers) {
+  const requestId =
+    meta?._bootstrapRequestId ??
+    headers?.["request-id"] ??
+    headers?.["x-request-id"] ??
+    null;
   return {
-    upstream_host: headers.host ?? null,
-    request_id: headers["request-id"] ?? headers["x-request-id"] ?? null,
+    upstream_host: meta?._bootstrapUpstreamHost ?? null,
+    request_id: requestId,
   };
 }
 
@@ -81,6 +98,10 @@ export default {
   name: "bootstrap-defense",
   description:
     "Audit (default) or block /api/claude_cli/bootstrap traffic. Audit mode proxies the response through to CC and logs metadata to ~/.claude/cache-fix-bootstrap-log.jsonl. Block mode returns empty 200, preserving v3.6.2's de-facto behavior in explicit form.",
+  // Pipeline route scoping (pipeline.mjs:appliesToRoute) gates this extension
+  // to the bootstrap path. The internal route guard below is belt-and-suspenders
+  // in case a caller invokes the hook directly.
+  routes: ["bootstrap"],
   order: 45,
 
   async onRequest(ctx) {
@@ -94,7 +115,7 @@ export default {
         recordShape({
           phase: "request_blocked",
           mode,
-          ...extractAuditFields(ctx.headers),
+          ...extractAuditFields(ctx.meta, ctx.headers),
         }),
       );
       return {
@@ -121,13 +142,18 @@ export default {
     }
 
     const upstreamError = ctx.meta?._bootstrapUpstreamError ?? null;
+    // Request-side context (request_id, upstream_host) is captured at
+    // forward time and stashed on ctx.meta — we read from meta here rather
+    // than ctx.headers (which on onResponse contains the upstream RESPONSE
+    // headers, not the client request).
     appendRecord(
       recordShape({
         phase: upstreamError ? "upstream_error_audited" : "response_audited",
         mode,
         status: ctx.status,
         body_bytes: bodyBytes,
-        ...extractAuditFields(ctx.headers),
+        upstream_host: ctx.meta?._bootstrapUpstreamHost ?? null,
+        request_id: ctx.meta?._bootstrapRequestId ?? null,
         error: upstreamError,
       }),
     );

@@ -46,10 +46,27 @@ export function snapshotRegistry() {
   return [...registry];
 }
 
+// Route scoping: extensions default to messages-only so that adding a new
+// route (e.g. /api/claude_cli/bootstrap) doesn't drag every existing
+// message-mutating extension onto it — most throw on a null body because
+// they were never designed for non-messages traffic. Cross-cutting
+// extensions (cache-telemetry, usage-log, …) opt into additional routes
+// by declaring an explicit `routes` array on their default export.
+//
+// If ctx.meta.route is undefined we skip filtering entirely — preserves
+// back-compat for callers that don't tag routes (legacy tests, embedders).
+function appliesToRoute(ext, route) {
+  if (!route) return true;
+  const routes = ext.routes || ["messages"];
+  return routes.includes(route);
+}
+
 export async function runOnRequest(ctx, snapshot) {
   const exts = snapshot || registry;
+  const route = ctx.meta?.route;
   for (const ext of exts) {
     if (!ext.onRequest) continue;
+    if (!appliesToRoute(ext, route)) continue;
     try {
       const result = await ext.onRequest(ctx);
       if (result && result.skip) return result;
@@ -62,8 +79,10 @@ export async function runOnRequest(ctx, snapshot) {
 
 export async function runOnResponseStart(ctx, snapshot) {
   const exts = snapshot || registry;
+  const route = ctx.meta?.route;
   for (const ext of exts) {
     if (!ext.onResponseStart) continue;
+    if (!appliesToRoute(ext, route)) continue;
     try {
       await ext.onResponseStart(ctx);
     } catch (err) {
@@ -74,8 +93,10 @@ export async function runOnResponseStart(ctx, snapshot) {
 
 export async function runOnStreamEvent(ctx, snapshot) {
   const exts = snapshot || registry;
+  const route = ctx.meta?.route;
   for (const ext of exts) {
     if (!ext.onStreamEvent) continue;
+    if (!appliesToRoute(ext, route)) continue;
     try {
       await ext.onStreamEvent(ctx);
     } catch (err) {
@@ -86,8 +107,10 @@ export async function runOnStreamEvent(ctx, snapshot) {
 
 export async function runOnResponse(ctx, snapshot) {
   const exts = snapshot || registry;
+  const route = ctx.meta?.route;
   for (const ext of exts) {
     if (!ext.onResponse) continue;
+    if (!appliesToRoute(ext, route)) continue;
     try {
       await ext.onResponse(ctx);
     } catch (err) {

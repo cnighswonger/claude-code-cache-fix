@@ -1,5 +1,5 @@
 import http from "node:http";
-import { pathToFileURL } from "node:url";
+import { pathToFileURL, URL } from "node:url";
 import config from "./config.mjs";
 import { forwardRequest } from "./upstream.mjs";
 import { streamResponse, createTelemetryRecord } from "./stream.mjs";
@@ -23,7 +23,7 @@ function collectBody(req) {
 // `routeName` is stashed on ctx.meta.route so route-aware extensions
 // (bootstrap-defense, env-flag-detector) can discriminate without each
 // route needing its own pipeline hook.
-async function preForward(clientReq, clientRes, _abortController, extSnapshot, routeName) {
+async function preForward(clientReq, clientRes, _abortController, extSnapshot, routeName, baseMeta = {}) {
   const rawBody = await collectBody(clientReq);
 
   let parsed;
@@ -34,7 +34,11 @@ async function preForward(clientReq, clientRes, _abortController, extSnapshot, r
   }
 
   let forwardBody = rawBody;
-  const meta = { route: routeName };
+  // baseMeta lets routes pre-populate audit scalars (e.g. resolved upstream
+  // hostname, request_id) so they're available to onRequest hooks BEFORE the
+  // upstream call — block-mode short-circuits in onRequest, so a post-call
+  // stash would miss the block-path audit record.
+  const meta = { ...baseMeta, route: routeName };
 
   if (extSnapshot.length > 0) {
     const reqCtx = { body: parsed, headers: { ...clientReq.headers }, meta };
@@ -159,7 +163,21 @@ async function handleBootstrap(clientReq, clientRes) {
   const abortController = new AbortController();
   const extSnapshot = snapshotRegistry();
 
-  const pre = await preForward(clientReq, clientRes, abortController, extSnapshot, "bootstrap");
+  // Resolve audit-record scalars BEFORE preForward so they're visible to
+  // onRequest hooks (block-mode short-circuits there). HTTP responses don't
+  // carry a Host header, so the audit log derives upstream_host from
+  // config.upstream — the actual destination requests were forwarded to.
+  let upstreamHost = null;
+  try {
+    upstreamHost = new URL(config.upstream).hostname;
+  } catch {}
+  const baseMeta = {
+    _bootstrapUpstreamHost: upstreamHost,
+    _bootstrapRequestId:
+      clientReq.headers["request-id"] ?? clientReq.headers["x-request-id"] ?? null,
+  };
+
+  const pre = await preForward(clientReq, clientRes, abortController, extSnapshot, "bootstrap", baseMeta);
   if (pre.handled) return;
   const { forwardBody, meta } = pre;
 
