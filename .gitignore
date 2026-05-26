@@ -8,3 +8,15 @@ __pycache__/
 .claude/*
 !.claude/agent-name
 !.claude/github-app
+
+# Generated/local artifacts that have never been tracked in this repo.
+# hpagent is the sole runtime dep; we publish unbundled.
+package-lock.json
+# Codex possibility-space project state — per-host, not source.
+.possibilities/
+
+# Private working notes belong in a private location (e.g. ~/proxy-builder-private/),
+# not the public working tree. These belt-and-suspenders patterns block accidental
+# re-introduction via `git add -A` after the originals are moved out.
+docs/directives/proxy-hardening-falk-*
+docs/claude-design-meter-*
