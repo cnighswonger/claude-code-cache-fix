@@ -763,6 +763,7 @@ We monitor 30+ upstream Claude Code issues related to cache, quota, and context 
 - **[@deafsquad](https://github.com/deafsquad)** — Universal smoosh_split un-smoosh fix (PR #26), source-level function attribution of resume scatter bug (anthropics/claude-code#43657), OTEL telemetry discovery, proposed and built proxy architecture for v3.0.0
 - **[@vmfarms](https://github.com/vmfarms)** — Concurrent multi-runner production validation, surfaced proxy-mode resume-marker regex no-op (#96), TTL tier detection gap (#97), and image-strip stderr leak (#98)
 - **[@ojura](https://github.com/ojura)** — Opus 4.7 thinking-summaries root-cause analysis: filed [anthropics/claude-code#59844](https://github.com/anthropics/claude-code/issues/59844) with the CLI-binary decode (`!getIsNonInteractiveSession()` gate at offset 230510599 in v2.1.142) and the two-stacked-special-cases framing, which made the `thinking-display` extension (v3.6.1) a clean proxy-side complement to the proposed upstream fix
+- **[@schuay](https://github.com/schuay)** — `quota-statusline.sh` enhancements: 10-cell quota bar with elapsed-time tick and exhaust-vs-reset projection replacing the prior `%/min` burn-rate display (PR #140, v3.6.2), and d/h vs h/m time-format autoselect plus named time-unit and burn-warmup constants (PR #143, v3.7.0)
 
 If you contributed to the community effort on these issues and aren't listed here, please open an issue or PR — we want to credit everyone properly.
 
