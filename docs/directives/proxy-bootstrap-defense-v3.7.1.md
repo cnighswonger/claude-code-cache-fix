@@ -56,7 +56,9 @@ Other GrowthBook flag keys in the response are not touched by allowlist mode —
 
 ## Detection mechanism
 
-Response-time over env-var-presence. Env-var presence tells you what the launcher disclosed; the parsed bootstrap response is where injection actually lands and where defense actually applies. Env-var presence is captured as the secondary `setup_detected` field on the response audit record, not as a separate event phase.
+Response-time over env-var-presence. Env-var presence tells you what the launcher disclosed; the parsed bootstrap response is where injection actually lands and where defense actually applies. The env-var signal for `CLAUDE_CODE_SYSTEM_PROMPT_GB_FEATURE` is implicit in the audit record: when `surface: "prompt_injection_gb"`, `prompt_key` carries the value of that env var. The orthogonal `CLAUDE_CODE_REMOTE` signal (which gates the entire new consumer pattern on the CC side) is captured as the `remote_mode` boolean.
+
+**Stale-cache blind spot (out of scope for v3.7.1).** If CC reads a previously-written on-disk GrowthBook cache without making a fresh `/api/claude_cli/bootstrap` fetch through this proxy run, the audit log will not emit a fresh record for that session. v3.7.1 protects against new bootstrap fetches; it does not retroactively audit cache contents written by prior runs. Users who want belt-and-suspenders on this should clear the on-disk cache on proxy start, or use `block`/`allowlist` mode (which prevents new cache writes from injection-class keys going forward).
 
 ## Audit log schema
 
@@ -72,7 +74,17 @@ Same file (`~/.claude/cache-fix-bootstrap-log.jsonl`). Schema bumps from v1 to v
 
 `SCHEMA_VERSION` constant bumps from `1` to `2`. `EXTENSION_VERSION` bumps to `"v3.7.1"`. Existing v1 records remain readable — consumers should treat absent v1 fields as null/empty array.
 
-When the bootstrap response would normally carry prompt-source keys but the body is JSON-unparseable, all new fields default to null/empty array and the existing anomaly audit (`upstream_error_audited` / `response_audited` with null body) records the unparseable case.
+### Multi-surface records
+
+A single bootstrap response can carry both `tengu_heron_brook` AND the key named by `CLAUDE_CODE_SYSTEM_PROMPT_GB_FEATURE`. `surface` / `prompt_key` / `prompt_value_hash` are scalar fields — they cannot represent both surfaces in one record.
+
+**Resolution: one audit record per detected prompt-source surface.** When `onResponse` finds N prompt-source-eligible keys present in the response body, it emits N records, one per surface (`"bootstrap"` and/or `"prompt_injection_gb"`). Each record carries the scalar fields for its own surface only. `stripped_keys` on each record reflects only the strip outcome for that surface's key. Other scalar fields (`status`, `body_bytes`, `request_id`, `remote_mode`, etc.) are duplicated across the records emitted from a single response — consumers correlate by matching `request_id` + timestamp window.
+
+This keeps each record's `surface` field meaningful, avoids array-typed fields that complicate downstream consumers, and lets future surfaces extend the same one-record-per-surface convention.
+
+When neither surface is detected in the response (no `tengu_heron_brook` and no env-var-selected key present), the existing single `response_audited` record is emitted with `surface: "bootstrap"`, `prompt_key: null`, `prompt_value_hash: null`. This preserves the existing record shape for the no-injection-detected case.
+
+When the bootstrap response would normally carry prompt-source keys but the body is JSON-unparseable, the single existing anomaly audit (`upstream_error_audited` / `response_audited` with null body) records the unparseable case; new fields default to null / empty array. No multi-surface emission for unparseable bodies.
 
 ## Implementation surface
 
@@ -80,7 +92,7 @@ When the bootstrap response would normally carry prompt-source keys but the body
 - Bump `SCHEMA_VERSION` to `2`, `EXTENSION_VERSION` to `"v3.7.1"`
 - Update extension `name`/`description` to reflect both surfaces
 - Extend `recordShape` with `surface`, `prompt_key`, `prompt_value_hash`, `remote_mode`, `stripped_keys` fields
-- Extend `onResponse` to inspect parsed body for prompt-source-eligible keys, compute SHA-256 hash of values when present, and in `allowlist` mode mutate `ctx.body` to strip non-allowlisted prompt-source keys before the existing serialization path returns the response to CC
+- Extend `onResponse` to inspect parsed body for prompt-source-eligible keys, compute SHA-256 hash of values when present, emit one audit record per detected surface (see "Multi-surface records"), and in `allowlist` mode mutate `ctx.body` to strip non-allowlisted prompt-source keys before the existing serialization path returns the response to CC
 - Add `modeFromEnv` support for `"allowlist"` value
 - Add `allowedKeysFromEnv` helper that parses `CACHE_FIX_BOOTSTRAP_ALLOWED_KEYS` (default `["tengu_heron_brook"]`, explicit empty string → empty array)
 - Add `promptSourceKeysFromEnv` helper that returns the set of prompt-source-eligible keys based on `CLAUDE_CODE_SYSTEM_PROMPT_GB_FEATURE` + the hardcoded `tengu_heron_brook` baseline
@@ -89,18 +101,25 @@ Hot-path note: the bootstrap path is a single non-SSE JSON response, not a hot p
 
 ## Test coverage
 
-`test/extensions/bootstrap-defense.test.mjs` additions:
+### Unit tests — `test/proxy-bootstrap-defense.test.mjs`
 
-1. Audit mode, response carries `tengu_heron_brook` only → record has `surface: "bootstrap"`, `prompt_key: "tengu_heron_brook"`, `prompt_value_hash` populated, `stripped_keys: []`
-2. Audit mode, `CLAUDE_CODE_SYSTEM_PROMPT_GB_FEATURE=foo_bar`, response carries `foo_bar` key → record has `surface: "prompt_injection_gb"`, `prompt_key: "foo_bar"`, `prompt_value_hash` populated, `stripped_keys: []`
-3. Audit mode, env var set but response does not carry the named key → `prompt_value_hash: null`, `stripped_keys: []`
-4. Audit mode, JSON-unparseable response body → new fields all default cleanly, no crash
-5. Block mode unchanged → still empty 200 from `onRequest`, no body inspection
-6. Allowlist mode, env-var-selected key NOT in allowlist → key stripped from response, `stripped_keys: ["<key>"]`, returned body lacks the key
-7. Allowlist mode, env-var-selected key IS in allowlist → key passes through, `stripped_keys: []`
-8. Allowlist mode with `CACHE_FIX_BOOTSTRAP_ALLOWED_KEYS=` (empty) → even `tengu_heron_brook` stripped
-9. Allowlist mode preserves non-prompt-source keys → only prompt-source-eligible keys are subject to stripping
-10. `remote_mode` field correctly reflects `CLAUDE_CODE_REMOTE` presence/absence
+1. Audit mode, response carries `tengu_heron_brook` only → one record with `surface: "bootstrap"`, `prompt_key: "tengu_heron_brook"`, `prompt_value_hash` populated, `stripped_keys: []`
+2. Audit mode, `CLAUDE_CODE_SYSTEM_PROMPT_GB_FEATURE=foo_bar`, response carries `foo_bar` key only → one record with `surface: "prompt_injection_gb"`, `prompt_key: "foo_bar"`, `prompt_value_hash` populated, `stripped_keys: []`
+3. **Multi-surface case:** Audit mode, env var set to `foo_bar`, response carries BOTH `tengu_heron_brook` AND `foo_bar` → two records emitted from the single response, one per surface, each with its own `prompt_key` / `prompt_value_hash`, shared `request_id` + timestamp window for correlation
+4. Audit mode, env var set but response does not carry the named key → one `prompt_injection_gb` record with `prompt_value_hash: null`, `stripped_keys: []`
+5. Audit mode, neither prompt-source key in response → single record with `surface: "bootstrap"`, `prompt_key: null`, `prompt_value_hash: null` (preserves no-injection-detected baseline)
+6. Audit mode, JSON-unparseable response body → single anomaly audit record with new fields defaulted to null/empty array, no multi-surface emission
+7. Block mode unchanged → still empty 200 from `onRequest`, no body inspection, single `request_blocked` record
+8. Allowlist mode, env-var-selected key NOT in allowlist → key stripped from response body, record has `stripped_keys: ["<key>"]`, returned body lacks the key
+9. Allowlist mode, env-var-selected key IS in allowlist → key passes through, `stripped_keys: []`
+10. Allowlist mode with `CACHE_FIX_BOOTSTRAP_ALLOWED_KEYS=` (explicit empty) → even `tengu_heron_brook` stripped (deny-all semantics)
+11. Allowlist mode preserves non-prompt-source keys → only prompt-source-eligible keys are subject to stripping; other GB flag keys in the response pass through untouched
+12. Allowlist mode, multi-surface case (both prompt-source keys in response, only one allowlisted) → two records emitted, only the non-allowlisted key appears in its record's `stripped_keys`, returned body lacks only the stripped key
+13. `remote_mode` field correctly reflects `CLAUDE_CODE_REMOTE` presence/absence across audit/block/allowlist modes
+
+### Integration test — `test/proxy-server-bootstrap.test.mjs`
+
+14. **End-to-end allowlist mutation:** `allowlist` mode, env-var-selected key NOT in allowlist, full request through `handleBootstrap` — assert the response Claude Code actually receives on the wire lacks the stripped key (proves `ctx.body` mutation flows through the existing `JSON.stringify(resCtx.body)` serialization path in `proxy/server.mjs`)
 
 ## Documentation
 
