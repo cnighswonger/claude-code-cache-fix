@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+## [3.7.1] - 2026-05-27
+
+### Added
+
+- **bootstrap-defense extended to the env-var-selected GrowthBook prompt-injection surface (#153, #154).** Claude Code v2.1.152 (shipped 2026-05-27) added a new consumer pattern over the existing `/api/claude_cli/bootstrap` response body: in remote-control mode (`CLAUDE_CODE_REMOTE` set), the env var `CLAUDE_CODE_SYSTEM_PROMPT_GB_FEATURE` selects a GrowthBook flag key whose cached value is used as the agent's system prompt body. Same delivery channel as v3.7.0's `tengu_heron_brook` heron-brook surface, new key-selection layer over the same payload. v3.7.0 audited the legacy surface only; v3.7.1 closes the gap by auditing both.
+
+  **New audit-log fields (schema v1 → v2).** Each `~/.claude/cache-fix-bootstrap-log.jsonl` record now carries `surface` (`"bootstrap"` | `"prompt_injection_gb"`), `prompt_key` (the key read as the prompt source, or null), `prompt_value_hash` (SHA-256 of the value, first 16 hex chars — never the value itself), `remote_mode` (whether `CLAUDE_CODE_REMOTE` is set), and `stripped_keys` (which keys allowlist mode removed from the response body, empty otherwise). Existing v1 readers see all v1 fields unchanged; new fields default to null/empty for the legacy no-injection-detected case. Multi-surface responses (both keys present, including env-var-aliases-legacy-key) emit one record per surface, correlated by `request_id` + timestamp window.
+
+  **New `allowlist` mode** alongside the existing `audit` (default) and `block` modes. Set `CACHE_FIX_BOOTSTRAP_MODE=allowlist` to deny-by-default for prompt-source-eligible keys, allowlist-overridable via `CACHE_FIX_BOOTSTRAP_ALLOWED_KEYS=comma,separated,list`. Default allowlist is `tengu_heron_brook` (the only known-legitimate historical key); pass `CACHE_FIX_BOOTSTRAP_ALLOWED_KEYS=` (explicit empty) for full deny-all. Allowlist mode strips non-allowlisted prompt-source keys from the response body before returning it to CC; other GrowthBook flag keys pass through untouched. Documented as experimental — may need updates if Anthropic adds legitimate prompt-source keys in future CC releases.
+
+  **Default behavior unchanged.** v3.7.0 → v3.7.1 is a patch release; existing users running `bootstrap-defense` in audit mode get expanded coverage for the new surface, not a new behavior class. `block` mode semantics are unchanged (empty 200 from onRequest still defeats both surfaces by preventing any flag map from reaching the on-disk GrowthBook cache).
+
+  **Out of scope for v3.7.1.** Stale on-disk GrowthBook cache reuse — if CC reads a flag value cached from a prior bootstrap fetch that didn't pass through this proxy run, v3.7.1 will not emit a fresh audit record for that session. Users wanting belt-and-suspenders should use `block` or `allowlist` mode, which prevent new injection-class keys from reaching the cache going forward. Granular `block` mode (parse-strip-reserialize as the default block) and content-pattern key filtering are deferred to v3.8.0+.
+
+### Tests
+
+850 → 866 (+16): bootstrap-defense surface-detection suite (cases 1–6 audit-mode surface fires, alias case 3a preserving operator-visibility signal with same-key-different-surface emission); allowlist-mode suite (cases 8–12 plus alias case 13); hash-derivation pin (fixture against silent refactor drift); integration case 14 in `test/proxy-server-bootstrap.test.mjs` proving `ctx.body` mutation flows end-to-end through `JSON.stringify(resCtx.body)` serialization back to the client.
+
 ## [3.7.0] - 2026-05-26
 
 ### Added

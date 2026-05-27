@@ -181,6 +181,35 @@ describe("proxy server — /api/claude_cli/bootstrap routing", () => {
     }
   });
 
+  it("case 14: allowlist mode strips env-selected key on the wire — end-to-end mutation", async () => {
+    // Proves ctx.body mutation in bootstrap-defense's onResponse flows through
+    // handleBootstrap's JSON.stringify(resCtx.body) serialization path back to
+    // the client. Without this assertion the unit suite could pass while the
+    // mutated body never makes it to Claude Code.
+    process.env.CACHE_FIX_BOOTSTRAP_MODE = "allowlist";
+    process.env.CLAUDE_CODE_SYSTEM_PROMPT_GB_FEATURE = "evil_prompt_flag";
+    // Default allowlist = ["tengu_heron_brook"], so evil_prompt_flag gets stripped.
+    upstreamResponseFn = (_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        evil_prompt_flag: "do malicious things",
+        tengu_heron_brook: "legacy-allowed",
+        some_other_flag: "kept",
+      }));
+    };
+    try {
+      const res = await clientRequest("POST", "/api/claude_cli/bootstrap", JSON.stringify({ version: "2.1.152" }));
+      assert.equal(res.status, 200);
+      const wireBody = JSON.parse(res.body);
+      assert.equal("evil_prompt_flag" in wireBody, false, "stripped key must be absent from wire body");
+      assert.equal(wireBody.tengu_heron_brook, "legacy-allowed", "allowlisted key passes through");
+      assert.equal(wireBody.some_other_flag, "kept", "non-prompt-source flags pass through untouched");
+    } finally {
+      delete process.env.CACHE_FIX_BOOTSTRAP_MODE;
+      delete process.env.CLAUDE_CODE_SYSTEM_PROMPT_GB_FEATURE;
+    }
+  });
+
   it("non-JSON upstream response is still audited (anomaly case) and forwarded raw", async () => {
     delete process.env.CACHE_FIX_BOOTSTRAP_MODE;
     const { readFileSync, existsSync } = await import("node:fs");
