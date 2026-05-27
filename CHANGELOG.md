@@ -18,7 +18,11 @@
 
 ### Tests
 
-850 → 866 (+16): bootstrap-defense surface-detection suite (cases 1–6 audit-mode surface fires, alias case 3a preserving operator-visibility signal with same-key-different-surface emission); allowlist-mode suite (cases 8–12 plus alias case 13); hash-derivation pin (fixture against silent refactor drift); integration case 14 in `test/proxy-server-bootstrap.test.mjs` proving `ctx.body` mutation flows end-to-end through `JSON.stringify(resCtx.body)` serialization back to the client.
+850 → 871 (+21): bootstrap-defense surface-detection suite (cases 1–6 audit-mode surface fires, alias case 3a preserving operator-visibility signal with same-key-different-surface emission); allowlist-mode suite (cases 8–12 plus alias case 13); hash-derivation pin (fixture against silent refactor drift); empty-string env-var truthiness pin (4 cases asserting `CLAUDE_CODE_REMOTE=""` and `CLAUDE_CODE_SYSTEM_PROMPT_GB_FEATURE=""` are treated as unset, plus inverse non-empty assertions); integration case 14 in `test/proxy-server-bootstrap.test.mjs` proving `ctx.body` mutation flows end-to-end through `JSON.stringify(resCtx.body)` serialization back to the client; integration case 14b proving audit-mode multi-surface emission produces two correlated records end-to-end through `handleBootstrap`.
+
+### Release tests
+
+Docker smoke test (`docs/release-tests/v3.7.1-docker-smoke-2026-05-27.md`): five-section validation of the v3.7.1 build in a `node:22-alpine` container against a stubbed bootstrap upstream. Covers container boot/`/health`, extension manifest version (`SCHEMA_VERSION=2`, `EXTENSION_VERSION="v3.7.1"`), audit-mode single-surface record shape, audit-mode multi-surface emission with shared `request_id` correlation, block-mode empty-200 with upstream-not-called assertion, and allowlist-mode on-the-wire key stripping. Verdict: GREEN.
 
 ## [3.7.0] - 2026-05-26
 

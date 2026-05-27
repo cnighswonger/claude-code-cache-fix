@@ -318,6 +318,66 @@ describe("bootstrap-defense extension", () => {
     });
   });
 
+  describe("empty-string env-var semantics (pin truthiness behavior)", () => {
+    // The implementation uses truthiness checks (`if (envKey)`, `Boolean(env.X)`)
+    // to gate surface activation and remote_mode. Empty string is falsy in JS,
+    // so empty == unset. These tests pin that behavior so a future refactor
+    // that switches to `!== undefined` (a common ESLint suggestion) cannot
+    // silently flip the empty-string case from "unset" to "set."
+
+    function baseCtx() {
+      return {
+        status: 200,
+        headers: {},
+        body: { system_prompt_section: "hello" },
+        meta: {
+          route: "bootstrap",
+          _bootstrapDefenseMode: "audit",
+          _bootstrapUpstreamHost: "api.anthropic.com",
+          _bootstrapRequestId: "req-empty-env",
+        },
+      };
+    }
+
+    it("CLAUDE_CODE_REMOTE='' is treated as unset → remote_mode: false", async () => {
+      process.env.CLAUDE_CODE_REMOTE = "";
+      await extension.onResponse(baseCtx());
+      const records = readRecords();
+      assert.equal(records.length, 1);
+      assert.equal(records[0].remote_mode, false);
+    });
+
+    it("CLAUDE_CODE_REMOTE='1' (non-empty) is treated as set → remote_mode: true", async () => {
+      // Adjacent inverse coverage — confirms the truthiness check still
+      // recognizes non-empty values as activation.
+      process.env.CLAUDE_CODE_REMOTE = "1";
+      await extension.onResponse(baseCtx());
+      const records = readRecords();
+      assert.equal(records[0].remote_mode, true);
+    });
+
+    it("CLAUDE_CODE_SYSTEM_PROMPT_GB_FEATURE='' is treated as unset → no prompt_injection_gb surface", async () => {
+      process.env.CLAUDE_CODE_SYSTEM_PROMPT_GB_FEATURE = "";
+      await extension.onResponse(baseCtx());
+      const records = readRecords();
+      // Only the no-injection-detected baseline record; no prompt_injection_gb fires.
+      assert.equal(records.length, 1);
+      assert.equal(records[0].surface, "bootstrap");
+      assert.equal(records[0].prompt_key, null);
+    });
+
+    it("CLAUDE_CODE_SYSTEM_PROMPT_GB_FEATURE='foo_bar' (non-empty) is treated as set → prompt_injection_gb surface fires", async () => {
+      // Adjacent inverse coverage — pins that the truthiness check still
+      // activates the surface on any non-empty string.
+      process.env.CLAUDE_CODE_SYSTEM_PROMPT_GB_FEATURE = "foo_bar";
+      await extension.onResponse(baseCtx());
+      const records = readRecords();
+      assert.equal(records.length, 1);
+      assert.equal(records[0].surface, "prompt_injection_gb");
+      assert.equal(records[0].prompt_key, "foo_bar");
+    });
+  });
+
   describe("remote_mode signal", () => {
     it("case 13: remote_mode reflects CLAUDE_CODE_REMOTE env var presence/absence", async () => {
       const baseCtx = () => ({
