@@ -86,6 +86,18 @@ When neither surface is detected in the response (no `tengu_heron_brook` and no 
 
 When the bootstrap response would normally carry prompt-source keys but the body is JSON-unparseable, the single existing anomaly audit (`upstream_error_audited` / `response_audited` with null body) records the unparseable case; new fields default to null / empty array. No multi-surface emission for unparseable bodies.
 
+**Env-var-aliases-legacy-key.** If `CLAUDE_CODE_SYSTEM_PROMPT_GB_FEATURE=tengu_heron_brook` (env var aliases the hardcoded legacy key) and the response carries the key, multi-surface emission still applies — two records, same `prompt_key`, same `prompt_value_hash`, distinct `surface` values. The two CC consumer patterns are semantically-distinct attack-decision points even when they happen to read the same key, and the audit log preserves the operator-visibility signal that the env var configuration was pointed at the legacy key.
+
+### Hash derivation
+
+`prompt_value_hash` MUST be derived as exactly:
+
+```js
+crypto.createHash('sha256').update(flagValue, 'utf8').digest('hex').slice(0, 16)
+```
+
+First 16 characters of the lowercase hexadecimal SHA-256 digest of the UTF-8-encoded flag value. Not first-16-bytes (would yield 32 hex chars), not base64-truncated, not last-16-chars. Pin a test fixture asserting the hash of a known string (e.g. `"test value"`) matches this derivation byte-for-byte so a future refactor cannot silently change the audit-log identity of historical records.
+
 ## Implementation surface
 
 `proxy/extensions/bootstrap-defense.mjs`:
@@ -106,6 +118,7 @@ Hot-path note: the bootstrap path is a single non-SSE JSON response, not a hot p
 1. Audit mode, response carries `tengu_heron_brook` only → one record with `surface: "bootstrap"`, `prompt_key: "tengu_heron_brook"`, `prompt_value_hash` populated, `stripped_keys: []`
 2. Audit mode, `CLAUDE_CODE_SYSTEM_PROMPT_GB_FEATURE=foo_bar`, response carries `foo_bar` key only → one record with `surface: "prompt_injection_gb"`, `prompt_key: "foo_bar"`, `prompt_value_hash` populated, `stripped_keys: []`
 3. **Multi-surface case:** Audit mode, env var set to `foo_bar`, response carries BOTH `tengu_heron_brook` AND `foo_bar` → two records emitted from the single response, one per surface, each with its own `prompt_key` / `prompt_value_hash`, shared `request_id` + timestamp window for correlation
+3a. **Multi-surface, env-var-aliases-legacy-key case:** Audit mode, env var set to `tengu_heron_brook` (aliases the legacy hardcoded key), response carries the key → still emits **two records**, each with `prompt_key: "tengu_heron_brook"` and `prompt_value_hash` identical, but `surface: "bootstrap"` vs `surface: "prompt_injection_gb"`. The two CC consumer patterns remain semantically distinct attack-decision points even when they read the same key, and the audit log preserves the operator-visibility signal that env-var configuration was pointed at the legacy key.
 4. Audit mode, env var set but response does not carry the named key → one `prompt_injection_gb` record with `prompt_value_hash: null`, `stripped_keys: []`
 5. Audit mode, neither prompt-source key in response → single record with `surface: "bootstrap"`, `prompt_key: null`, `prompt_value_hash: null` (preserves no-injection-detected baseline)
 6. Audit mode, JSON-unparseable response body → single anomaly audit record with new fields defaulted to null/empty array, no multi-surface emission
