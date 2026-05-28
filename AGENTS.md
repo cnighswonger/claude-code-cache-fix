@@ -88,7 +88,7 @@ Significant implementation plans and code go to the Codex Review Agent before me
 
 LLM-written code reliably satisfies functional requirements and neglects non-functional ones — security, maintainability, and especially size/complexity. These rules add the missing lens. (Canonical cross-repo standard maintained by the Project Lead; the reviewer-side anti-bloat lens lives in the "Codex Review Agent" section below.)
 
-**Every directive must address these non-functional topics in a `## Non-Functional Requirements` section** (after Goal/Background, before scope). It is a short fixed checklist, not a rigid template — answer each in a line or two. `n/a` is valid for any topic except **Load-bearing?**, which is a required yes/no.
+**Every directive created or materially revised after this policy must address these non-functional topics in a `## Non-Functional Requirements` section** (after Goal/Background, before scope; existing directives are grandfathered until their next material revision). It is a short fixed checklist, not a rigid template — answer each in a line or two. `n/a` is valid for any topic except **Load-bearing?**, which is a required yes/no.
 
 - **Size/complexity budget** — a qualitative trigger: state the rough expected size (LOC and/or module count) so review can flag an implementation that lands materially larger (≈2×) than the directive anticipated.
 - **Threat model** — inputs, trust boundaries, what must never leak or execute. The proxy handles API keys and full request/response bodies — be specific here.
@@ -96,7 +96,7 @@ LLM-written code reliably satisfies functional requirements and neglects non-fun
 - **Performance/reliability** — only where it applies.
 - **Load-bearing?** (required yes/no) — yes if it touches a shared abstraction, a wire/schema contract, or anything security-relevant.
 
-**Load-bearing changes require human (Chris) review before merge**, not just Lead + Codex — the independent reviewer and the Lead are both LLMs with correlated blind spots, and an LLM reviewer can even confabulate findings. Routine leaf code rides on Lead + Codex.
+**When `Load-bearing?` is yes, Chris's review is part of the required review set** — do not apply `ready-for-merge` (or merge) until he signs off. This adds a required approver; it is **not** the `needs-human-review` hard-stop, so bots continue normal review and labeling (no conflict with the Codex review post). The independent reviewer and the Lead are both LLMs with correlated blind spots, and an LLM reviewer can even confabulate findings. Routine leaf code rides on Lead + Codex.
 
 ## Public Communication
 
