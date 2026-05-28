@@ -83,13 +83,13 @@ Significant implementation plans and code go to the Codex Review Agent before me
 
 LLM-written code reliably satisfies functional requirements and neglects non-functional ones — security, maintainability, and especially size/complexity. These rules add the missing lens. (Canonical cross-repo standard maintained by the Project Lead; the reviewer-side anti-bloat lens lives in this repo's `AGENTS.md`.)
 
-**Every directive must include a `## Non-Functional Requirements` section** (after Goal/Background, before scope). Keep each line terse; `n/a` is a valid answer.
+**Every directive must address these non-functional topics in a `## Non-Functional Requirements` section** (after Goal/Background, before scope). It is a short fixed checklist, not a rigid template — answer each in a line or two. `n/a` is valid for any topic except **Load-bearing?**, which is a required yes/no.
 
-- **Size/complexity budget** — rough expected magnitude; reviewers flag if exceeded by ~2×.
+- **Size/complexity budget** — a qualitative trigger: state the rough expected size (LOC and/or module count) so review can flag an implementation that lands materially larger (≈2×) than the directive anticipated.
 - **Threat model** — inputs, trust boundaries, what must never leak or execute. The proxy handles API keys and full request/response bodies — be specific here.
-- **Maintainability constraints** — no new abstraction without ≥3 call sites; no dead code; no defensive handling for impossible cases; no back-compat shims unless required.
+- **Maintainability constraints** — new abstractions require explicit justification (repeated use, ≈3+ call sites, or a concrete near-term reuse case); otherwise default to inlining. No dead code; no defensive handling for impossible cases; no back-compat shims unless required.
 - **Performance/reliability** — only where it applies.
-- **Load-bearing?** yes if it touches a shared abstraction, a wire/schema contract, or anything security-relevant.
+- **Load-bearing?** (required yes/no) — yes if it touches a shared abstraction, a wire/schema contract, or anything security-relevant.
 
 **Load-bearing changes require human (Chris) review before merge**, not just Lead + Codex — the independent reviewer and the Lead are both LLMs with correlated blind spots, and an LLM reviewer can even confabulate findings. Routine leaf code rides on Lead + Codex.
 
