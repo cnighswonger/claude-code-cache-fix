@@ -51,7 +51,7 @@ Extend the per-session quota-status JSON, written on each request via the existi
 
 - `CACHE_FIX_THINKING_RISK_WARN_TOKENS` (default **250000**)
 - `CACHE_FIX_THINKING_RISK_HIGH_TOKENS` (default **340000** — just under the observed ~382K trip, with margin)
-- `CACHE_FIX_THINKING_RISK=off` to disable the warning (telemetry still recorded)
+- `CACHE_FIX_THINKING_RISK=off` disables the warning signal — both the stderr warn line AND the computed `thinking_desync_risk` field — while raw count telemetry (`context_tokens`, `thinking_block_count`, `thinking_block_max`) keeps recording (always useful, and it feeds the block-threshold calibration)
 - Block-threshold env vars (`..._WARN_BLOCKS` / `..._HIGH_BLOCKS`) are **deferred to the fast-follow**, set once `thinking_block_max` telemetry gives the failure distribution. Not introduced this release.
 
 Conservative early-warn bias is intentional: a premature "retire soon" is far cheaper than a dead session.
@@ -73,7 +73,7 @@ Once production `thinking_block_max` telemetry shows the in-context block count 
 - **Threat model:** counts/tokens only. MUST NOT log, persist, or emit thinking text, signatures, or any request/response content — telemetry is numeric (`context_tokens`, `thinking_block_count`, `thinking_block_max`, risk level) plus a content-free warn line. **Read-only on request/response bodies** — this extension observes and records; it never mutates the body. No new inbound surface.
 - **Maintainability constraints:** reuse the existing per-session quota-status writer and `cache-telemetry`'s usage extraction; do not introduce a new abstraction for the count/threshold logic. New JSON fields are additive. No dead code, no back-compat shims.
 - **Performance/reliability:** O(content-blocks) per request to count thinking blocks; cheap. Because the transform is read-only on the body, it does not churn the prompt-cache prefix.
-- **Load-bearing? yes — schema-contract dimension only.** It does **not** modify request/response bodies (unlike the sibling #162 sanitize), so it carries none of the request-path correctness/cache-mutation risk. BUT it extends the per-session quota-status JSON — a wire/schema contract that downstream consumers (statusline, dashboards) read — so it qualifies as load-bearing on the schema dimension. The additions are backward-compatible (new optional fields; existing consumers unaffected). Recommend the `schema-change` label and a brief human (Chris) confirmation that the schema additions don't break existing per-session consumers; it does not carry the request-mutation review burden #162 does.
+- **Load-bearing? yes — schema-contract dimension only.** It does **not** modify request/response bodies (unlike the sibling #162 sanitize), so it carries none of the request-path correctness/cache-mutation risk. BUT it extends the per-session quota-status JSON — a wire/schema contract that downstream consumers (statusline, dashboards) read — so it qualifies as load-bearing on the schema dimension. The additions are backward-compatible (new optional fields; existing consumers unaffected). Per CLAUDE.md's load-bearing rule, wire/schema-contract changes **require** human (Chris) review before merge — here specifically to confirm the additive fields don't break existing per-session consumers — and the `schema-change` label applies. (It does not carry #162's request-mutation review burden, but the schema-contract change is a Chris-review gate, not a recommendation.)
 
 ## Out of scope
 
