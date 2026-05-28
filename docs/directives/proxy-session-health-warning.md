@@ -1,7 +1,7 @@
 # Directive: session-health early-warning (thinking-desync risk)
 
-**Status:** DRAFT — authored by Proxy Builder 2026-05-28, pending AI Team Lead scope approval. New feature → minor release; per `docs/release-workflow.md` the maintenance-mode gate is at this directive stage.
-**Author:** Proxy Builder
+**Status:** Scope APPROVED by AI Team Lead 2026-05-28 (issue #158). Ready for directive-stage PR + Codex review. New feature → minor release (v3.8.0); per `docs/release-workflow.md` the maintenance-mode gate is at this directive stage and has been cleared.
+**Author:** Proxy Builder (directive), AI Team Lead (scope approval + refinements)
 **References:**
 - `anthropics/claude-code#63172` — upstream root-cause bug (interleaved-thinking signature desync on extreme-scale sessions)
 - cache-fix `#157` — defensive thinking-block guards (related but separate)
@@ -24,39 +24,46 @@ cache-fix is uniquely positioned to provide the missing early warning: it proxie
 - **Session age / first-seen** — the per-session quota-status file already exists (cache-fix v3.5.0+); first-seen timestamp gives age.
 - **Per-session keying** — session id is already resolved in `onRequest` (the v3.5.4 fix moved session-id resolution to request headers).
 
-## Proposed design
+## Design (v3.8.0 — single release, split by dimension)
 
-### Phase 1 — measure (no thresholds yet)
+Per AI Team Lead's scope decision: ship one useful release now rather than a warn-nothing telemetry release followed by a warn release. The **token dimension is already anchored** (we directly observed the trip at ~382K live context), so it gates an active warning immediately. The **block dimension is recorded in telemetry but does not yet gate a warning** — we lack the in-context block distribution at failure (the incident only gives session-*total* ~6,850), so its threshold stays evidence-driven and activates in a calibrated fast-follow.
 
-Add per-session telemetry so we can calibrate thresholds against real data rather than guessing:
+### Telemetry (all fields, this release)
 
-- Extend the per-session quota-status JSON with: `context_tokens` (latest), `thinking_block_count` (latest request), `thinking_block_max` (session high-water), `first_seen`, `request_count`.
-- Emit these on each request via the existing per-session writer.
-- No warning behavior yet — this phase exists to gather the distribution of `thinking_block_count` and `context_tokens` at which real sessions start failing, since the incident data only gives session-*total* thinking blocks (~6,850), not the in-context count at the trip.
+Extend the per-session quota-status JSON, written on each request via the existing per-session writer:
 
-### Phase 2 — warn (thresholds calibrated from Phase 1 data)
+- `context_tokens` — latest request's live context (`input_tokens + cache_read_input_tokens + cache_creation_input_tokens`)
+- `thinking_block_count` — count of `thinking`/`redacted_thinking` blocks in the latest request (the live risk driver)
+- `thinking_block_max` — session high-water mark of the above (this is exactly the calibration data we're missing for the block threshold; free to record)
+- `first_seen`, `request_count`
+- `thinking_desync_risk` — `"ok" | "warn" | "high"` (computed; see below)
 
-- Compute a `thinking_desync_risk` field per session: `"ok" | "warn" | "high"`, derived from `context_tokens` and `thinking_block_count` crossing configurable thresholds.
-- Surface in three places:
-  1. **Per-session JSON** — `thinking_desync_risk` + the raw counts (for any consumer).
-  2. **Statusline** — a segment that appears only at `warn`/`high` (e.g. `⚠ ctx 310K / 220 think-blocks — consider retiring`), consumed by `tools/quota-statusline.sh`.
-  3. **One-time stderr log** — when a session first crosses into `high`, so headless/non-statusline surfaces still get the signal once.
-- Config (env vars, with defaults anchored to the observed failure scale):
-  - `CACHE_FIX_THINKING_RISK_WARN_TOKENS` (default ~250000)
-  - `CACHE_FIX_THINKING_RISK_HIGH_TOKENS` (default ~340000)
-  - `CACHE_FIX_THINKING_RISK_WARN_BLOCKS` / `_HIGH_BLOCKS` (defaults TBD from Phase 1)
-  - `CACHE_FIX_THINKING_RISK=off` to disable entirely
+### Active warning (token-gated, this release)
 
-### Risk model (starting point, to refine in Phase 2)
+- Compute `thinking_desync_risk` from `context_tokens` only, in this release: `high` when `context_tokens ≥ high-tokens`, `warn` at `≥ warn-tokens`, else `ok`. (Block-count is recorded but does NOT contribute to the risk level yet.)
+- Surface in **two** places (NOT the statusline this release — see Resolved decisions #2):
+  1. **Per-session JSON** — `thinking_desync_risk` + the raw counts, for any consumer.
+  2. **One-time stderr log** — when a session first crosses into `high`, so headless/non-statusline surfaces get the signal once (not on every request).
 
-`high` when EITHER context_tokens ≥ high-tokens OR thinking_block_count ≥ high-blocks; `warn` at the lower thresholds; `ok` otherwise. Token-OR-block (not AND) because either dimension alone can carry the risk, and the cheap conservative bias is to warn early — a false "retire soon" is far cheaper than a dead session.
+### Config (env vars)
 
-## Open questions (for AI Team Lead)
+- `CACHE_FIX_THINKING_RISK_WARN_TOKENS` (default **250000**)
+- `CACHE_FIX_THINKING_RISK_HIGH_TOKENS` (default **340000** — just under the observed ~382K trip, with margin)
+- `CACHE_FIX_THINKING_RISK=off` to disable the warning (telemetry still recorded)
+- Block-threshold env vars (`..._WARN_BLOCKS` / `..._HIGH_BLOCKS`) are **deferred to the fast-follow**, set once `thinking_block_max` telemetry gives the failure distribution. Not introduced this release.
 
-1. **Phasing** — ship measure + warn together (one minor), or land Phase 1 telemetry first to calibrate, then Phase 2 in a follow-up? Lean: separate, so thresholds are evidence-based. But that's two releases.
-2. **Statusline ownership** — `quota-statusline.sh` is community-contributed (@schuay). A new risk segment touches it; coordinate or keep the signal in the per-session JSON only and let the statusline opt in later?
-3. **Default thresholds** — anchor on the single observed incident (~382K / ~6,850 total), or hold defaults conservative and let Phase 1 data set them? The in-context block count at failure is the number we actually lack.
-4. **Scope of "thinking_block_count"** — count only the latest request's blocks, or track session high-water? (Directive proposes both fields.)
+Conservative early-warn bias is intentional: a premature "retire soon" is far cheaper than a dead session.
+
+### Fast-follow (separate, after data)
+
+Once production `thinking_block_max` telemetry shows the in-context block count at/near failure, add the block dimension to the risk computation (`high`/`warn` on EITHER tokens OR blocks) with calibrated `..._BLOCKS` defaults. Tracked as a follow-up, not part of v3.8.0.
+
+## Resolved scope decisions (AI Team Lead, 2026-05-28, #158)
+
+1. **Phasing → split by dimension, one release.** v3.8.0 ships full telemetry + the active token-gated warn now (token trip is anchored); the block dimension is telemetry-only and activates in a calibrated fast-follow. Avoids shipping a warn-nothing release while the failure keeps recurring.
+2. **Statusline → leave `quota-statusline.sh` untouched this release.** Signal via per-session JSON + one-time stderr log only. A separate coordination issue/PR will propose the optional risk segment for @schuay to opt into or own — keeping community-code edits out of this release and the contributor boundary clean.
+3. **Defaults → anchor tokens, hold blocks.** Token `high` ~340K / `warn` ~250K; no blind block defaults (telemetry-only until data sets them). Conservative early-warn bias retained.
+4. **`thinking_block_count` → track both.** Latest-request count (live driver) and `thinking_block_max` high-water (the missing calibration data).
 
 ## Out of scope
 
@@ -66,4 +73,4 @@ Add per-session telemetry so we can calibrate thresholds against real data rathe
 
 ## Version target
 
-Minor — **v3.8.0** (new extension + new env vars + new statusline behavior). Per `docs/release-workflow.md`, AI Team Lead approves this directive's scope before implementation begins. If split into measure/warn phases, Phase 1 telemetry could ship as a smaller minor and Phase 2 as the next.
+Minor — **v3.8.0** (new extension + new env vars). No statusline change this release (decision #2), so no community-code edit. Scope approved by AI Team Lead (#158); ready for the directive-stage PR + Codex review loop. The block-dimension fast-follow is a later patch/minor once telemetry calibrates it.
