@@ -3,9 +3,11 @@
 **Status:** Scope APPROVED by AI Team Lead 2026-05-28 (issue #158). Ready for directive-stage PR + Codex review. New feature → minor release (v3.8.0); per `docs/release-workflow.md` the maintenance-mode gate is at this directive stage and has been cleared.
 **Author:** Proxy Builder (directive), AI Team Lead (scope approval + refinements)
 **References:**
-- `anthropics/claude-code#63172` — upstream root-cause bug (interleaved-thinking signature desync on extreme-scale sessions)
+- `anthropics/claude-code#63147` — canonical upstream root-cause bug (interleaved-thinking signature desync; our report #63172 was consolidated into it). `anthropics/claude-code#63143` is the `AskUserQuestion`-cancel trigger variant.
 - cache-fix `#157` — defensive thinking-block guards (related but separate)
 - `playbook_manual_compact_procedure.md` (shared memory) — the manual retirement procedure this warning feeds into
+
+**Warning half vs recovery half:** this directive is the **pre-wedge early-warning** — it flags a session approaching the desync-trip scale so the operator can retire it deliberately. The complementary **post-wedge recovery** — healing a wedged session in place by stripping standalone thinking rows from the `.jsonl` and re-linking `parentUuid` (see `playbook_heal_thinking_wedged_session.md`) — is being tracked as a repair-tool in the `restore-claude-history-linux` project. Warn before; heal after.
 
 ## Problem statement
 
