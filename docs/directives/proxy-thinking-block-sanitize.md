@@ -29,7 +29,7 @@ On the request path, drop **prior-turn** extended-thinking blocks (which CC pers
 2. **Do not touch non-empty thinking blocks** — a block with real thinking text + signature is intact, valid, and load-bearing; leave it exactly as-is. (In practice CC stores prior thinking empty, but guard against it anyway.)
 3. **Latest-assistant-message handling is the open question (see below).** The 400 names the *latest* assistant message, so a prior-turn-only drop may not clear it in every trigger. Default behavior in v1: do not modify the latest assistant message (conservative — never break a live interleaved-thinking continuation). Whether the latest *completed* (non-continuation) turn can also be safely dropped is to be settled empirically before this ships.
 4. If removing blocks would leave an assistant message with empty `content[]`, drop that message (prior-turn thinking-only messages are optional history). The proxy operates on the wire request, not the on-disk transcript, so there is no `parentUuid` to relink.
-5. Default-on, with a single env kill-switch (e.g. `CACHE_FIX_THINKING_SANITIZE=off`). Justified because it removes only omitted prior-turn thinking (optional history, no semantic content).
+5. **Opt-in for v1** via `CACHE_FIX_THINKING_SANITIZE=on` (default **off**). Per Chris's release-safety call (2026-05-28): the transform mutates request bodies for every session and its coverage is not yet live-validated (Open Question 1), so v1 ships opt-in — we do not ship a body-mutating, not-yet-validated transform default-on. Revisit default-on once a captured wedged request confirms the predicate clears a real 400 without touching healthy sessions.
 
 ## Telemetry
 
@@ -45,7 +45,7 @@ Emit a per-request count of blocks dropped (counts only — never content). A no
 
 1. **Coverage (load-bearing):** confirm empirically against a captured wedged request whether dropping *prior-turn* omitted thinking actually clears a 400 that names the *latest* assistant message. If the failing block is the latest *completed* (non-continuation) turn, the transform likely must also drop that turn's omitted thinking — while still never touching a latest turn that is an active tool-continuation. Settle the exact "which turns" rule with a real repro before implementation locks.
 2. Drop-the-message vs. placeholder-text-block when an assistant message becomes empty-content — which does the API accept more cleanly in the messages array?
-3. Default-on vs. opt-in for the first release — lean default-on; confirm against cache-fix's release-safety posture.
+3. **RESOLVED (Chris, 2026-05-28): opt-in for v1** (`CACHE_FIX_THINKING_SANITIZE=on`, default off). Revisit default-on only after live coverage validation (Open Question 1). Rationale: don't ship a body-mutating, not-yet-validated transform default-on — no train wreck.
 
 ## Testing
 
