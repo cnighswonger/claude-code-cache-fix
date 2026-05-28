@@ -18,14 +18,14 @@ On the request path, drop **prior-turn** extended-thinking blocks (which CC pers
 ## Non-Functional Requirements
 
 - **Size/complexity budget:** small — one focused request-transform extension plus tests (~100–200 LOC). A bounded `messages[].content[]` walk, not a new subsystem. Flag at review if it grows materially past that.
-- **Threat model:** operates on request bodies that contain conversation content. MUST NOT log, persist, or emit thinking text or signature values (telemetry is counts only). MUST NOT remove content other than prior-turn omitted (`thinking:""`) thinking/`redacted_thinking` blocks. No new inbound surface.
+- **Threat model:** operates on request bodies that contain conversation content. MUST NOT log, persist, or emit thinking text or signature values (telemetry is counts only). MUST NOT remove content other than prior-turn omitted (`thinking:""`) `thinking` blocks. No new inbound surface.
 - **Maintainability constraints:** reuse the existing extension pipeline and any existing message/content-walk helper in `preload.mjs`; do not introduce a new abstraction for a single transform. No dead code; no back-compat shims.
 - **Performance/reliability:** O(content-blocks) per request, cheap. The transform MUST be deterministic and stable — identical input → identical output — so it does not itself churn the prompt-cache prefix across turns (a non-deterministic transform would defeat cache-fix's own purpose).
 - **Load-bearing? yes** — modifies request bodies in a shared proxy on the request path; correctness-, security-, and cache-relevant. Requires human (Chris) review before merge, not just Lead + Codex.
 
 ## Behavior
 
-1. In `onRequest`, walk `body.messages`. For every assistant message **except the latest assistant message**, remove `thinking` / `redacted_thinking` blocks whose text is empty/whitespace-only (the omitted shape). These are prior-turn optional history; dropping them is safe.
+1. In `onRequest`, walk `body.messages`. For every assistant message **except the latest assistant message**, remove `thinking` blocks whose text is empty/whitespace-only (the omitted shape). These are prior-turn optional history; dropping them is safe. (`redacted_thinking` is **out of scope for v1** — see Out of scope.)
 2. **Do not touch non-empty thinking blocks** — a block with real thinking text + signature is intact, valid, and load-bearing; leave it exactly as-is. (In practice CC stores prior thinking empty, but guard against it anyway.)
 3. **Latest-assistant-message handling is the open question (see below).** The 400 names the *latest* assistant message, so a prior-turn-only drop may not clear it in every trigger. Default behavior in v1: do not modify the latest assistant message (conservative — never break a live interleaved-thinking continuation). Whether the latest *completed* (non-continuation) turn can also be safely dropped is to be settled empirically before this ships.
 4. If removing blocks would leave an assistant message with empty `content[]`, drop that message (prior-turn thinking-only messages are optional history). The proxy operates on the wire request, not the on-disk transcript, so there is no `parentUuid` to relink.
@@ -40,6 +40,7 @@ Emit a per-request count of blocks dropped (counts only — never content). A no
 - **The latest interleaved-thinking continuation.** When the latest assistant turn ended mid-tool-use and tool_results follow, the API requires that turn's thinking intact — the proxy cannot supply it (the text is gone) and must not strip it. **User-side answer for this case: `DISABLE_INTERLEAVED_THINKING=1` in settings `env`** (forces thinking to lead / avoids the failing form), reported effective on #63147. Document this; it is the part the proxy cannot cover.
 - **Repairing the on-disk `.jsonl` transcript.** The proxy acts on requests, not disk. Transcript repair is a recovery-tool concern (restore-claude-history-linux `heal-thinking-wedge`, RCB#5), tracked separately.
 - **Persisting the real thinking text.** That is CC's job; the upstream fix lives in #63147.
+- **`redacted_thinking` blocks (deferred from v1).** `redacted_thinking` is a distinct opaque `{ "type":"redacted_thinking", "data":"..." }` block — it carries no emptied text field, so it does not exhibit the empty-text-vs-signature mismatch that drives this 400 and is therefore unlikely to be part of the failure mode. Rather than special-case a schema-aware rule for a rare block with no evidence it wedges, v1 scopes to `thinking` only. Revisit if a captured repro ever shows prior-turn `redacted_thinking` contributing to the rejection (Codex re-review, 2026-05-28).
 
 ## Open questions (for Codex / Proxy Builder)
 
