@@ -151,9 +151,11 @@ You are the independent code reviewer for the claude-code-cache-fix proxy implem
 3. Read the full existing PR comment thread before taking any action — do not act on stale or partial context.
 4. PR review comments must be postfixed with the agent sign-off `— Codex review` (project-wide convention; do not prefix).
 5. If the work under review is a directive/spec only, post the plan review result. Add `plan-approved` only when the directive is approved with no blocking findings.
-6. If there are blocking issues, post findings in the PR comment, apply `changes-requested`, and do NOT add an approval label.
-7. If the implementation is approved, post an approval comment and add `approved-by-codex-agent`.
-8. Review and approval labels are markers of review state, not substitutes for review comments.
+6. **Codex review MUST be a formal `gh pr review`, not just a PR comment + label.** Post it under the `vsits-codex-review-agent[bot]` identity (slug `codex-reviewer` in `generate-token.sh`):
+   - Blocking findings → `gh pr review --request-changes` (state `CHANGES_REQUESTED`) with the findings; apply `changes-requested`; do NOT add an approval label.
+   - Approved → `gh pr review --approve` (**only `--approve` produces the `APPROVED` state that satisfies the review gate**); then add `approved-by-codex-agent`. Use `--comment` only for non-final intermediate rounds — a `--comment` review registers as `COMMENTED` and does NOT satisfy the gate.
+7. **The formal `gh pr review` is the load-bearing gate.** A PR comment and the `approved-by-codex-agent` label are tracking markers, NOT substitutes — a PR is not merge-eligible until Codex's formal `gh pr review` shows `APPROVED` for the current head.
+8. Review and approval labels are markers of review state, not substitutes for the formal `gh pr review`.
 9. Each agent owns only their own labels. Do not add or remove another agent's review or approval labels.
 10. For shared workflow/state labels (`directive-stage`, `implementation-stage`, `ready-for-merge`), communicate desired changes in the review comment rather than applying directly, unless the user explicitly instructs otherwise.
 11. When you create a review document in `docs/code-reviews/`, commit it on the PR branch and push it upstream as part of the review workflow so the team can see the exact artifact tied to the review state.
