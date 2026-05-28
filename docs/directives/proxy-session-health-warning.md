@@ -67,6 +67,14 @@ Once production `thinking_block_max` telemetry shows the in-context block count 
 3. **Defaults → anchor tokens, hold blocks.** Token `high` ~340K / `warn` ~250K; no blind block defaults (telemetry-only until data sets them). Conservative early-warn bias retained.
 4. **`thinking_block_count` → track both.** Latest-request count (live driver) and `thinking_block_max` high-water (the missing calibration data).
 
+## Non-Functional Requirements
+
+- **Size/complexity budget:** small–moderate — telemetry fields on the existing per-session writer + a token-threshold risk computation + a one-time stderr warn. Reuses `cache-telemetry`'s `usage` read, the per-session quota-status writer, and `onRequest` body access. No new subsystem. ~100–200 LOC + tests; flag at review if it grows materially past that.
+- **Threat model:** counts/tokens only. MUST NOT log, persist, or emit thinking text, signatures, or any request/response content — telemetry is numeric (`context_tokens`, `thinking_block_count`, `thinking_block_max`, risk level) plus a content-free warn line. **Read-only on request/response bodies** — this extension observes and records; it never mutates the body. No new inbound surface.
+- **Maintainability constraints:** reuse the existing per-session quota-status writer and `cache-telemetry`'s usage extraction; do not introduce a new abstraction for the count/threshold logic. New JSON fields are additive. No dead code, no back-compat shims.
+- **Performance/reliability:** O(content-blocks) per request to count thinking blocks; cheap. Because the transform is read-only on the body, it does not churn the prompt-cache prefix.
+- **Load-bearing? yes — schema-contract dimension only.** It does **not** modify request/response bodies (unlike the sibling #162 sanitize), so it carries none of the request-path correctness/cache-mutation risk. BUT it extends the per-session quota-status JSON — a wire/schema contract that downstream consumers (statusline, dashboards) read — so it qualifies as load-bearing on the schema dimension. The additions are backward-compatible (new optional fields; existing consumers unaffected). Recommend the `schema-change` label and a brief human (Chris) confirmation that the schema additions don't break existing per-session consumers; it does not carry the request-mutation review burden #162 does.
+
 ## Out of scope
 
 - **Fixing or working around the desync** — that's #63172, CC-side. cache-fix must not attempt to mutate/strip thinking blocks to "repair" a session (that path is exactly what #157 guards against). Warning only.
