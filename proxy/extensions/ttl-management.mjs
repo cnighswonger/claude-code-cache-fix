@@ -10,7 +10,17 @@ function detectRequestType(system) {
   return isSubagent ? "subagent" : "main";
 }
 
+// Thinking and redacted_thinking blocks must be returned to the API byte-identical
+// to the original model response — the API validates them and rejects any
+// modification with "thinking blocks ... cannot be modified" (a 400 on the whole
+// request). On Opus 4.7 interleaved thinking, CC can place a cache_control
+// breakpoint on a thinking block; injecting a ttl there would mutate the block
+// and break the request. Skip them — the marginal TTL benefit on one breakpoint
+// is never worth corrupting a thinking turn.
+const PROTECTED_BLOCK_TYPES = new Set(["thinking", "redacted_thinking"]);
+
 function injectTtl(block, ttlParam) {
+  if (block && PROTECTED_BLOCK_TYPES.has(block.type)) return block;
   if (block.cache_control?.type === "ephemeral" && !block.cache_control.ttl) {
     return { ...block, cache_control: { ...block.cache_control, ttl: ttlParam } };
   }

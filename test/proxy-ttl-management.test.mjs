@@ -37,6 +37,32 @@ test("injectTtl: does not overwrite existing ttl", () => {
   assert.equal(result, block);
 });
 
+// --- thinking-block guard (cache-fix #157) ---
+// Thinking / redacted_thinking blocks must be returned byte-identical; injecting
+// a ttl into a cache_control that landed on one would mutate the block and the
+// API rejects with "thinking blocks ... cannot be modified". injectTtl must skip
+// them even when they carry an ephemeral cache_control without a ttl.
+
+test("injectTtl: does NOT modify a thinking block with ephemeral cache_control", () => {
+  const block = { type: "thinking", thinking: "", signature: "SIG==", cache_control: { type: "ephemeral" } };
+  const result = injectTtl(block, "1h");
+  assert.equal(result, block, "must return the same block reference, untouched");
+  assert.deepEqual(result.cache_control, { type: "ephemeral" }, "no ttl injected");
+});
+
+test("injectTtl: does NOT modify a redacted_thinking block with ephemeral cache_control", () => {
+  const block = { type: "redacted_thinking", data: "OPAQUE==", cache_control: { type: "ephemeral" } };
+  const result = injectTtl(block, "1h");
+  assert.equal(result, block);
+  assert.deepEqual(result.cache_control, { type: "ephemeral" });
+});
+
+test("injectTtl: still injects ttl into a non-thinking block (happy-path regression guard)", () => {
+  const block = { type: "text", text: "content", cache_control: { type: "ephemeral" } };
+  const result = injectTtl(block, "1h");
+  assert.deepEqual(result.cache_control, { type: "ephemeral", ttl: "1h" });
+});
+
 // --- Integration test: onRequest ---
 
 test("onRequest: injects TTL on system blocks with existing cache_control", async () => {
@@ -67,6 +93,33 @@ test("onRequest: no-op on system blocks without cache_control", async () => {
 
   await ext.onRequest(ctx);
   assert.equal(ctx.body.system[0].cache_control, undefined);
+});
+
+test("onRequest: leaves a thinking block untouched but still injects ttl on a sibling text block", async () => {
+  // Interleaved-thinking turn where a cache breakpoint landed on the thinking
+  // block AND on a sibling text block. The thinking block must come out
+  // byte-identical (preserving its signature); the text block gets the ttl.
+  const ctx = {
+    body: {
+      system: [{ type: "text", text: "System prompt" }],
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "", signature: "SIG==", cache_control: { type: "ephemeral" } },
+            { type: "text", text: "answer", cache_control: { type: "ephemeral" } },
+          ],
+        },
+      ],
+    },
+    headers: {},
+    meta: { _ttlTier: "1h" },
+  };
+
+  await ext.onRequest(ctx);
+  const [thinkBlock, textBlock] = ctx.body.messages[0].content;
+  assert.deepEqual(thinkBlock.cache_control, { type: "ephemeral" }, "thinking block cache_control unchanged");
+  assert.deepEqual(textBlock.cache_control, { type: "ephemeral", ttl: "1h" }, "sibling text block got ttl");
 });
 
 // --- Auto-detection consumption tests (directive #12-#17) ---

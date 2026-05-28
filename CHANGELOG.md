@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **`ttl-management`: never inject a TTL into `thinking` / `redacted_thinking` blocks (#157).** `injectTtl` iterated every block in the request; if a `cache_control: {type: "ephemeral"}` breakpoint landed on a thinking block (possible on Opus 4.7 interleaved-thinking turns), it rewrote the block to add `ttl`, which mutates a signed thinking block — the API rejects that with `400 ... thinking blocks ... cannot be modified`. The injector now skips `thinking`/`redacted_thinking` blocks entirely (the chokepoint covers both the system-block and message-block paths). Defensive hardening: this was not the cause of the 2026-05-28 interleaved-thinking incident (that was CC-side, `anthropics/claude-code#63172`), but it's a real latent mutation path with zero upside to keeping. Regression tests pin the skip and the still-inject-on-non-thinking happy path.
+
 ## [3.7.1] - 2026-05-27
 
 ### Added
