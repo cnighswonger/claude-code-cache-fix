@@ -191,7 +191,7 @@ test("T8 (format). under-pace: tick past fill; `exhaust` and `reset` both shown"
   try {
     // 5h: 30% used, 2h elapsed of 5h = 40% elapsed (tick at idx 4).
     //     exhaust = 70 * 7200 / 30 = 16800s = 4h40m; reset = 3h00m.
-    // 7d: 53% used, 4d elapsed of 7d ≈ 57% elapsed (tick at idx 5).
+    // 7d: 53% used, 4d elapsed of 7d ≈ 57.1% elapsed (tick at idx 6).
     //     exhaust = 47 * 345600 / 53 ≈ 306475s = 3d13h; reset = 3d0h.
     writeFileSync(env.account, formatAccount({
       q5hPct: 30, q5hOffsetSec: 3 * 3600,
@@ -200,7 +200,7 @@ test("T8 (format). under-pace: tick past fill; `exhaust` and `reset` both shown"
     const r = runScript(env.home, '{"session_id":"x"}');
     assert.equal(r.status, 0, r.stderr);
     assert.match(r.stdout, /Q5h \[███░┃░░░░░\] 30% \(exhaust 4h40m, reset 3h00m\)/);
-    assert.match(r.stdout, /Q7d \[█████┃░░░░\] 53% \(exhaust 3d13h, reset 3d0h\)/);
+    assert.match(r.stdout, /Q7d \[█████░┃░░░\] 53% \(exhaust 3d13h, reset 3d0h\)/);
   } finally {
     env.cleanup();
   }
@@ -346,6 +346,27 @@ test("T16 (format). burn-warmup gate: 100s elapsed (between legacy 60s gate and 
     assert.equal(r.status, 0, r.stderr);
     assert.doesNotMatch(r.stdout, /\bexhaust\b/);
     assert.match(r.stdout, /Q5h \[.{10}\] 20% \(reset 4h58m\)/);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("T17 (format). under-pace at rounding boundary: tick must not flip into fill", () => {
+  // Regression for a field report:
+  //   Q7d [█┃█░░░░░░░] 15% (exhaust 7d15h, reset 5d15h)
+  // 15% consumed, 1d9h elapsed of 7d (= 19.64% elapsed) is clearly under-pace
+  // (exhaust > reset), yet the bar drew ┃ inside the filled run. Cause:
+  // fill = int(round(1.5)) = 2 but tick = int(1.964) = 1 — round vs. truncate.
+  // With symmetric rounding both land on 2 and ┃ sits at the fill boundary.
+  const env = setupHome();
+  try {
+    writeFileSync(env.account, formatAccount({
+      q5hPct: 0, q5hOffsetSec: 5 * 3600,
+      q7dPct: 15, q7dOffsetSec: 5 * 86400 + 15 * 3600,
+    }));
+    const r = runScript(env.home, '{"session_id":"x"}');
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /Q7d \[██┃░░░░░░░\] 15%/);
   } finally {
     env.cleanup();
   }

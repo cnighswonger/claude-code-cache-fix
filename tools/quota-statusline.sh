@@ -115,11 +115,13 @@ def draw_bar(consumed_pct, elapsed_pct, width=BAR_WIDTH):
     # Tick overlays a fill cell when consumed > elapsed, keeping bar width
     # constant — that's what makes the over-pace state legible (┃ inside the
     # filled run) rather than just pushing fill cells around.
-    fill = int(round(max(0, min(100, consumed_pct)) / 100 * width))
+    def to_cells(pct):
+        return int(round(max(0, min(100, pct)) / 100 * width))
+    fill = to_cells(consumed_pct)
     if elapsed_pct is None:
         tick = -1
     else:
-        tick = min(int(max(0, min(100, elapsed_pct)) / 100 * width), width - 1)
+        tick = min(to_cells(elapsed_pct), width - 1)
     cells = []
     remaining = fill
     for i in range(width):
