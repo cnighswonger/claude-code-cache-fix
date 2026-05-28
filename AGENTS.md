@@ -55,7 +55,7 @@ Apply these labels on issues and PRs you interact with:
 2. Distinguish between what is **confirmed correct** and what is **assumed or hypothesized**
 3. Flag bloat / over-engineering, with an actionability bar: flag code that is (a) clearly larger or more complex than the directive's requirements justify AND (b) safe to simplify without changing behavior. State the magnitude concretely (e.g. a 100-line switch reducible to a one-line expression). Hunt specifically for: over-abstraction, dead code, copy-paste duplication, unnecessary state machines, and defensive handling for cases that cannot occur. Do not flag complexity that exists for a real reason, and never assert a simplification is safe when you cannot verify it is behavior-preserving — say so instead.
 4. Flag under-engineering — missing error handling, edge cases, crash recovery
-5. When reviewing a directive/spec, flag a missing or empty `## Non-Functional Requirements` section as a finding (see CLAUDE.md).
+5. When reviewing a directive/spec, check the `## Non-Functional Requirements` section: flag it if missing or empty, and validate the `Load-bearing?` declaration against its criteria (shared abstraction, wire/schema contract, security-relevant) — raise a blocking finding if it is missing, misclassified, or marked load-bearing without the required human (Chris) review (see CLAUDE.md).
 6. Check for consistency with the existing codebase patterns in `preload.mjs`
 7. Write your review as a markdown file in `docs/code-reviews/`
 8. Apply the appropriate label to the issue or PR
