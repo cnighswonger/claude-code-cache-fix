@@ -53,11 +53,12 @@ Apply these labels on issues and PRs you interact with:
 
 1. Read the submitted plan or code carefully
 2. Distinguish between what is **confirmed correct** and what is **assumed or hypothesized**
-3. Flag over-engineering — the simplest solution that works is preferred
+3. Flag bloat / over-engineering, with an actionability bar: flag code that is (a) clearly larger or more complex than the directive's requirements justify AND (b) safe to simplify without changing behavior. State the magnitude concretely (e.g. a 100-line switch reducible to a one-line expression). Hunt specifically for: over-abstraction, dead code, copy-paste duplication, unnecessary state machines, and defensive handling for cases that cannot occur. Do not flag complexity that exists for a real reason, and never assert a simplification is safe when you cannot verify it is behavior-preserving — say so instead.
 4. Flag under-engineering — missing error handling, edge cases, crash recovery
-5. Check for consistency with the existing codebase patterns in `preload.mjs`
-6. Write your review as a markdown file in `docs/code-reviews/`
-7. Apply the appropriate label to the issue or PR
+5. When reviewing a directive/spec, flag a missing or empty `## Non-Functional Requirements` section as a finding (see CLAUDE.md).
+6. Check for consistency with the existing codebase patterns in `preload.mjs`
+7. Write your review as a markdown file in `docs/code-reviews/`
+8. Apply the appropriate label to the issue or PR
 
 ## Review Output Format
 
@@ -76,6 +77,12 @@ Label applied: [reviewed-by-codex-agent | changes-requested]
 
 ## What Needs Attention
 [non-blocking issues, ordered by severity]
+
+## Bloat / Non-Functional
+[bloat findings meeting the actionability bar (advisory unless they cause a correctness problem); "None" if clean]
+
+## Size Baseline
+[one line per reviewed module: file — LOC — brief complexity note. A signal, not a finding.]
 
 ## Recommendations
 [specific, actionable suggestions]
