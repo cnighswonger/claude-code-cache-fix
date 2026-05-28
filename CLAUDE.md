@@ -79,6 +79,20 @@ Policy:
 
 Significant implementation plans and code go to the Codex Review Agent before merging. Skip for hotfixes; always for infrastructure and new features. Different model catches different blind spots.
 
+## Non-Functional Requirements & Anti-Bloat
+
+LLM-written code reliably satisfies functional requirements and neglects non-functional ones — security, maintainability, and especially size/complexity. These rules add the missing lens. (Canonical cross-repo standard maintained by the Project Lead; the reviewer-side anti-bloat lens lives in this repo's `AGENTS.md`.)
+
+**Every directive must include a `## Non-Functional Requirements` section** (after Goal/Background, before scope). Keep each line terse; `n/a` is a valid answer.
+
+- **Size/complexity budget** — rough expected magnitude; reviewers flag if exceeded by ~2×.
+- **Threat model** — inputs, trust boundaries, what must never leak or execute. The proxy handles API keys and full request/response bodies — be specific here.
+- **Maintainability constraints** — no new abstraction without ≥3 call sites; no dead code; no defensive handling for impossible cases; no back-compat shims unless required.
+- **Performance/reliability** — only where it applies.
+- **Load-bearing?** yes if it touches a shared abstraction, a wire/schema contract, or anything security-relevant.
+
+**Load-bearing changes require human (Chris) review before merge**, not just Lead + Codex — the independent reviewer and the Lead are both LLMs with correlated blind spots, and an LLM reviewer can even confabulate findings. Routine leaf code rides on Lead + Codex.
+
 ## Public Communication
 
 Never post publicly without Chris's approval. Draft and wait for go-ahead.
