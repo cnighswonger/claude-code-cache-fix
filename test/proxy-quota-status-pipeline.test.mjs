@@ -154,6 +154,31 @@ test("[pipeline #160] session-health fields are merged into the per-session JSON
   }
 });
 
+test("[pipeline #160] degraded path: no quota headers → no per-session write, but the high warn still fires once", async () => {
+  const env = setupHome();
+  const origWrite = process.stderr.write.bind(process.stderr);
+  const lines = [];
+  process.stderr.write = (s) => { lines.push(String(s)); return true; };
+  try {
+    const exts = await loadExtensions(EXT_DIR, EXT_CONFIG);
+    const sid = "sess-noquota";
+    // No QUOTA_HEADERS → cache-telemetry skips the per-session write. High
+    // context (cacheRead) → session-health still computes "high" and warns.
+    // The warn lives in session-health's own hook, independent of quota.
+    await driveFullResponse(exts, { "x-claude-code-session-id": sid }, { cacheRead: 345_000, cacheCreation: 0 });
+
+    const sessionsDir = join(env.home, ".claude", "quota-status", "sessions");
+    assert.ok(!existsSync(join(sessionsDir, `${sid}.json`)), "no per-session file when quota headers absent");
+    assert.ok(!existsSync(join(env.home, ".claude", "quota-status", "account.json")), "no account.json either");
+
+    const warns = lines.filter((l) => l.includes("[session-health]") && l.includes("high thinking-desync risk"));
+    assert.equal(warns.length, 1, "the high warn fires once even on the degraded (no-write) path");
+  } finally {
+    process.stderr.write = origWrite;
+    env.cleanup();
+  }
+});
+
 test("[pipeline #11j] malformed session-id ends up in a hashed file, no path-traversal escape", async () => {
   const env = setupHome();
   try {

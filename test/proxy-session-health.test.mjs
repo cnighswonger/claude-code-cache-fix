@@ -131,11 +131,16 @@ test("onStreamEvent: stashes health fields with risk ok below thresholds", async
 
 test("onStreamEvent: risk 'high' at high threshold", async () => {
   const env = setupTmpHome();
+  // High context fires the one-time stderr warn; stub it so the suite stays
+  // quiet (the dedicated one-time-warn test asserts the line content).
+  const origWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = () => true;
   try {
     const meta = await driveHealth({ cacheStats: { inputTokens: 0, cacheRead: 345_000, cacheCreation: 0 } });
     assert.equal(meta._sessionHealth.context_tokens, 345_000);
     assert.equal(meta._sessionHealth.thinking_desync_risk, "high");
   } finally {
+    process.stderr.write = origWrite;
     env.cleanup();
   }
 });
