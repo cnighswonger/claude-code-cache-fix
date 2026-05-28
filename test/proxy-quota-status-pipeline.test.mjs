@@ -41,7 +41,7 @@ function setupHome() {
   };
 }
 
-async function driveFullResponse(extSnapshot, headers, { cacheRead = 0, cacheCreation = 100 } = {}) {
+async function driveFullResponse(extSnapshot, headers, { cacheRead = 0, cacheCreation = 100, body } = {}) {
   // Real proxy puts request and response headers on different ctx objects;
   // session-id headers come from the request, quota fields from the response.
   // For these synthetic tests we drive the same `headers` map through both
@@ -51,8 +51,8 @@ async function driveFullResponse(extSnapshot, headers, { cacheRead = 0, cacheCre
   const telemetry = {};
   // body required by some upstream-of-cache-telemetry extensions (e.g.
   // ttl-tier-detect at order 75 walks body.system / body.messages).
-  const minimalBody = { system: [], messages: [] };
-  await runOnRequest({ body: minimalBody, headers, meta }, extSnapshot);
+  const reqBody = body || { system: [], messages: [] };
+  await runOnRequest({ body: reqBody, headers, meta }, extSnapshot);
   await runOnResponseStart({ headers, meta }, extSnapshot);
   await runOnStreamEvent(
     {
@@ -114,6 +114,41 @@ test("[pipeline #17] two-session interleaving: per-session files distinct; accou
     // account.json reflects the most recent write.
     const account = JSON.parse(readFileSync(join(env.home, ".claude", "quota-status", "account.json"), "utf8"));
     assert.ok(account.timestamp);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("[pipeline #160] session-health fields are merged into the per-session JSON by the writer", async () => {
+  const env = setupHome();
+  try {
+    const exts = await loadExtensions(EXT_DIR, EXT_CONFIG);
+    const sid = "sess-health-merge";
+    const body = {
+      system: [],
+      messages: [
+        { role: "assistant", content: [
+          { type: "thinking", thinking: "", signature: "S" },
+          { type: "redacted_thinking", data: "OPAQUE" },
+          { type: "text", text: "ok" },
+        ] },
+      ],
+    };
+    // input_tokens 5 + cacheRead 0 + cacheCreation 100 = 105 context tokens → risk "ok"
+    await driveFullResponse(exts, { ...QUOTA_HEADERS, "x-claude-code-session-id": sid }, { body });
+
+    const sessionPath = join(env.home, ".claude", "quota-status", "sessions", `${sid}.json`);
+    const sess = JSON.parse(readFileSync(sessionPath, "utf8"));
+    // existing cache fields still present
+    assert.equal(sess.session_id, sid);
+    assert.equal(sess.cache.cache_creation, 100);
+    // merged session-health fields
+    assert.equal(sess.context_tokens, 105);
+    assert.equal(sess.thinking_block_count, 2, "counts thinking + redacted_thinking");
+    assert.equal(sess.thinking_block_max, 2);
+    assert.equal(sess.request_count, 1);
+    assert.equal(sess.thinking_desync_risk, "ok");
+    assert.match(sess.first_seen, /^\d{4}-\d{2}-\d{2}T/);
   } finally {
     env.cleanup();
   }

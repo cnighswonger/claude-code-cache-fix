@@ -49,6 +49,13 @@ export function sessionFilename(rawId) {
   return "inv-" + createHash("sha256").update(s).digest("hex").slice(0, 16);
 }
 
+// Full path to the per-session file for a raw session id. Exported so sibling
+// extensions (e.g. session-health) can READ the prior state this writer wrote,
+// using the identical filename rule — reuse, not duplicate.
+export function sessionFilePath(rawId) {
+  return join(paths().sessionsDir, `${sessionFilename(rawId)}.json`);
+}
+
 function resolveSessionId(headers) {
   if (!headers) return null;
   const sid =
@@ -222,6 +229,10 @@ export default {
             hit_rate: hitRate,
             timestamp,
           },
+          // Additive session-health fields (session-health extension, order
+          // 590, stashes these before this writer runs). Optional — absent if
+          // that extension is disabled or produced nothing this request.
+          ...(ctx.meta._sessionHealth || {}),
           timestamp,
           session_id: rawSid,
         },

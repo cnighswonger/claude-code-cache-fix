@@ -29,7 +29,7 @@ That's it. The proxy applies all 7 cache-fix extensions automatically. No wrappe
 
 ### What the proxy does
 
-On every `/v1/messages` request, 7 extensions run in order:
+On every `/v1/messages` request, 8 extensions run in order:
 
 | Extension | What it fixes |
 |-----------|--------------|
@@ -40,6 +40,7 @@ On every `/v1/messages` request, 7 extensions run in order:
 | `fresh-session-sort` | Fixes non-deterministic ordering on first turn |
 | `cache-control-normalize` | Normalizes cache_control markers across messages |
 | `cache-telemetry` | Extracts cache stats from response headers → `~/.claude/quota-status/{account.json,sessions/<id>.json}` |
+| `session-health` | Observes per-session thinking-desync risk (context size + thinking-block count) and warns before a session reaches the danger zone. Read-only |
 
 Extensions are hot-reloadable — add, remove, or modify `.mjs` files in `proxy/extensions/` and changes apply to the next request without restarting. Configuration in `proxy/extensions.json`.
 
@@ -722,6 +723,28 @@ Scoping rules baked into the extension:
 | Env var | Default | Purpose |
 |---------|---------|---------|
 | `CACHE_FIX_THINKING_DISPLAY` | `summarized` (built-in) | One of `summarized` / `omitted` / `disabled`. `summarized` restores thinking summaries (default). `omitted` force-suppresses thinking blocks. `disabled` opts the extension out entirely. |
+
+## Session-health early-warning (proxy mode, thinking-desync risk)
+
+Long-running Opus 4.7 `[1m]` sessions accumulate interleaved thinking blocks and grow their live context until Claude Code's own history reconstruction desyncs a thinking-block signature, producing a permanent `400 … thinking blocks … cannot be modified` on every subsequent turn (upstream root cause: [anthropics/claude-code#63147](https://github.com/anthropics/claude-code/issues/63147)). The session dies abruptly with no prior signal.
+
+The `session-health` extension watches the conditions that correlate with the trip and warns **before** a session reaches the danger zone, so the operator can retire it deliberately (write a session-state handoff, `/clear`) instead of being surprised by a dead session. It is **read-only** — it never mutates the request/response body and never attempts to repair the desync (that is CC-side, #63147). It records numeric telemetry into the per-session file (`~/.claude/quota-status/sessions/<id>.json`) on each request and, when a session first crosses into `high` risk, emits a one-time stderr line. Counts only — no thinking text or signatures are ever logged.
+
+Fields added to the per-session JSON:
+
+- `context_tokens` — latest request's live context (`input + cache_read + cache_creation`)
+- `thinking_block_count` — `thinking`/`redacted_thinking` blocks in the latest request
+- `thinking_block_max` — session high-water mark (carried across proxy restarts)
+- `first_seen`, `request_count` — session age + request tally
+- `thinking_desync_risk` — `ok` / `warn` / `high` (omitted when the signal is disabled)
+
+Token thresholds are anchored to the observed ~382K-token trip with margin; the warning is conservative by design — a premature "retire soon" is far cheaper than a dead session. Block-count is recorded but does not yet gate the warning (it activates in a calibrated fast-follow once the failure distribution is known).
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `CACHE_FIX_THINKING_RISK_WARN_TOKENS` | `250000` | Context-token level at which `thinking_desync_risk` becomes `warn`. |
+| `CACHE_FIX_THINKING_RISK_HIGH_TOKENS` | `340000` | Context-token level at which risk becomes `high` and the one-time stderr warn fires. |
+| `CACHE_FIX_THINKING_RISK` | unset (on) | Set to `off` to suppress the warning signal (stderr line + `thinking_desync_risk` field). Raw count telemetry keeps recording. |
 
 ## System prompt rewrite (preload mode, optional)
 

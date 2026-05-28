@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- **session-health early-warning extension (#158, #160).** A new read-only observation extension (`proxy/extensions/session-health.mjs`, order 590) that flags long-running Opus 4.7 `[1m]` sessions approaching the thinking-desync wedge (upstream `anthropics/claude-code#63147`) before they die. It never mutates the request/response body and never attempts to repair the desync — it only warns so the operator can retire the session deliberately. This is the *warn-before* half of the thinking-desync response; mitigation (#162) and offline heal are tracked separately.
+
+  **New per-session JSON fields (additive).** `~/.claude/quota-status/sessions/<id>.json` now also carries `context_tokens` (latest live context = `input + cache_read + cache_creation`), `thinking_block_count` (`thinking`/`redacted_thinking` blocks in the latest request), `thinking_block_max` (session high-water, carried across proxy restarts), `first_seen`, `request_count`, and `thinking_desync_risk` (`ok`/`warn`/`high`). Fields are written by the existing single per-session writer (`cache-telemetry`); existing consumers are unaffected (all use optional reads). Counts only — no thinking text or signatures are ever recorded.
+
+  **Token-gated warning.** `thinking_desync_risk` is computed from `context_tokens` against `CACHE_FIX_THINKING_RISK_HIGH_TOKENS` (default `340000`, just under the observed ~382K trip) and `CACHE_FIX_THINKING_RISK_WARN_TOKENS` (default `250000`). On first crossing into `high`, a one-time content-free stderr line is emitted. Block-count is recorded but does not yet gate the warning (calibrated fast-follow). `CACHE_FIX_THINKING_RISK=off` suppresses the warning signal (stderr line + risk field) while raw count telemetry keeps recording.
+
 ### Fixed
 
 - **`ttl-management`: never inject a TTL into `thinking` / `redacted_thinking` blocks (#157).** `injectTtl` iterated every block in the request; if a `cache_control: {type: "ephemeral"}` breakpoint landed on a thinking block (possible on Opus 4.7 interleaved-thinking turns), it rewrote the block to add `ttl`, which mutates a signed thinking block — the API rejects that with `400 ... thinking blocks ... cannot be modified`. The injector now skips `thinking`/`redacted_thinking` blocks entirely (the chokepoint covers both the system-block and message-block paths). Defensive hardening: this was not the cause of the 2026-05-28 interleaved-thinking incident (that was CC-side, `anthropics/claude-code#63172`), but it's a real latent mutation path with zero upside to keeping. Regression tests pin the skip and the still-inject-on-non-thinking happy path.
