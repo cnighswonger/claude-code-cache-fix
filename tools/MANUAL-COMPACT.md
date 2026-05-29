@@ -10,10 +10,10 @@ When using the 1M context window hack (`DISABLE_COMPACT=1` + `CLAUDE_CODE_MAX_CO
 
 1. Extracts conversation turns from the session JSONL transcript
 2. Splits turns into three weighted segments:
-   - **Foundational** (first 20%) — truncated to 200 chars each
-   - **Working** (middle 40%) — truncated to 400 chars each
-   - **Active** (last 40%) — preserved up to 2000 chars each
-3. Sends the weighted extract to Claude Sonnet for summarization
+   - **Foundational** (first 20%) — truncated to 300 chars each
+   - **Working** (middle 40%) — truncated to 1500 chars each
+   - **Active** (last 40%) — preserved up to 8000 chars each
+3. Sends the weighted extract to Claude Opus for summarization
 4. Produces a structured summary optimized for agent handoff
 
 The weighting ensures recent active work (the part you're most likely to need) gets full detail, while earlier completed work is compressed.
@@ -142,7 +142,7 @@ Use the user context file to fill known gaps.
 
 Two costs to account for:
 
-1. **Summarization call** — the `claude --print` call through Sonnet. At ~50K extract tokens, expect ~1-2% Q5h.
+1. **Summarization call** — the `claude --print` call through Opus. With the relaxed recent-turn caps the extract is larger (and Opus costs more per token than Sonnet), so expect a few % Q5h rather than ~1-2%. The tradeoff buys markedly higher-fidelity summaries; override with `MANUAL_COMPACT_MODEL=claude-sonnet-4-6` if you need to minimize cost.
 2. **Cold start after /clear** — the first API call rebuilds the full cache from scratch. Real-world example from a 954K-token session:
 
 ```
@@ -153,11 +153,11 @@ Second call:    cache_read=957,253  cache_creation=5,569   (warm again)
 
 The cold rebuild consumed ~15% Q5h in one call on our Max 5x account. After that single rebuild, the session is warm again and cache hits resume at 99%+.
 
-**Total cost of a manual compact cycle:** ~17% Q5h (2% summarization + 15% cold rebuild). Compare to hitting the 1M wall and losing the session entirely.
+**Total cost of a manual compact cycle:** roughly ~15% cold rebuild plus a few % for the Opus summarization. Compare to hitting the 1M wall and losing the session entirely.
 
-### Requires Claude Sonnet access
+### Summarizer model
 
-The tool uses `claude --print --model claude-sonnet-4-6` for summarization. Sonnet is used instead of Opus to minimize Q5h impact. If Sonnet is unavailable, change the model in the script.
+The tool defaults to `claude --print --model claude-opus-4-7` for the highest-fidelity summary. Override with the `MANUAL_COMPACT_MODEL` env var — e.g. `MANUAL_COMPACT_MODEL=claude-sonnet-4-6` to minimize Q5h impact, or to point at a different model if Opus is rate-limited or retired.
 
 ## Why the 1M Hack Disables /compact
 
