@@ -145,31 +145,33 @@ if total == 0:
     sys.exit(1)
 
 # Split into three segments with different detail levels:
-# - First 20%: truncate to 200 chars each (foundational context)
-# - Middle 40%: truncate to 400 chars each (working context)
-# - Last 40%: full text up to 2000 chars each (active work — most important)
+# - First 20%: truncate to 300 chars each (foundational context)
+# - Middle 40%: truncate to 1500 chars each (working context)
+# - Last 40%: full text up to 8000 chars each (active work — most important)
+# Recent-turn caps were relaxed (was 200/400/2000) so the summarizer sees the
+# active work in near-full detail; the stronger model (Opus, below) handles it.
 seg1_end = int(total * 0.2)
 seg2_end = int(total * 0.6)
 
 with open("$EXTRACT", 'w') as f:
     f.write("=== FOUNDATIONAL CONTEXT (early session) ===\n\n")
     for role, text in conversation[:seg1_end]:
-        f.write(f"[{role}]: {text[:200]}\n\n")
+        f.write(f"[{role}]: {text[:300]}\n\n")
 
     f.write("\n=== WORKING CONTEXT (mid session) ===\n\n")
     for role, text in conversation[seg1_end:seg2_end]:
-        f.write(f"[{role}]: {text[:400]}\n\n")
+        f.write(f"[{role}]: {text[:1500]}\n\n")
 
     f.write("\n=== ACTIVE WORK (recent — preserve in full detail) ===\n\n")
     for role, text in conversation[seg2_end:]:
-        f.write(f"[{role}]: {text[:2000]}\n\n")
+        f.write(f"[{role}]: {text[:8000]}\n\n")
 
 import os
 size = os.path.getsize("$EXTRACT")
 print(f"Extracted {total} turns ({size:,} bytes, ~{size//4:,} est. tokens)")
-print(f"  Foundational: {seg1_end} turns (truncated to 200 chars)")
-print(f"  Working: {seg2_end - seg1_end} turns (truncated to 400 chars)")
-print(f"  Active: {total - seg2_end} turns (up to 2000 chars)")
+print(f"  Foundational: {seg1_end} turns (truncated to 300 chars)")
+print(f"  Working: {seg2_end - seg1_end} turns (truncated to 1500 chars)")
+print(f"  Active: {total - seg2_end} turns (up to 8000 chars)")
 PYEOF
 
 # Build the summarization prompt
@@ -199,10 +201,14 @@ ADDITIONAL USER CONTEXT TO PRESERVE:
 $USER_CONTEXT"
 fi
 
-echo ""
-echo "Sending to Claude for summarization..."
+# Summarizer model. Defaults to Opus for highest-fidelity summaries; override
+# with MANUAL_COMPACT_MODEL (e.g. when Opus is rate-limited or retired).
+COMPACT_MODEL="${MANUAL_COMPACT_MODEL:-claude-opus-4-7}"
 
-cat "$EXTRACT" | claude --print --model claude-sonnet-4-6 "$PROMPT" > "$OUTPUT" 2>/dev/null
+echo ""
+echo "Sending to Claude ($COMPACT_MODEL) for summarization..."
+
+cat "$EXTRACT" | claude --print --model "$COMPACT_MODEL" "$PROMPT" > "$OUTPUT" 2>/dev/null
 
 SIZE=$(wc -c < "$OUTPUT")
 echo ""
