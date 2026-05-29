@@ -34,7 +34,7 @@ Record, per (variant × scope): does the 400 clear (200) or not?
 ### Phase 3 — regression + safety
 - **Healthy passthrough:** a normal request (no omitted-thinking issue) yields the same outcome (200, equivalent response) with the transform on vs off.
 - **Determinism:** same input → byte-identical transformed body.
-- **Env-lever determination (do this — the working lever is unconfirmed):** on the running 2.1.148, set each candidate in turn and run a thinking+tool turn, recording which produces **0 `type:thinking` blocks**: `CLAUDE_CODE_DISABLE_THINKING=1`, `MAX_THINKING_TOKENS=0`, `DISABLE_INTERLEAVED_THINKING=1`, `CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1`. Known going in: ADAPTIVE does NOT stop thinking (verified, 6,866 blocks with it set) and INTERLEAVED is community-reported ineffective — confirm/refute both, and identify the one that actually zeroes thinking. That lever is the real user-side answer for variant (b).
+- **Env-lever — statically CONFIRMED via 2.1.148 binary analysis** (runtime-verify optional): `CLAUDE_CODE_DISABLE_THINKING=1` (`Y$ = q.type!="disabled" && !mH(env.CLAUDE_CODE_DISABLE_THINKING)`) and `MAX_THINKING_TOKENS=0` (`if(env.MAX_THINKING_TOKENS) return parseInt(...)>0`) disable thinking entirely; `DISABLE_INTERLEAVED_THINKING=1` only drops the interleaved beta (thinking still emits); `CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1` only gates adaptive effort on 4.6 models. **User-side answer for variant (b): `CLAUDE_CODE_DISABLE_THINKING=1` or `MAX_THINKING_TOKENS=0`.** Optionally runtime-confirm via 0 `type:thinking` blocks.
 
 ## Harness
 
