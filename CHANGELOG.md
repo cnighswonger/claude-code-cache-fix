@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [3.8.0] - 2026-05-29
+
+The thinking-desync response (upstream `anthropics/claude-code#63147`): the *warn-before* half (session-health, #160) and the *mitigate* half (thinking-block-sanitize, #162), plus the `ttl-management` thinking-block guard (#157/#159).
+
 ### Added
 
 - **session-health early-warning extension (#158, #160).** A new read-only observation extension (`proxy/extensions/session-health.mjs`, order 590) that flags long-running Opus 4.7 `[1m]` sessions approaching the thinking-desync wedge (upstream `anthropics/claude-code#63147`) before they die. It never mutates the request/response body and never attempts to repair the desync — it only warns so the operator can retire the session deliberately. This is the *warn-before* half of the thinking-desync response; mitigation (#162) and offline heal are tracked separately.
