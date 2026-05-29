@@ -34,7 +34,7 @@ Record, per (variant × scope): does the 400 clear (200) or not?
 ### Phase 3 — regression + safety
 - **Healthy passthrough:** a normal request (no omitted-thinking issue) yields the same outcome (200, equivalent response) with the transform on vs off.
 - **Determinism:** same input → byte-identical transformed body.
-- **Continuation fallback:** confirm `DISABLE_INTERLEAVED_THINKING=1` avoids the failing form for variant (b) — the documented user-side answer for the case the proxy can't cover.
+- **Env-lever determination (do this — the working lever is unconfirmed):** on the running 2.1.148, set each candidate in turn and run a thinking+tool turn, recording which produces **0 `type:thinking` blocks**: `CLAUDE_CODE_DISABLE_THINKING=1`, `MAX_THINKING_TOKENS=0`, `DISABLE_INTERLEAVED_THINKING=1`, `CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1`. Known going in: ADAPTIVE does NOT stop thinking (verified, 6,866 blocks with it set) and INTERLEAVED is community-reported ineffective — confirm/refute both, and identify the one that actually zeroes thinking. That lever is the real user-side answer for variant (b).
 
 ## Harness
 
@@ -46,9 +46,16 @@ Reuse the docker rig, but point `CACHE_FIX_PROXY_UPSTREAM` at the **real `api.an
 - **Sensitive data:** the captured bodies contain real thinking content + signatures. Treat as sensitive: do **not** commit raw thinking text or signatures; record only variant description, 400/200, the `content.M` pointer, and transform on/off outcome. Honor the repo's public-info-hygiene rules (no secrets/IPs/tokens in any committed artifact).
 - **Auth:** use a test key or a throwaway subscription context; never embed the key in committed files or logs.
 
+
+## Refinements from #63147 overnight evidence (2026-05-29)
+
+- **Latest-turn *removal* may be accepted (beemusicco):** the API rejects only thinking blocks that are *present but altered* in the latest assistant message; it does NOT require thinking on any turn. So **removing** (not altering) the latest turn's omitted thinking may clear the 400 — Scope B must explicitly test *removing latest-turn* thinking, not just prior-turn. If it works, #162's coverage expands past the resume-replay subset.
+- **Preserve tool_use/tool_result pairing when removing blocks:** an orphaned `tool_use_id` (tool_use with no matching tool_result, or vice-versa) 400s on replay. The transform must keep pairs balanced after any removal.
+- **Wedge-detection signal:** do NOT key off empty-text+signature (normal on every block). The unambiguous live-wedge signal is the latest transcript entry being the `400 … cannot be modified` error text.
+
 ## Deliverable
 
 A results table mapping **{trigger variant (a/b/c)} × {transform scope (A/B/off)} → {400 cleared?}**, posted to #162. It resolves Open Question 1 and tells PB the exact "which turns to drop" rule. Expected high-value outcomes:
-- If Scope A clears (a) but not (b): #162-as-written covers resume/replay; (b) stays the documented `DISABLE_INTERLEAVED_THINKING=1` case.
+- If Scope A clears (a) but not (b): #162-as-written covers resume/replay; (b) stays the env-disable case (whichever lever the determination step confirms).
 - If only Scope B clears (a): #162 must also drop the latest *completed* turn's omitted thinking (update the directive's "which turns" rule).
-- If neither scope clears the continuation case (b): confirms the proxy cannot fix it — elevate `DISABLE_INTERLEAVED_THINKING=1` as the sole answer there.
+- If neither scope clears the continuation case (b): confirms the proxy cannot fix it — elevate the confirmed thinking-disable env lever as the sole answer there.
