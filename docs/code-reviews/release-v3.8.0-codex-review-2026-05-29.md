@@ -1,12 +1,12 @@
 # Review: release v3.8.0
 
 Date: 2026-05-29
-Reviewed: PR #168 (`release/v3.8.0`) at `121496b`
+Reviewed: PR #168 release payload (`release/v3.8.0`) at `121496b`
 Label applied: `approved-by-codex-agent`
 
 ## What Is Correct
 
-- `git diff --name-only main...release/v3.8.0` contains only `package.json` and `CHANGELOG.md`; there are no stray release-branch edits.
+- Before the required review-artifact commit, `git diff --name-only main...121496b` contained only `package.json` and `CHANGELOG.md`; there were no stray release-branch edits in the release payload. The only later branch delta is this review artifact under `docs/code-reviews/`, committed per workflow.
 - Package semver is correctly bumped to `3.8.0`, while `proxy/extensions/bootstrap-defense.mjs` keeps `EXTENSION_VERSION="v3.7.1"`, which is correct because bootstrap-defense itself is unchanged in this release.
 - The `## [3.8.0] - 2026-05-29` changelog section matches shipped scope without overclaiming it: #160 adds per-session JSON fields plus the token-gated warning and keeps `CACHE_FIX_THINKING_RISK=off` as warning-signal suppression only; #162 is opt-in via `CACHE_FIX_THINKING_SANITIZE=on`, uses the resolved "drop prior turns plus latest unless active tool-continuation" rule, and records `thinking_blocks_dropped`; #157/#159 is the `ttl-management` guard that skips `thinking` / `redacted_thinking` mutation.
 - Packaging is clean. `npm pack --dry-run --json` reports `claude-code-cache-fix-3.8.0.tgz`, includes `proxy/extensions/session-health.mjs` and `proxy/extensions/thinking-block-sanitize.mjs`, includes `proxy/extensions.json`, and contains no `test/`, `docs/`, secrets, or local-worktree cruft. Loader sanity check confirms the packaged config still loads `thinking-block-sanitize:550` and `session-health:590`.
