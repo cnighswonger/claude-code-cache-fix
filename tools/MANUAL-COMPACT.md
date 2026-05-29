@@ -159,6 +159,13 @@ The cold rebuild consumed ~15% Q5h in one call on our Max 5x account. After that
 
 The tool defaults to `claude --print --model claude-opus-4-7` for the highest-fidelity summary. Override with the `MANUAL_COMPACT_MODEL` env var — e.g. `MANUAL_COMPACT_MODEL=claude-sonnet-4-6` to minimize Q5h impact, or to point at a different model if Opus is rate-limited or retired.
 
+### Troubleshooting: empty summary output
+
+If `$OUTPUT` comes back empty, the most likely cause is that the extract exceeded the summarizer's context window — this tool runs near the 1M wall, and the relaxed recent-turn caps (active turns up to 8000 chars) make the extract large on exactly those big sessions. The summarizer call swallows stderr, so an oversized-input rejection surfaces as an empty file rather than a visible error. Fixes, in order of preference:
+
+- Use a 1M-window model for the summarization: `MANUAL_COMPACT_MODEL='claude-opus-4-7[1m]' manual-compact.sh ...`
+- Or lower the per-turn caps in the script's extraction block (the `text[:8000]` / `text[:1500]` / `text[:300]` slices).
+
 ## Why the 1M Hack Disables /compact
 
 The 1M context hack works by setting `DISABLE_COMPACT=1`, which CC reads as "disable all compaction." CC's code uses a single env var to control both:
