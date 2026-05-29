@@ -46,6 +46,14 @@ test("isActiveToolContinuation: ends tool_use but no following tool_result → f
   assert.equal(isActiveToolContinuation(messages, 0), false);
 });
 
+test("isActiveToolContinuation: later tool_result answers a DIFFERENT tool_use_id → false (must match the terminal call)", () => {
+  const messages = [
+    { role: "assistant", content: [omitted(), toolUse("t1")] },
+    { role: "user", content: [toolResult("other")] }, // answers a different call, not t1
+  ];
+  assert.equal(isActiveToolContinuation(messages, 0), false);
+});
+
 // --- planSanitize ---
 
 test("planSanitize: drops omitted thinking from a prior turn AND the latest completed turn", () => {
@@ -73,6 +81,17 @@ test("planSanitize: protects the latest assistant turn when it is an active tool
   assert.equal(r.dropped, 1, "only the prior turn's thinking is dropped");
   assert.deepEqual(r.messages[1].content, [text("a1")]);
   assert.deepEqual(r.messages[3].content, [omitted(), toolUse("t1")], "continuation turn left byte-identical");
+});
+
+test("planSanitize: latest turn whose terminal tool_use is NOT answered (mismatched tool_result) is stripped, not protected", () => {
+  const messages = [
+    { role: "user", content: [text("q")] },
+    { role: "assistant", content: [omitted(), toolUse("t1")] }, // latest assistant, terminal tool_use t1
+    { role: "user", content: [toolResult("other")] }, // answers a different call → NOT the protected continuation
+  ];
+  const r = planSanitize(messages);
+  assert.equal(r.dropped, 1, "latest-turn omitted thinking is stripped when its tool_use is unanswered");
+  assert.deepEqual(r.messages[1].content, [toolUse("t1")], "thinking removed; tool_use kept");
 });
 
 test("planSanitize: keeps non-empty thinking and redacted_thinking (v1 scope = thinking-empty only)", () => {

@@ -32,24 +32,30 @@ export function isOmittedThinking(block) {
   );
 }
 
-function hasToolResult(msg) {
+function answersToolUse(msg, toolUseId) {
   return (
     !!msg &&
     Array.isArray(msg.content) &&
-    msg.content.some((b) => b && b.type === "tool_result")
+    msg.content.some(
+      (b) => b && b.type === "tool_result" && b.tool_use_id === toolUseId,
+    )
   );
 }
 
-// The latest assistant message is an active tool-continuation when its last
-// block is a tool_use that a later message answers with a tool_result. The API
-// requires that turn's thinking intact, so we must not strip it.
+// The latest assistant message is an active tool-continuation when its terminal
+// block is a `tool_use` that is *paired with* — i.e. answered by — a following
+// `tool_result` carrying the same `tool_use_id`. Only then does the API require
+// that turn's thinking intact, so only then must we leave it untouched. Matching
+// the id (not merely the presence of any later tool_result) keeps the guard as
+// narrow as the approved rule: an unanswered terminal tool_use, or a later
+// tool_result that answers a *different* call, is not the protected case.
 export function isActiveToolContinuation(messages, idx) {
   const msg = messages[idx];
   if (!msg || !Array.isArray(msg.content) || msg.content.length === 0) return false;
   const last = msg.content[msg.content.length - 1];
-  if (!last || last.type !== "tool_use") return false;
+  if (!last || last.type !== "tool_use" || !last.id) return false;
   for (let j = idx + 1; j < messages.length; j++) {
-    if (hasToolResult(messages[j])) return true;
+    if (answersToolUse(messages[j], last.id)) return true;
   }
   return false;
 }
