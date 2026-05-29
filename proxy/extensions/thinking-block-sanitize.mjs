@@ -11,8 +11,11 @@
 //   - from the LATEST assistant turn UNLESS it is an active tool-continuation
 //     (last block is a tool_use with a following tool_result) — that case is
 //     uncoverable by the proxy (the API needs the signed thinking for the
-//     pending tool call; we can't restore the emptied text) → user-side
-//     DISABLE_INTERLEAVED_THINKING=1.
+//     pending tool call; we can't restore the emptied text). No env var both
+//     preserves thinking and avoids the wedge there — CLAUDE_CODE_DISABLE_THINKING=1
+//     / MAX_THINKING_TOKENS=0 stop it only by disabling thinking entirely
+//     (lossy); DISABLE_INTERLEAVED_THINKING=1 does NOT stop the 400 — so the
+//     answer for that case is don't-resume + heal/retire.
 // Never touches non-empty thinking, and never touches redacted_thinking (v1).
 //
 // OPT-IN for v1: only runs when CACHE_FIX_THINKING_SANITIZE=on (default off) —
