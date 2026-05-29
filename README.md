@@ -29,7 +29,7 @@ That's it. The proxy applies all 7 cache-fix extensions automatically. No wrappe
 
 ### What the proxy does
 
-On every `/v1/messages` request, 8 extensions run in order:
+On every `/v1/messages` request, 9 extensions run in order (one opt-in):
 
 | Extension | What it fixes |
 |-----------|--------------|
@@ -41,6 +41,7 @@ On every `/v1/messages` request, 8 extensions run in order:
 | `cache-control-normalize` | Normalizes cache_control markers across messages |
 | `cache-telemetry` | Extracts cache stats from response headers → `~/.claude/quota-status/{account.json,sessions/<id>.json}` |
 | `session-health` | Observes per-session thinking-desync risk (context size + thinking-block count) and warns before a session reaches the danger zone. Read-only |
+| `thinking-block-sanitize` | Drops omitted (empty-text) thinking blocks to head off the CC thinking-desync `400` (#63147). **Opt-in** (`CACHE_FIX_THINKING_SANITIZE=on`) |
 
 Extensions are hot-reloadable — add, remove, or modify `.mjs` files in `proxy/extensions/` and changes apply to the next request without restarting. Configuration in `proxy/extensions.json`.
 
@@ -745,6 +746,18 @@ Token thresholds are anchored to the observed ~382K-token trip with margin; the 
 | `CACHE_FIX_THINKING_RISK_WARN_TOKENS` | `250000` | Context-token level at which `thinking_desync_risk` becomes `warn`. |
 | `CACHE_FIX_THINKING_RISK_HIGH_TOKENS` | `340000` | Context-token level at which risk becomes `high` and the one-time stderr warn fires. |
 | `CACHE_FIX_THINKING_RISK` | unset (on) | Set to `off` to suppress the warning signal (stderr line + `thinking_desync_risk` field). Raw count telemetry keeps recording. |
+
+## Thinking-block sanitize (proxy mode, opt-in, thinking-desync mitigation)
+
+The *mitigate* half of the thinking-desync response (the *warn-before* half is session-health above). On history-replay paths (resume / `--continue` / auto-compaction / parallel-tool-cancel), Claude Code re-sends prior assistant turns' extended thinking in the **omitted** shape `{ "type":"thinking", "thinking":"", "signature":"<intact>" }`. The API rejects modified thinking in the **latest** assistant message with a permanent `400 … thinking … blocks cannot be modified`, which wedges the session on every subsequent turn (upstream root cause: [anthropics/claude-code#63147](https://github.com/anthropics/claude-code/issues/63147)).
+
+The `thinking-block-sanitize` extension drops those omitted blocks — which the API treats as optional history — from the request before it is forwarded. Empirically-resolved turn-selection rule: drop omitted thinking from **all prior assistant turns and the latest assistant turn, unless the latest turn is an active tool-continuation** (its last block is a `tool_use` answered by a following `tool_result`). In that one case the API requires the signed thinking intact and the proxy cannot restore the emptied text, so it leaves the turn untouched — **the user-side answer for that case is `DISABLE_INTERLEAVED_THINKING=1`** in Claude Code's settings `env`. Non-empty thinking is never touched; `redacted_thinking` is out of scope for v1.
+
+**Opt-in.** v1 ships behind `CACHE_FIX_THINKING_SANITIZE=on` (default off): it mutates request bodies and full live-coverage validation is pending. The transform is deterministic and cache-prefix-stable, and emits a per-request `thinking_blocks_dropped` count into the per-session JSON (counts only — never content) that complements the session-health signal.
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `CACHE_FIX_THINKING_SANITIZE` | unset (off) | Set to `on` to enable the request-path drop of omitted thinking blocks. Off = no-op (no mutation, no telemetry). |
 
 ## System prompt rewrite (preload mode, optional)
 

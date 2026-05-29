@@ -179,6 +179,35 @@ test("[pipeline #160] degraded path: no quota headers → no per-session write, 
   }
 });
 
+test("[pipeline #162] thinking-block-sanitize drop count merges into the per-session JSON (opt-in)", async () => {
+  const env = setupHome();
+  const old = process.env.CACHE_FIX_THINKING_SANITIZE;
+  process.env.CACHE_FIX_THINKING_SANITIZE = "on";
+  try {
+    const exts = await loadExtensions(EXT_DIR, EXT_CONFIG);
+    const sid = "sess-sanitize-merge";
+    const body = {
+      system: [],
+      messages: [
+        { role: "assistant", content: [{ type: "thinking", thinking: "", signature: "S" }, { type: "text", text: "a1" }] },
+        { role: "user", content: [{ type: "text", text: "q" }] },
+        { role: "assistant", content: [{ type: "thinking", thinking: "", signature: "S" }, { type: "text", text: "a2" }] },
+      ],
+    };
+    await driveFullResponse(exts, { ...QUOTA_HEADERS, "x-claude-code-session-id": sid }, { body });
+
+    const sessionPath = join(env.home, ".claude", "quota-status", "sessions", `${sid}.json`);
+    const sess = JSON.parse(readFileSync(sessionPath, "utf8"));
+    assert.equal(sess.thinking_blocks_dropped, 2, "drop count merged into per-session JSON");
+    // session-health (590) runs after sanitize (550), so it counts the post-sanitize forwarded body
+    assert.equal(sess.thinking_block_count, 0, "session-health counts the post-sanitize forwarded body");
+  } finally {
+    if (old === undefined) delete process.env.CACHE_FIX_THINKING_SANITIZE;
+    else process.env.CACHE_FIX_THINKING_SANITIZE = old;
+    env.cleanup();
+  }
+});
+
 test("[pipeline #11j] malformed session-id ends up in a hashed file, no path-traversal escape", async () => {
   const env = setupHome();
   try {

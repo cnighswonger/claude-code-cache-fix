@@ -233,6 +233,9 @@ export default {
           // 590, stashes these before this writer runs). Optional — absent if
           // that extension is disabled or produced nothing this request.
           ...(ctx.meta._sessionHealth || {}),
+          // Additive thinking-block-sanitize drop count (order 550, opt-in).
+          // Optional — absent unless CACHE_FIX_THINKING_SANITIZE=on.
+          ...(ctx.meta._thinkingSanitize || {}),
           timestamp,
           session_id: rawSid,
         },
