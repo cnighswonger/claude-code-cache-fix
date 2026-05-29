@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **`tools/manual-compact.sh`: Opus summarizer + relaxed recent-turn truncation (#169).** The manual-compaction dev tool now defaults to `claude-opus-4-7` (was `claude-sonnet-4-6`), overridable via `MANUAL_COMPACT_MODEL`, and keeps more per-turn detail in the extract (active turns 2000→8000 chars, working 400→1500, foundational 200→300) for higher-fidelity summaries. Doc adds a troubleshooting note for the oversized-extract / empty-output case (use a `[1m]`-window model or lower the caps).
+
 ## [3.8.0] - 2026-05-29
 
 The thinking-desync response (upstream `anthropics/claude-code#63147`): the *warn-before* half (session-health, #160) and the *mitigate* half (thinking-block-sanitize, #162), plus the `ttl-management` thinking-block guard (#157/#159).
