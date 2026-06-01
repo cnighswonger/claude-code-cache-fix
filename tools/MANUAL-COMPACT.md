@@ -155,6 +155,18 @@ The cold rebuild consumed ~15% Q5h in one call on our Max 5x account. After that
 
 **Total cost of a manual compact cycle:** roughly ~15% cold rebuild plus a few % for the Opus summarization. Compare to hitting the 1M wall and losing the session entirely.
 
+### Stale transcripts get swept (CC's `cleanupPeriodDays`)
+
+Heads up if you're treating the on-disk `.jsonl` as a "keep just in case" backup after `/clear`: it isn't durable. Claude Code maintains a transcript-retention setting `cleanupPeriodDays` in `~/.claude/settings.json` (default 30 days). On every fresh `claude` startup, CC walks every `.jsonl` under `~/.claude/projects/` and deletes any whose `mtime` is past the cutoff — including the matching `<session-id>/` companion directory next to it. A session you compacted, `/clear`-ed, and stopped retaining ~31 days ago will be gone the next time you launch CC, even if you'd planned to grep it for context.
+
+Practical implications:
+
+- **If you need the post-compact JSONL preserved**, copy it out of `~/.claude/projects/` to a path that isn't subject to CC's cleanup — e.g. `~/snapshots/cc-jsonl-backups/`. Copying it into the same project dir as a `.bak` does not help; the sweep walks the whole dir.
+- **A stopped session held in heal-and-await state is especially vulnerable** — it's idle by definition, so it crosses `cleanupPeriodDays` faster than an actively-used session whose appends keep mtime fresh. If you've stopped a session intending to resume later, either resume promptly, `touch` the `.jsonl` to refresh mtime, or copy it out of the tree.
+- A read (`cat`/`grep`/`less`) does **not** advance mtime — modern Linux mounts default to `relatime`/`noatime`, so inspecting the file for recovery doesn't extend its lifespan. Only an append (CC writing to it during an active session, or a manual `touch`) refreshes mtime.
+
+Tracked upstream as [anthropics/claude-code#62272](https://github.com/anthropics/claude-code/issues/62272) — cache-fix doesn't touch this surface, but documenting it because manual-compact users are the population most likely to bank on the `.jsonl` sticking around.
+
 ### Summarizer model
 
 The tool defaults to `claude --print --model claude-opus-4-7` for the highest-fidelity summary. Override with the `MANUAL_COMPACT_MODEL` env var — e.g. `MANUAL_COMPACT_MODEL=claude-sonnet-4-6` to minimize Q5h impact, or to point at a different model if Opus is rate-limited or retired.
