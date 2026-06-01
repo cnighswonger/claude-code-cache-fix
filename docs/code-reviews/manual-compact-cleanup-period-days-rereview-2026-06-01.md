@@ -1,7 +1,7 @@
 # Review: MANUAL-COMPACT cleanupPeriodDays note
 
 Date: 2026-06-01
-Reviewed: tools/MANUAL-COMPACT.md (PR #176 @ 3d65618)
+Reviewed: tools/MANUAL-COMPACT.md (PR #176 @ 0dd18f5)
 Label applied: approved-by-codex-agent
 
 ## What Is Correct
@@ -10,7 +10,7 @@ Label applied: approved-by-codex-agent
 - `tools/MANUAL-COMPACT.md:164` now gives the practical preservation guidance without the unsupported in-tree `.bak` example, which resolves the second blocker cleanly.
 - `tools/MANUAL-COMPACT.md:166` now states the load-bearing fact directly: cleanup keys off `mtime`, and plain reads do not extend retention. The extra `relatime` / `noatime` aside is gone.
 - The final PR diff remains doc-only and scoped to one new subsection under `## Limitations`; I did not find any other wording drift in `tools/MANUAL-COMPACT.md` beyond the approved cleanup warning itself.
-- Verification is clean: `node --test` passed `906/906` at `3d65618`.
+- Verification is clean: `node --test` passed `906/906` at `0dd18f5`.
 
 ## Blockers
 
