@@ -19,9 +19,9 @@ This hook is a user-side workaround until Anthropic fixes the harness. It's a `P
 For each in-scope call, the hook:
 
 1. Detects whether the session is in a linked worktree (realpath-compares `git rev-parse --git-dir` and `--git-common-dir`; they differ inside a linked worktree, match in a regular checkout from any depth).
-2. Realpath-resolves the target. For paths that don't exist yet (`Write`'s common case), it resolves the parent directory first so a symlinked parent still gets caught.
+2. Realpath-resolves the target. If the target exists (including as a symlink or a broken symlink), `realpath` resolves it directly so a target that IS a symlink follows to its destination. If it doesn't exist yet (`Write`'s common case), the hook realpaths the parent directory and reattaches the basename, so a symlinked parent still gets caught.
 3. If the resolved target is inside the resolved worktree root → exit 0 (CC proceeds).
-4. Otherwise → exit 2 with a stderr message naming the rejected path and worktree root. CC feeds stderr back to the agent as an error.
+4. Otherwise → exit 2 with a stderr message naming the **resolved** path (so a symlink escape shows the actual destination, not the symlink path) and worktree root. CC feeds stderr back to the agent as an error.
 
 When the session is **not** in a linked worktree (regular checkout, no git repo, or git command failure), the hook exits 0 and stays out of the way. It's safe to install globally.
 

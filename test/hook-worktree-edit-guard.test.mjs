@@ -70,11 +70,22 @@ test("Edit in /tmp (totally out of tree) → exit 2 (block)", () => {
   } finally { cleanup(repo); }
 });
 
-test("Edit on in-tree symlink pointing outside → exit 2 (realpath catches)", () => {
+test("Edit on file_path that IS a symlink in worktree → resolves to symlink target outside → exit 2 (the directive's symlink-escape case)", () => {
+  const repo = makeRepo(); const wt = makeWorktree(repo);
+  try {
+    const linkPath = join(wt, "filelink");
+    symlinkSync("/tmp/wgt-target-outside", linkPath);  // broken symlink is fine; lexists detects it
+    const r = runHook({ toolName: "Edit", toolInput: { file_path: linkPath }, cwd: wt });
+    assert.equal(r.code, 2);
+    assert.match(r.stderr, /\/tmp\/wgt-target-outside/);  // stderr names the actual target, not the symlink path
+  } finally { cleanup(repo); }
+});
+
+test("Edit through symlinked-parent-dir to an in-leaf path → exit 2 (parent-dir realpath catches)", () => {
   const repo = makeRepo(); const wt = makeWorktree(repo);
   try {
     const linkPath = join(wt, "escape");
-    symlinkSync("/tmp", linkPath);
+    symlinkSync("/tmp", linkPath);  // escape/ -> /tmp/
     const r = runHook({ toolName: "Edit", toolInput: { file_path: join(linkPath, "x") }, cwd: wt });
     assert.equal(r.code, 2);
   } finally { cleanup(repo); }
@@ -173,6 +184,37 @@ test("Regular checkout from nested subdirectory → exit 0 (validates realpath d
 test("Not in any git repo → exit 0 (fail-open)", () => {
   const r = runHook({ toolName: "Edit", toolInput: { file_path: "/tmp/x" }, cwd: "/tmp" });
   assert.equal(r.code, 0);
+});
+
+test("`git` subprocess times out → exit 0 (fail-open environmental, deterministic via PATH shim)", () => {
+  const repo = makeRepo(); const wt = makeWorktree(repo);
+  const shimDir = realpathSync(mkdtempSync(join(tmpdir(), "wgt-shim-")));
+  try {
+    const shim = join(shimDir, "git");
+    writeFileSync(shim, "#!/usr/bin/env bash\nsleep 10\n");
+    spawnSync("chmod", ["+x", shim]);
+    const payload = JSON.stringify({ tool_name: "Edit", tool_input: { file_path: join(wt, "x") }, cwd: wt });
+    const r = spawnSync(SCRIPT, [], {
+      input: payload, encoding: "utf8",
+      env: { ...process.env, PATH: `${shimDir}:${process.env.PATH}` },
+    });
+    assert.equal(r.status, 0);
+  } finally {
+    cleanup(repo); cleanup(shimDir);
+  }
+});
+
+test("Relative file_path (defense in depth — CC docs use absolute paths, but verify the cwd-join fallback) → enforcement still applies", () => {
+  const repo = makeRepo(); const wt = makeWorktree(repo);
+  try {
+    // Relative path resolving inside the worktree → exit 0
+    writeFileSync(join(wt, "rel.txt"), "x");
+    const inHook = runHook({ toolName: "Edit", toolInput: { file_path: "rel.txt" }, cwd: wt });
+    assert.equal(inHook.code, 0);
+    // Relative path resolving to parent main checkout → exit 2
+    const outHook = runHook({ toolName: "Edit", toolInput: { file_path: "../a" }, cwd: wt });
+    assert.equal(outHook.code, 2);
+  } finally { cleanup(repo); }
 });
 
 // --- out-of-scope tools pass-through ---

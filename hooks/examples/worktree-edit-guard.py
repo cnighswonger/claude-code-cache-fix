@@ -49,8 +49,13 @@ def worktree_root(cwd):
 
 
 def resolved_target(target):
-    """Realpath the target, with not-yet-existing files handled by resolving
-    the parent dir (so a symlinked parent still gets caught)."""
+    """Realpath the target. If the target exists (including as a broken
+    symlink), realpath it directly so a target that IS a symlink resolves
+    to its destination (not back to itself). If it doesn't exist, fall
+    back to realpath(parent_dir) + basename so a symlinked PARENT still
+    gets caught even when the leaf will be created by the tool."""
+    if os.path.lexists(target):
+        return os.path.realpath(target)
     return os.path.join(os.path.realpath(os.path.dirname(target)),
                         os.path.basename(target))
 
