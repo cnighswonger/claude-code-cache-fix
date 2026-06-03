@@ -6,7 +6,7 @@ Label applied: `changes-requested`
 
 ## What Is Correct
 
-- `git diff --name-only main...5ada94c` contains only `package.json` and `CHANGELOG.md`; the release payload itself is minimal and matches the expected "version bump + changelog promotion" shape.
+- `git diff --name-only main...5ada94c` contains only `package.json` and `CHANGELOG.md`; the release payload itself is minimal and matches the expected "version bump + changelog promotion" shape. The only later branch delta is this review artifact, committed per workflow.
 - The semver bump to `3.9.0` is correct for this release. The bundled scope is two backward-compatible, user-visible additions (`auto-1m-guard` and `worktree-edit-guard`) plus smaller fixes/docs updates, with no breaking default-behavior change (`package.json:3`, `CHANGELOG.md:7-45`).
 - The `hooks/` allowlist change is correct and necessary. `npm pack --dry-run` on `5ada94c` produces `claude-code-cache-fix-3.9.0.tgz`, includes both `proxy/extensions/auto-1m-guard.mjs` and `hooks/examples/worktree-edit-guard.py`, includes `hooks/README.md`, and shows no `__pycache__`, `.pyc`, or other local build artifacts (`package.json:14-24`).
 - The v3.9.0 changelog descriptions for both bundled features match the already-merged implementations and approved directives: `auto-1m-guard` is a header-based warn/strip proxy extension with the documented `off|warn|strip` modes and top-level `auto_1m_*` telemetry handoff, while `worktree-edit-guard` is the shipped `PreToolUse` hook example with strict realpath containment and the `exit 2` block contract (`CHANGELOG.md:11-27`).
