@@ -6,6 +6,36 @@ import { streamResponse, createTelemetryRecord } from "./stream.mjs";
 import { loadExtensions, snapshotRegistry, runOnRequest, runOnResponseStart, runOnResponse, getFailedExtensions } from "./pipeline.mjs";
 import { startWatcher } from "./watcher.mjs";
 
+// --------------------------------------------------------------------------
+// Debug logging (writes to ~/.claude/cache-fix-debug.log)
+// Set CACHE_FIX_DEBUG=1 to enable
+// --------------------------------------------------------------------------
+
+import { appendFileSync, readFileSync, writeFileSync, mkdirSync, renameSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import util from 'util';
+
+const LOG_PATH = join(homedir(), ".claude", "cache-fix-debug.log");
+
+function debugLog(...args) {
+  if (!config.debug) return;
+  const line = `[${new Date().toISOString()}] ${util.format(...args)}\n`;
+  try { appendFileSync(LOG_PATH, line); } catch {}
+}
+
+// --------------------------------------------------------------------------
+
+console.log(`config.port='${config.port}'`);
+console.log(`config.bind='${config.bind}'`);
+console.log(`config.upstream='${config.upstream}'`);
+console.log(`config.debug='${config.debug}'`);
+console.log(`config.httpsProxy='${config.httpsProxy}'`);
+console.log(`config.httpProxy='${config.httpProxy}'`);
+console.log(`config.noProxy='${config.noProxy}'`);
+console.log(`config.caFile='${config.caFile}'`);
+console.log(`config.rejectUnauthorized='${config.rejectUnauthorized}'`);
+
 function collectBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -74,7 +104,18 @@ async function handleMessages(clientReq, clientRes) {
   });
 
   const pre = await preForward(clientReq, clientRes, abortController, extSnapshot, "messages");
-  if (pre.handled) return;
+  if (pre.handled) {
+      debugLog("========================================");
+      debugLog("[PROXY] handled internally without upstream request");
+      debugLog("[PROXY -> CLAUDE] RESPONSE");
+      debugLog("url:", clientRes.url);
+      debugLog("method:", clientRes.method);
+      debugLog("status:", clientRes.statusCode);
+      debugLog("message:", clientRes.statusMessage);
+      debugLog("bytes:", clientRes.socket?.bytesWritten || 0);
+      debugLog("headers:", clientRes.getHeaders());
+      return;
+  }
   const { parsed, forwardBody, meta } = pre;
 
   const requestedModel = parsed?.model || null;
@@ -88,6 +129,8 @@ async function handleMessages(clientReq, clientRes) {
       abortController.signal
     ));
   } catch (err) {
+    console.error("[PROXY] forwardRequest error:", err.message);
+    debugLog("[PROXY] forwardRequest error:", err.message);
     if (abortController.signal.aborted) return;
     clientRes.writeHead(502, { "content-type": "application/json" });
     clientRes.end(JSON.stringify({ error: "upstream_error", message: err.message }));
@@ -98,6 +141,18 @@ async function handleMessages(clientReq, clientRes) {
   // (rate-limit-log, future per-connection diagnostics) can record which
   // socket carried the request without each one re-instrumenting upstream.
   meta._upstreamConnectionId = upstreamConnectionId ?? null;
+
+  debugLog("");
+  debugLog("========================================");
+  debugLog("[UPSTREAM -> PROXY -> CLAUDE] RESPONSE");
+  debugLog("url:", upstreamRes.url);
+  debugLog("method:", upstreamRes.method);
+  debugLog("status1:", statusCode);
+  debugLog("status2:", upstreamRes.statusCode);
+  debugLog("message:", upstreamRes.statusMessage);
+  debugLog("bytes:", upstreamRes.socket?.bytesWritten || 0);
+  debugLog("upstream headers:", upstreamRes.headers);
+  debugLog("proxy headers:", responseHeaders);
 
   if (extSnapshot.length > 0) {
     const resCtx = { status: statusCode, headers: responseHeaders, meta };
@@ -274,16 +329,52 @@ function handleNotFound(_req, res) {
  */
 export function createProxyServer() {
   return http.createServer((req, res) => {
-    if (req.method === "GET" && req.url === "/health") {
-      return handleHealth(req, res);
+    try {
+      debugLog("");
+      debugLog("========================================");
+      debugLog("[CLAUDE -> PROXY] REQUEST");
+      debugLog("method:", req.method);
+      debugLog("url:", req.url);
+      debugLog("headers:", req.headers);
+
+      const originalWrite = res.write;
+      const originalEnd = res.end;
+
+      res.write = function (chunk, ...args) {
+        debugLog(`[PROXY -> CLAUDE] Send chunk. Size: ${chunk ? chunk.length : 0} bytes`);
+        return originalWrite.apply(res, [chunk, ...args]);
+      };
+
+      res.end = function (chunk, ...args) {
+        debugLog("[PROXY -> CLAUDE] Close connection (res.end)");
+        return originalEnd.apply(res, [chunk, ...args]);
+      };
+
+      if (req.method === "GET" && req.url === "/health") {
+        return handleHealth(req, res);
+      }
+      if (req.method === "POST" && req.url?.startsWith("/v1/messages")) {
+        return handleMessages(req, res);
+      }
+      if (req.url?.startsWith("/api/claude_cli/bootstrap")) {
+        return handleBootstrap(req, res);
+      }
+      console.error(`ERROR: handler not found for req.url='${req.url}' req.method='${req.method}'`);
+      debugLog(`ERROR: handler not found for req.url='${req.url}' req.method='${req.method}'`);
+      handleNotFound(req, res);
     }
-    if (req.method === "POST" && req.url?.startsWith("/v1/messages")) {
-      return handleMessages(req, res);
+    catch (error) {
+      console.error("!!! REQUEST HANDLER ERROR !!!");
+      console.error(error);
+      debugLog("!!! REQUEST HANDLER ERROR !!!");
+      debugLog(error);
+      // Reply error 500 to prevent claude hanging
+      if (!res.headersSent) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: "Internal Proxy Error", message: error.message }));
+      }
     }
-    if (req.url?.startsWith("/api/claude_cli/bootstrap")) {
-      return handleBootstrap(req, res);
-    }
-    handleNotFound(req, res);
+
   });
 }
 
