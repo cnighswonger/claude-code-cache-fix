@@ -236,6 +236,11 @@ export default {
           // Additive thinking-block-sanitize drop count (order 550, opt-in).
           // Optional — absent unless CACHE_FIX_THINKING_SANITIZE=on.
           ...(ctx.meta._thinkingSanitize || {}),
+          // Additive auto-1m-guard annotation (order 520). Optional — absent
+          // unless the outbound request carried context-1m-2025-08-07 and the
+          // mode wasn't off. Keys: auto_1m_detected / auto_1m_action /
+          // auto_1m_advice.
+          ...(ctx.meta._auto1mGuard || {}),
           timestamp,
           session_id: rawSid,
         },

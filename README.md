@@ -231,6 +231,16 @@ Note: cache-fix v3.6.2 and earlier returned 404 for the bootstrap path because t
 - [`CHANGELOG.md`](CHANGELOG.md#371---2026-05-27) — v3.7.1 release entry (extended surface coverage + allowlist mode); [v3.7.0 entry](CHANGELOG.md#370---2026-05-26) covers the prior behavior-change note
 - [`cnighswonger/heron-brook-poc`](https://github.com/cnighswonger/heron-brook-poc) — reproducer for the bootstrap-channel behavior
 
+**Auto-1M-context overage protection.** CC v2.1.161 onward (notably the VS Code Extension surface) can auto-select 1M context on Pro Plan without user request, immediately consuming overage credits. The proxy's `auto-1m-guard` extension detects the `context-1m-2025-08-07` token on the outbound `anthropic-beta` header and either warns or strips it, depending on the mode you opt into via `CACHE_FIX_AUTO_1M_GUARD`:
+
+| Mode | Default? | Behavior |
+|---|---|---|
+| `off` | no | Extension no-op. |
+| `warn` | yes | Detect the token. Stash an annotation into the per-session JSON (`auto_1m_detected`, `auto_1m_action: "warn"`, `auto_1m_advice`) and emit a stderr log line. Does not modify the request. |
+| `strip` | opt-in | Detect AND remove the token from the `anthropic-beta` header before forwarding. Annotation: `auto_1m_action: "stripped"`. |
+
+The CC-side kill switch is `CLAUDE_CODE_DISABLE_1M_CONTEXT=1` (env var), which is the right fix when it actually reaches the CC process. On the VS Code extension surface that env var is reportedly unreliable; the proxy intercept bypasses that gap because it acts on the wire regardless of which CC launcher produced the request. Tracks [CC#64919](https://github.com/anthropics/claude-code/issues/64919); see [`docs/directives/proxy-auto-1m-guard.md`](docs/directives/proxy-auto-1m-guard.md) for the binary-walk that confirms the proxy-visible signal is the beta header (CC strips the `[1m]` suffix from `req.body.model` client-side before sending).
+
 ## Client-side hooks
 
 Some Claude Code behaviors live below the request layer — they happen client-side, in the tool-dispatch path, before the proxy ever sees traffic. cache-fix ships standalone hook scripts under [`hooks/examples/`](hooks/README.md) for those cases. They're independent of the proxy and you install them by pointing at them from your own `~/.claude/settings.json`.
