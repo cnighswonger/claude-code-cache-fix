@@ -79,8 +79,8 @@ A new proxy extension `auto-1m-guard` that operates on outbound requests:
 | Mode | env var | Behavior |
 |---|---|---|
 | `off` | `CACHE_FIX_AUTO_1M_GUARD=off` | Extension no-op; request passes unchanged. |
-| `warn` (default) | unset or `CACHE_FIX_AUTO_1M_GUARD=warn` | Detect `context-1m-2025-08-07` in the outbound `anthropic-beta` header. If present, emit a session-JSON annotation (`_auto1mGuard: { detected: true, action: "warn" }`) and write a one-line stderr message visible in proxy logs. Do not modify the request. |
-| `strip` (opt-in) | `CACHE_FIX_AUTO_1M_GUARD=strip` | Detect AND remove `context-1m-2025-08-07` from the `anthropic-beta` header before the request goes out. Annotation: `_auto1mGuard: { detected: true, action: "stripped" }`. |
+| `warn` (default) | unset or `CACHE_FIX_AUTO_1M_GUARD=warn` | Detect `context-1m-2025-08-07` in the outbound `anthropic-beta` header. If present, stash `ctx.meta._auto1mGuard = { auto_1m_detected: true, auto_1m_action: "warn", auto_1m_advice: <text> }` and write a one-line stderr message visible in proxy logs. Do not modify the request. |
+| `strip` (opt-in) | `CACHE_FIX_AUTO_1M_GUARD=strip` | Detect AND remove `context-1m-2025-08-07` from the `anthropic-beta` header before the request goes out. Stash the same flat object with `auto_1m_action: "stripped"`. |
 
 The session-JSON annotation lives at `ctx.meta._auto1mGuard`, written by the cache-telemetry extension's existing spread-into-JSON pattern (the same channel session-health and thinking-block-sanitize already use).
 
@@ -156,16 +156,16 @@ Rationale: (a) `anthropic-beta` does not carry trailing-whitespace semantics —
 
 | Case | Mode | Expected |
 |---|---|---|
-| Header carries `context-1m-2025-08-07` among other tokens | `warn` | Header unchanged; `ctx.meta._auto1mGuard.detected = true`, `action = "warn"` |
-| Header carries `context-1m-2025-08-07` among other tokens | `strip` | Token removed; remaining tokens preserved in order; annotation `action = "stripped"` |
-| Header is exactly `context-1m-2025-08-07` (single-element) | `strip` | Header becomes empty string (not deleted); annotation `action = "stripped"` |
+| Header carries `context-1m-2025-08-07` among other tokens | `warn` | Header unchanged; `ctx.meta._auto1mGuard.auto_1m_detected = true`, `auto_1m_action = "warn"` |
+| Header carries `context-1m-2025-08-07` among other tokens | `strip` | Token removed; remaining tokens rejoined with the canonical `, ` separator preserved in order; `auto_1m_action = "stripped"` |
+| Header is exactly `context-1m-2025-08-07` (single-element) | `strip` | Header becomes empty string (not deleted); `auto_1m_action = "stripped"` |
 | Header does not carry `context-1m-2025-08-07` | `warn` | No annotation; no log line |
 | Header does not carry `context-1m-2025-08-07` | `strip` | No annotation; no header change |
 | No `anthropic-beta` header at all | `warn` | No annotation (nothing to flag) |
 | Mode `off` even with header present | `off` | No annotation; no change |
 | Token with surrounding whitespace (e.g. `context-1m-2025-08-07 `) | `strip` | Detected and removed (whitespace-tolerant) |
 | `context-1m-` substring in a different token (defensive — no other tokens currently match, but verify the check is exact-token not substring) | any | No false positive |
-| `anthropic-beta` carries `context-1m-2025-08-07` repeated twice (defensive — pin strip semantics if upstream or an intermediary ever duplicates the token) | `strip` | All occurrences removed; annotation `action = "stripped"`; remaining tokens preserved |
+| `anthropic-beta` carries `context-1m-2025-08-07` repeated twice (defensive — pin strip semantics if upstream or an intermediary ever duplicates the token) | `strip` | All occurrences removed; `auto_1m_action = "stripped"`; remaining tokens preserved |
 
 Plus a small unit test over the helper that builds the modified header value, to lock the comma-join behavior.
 
