@@ -185,7 +185,9 @@ function getAgent(isHTTPS, hostname) {
 
 export function forwardRequest(clientReq, body, signal) {
   return new Promise((resolve, reject) => {
-    const upstreamUrl = new URL(clientReq.url, config.upstream);
+    const base = config.upstream.endsWith('/') ? config.upstream.slice(0, -1) : config.upstream;
+    const relative = clientReq.url.startsWith('/') ? clientReq.url : '/' + clientReq.url;
+    const upstreamUrl = new URL(base + relative);
 
     const headers = buildUpstreamHeaders(clientReq.headers, upstreamUrl.hostname);
     if (body) {
