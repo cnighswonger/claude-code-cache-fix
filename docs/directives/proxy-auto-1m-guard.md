@@ -87,24 +87,43 @@ The outbound `anthropic-beta` request header is a **comma-separated** list of be
 
 In `strip` mode: remove the token, rejoin the remaining tokens with `,`, and set the modified header on the outbound request. If the header becomes empty after removal, leave it as an empty string rather than deleting it (preserves the Anthropic SDK's idempotency over the request shape).
 
-### Warning text
+### Warning text and session-JSON handoff contract
 
-When `warn` mode fires, the session-JSON annotation captures:
+**Handoff shape**: the extension stashes a **flat object** at `ctx.meta._auto1mGuard` whose keys get **spread top-level** into the session JSON by cache-telemetry. This matches the established selective-spread pattern in `proxy/extensions/cache-telemetry.mjs` lines 232-238 — same channel as `_sessionHealth` and `_thinkingSanitize`. The leading underscore on `_auto1mGuard` keeps it namespaced within `ctx.meta` for inter-extension safety; the **keys inside the stashed object should be the final session-JSON field names**, so prefix them with `auto_1m_` to keep them disambiguated at top level.
+
+When `warn` mode fires, `ctx.meta._auto1mGuard` is set to:
+
+```js
+{
+  auto_1m_detected: true,
+  auto_1m_action: "warn",
+  auto_1m_advice: "Outbound request carries the context-1m-2025-08-07 beta header, which enables 1M context. On Pro plans this consumes overage credits immediately. To prevent CC from auto-selecting 1M: set CLAUDE_CODE_DISABLE_1M_CONTEXT=1 in your env, or use /model with a non-[1m] model variant in-session. Strip mode (CACHE_FIX_AUTO_1M_GUARD=strip) intercepts the header at the proxy."
+}
+```
+
+Which gets spread by cache-telemetry into the session JSON:
 
 ```json
 {
-  "_auto1mGuard": {
-    "detected": true,
-    "action": "warn",
-    "advice": "Outbound request carries the context-1m-2025-08-07 beta header, which enables 1M context. On Pro plans this consumes overage credits immediately. To prevent CC from auto-selecting 1M: set CLAUDE_CODE_DISABLE_1M_CONTEXT=1 in your env, or use /model with a non-[1m] model variant in-session. Strip mode (CACHE_FIX_AUTO_1M_GUARD=strip) intercepts the header at the proxy."
-  }
+  ...other top-level fields...,
+  "auto_1m_detected": true,
+  "auto_1m_action": "warn",
+  "auto_1m_advice": "Outbound request carries..."
 }
 ```
+
+In `strip` mode the same shape applies with `auto_1m_action: "stripped"`. When the extension is `off` or no `context-1m-*` token is present, **do not stash anything** — the spread is `...(ctx.meta._auto1mGuard || {})`, so absent fields stay absent in the JSON.
 
 Stderr message (single line):
 ```
 [auto-1m-guard] context-1m-2025-08-07 detected in outbound betas — see CACHE_FIX_AUTO_1M_GUARD=strip to intercept. Set CLAUDE_CODE_DISABLE_1M_CONTEXT=1 to prevent CC from sending it.
 ```
+
+### Strip-mode rewrite contract — whitespace policy
+
+The `anthropic-beta` header is a comma-separated list. CC's outbound form uses `, ` (comma + space) as the separator. Real-world parsers tolerate either `,` or `, ` between tokens. For the strip operation, **the directive blesses whitespace normalization**: after removing the matched token, rejoin remaining tokens with `, ` (the CC-canonical separator), trim the result. Trailing/leading whitespace around the whole header value is collapsed.
+
+Rationale: (a) `anthropic-beta` does not carry trailing-whitespace semantics — the API parses tokens, not whitespace. (b) Normalizing to `, ` matches what CC itself would have produced for the post-strip header, so the downstream wire shape is indistinguishable from "CC originally sent fewer betas." (c) Preserving the exact original whitespace would require remembering the original separator string per-position, which is fragile and adds complexity for no observable benefit. The threat-model line about "preserve surrounding whitespace shape that's load-bearing for the wire format" applies if a header has wire-significant whitespace; `anthropic-beta` does not, so normalization is the right default here.
 
 ## Out of scope
 
@@ -119,7 +138,7 @@ Stderr message (single line):
 
 - New file: `proxy/extensions/auto-1m-guard.mjs`. Pattern matches existing extensions (e.g. `proxy/extensions/thinking-block-sanitize.mjs`): default-export the extension object with `enabled: true`, `order: <position>`, `onRequest` handler. Runtime gating via env var, not via `enabled` field — same as the established pattern (see `feedback_extension_activation_pattern` memory).
 - **Order placement**: this runs `onRequest` before the request goes to upstream. Should fire before any other extension that depends on the final beta header. Look at the existing order numbers and pick a slot in the 400–500 range (between body-shape changes and the final outbound preparation). The cache-telemetry writer at order 600 spreads `ctx.meta` into the JSON write — auto-1m-guard's annotation needs to be set before that.
-- **Header-name casing**: HTTP headers are case-insensitive but the proxy normalizes them; check whether the proxy gives extensions a case-canonicalized view of headers, and access accordingly. (The bootstrap-defense and rate-limit-log extensions already operate on outbound headers — use the same access pattern.)
+- **Header-name casing**: HTTP headers are case-insensitive but the proxy normalizes them; check whether the proxy gives extensions a case-canonicalized view of headers, and access accordingly. (The bootstrap-defense and rate-limit-log extensions already operate on outbound headers — use the same access pattern.) Specifically, `proxy/extensions/upstream-change-detection.mjs` already has a case-insensitive / whitespace-tolerant `anthropic-beta` extraction pattern (~lines 195-207); mirror it here so the header reader is robust without inventing a new abstraction.
 - **Empty-list edge case**: if the request has only `context-1m-2025-08-07` in `anthropic-beta` (a one-element list), strip mode should leave the header as `""` (empty string), not delete the header entirely. Matches CC's request shape post-strip.
 - **No body inspection needed.** The extension only reads/writes the `anthropic-beta` request header. No body parsing, no streaming pipeline involvement.
 
@@ -138,6 +157,7 @@ Stderr message (single line):
 | Mode `off` even with header present | `off` | No annotation; no change |
 | Token with surrounding whitespace (e.g. `context-1m-2025-08-07 `) | `strip` | Detected and removed (whitespace-tolerant) |
 | `context-1m-` substring in a different token (defensive — no other tokens currently match, but verify the check is exact-token not substring) | any | No false positive |
+| `anthropic-beta` carries `context-1m-2025-08-07` repeated twice (defensive — pin strip semantics if upstream or an intermediary ever duplicates the token) | `strip` | All occurrences removed; annotation `action = "stripped"`; remaining tokens preserved |
 
 Plus a small unit test over the helper that builds the modified header value, to lock the comma-join behavior.
 
