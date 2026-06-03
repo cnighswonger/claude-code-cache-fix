@@ -13,7 +13,7 @@
 
 ## Problem statement
 
-When a Claude Code session is launched inside a git worktree, the harness sets cwd to the worktree path and announces "You are operating in a git worktree" in the system prompt, but it does **not** block `Edit`/`Write`/`NotebookEdit`/`MultiEdit` calls whose `file_path` resolves to a location outside the worktree (typically the parent main checkout). The agent can dirty whatever branch the main checkout has checked out — usually `master`/`main` — with no prompt, no warning, no confirmation. This bypasses the branch-isolation guarantee that worktrees are meant to provide.
+When a Claude Code session is launched inside a git worktree, the harness sets cwd to the worktree path and announces "You are operating in a git worktree" in the system prompt, but it does **not** block `Edit`/`Write`/`NotebookEdit`/`MultiEdit` calls whose target path (`file_path` for Edit/Write/MultiEdit, `notebook_path` for NotebookEdit) resolves to a location outside the worktree (typically the parent main checkout). The agent can dirty whatever branch the main checkout has checked out — usually `master`/`main` — with no prompt, no warning, no confirmation. This bypasses the branch-isolation guarantee that worktrees are meant to provide.
 
 Upstream [CC#59628](https://github.com/anthropics/claude-code/issues/59628) has the bug filed against the harness; the filer's own workaround note is "a `PreToolUse` hook ... roughly 20 lines of Python." Until Anthropic ships a harness-level fix, this directive ships that hook as a documented, tested, install-with-one-config-line script.
 
@@ -31,7 +31,7 @@ A single hook script under `hooks/examples/worktree-edit-guard.py` that:
 
 Plus:
 
-- A documentation page (`docs/hooks/worktree-edit-guard.md`) covering install steps, behavior, opt-in/out via `hooks.PreToolUse.matchers`, and the upstream CC issue cross-reference
+- A documentation page (`docs/hooks/worktree-edit-guard.md`) covering install steps, behavior, opt-in/out via the `matcher` field in `hooks.PreToolUse[].matcher`, and the upstream CC issue cross-reference
 - A test (`test/hook-worktree-edit-guard.test.mjs`) covering the containment cases that matter most: in-tree allow, parent-checkout block, symlink-escape block, non-worktree pass-through, MultiEdit handling
 - Hooks-collection README entry pointing at the new file
 
@@ -39,7 +39,7 @@ This is **independent of the proxy** — the hook fires client-side via CC's set
 
 ## Out of scope
 
-- **Bash-tool edits** (`sed -i path`, `cat > path`, `>path`, etc.) — different surface, different mitigation. This directive sticks to the four documented file-editing tools that take an explicit `file_path` argument.
+- **Bash-tool edits** (`sed -i path`, `cat > path`, `>path`, etc.) — different surface, different mitigation. This directive sticks to the four documented file-editing tools (`Edit`/`Write`/`MultiEdit`/`NotebookEdit`) that take an explicit target-path argument in their `tool_input`.
 - **Read-side containment** — agent reading parent-checkout files is not a corruption risk; only writes are. Hook does not block `Read`/`Grep`/`Glob`.
 - **Subprocess-spawned editors** — a Bash call that launches `vim` or `code` against a path outside the worktree is out of scope. Same reason as Bash-edits above.
 - **Convincing CC to harden the harness** — that's upstream's job (CC#59628).
