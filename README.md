@@ -231,6 +231,14 @@ Note: cache-fix v3.6.2 and earlier returned 404 for the bootstrap path because t
 - [`CHANGELOG.md`](CHANGELOG.md#371---2026-05-27) — v3.7.1 release entry (extended surface coverage + allowlist mode); [v3.7.0 entry](CHANGELOG.md#370---2026-05-26) covers the prior behavior-change note
 - [`cnighswonger/heron-brook-poc`](https://github.com/cnighswonger/heron-brook-poc) — reproducer for the bootstrap-channel behavior
 
+## Client-side hooks
+
+Some Claude Code behaviors live below the request layer — they happen client-side, in the tool-dispatch path, before the proxy ever sees traffic. cache-fix ships standalone hook scripts under [`hooks/examples/`](hooks/README.md) for those cases. They're independent of the proxy and you install them by pointing at them from your own `~/.claude/settings.json`.
+
+| Script | What it does |
+|---|---|
+| [`worktree-edit-guard.py`](docs/hooks/worktree-edit-guard.md) | Block `Edit`/`Write`/`MultiEdit`/`NotebookEdit` tool calls whose target path escapes the active git worktree, preventing parent-checkout corruption from worktree sessions. Addresses [CC#59628](https://github.com/anthropics/claude-code/issues/59628). |
+
 ## Recommended CC operational config
 
 The proxy fixes what it can fix at the request layer. A handful of CC client-side env vars and `~/.claude/settings.json` knobs solve adjacent problems the proxy can't reach — silent model swaps on CC update, ambiguous model fallback, schema-strip side effects. Surfacing these here as a recommendation; users decide their own config.
