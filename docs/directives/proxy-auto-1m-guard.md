@@ -6,13 +6,21 @@
 
 ## Pre-work — binary-walk of CC's 1M-context wire shape
 
-Per the prior commitment when this issue was queued, before scoping the extension I walked the CC v2.1.148 binary to confirm exactly what the proxy can see on the wire. Findings change the directive's scope from AITL's initial sketch:
+Per the prior commitment when this issue was queued, before scoping the extension I walked the CC binary to confirm exactly what the proxy can see on the wire. **Verified against both v2.1.148 (the version installed at the time of the initial walk) and v2.1.161 (current at time of directive submission).** Mangled identifiers churn between minified releases — same code body, different short names — so this section cites both. Future re-verifications should look up the new short names by code-body signature, not by name.
+
+| What | 2.1.148 name | 2.1.161 name | Body (unchanged across both) |
+|---|---|---|---|
+| Model `[1m]/[2m]` sanitizer | `sL(H)` | `kJ(H)` | `return H.replace(/\[(1\|2)m\]/gi, "")` |
+| 1M-beta gate (decides whether to add `long_context` beta) | `W2(H)` | `bZ(H)` | `if (kill()) return !1; return /\[1m\]/i.test(H)` |
+| Kill-switch helper | `xKH()` | `E9H()` | `return mH(process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT)` |
+
+The header value (`context-1m-2025-08-07`) and behavior are unchanged across the 13 versions in between. Findings change the directive's scope from AITL's initial sketch:
 
 ### What the binary actually does
 
 CC's binary represents 1M-context as a string suffix on the model identifier — `claude-opus-4-7[1m]`, `claude-sonnet-4-6[1m]`, etc. That suffix is the load-bearing signal **inside CC**, but the outbound API request body **does not carry it**.
 
-The relevant code (offsets cited from CC v2.1.148 `claude.exe`, mangled identifiers preserved for searchability):
+The relevant code (offsets cited from CC v2.1.148 `claude.exe`; equivalent code present in v2.1.161 under the renamed identifiers in the table above):
 
 1. **Beta-flag enablement** (offset ≈ 220545):
    ```js
