@@ -1,6 +1,6 @@
 {
   "name": "claude-code-cache-fix",
-  "version": "3.8.0",
+  "version": "3.9.0",
   "description": "Cache optimization proxy and interceptor for Claude Code. Fixes prompt cache bugs, stabilizes prefix, reduces quota burn.",
   "type": "module",
   "exports": {
@@ -15,6 +15,7 @@
     "preload.mjs",
     "postinstall.js",
     "tools/",
+    "hooks/",
     "claude-fixed.bat",
     "proxy/",
     "bin/",
