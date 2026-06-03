@@ -10,6 +10,8 @@ Restart=on-failure
 RestartSec=5
 Environment=CACHE_FIX_PROXY_PORT={{PORT}}
 {{UPSTREAM_LINE}}
+{{CA_FILE_LINE}}
+{{REJECT_UNAUTHORIZED_LINE}}
 {{DEBUG_LINE}}
 {{HOT_RELOAD_LINE}}
 WorkingDirectory={{WORKING_DIR}}

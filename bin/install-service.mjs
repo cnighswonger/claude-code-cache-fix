@@ -22,6 +22,8 @@ function getDefaults() {
   return {
     port: validatePort(process.env.CACHE_FIX_PROXY_PORT || "9801"),
     upstream: process.env.CACHE_FIX_PROXY_UPSTREAM || "",
+    caFile: process.env.CACHE_FIX_PROXY_CA_FILE || "",
+    rejectUnauthorized: process.env.CACHE_FIX_PROXY_REJECT_UNAUTHORIZED || "",
     debug: process.env.CACHE_FIX_DEBUG || "",
     // Hot-reload is opt-in as of v4.0.0 (#196). Capture from env at install
     // time so the operator can bake `CACHE_FIX_HOT_RELOAD=on` into the
@@ -95,6 +97,12 @@ function renderSystemdTemplate(template, vars) {
   const upstreamLine = vars.upstream
     ? `Environment=CACHE_FIX_PROXY_UPSTREAM=${vars.upstream}`
     : "";
+  const caFileLine = vars.caFile
+    ? `Environment=CACHE_FIX_PROXY_CA_FILE=${vars.caFile}`
+    : "";
+  const rejectUnauthorizedLine = vars.rejectUnauthorized
+    ? `Environment=CACHE_FIX_PROXY_REJECT_UNAUTHORIZED=${vars.rejectUnauthorized}`
+    : "";
   const debugLine = vars.debug
     ? `Environment=CACHE_FIX_DEBUG=${vars.debug}`
     : "";
@@ -111,6 +119,8 @@ function renderSystemdTemplate(template, vars) {
     .replaceAll("{{SERVER_PATH}}", vars.serverPath)
     .replaceAll("{{PORT}}", vars.port)
     .replaceAll("{{UPSTREAM_LINE}}", upstreamLine)
+    .replaceAll("{{CA_FILE_LINE}}", caFileLine)
+    .replaceAll("{{REJECT_UNAUTHORIZED_LINE}}", rejectUnauthorizedLine)
     .replaceAll("{{DEBUG_LINE}}", debugLine)
     .replaceAll("{{HOT_RELOAD_LINE}}", hotReloadLine)
     .replaceAll("{{REQUIRES_LINE}}", requiresLine)
@@ -123,6 +133,12 @@ function renderLaunchdTemplate(template, vars) {
   const upstreamPlist = vars.upstream
     ? `        <key>CACHE_FIX_PROXY_UPSTREAM</key>\n        <string>${vars.upstream}</string>`
     : "";
+  const caFilePlist = vars.caFile
+    ? `        <key>CACHE_FIX_PROXY_CA_FILE</key>\n        <string>${vars.caFile}</string>`
+    : "";
+  const rejectUnauthorizedPlist = vars.rejectUnauthorized
+    ? `        <key>CACHE_FIX_PROXY_REJECT_UNAUTHORIZED</key>\n        <string>${vars.rejectUnauthorized}</string>`
+    : "";
   const debugPlist = vars.debug
     ? `        <key>CACHE_FIX_DEBUG</key>\n        <string>${vars.debug}</string>`
     : "";
@@ -134,6 +150,8 @@ function renderLaunchdTemplate(template, vars) {
     .replaceAll("{{SERVER_PATH}}", vars.serverPath)
     .replaceAll("{{PORT}}", vars.port)
     .replaceAll("{{UPSTREAM_PLIST}}", upstreamPlist)
+    .replaceAll("{{CA_FILE_PLIST}}", caFilePlist)
+    .replaceAll("{{REJECT_UNAUTHORIZED_PLIST}}", rejectUnauthorizedPlist)
     .replaceAll("{{DEBUG_PLIST}}", debugPlist)
     .replaceAll("{{HOT_RELOAD_PLIST}}", hotReloadPlist)
     .replaceAll("{{WORKING_DIR}}", vars.workingDir)
@@ -186,12 +204,8 @@ async function installSystemd({ paths, defaults, force = false } = {}) {
   const rendered = renderSystemdTemplate(template, {
     node: process.execPath,
     serverPath: SERVER_PATH,
-    port: defaults.port,
-    upstream: defaults.upstream,
-    debug: defaults.debug,
-    hotReload: defaults.hotReload,
-    workingDir: defaults.workingDir,
     requires: "",
+    ...defaults,
   });
   await mkdir(paths.configDir, { recursive: true });
   await writeFile(targetPath, rendered);
@@ -286,12 +300,8 @@ async function installLaunchd({ paths, defaults, force = false } = {}) {
   const rendered = renderLaunchdTemplate(template, {
     node: process.execPath,
     serverPath: SERVER_PATH,
-    port: defaults.port,
-    upstream: defaults.upstream,
-    debug: defaults.debug,
-    hotReload: defaults.hotReload,
-    workingDir: defaults.workingDir,
     logDir: paths.logDir,
+    ...defaults,
   });
   await mkdir(paths.configDir, { recursive: true });
   await writeFile(targetPath, rendered);

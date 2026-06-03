@@ -14,6 +14,8 @@
         <key>CACHE_FIX_PROXY_PORT</key>
         <string>{{PORT}}</string>
 {{UPSTREAM_PLIST}}
+{{CA_FILE_PLIST}}
+{{REJECT_UNAUTHORIZED_PLIST}}
 {{DEBUG_PLIST}}
 {{HOT_RELOAD_PLIST}}
     </dict>
