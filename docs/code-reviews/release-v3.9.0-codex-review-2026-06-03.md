@@ -46,3 +46,5 @@ Label applied: `changes-requested`
 ## Bottom Line
 
 Revise, then ship. The release mechanics are sound: `3.9.0` is the right semver bump, `npm test` passes `950/950` on the exact release commit, `npm pack --dry-run` ships the intended new hook and proxy artifacts, and the v3.9.0 notes otherwise match what landed between `v3.8.0` and `5ada94c`. The current blocker is the new changelog line that leaks an internal dashboard IP/port into a public repo file, which violates the repo's own release-hygiene rule and should not merge or tag as-is.
+
+Update (rereview at `65b0894`): `CHANGELOG.md:45` now uses the approved internal-tooling placeholder, so the only blocking finding in this review is resolved and superseded by the refreshed approval review on PR #187.
