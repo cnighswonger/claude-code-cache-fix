@@ -2,7 +2,7 @@
 
 **Status:** DRAFT — Proxy Builder, 2026-06-04. Pre-vetted by Codex via consultative design review (`docs/code-reviews/issue-171-v2-predicate-design-consult-2026-06-04.md` on branch `consult/issue-171-design`). Approved spec from AI Team Lead. Pending formal Codex directive-stage review + implementation.
 
-**References:** [#171](https://github.com/cnighswonger/claude-code-cache-fix/issues/171) (this directive's tracking issue, AITL-authored). [#63147](https://github.com/anthropics/claude-code/issues/63147) (canonical upstream cluster — yurukusa's "13E" sub-pattern, ToolSearch surface). [#63792](https://github.com/anthropics/claude-code/issues/63792) (cited 13E repro: Opus 4.8 + ToolSearch, 400 strip-and-retry storm on every turn). v1 directive at `docs/directives/proxy-thinking-block-sanitize.md`. v1 source at `proxy/extensions/thinking-block-sanitize.mjs:29-130`. Codex consult artifact at `docs/code-reviews/issue-171-v2-predicate-design-consult-2026-06-04.md`. AITL sign-off in `aitl-reply-issue-171-spec-signoff.md`.
+**References:** [#171](https://github.com/cnighswonger/claude-code-cache-fix/issues/171) (this directive's tracking issue, AITL-authored). [#63147](https://github.com/anthropics/claude-code/issues/63147) (canonical upstream cluster — yurukusa's "13E" sub-pattern, ToolSearch surface). [#63792](https://github.com/anthropics/claude-code/issues/63792) (cited 13E repro: Opus 4.8 + ToolSearch, 400 strip-and-retry storm on every turn). v1 directive at `docs/directives/proxy-thinking-block-sanitize.md`. v1 source at `proxy/extensions/thinking-block-sanitize.mjs:29-130`. Codex consult artifact at `docs/code-reviews/issue-171-v2-predicate-design-consult-2026-06-04.md` (branch `consult/issue-171-design`, commit `a39f812`). AITL sign-off recorded in the Proxy Builder ↔ AITL handoff loop (`~/drafts/aitl-reply-issue-171-spec-signoff.md` on Chris's working tree — not a public-repo artifact; the integrated spec from that sign-off is reproduced in the design choices below).
 
 ## Goal
 
@@ -125,7 +125,7 @@ A/B coverage is measurable post-flip by querying both counters across `sessions/
 - v2 fires on `CACHE_FIX_THINKING_SANITIZE=v2`, dropping signed `thinking` + `redacted_thinking` blocks from all prior assistant turns when `current_tools_hash !== baseline_tools_hash`.
 - Latest-turn active-tool-continuation protection preserved (same `isActiveToolContinuation` logic as v1).
 - First request in a session establishes the baseline (on response success) without stripping.
-- 4xx responses leave the baseline unchanged.
+- 4xx AND 5xx responses leave the baseline unchanged (any non-2xx response means the request was not successfully processed; baseline only advances on confirmed success).
 - `"unknown"` canonical session id triggers no-op.
 - Per-session JSON gains `tools_hash_baseline` and `thinking_blocks_dropped_v2` fields, additive (existing consumers unaffected).
 - Hash helper handles nested JSON-schema key ordering; preserves array order; uses `"none"` sentinel for empty.
@@ -154,6 +154,8 @@ Per Codex's consult + AITL's sign-off additions. All unit-testable against the p
 
 - **First-request-no-baseline-no-strip:** fresh session, turn 1 with signed thinking present, no baseline → forward intact. Turn 2 with the same hash and same signed thinking → still forward intact (baseline established correctly on turn 1's response).
 - **4xx-leaves-baseline-untouched:** request gets a 400 response, verify baseline was NOT updated to that request's hash (next request's compare is against the prior baseline, not the failed request's).
+- **5xx-leaves-baseline-untouched:** same shape, but with a 500/502/503 response. Pins that the response-success gate is "HTTP 2xx", not "not-4xx", so transient upstream failures don't silently advance the baseline either.
+- **Oscillation over-strip is deliberate:** session with tools hash `A → B → A` sequence; verify the predicate strips signed thinking on each transition (the `B → A` transition is a false-positive strip by design — A's prior-turn signatures would have re-validated against A's current tools surface, but C's single-baseline contract treats any hash change as invalidating). Test name should include "deliberate-overstrip" so the trade is locked in test history, not implicit.
 - **Two-pipelined-requests-same-new-hash:** request A and request B in flight back-to-back, both carrying the same new tools hash; both should strip (acceptable over-strip), final baseline = new hash after both responses complete.
 - **First-strip-success-then-stable:** baseline H0 → strip on H1 → response 200 → baseline now H1. Next request at H1 → no strip (baseline matches).
 - **Concurrent unknown-session requests don't cross-contaminate:** two simultaneous requests with empty session id both hit the no-op path; neither leaks state into the other.
@@ -181,10 +183,13 @@ Per Codex's consult + AITL's sign-off additions. All unit-testable against the p
 
 ## Non-functional requirements
 
-- **Performance:** the hash compute runs on every request. Tools arrays are small (typically <100 tools × small schemas); a recursive canonical stringify + sha256 over the result is sub-millisecond. No measurable hot-path impact.
-- **Memory:** in-memory Map of `Map<canonical-session-filename, { tools_hash, ... }>`. Bounded by the number of distinct active sessions in proxy memory. Trivial.
-- **Disk:** the persisted baseline adds ~30 bytes per session JSON file (16-hex hash + field name + JSON overhead). Negligible.
-- **Failure mode:** if the hash helper throws, the extension fails open (no strip). If the session-state read/write throws, the extension fails open (no strip, log warning). Errors in v2 never escalate into a request-blocking failure.
+Per the CLAUDE.md NFR rubric for directives, addressing each required topic:
+
+- **Size/complexity budget.** v2 extends the existing `proxy/extensions/thinking-block-sanitize.mjs` in place (no new extension file). Expected delta: ~80-120 LOC added to the extension file (hash helper, in-memory state map, seed-from-disk function, predicate extension, telemetry stash). Plus ~150-200 LOC of new test cases in `test/proxy-thinking-block-sanitize.test.mjs`. Plus ~10 LOC in `cache-telemetry.mjs` for the new `_thinkingSanitizeV2` spread. Total directive size: under ~350 LOC of net code change. If implementation lands materially larger (>2x), the directive should be revisited.
+- **Threat model.** v2 modifies the outbound request body (strips thinking blocks) and persists per-session state to disk. **Privacy invariant: never log or persist thinking content — only counts, signatures of structural identifiers (the 16-hex tools-hash), and the boolean drop event.** The hash helper's input is the `tools` array, which contains tool definitions (names, descriptions, schemas) but no user content; hashing it is not a content leak. The persisted `tools_hash_baseline` is a structural fingerprint, not request content. The new in-memory map keyed by canonical session filename does not retain message content. Failure mode for the strip itself: stripping a block we shouldn't is lossy (loses prior reasoning context) but not a security violation; the strip path never modifies destinations other than the outbound request body.
+- **Maintainability constraints.** Reuse over duplication: extension in place (no new file), telemetry channel reuses the existing `ctx.meta` spread pattern (`_sessionHealth` / `_thinkingSanitize` / `_auto1mGuard`), state pattern mirrors `session-health` rather than inventing a new state shape, single-writer-via-cache-telemetry contract preserved. The hash helper is a new exported function but justified by its 3+ call sites (predicate fire, baseline seed, baseline update) and clear single-purpose contract. No new dependencies; uses Node's existing `crypto.createHash` already imported by `cache-telemetry`.
+- **Performance/reliability.** The hash compute runs on every request. Tools arrays are small (typically <100 tools × small schemas); a recursive canonical stringify + sha256 over the result is sub-millisecond. No measurable hot-path impact. In-memory map is bounded by the number of distinct active sessions in proxy memory — trivial. Persisted baseline adds ~30 bytes per session JSON file — negligible. **Failure mode is fail-open throughout**: if the hash helper throws, the extension fails open (no strip). If the session-state read/write throws, the extension fails open (no strip, log warning to stderr). If the session id canonicalizes to `unknown`, the extension no-ops entirely. Errors in v2 never escalate into a request-blocking failure.
+- **Load-bearing? Yes.** This is a request-body mutator on the shared proxy path AND adds new fields to per-session persisted state (`sessions/<sid>.json`). Per CLAUDE.md, load-bearing changes require **Chris human review** on the implementation PR in addition to Lead + Codex. (Directive-stage review remains Lead + Codex.) The directive also classifies as a `schema-change` (additive fields to the per-session JSON schema) and `needs-sim-validation` (the motivating win — eliminating CC's harness retry on every ToolSearch turn — needs live traffic to confirm; unit tests can validate the predicate but not the end-to-end retry elimination).
 
 ## What I'm NOT building
 
@@ -203,7 +208,7 @@ None of these block the directive — all are confirmed by the consult / sign-of
 - Baseline update timing: **on response success (200), not on send**.
 - Env var: **single var, versioned values** (`off` / `on` / `v2`).
 - First request: **observe, don't strip**.
-- 4xx response: **baseline unchanged**.
+- 4xx/5xx response: **baseline unchanged** (any non-2xx; baseline advances only on confirmed HTTP 2xx success).
 - `unknown` session: **no-op**.
 
 — Proxy Builder
