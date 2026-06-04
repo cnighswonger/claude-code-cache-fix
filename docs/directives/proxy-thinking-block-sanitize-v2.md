@@ -71,7 +71,7 @@ computeSignatureSurfaceHash({ tools, system?, anthropic_beta? }) -> 16-char sha2
 
 - `tools` input: an array of tool definition objects.
 - Each tool object: **recursive stable JSON stringify** with **recursive key sorting** at every nesting level. Nested JSON-schema objects (in `input_schema`, `parameters`, etc.) have their own keys, which must also sort stably or we'd false-positive on benign key-order differences.
-- **Preserve `tools[]` array order.** Reordering tools in the request changes which slot which tool occupies in the API's view, which could affect signing. The hash MUST reflect array order.
+- **Preserve `tools[]` array order.** Reordering tools in the request changes which slot which tool occupies in the API's view, which could affect signing. The hash MUST reflect array order. (Note: two upstream extensions already pre-normalize the input v2 sees — `sort-stabilization` at order 200 sorts `body.tools` alphabetically by `name`, and `tool-input-normalize` at order 280 normalizes inner-schema field ordering within each tool object. By the time v2 fires at order 550, the tools array is already deterministic. The recursive-key-sort + preserve-order rules in this section are therefore forward-compatibility defenses against any future change in upstream ordering, not corrections of input drift v2 currently sees. Keep the defensive shape; the cost is trivial.)
 - **Sentinel for empty/absent:** if `tools` is undefined, null, or `[]`, the hash input is the literal string `"none"` (not the canonical-stringify of `[]`, which would be `"[]"` and could collide with other empty-shaped inputs in a future extension). One-line sentinel rules out ambiguity.
 - Output: `sha256(canonical_input).slice(0, 16)` — 16 hex chars matches the existing `_sessionHealth` / `_thinkingSanitize` precedent.
 
@@ -174,6 +174,7 @@ Per Codex's consult + AITL's sign-off additions. All unit-testable against the p
 - The hash helper goes into a small helper module that can be exported separately for unit testing.
 - Telemetry merge into the session JSON: the existing `cache-telemetry.mjs:232-245` spread block already handles `_sessionHealth` and `_thinkingSanitize`. Add `_thinkingSanitizeV2` to that list.
 - Field names in the per-session JSON: `tools_hash_baseline`, `thinking_blocks_dropped_v2`. Lowercase-snake-case to match the existing convention.
+- **Session-id resolution at order 550.** `cache-telemetry` populates `ctx.meta._sessionId` in its `onRequest` at order **600** — which fires *after* v2 at order 550. So at v2's `onRequest`, `ctx.meta._sessionId` is `undefined`. `session-health` (order 590) sidesteps the same constraint by deferring session-keyed work to `onStreamEvent`, but v2 cannot — the strip decision and request-body mutation have to happen in `onRequest`. **Resolution:** v2 calls `resolveSessionId(ctx.headers)` inline in its own `onRequest`. The helper is already exported from `cache-telemetry.mjs:173`; reusing it keeps canonicalization consistent across extensions and avoids drift if cache-telemetry's session-id resolution ever changes. (If `resolveSessionId` is not yet exported at implementation time, the one-line export change is part of the v2 PR.)
 
 ## Labels (per Codex consult prediction)
 
