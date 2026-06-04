@@ -8,3 +8,5 @@ __pycache__/
 .claude/*
 !.claude/agent-name
 !.claude/github-app
+.possibilities/
+package-lock.json
