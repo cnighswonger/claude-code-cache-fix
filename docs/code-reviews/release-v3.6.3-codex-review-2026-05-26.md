@@ -18,6 +18,6 @@ CHANGES-REQUESTED
 ## Things-the-release-commit-got-right
 - The release commit itself is clean and release-scoped: exactly five files, no code or test artifacts accidentally bundled into `ab79eaf`.
 - The bootstrap-defense narrative is internally consistent across `CHANGELOG.md`, `README.md`, and `docs/disclosure/heron-brook-2026-05.md` on audit mode, block mode, and the log-path/env-var surface.
-- `proxy/extensions.json` matches `origin/main`, so the visits-01 local usage-log modification was not published.
+- `proxy/extensions.json` matches `origin/main`, so the <internal-host> local usage-log modification was not published.
 - Local verification passed: `npm test` completed cleanly at `850/850`.
 - No release PR exists yet for `release/v3.6.3`, so no formal `gh pr review` object could be created at review time; this review document is the branch-direct record to retrofit once a PR exists.

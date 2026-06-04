@@ -64,6 +64,8 @@ Apply these labels on issues and PRs you interact with:
 
 ## Review Output Format
 
+**File-path citations: use repo-relative paths, NEVER operator-absolute paths.** When citing source lines in a review, the correct shape is `[label](proxy/extensions/foo.mjs#L144)` or the plaintext form `proxy/extensions/foo.mjs:144` — both render as relative links on GitHub. Do NOT use `[label](/home/<user>/git_repos/claude-code-cache-fix/proxy/extensions/foo.mjs:144)` or any other absolute path that includes the operator's home directory or hostname. Those paths become permanent public-repo content via the review file commit, leaking host topology that's not yours to ship. (This rule also applies to inline references in prose: `proxy/extensions/foo.mjs:144` is fine; `/home/<user>/git_repos/.../foo.mjs` is not.) For external repos cited in the review, use the repo identifier shape `claude-meter:src/log/schema.mjs` rather than a local mount path.
+
 ```
 # Review: [component name]
 

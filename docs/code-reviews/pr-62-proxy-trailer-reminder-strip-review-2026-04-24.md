@@ -12,11 +12,11 @@ Label applied: changes-requested
 - Focused tests cover the main happy paths for trailer stripping, reminder stripping, key reordering, and extra-key removal.
 
 ## Blockers
-- `content-strip` does not match the full documented bookkeeping reminder set already defined in [preload.mjs](/home/manager/git_repos/claude-code-cache-fix/preload.mjs:518). The new matcher only handles token usage, output tokens, USD budget, and the task-tools nudge in [proxy/extensions/content-strip.mjs](/home/manager/git_repos/claude-code-cache-fix/proxy/extensions/content-strip.mjs:4), but omits:
+- `content-strip` does not match the full documented bookkeeping reminder set already defined in [preload.mjs](preload.mjs#L518). The new matcher only handles token usage, output tokens, USD budget, and the task-tools nudge in [proxy/extensions/content-strip.mjs](proxy/extensions/content-strip.mjs#L4), but omits:
   - `The TodoWrite tool hasn't been used recently. …`
   - `Remaining conversation turns: <N>`
   - `Messages until auto-compact: <N>` / `Message until auto-compact: <N>`
-  This means PR #62 would leave part of the documented bookkeeping churn in place, and the new tests would still pass because they only assert the reduced subset in [test/proxy-content-strip.test.mjs](/home/manager/git_repos/claude-code-cache-fix/test/proxy-content-strip.test.mjs:30).
+  This means PR #62 would leave part of the documented bookkeeping churn in place, and the new tests would still pass because they only assert the reduced subset in [test/proxy-content-strip.test.mjs](test/proxy-content-strip.test.mjs#L30).
 
 ## What Needs Attention
 - `stripContentBlocks()` increments `trailerCount` / `reminderCount` before the empty-array guard. If a message consists only of removable blocks, the function returns the original message unchanged but still reports non-zero strip stats, so `onRequest()` records `ctx.meta.contentStripStats` for a no-op request. That is an observability bug, not a payload corruption bug.

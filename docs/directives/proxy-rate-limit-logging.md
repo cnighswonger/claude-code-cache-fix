@@ -11,7 +11,7 @@
 
 Anthropic's burst/concurrency rate-limiter is a separate mechanism from Q5h/Q7d quota. It surfaces as **"Server is temporarily limiting requests · Rate limited"** with no `Retry-After` header, fires when the account's concurrent-stream cap is exceeded, and is invisible to per-request quota metrics. The community has converged on it as a real architectural problem — see anthropics/claude-code#53922 and cross-refs at #46037, #38335, #41788, #54750, #8449.
 
-Anthropic's 2026-05-07 announcement doubled Q5h limits and removed peak-hour reductions, but did NOT address burst/concurrency. We're observing burst-limit hits on visits-01 during multi-agent workloads.
+Anthropic's 2026-05-07 announcement doubled Q5h limits and removed peak-hour reductions, but did NOT address burst/concurrency. We're observing burst-limit hits on <internal-host> during multi-agent workloads.
 
 **Hypothesis worth testing:** does the burst limiter still operate on the **old peak-hour schedule** (13:00–19:00 UTC weekdays) even though the Q5h peak-hour reduction is gone?
 

@@ -13,7 +13,7 @@ Label applied: changes-requested
 - `test/proxy-wrapper.test.mjs:89-112` and `:114-136` still fail under local verification because the fake child scripts are deleted before the forked wrapper process reliably consumes them. Reproducible failures:
   - `node --test test/proxy-wrapper.test.mjs` failed at `:107` with `Expected BASE_URL in output, got:`.
   - `node --test test/proxy-wrapper.test.mjs test/proxy-server.test.mjs test/proxy-upstream.test.mjs test/proxy-stream.test.mjs` failed at `:134` with `Expected exit 42, got 1`, and stderr showed `ENOENT` opening `test/.fake-claude-exit.mjs`.
-  - `npm test` failed on both wrapper assertions, including `Cannot find module '/home/manager/git_repos/claude-code-cache-fix_codex/test/.fake-claude-exit.mjs'`.
+  - `npm test` failed on both wrapper assertions, including `Cannot find module '<repo-root>/test/.fake-claude-exit.mjs'`.
 
 ## What Needs Attention
 - The current test cleanup strategy uses `finally { unlinkSync(script) }` immediately after awaiting wrapper process exit. That is not sufficient when the wrapper's spawned child may still be in module-load startup or stdio-drain timing; the test should not remove the file until the fake child has definitely finished consuming it.

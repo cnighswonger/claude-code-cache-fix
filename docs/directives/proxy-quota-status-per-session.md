@@ -10,7 +10,7 @@ Replace the proxy-global `~/.claude/quota-status.json` with per-session attribut
 
 ## Why
 
-`proxy/extensions/cache-telemetry.mjs:5,108` writes `~/.claude/quota-status.json` on every response, unconditionally overwriting it. The path is process-global (one proxy serves N CC sessions), but every consumer treats it as "my session's state." On a multi-agent host (visits-01 runs 6+ concurrent CC sessions through one proxy), whichever request finishes most recently wins the file. Readers race against unrelated agents' traffic.
+`proxy/extensions/cache-telemetry.mjs:5,108` writes `~/.claude/quota-status.json` on every response, unconditionally overwriting it. The path is process-global (one proxy serves N CC sessions), but every consumer treats it as "my session's state." On a multi-agent host (<internal-host> runs 6+ concurrent CC sessions through one proxy), whichever request finishes most recently wins the file. Readers race against unrelated agents' traffic.
 
 Concrete failure surfaced 2026-05-05: a `/coffee` warmer in one session reported "TTL just flipped to 5m" because it read the file in the millisecond after another agent's cold rebuild landed (`cache_read=0`, `cache_creation=652609`). Reader's actual tier hadn't changed. Misdiagnosis was harmless but cost an hour of root-causing because nothing carries per-session attribution.
 
@@ -47,7 +47,7 @@ This directive adopts **(b)**.
 - File layout:
   - `~/.claude/quota-status/account.json` — global file at the directory root.
   - `~/.claude/quota-status/sessions/<filename>.json` — per-session files in a dedicated subdirectory. The subdirectory split is structural: it makes a stray session id of `account` (or any other reserved name) physically unable to collide with the global file, and gives sweep + readers a single directory to scan.
-- **Per-session filename derivation rule (canonical writer/reader contract).** Both the writer (cache-telemetry) and every reader (`tools/quota-statusline.sh`, `tools/cache-test.sh`, `tools/cross-version-cache-test.sh`, `/coffee`, visits-01 hooks) must apply this rule identically:
+- **Per-session filename derivation rule (canonical writer/reader contract).** Both the writer (cache-telemetry) and every reader (`tools/quota-statusline.sh`, `tools/cache-test.sh`, `tools/cross-version-cache-test.sh`, `/coffee`, <internal-host> hooks) must apply this rule identically:
 
   ```
   function sessionFilename(rawId):
@@ -103,9 +103,9 @@ Per-session files accumulate forever otherwise. Sweep on write, throttled, confi
 - Sweep failures (e.g. `unlinkSync` race against a consumer reading) are caught and ignored — same try/catch envelope as the writes.
 - Sweep operates only on `sessions/`. `account.json` lives in the parent directory and is never touched by the sweep.
 
-This is intentionally simple: O(n) directory scan once a minute. For visits-01-class hosts (n ~ 6–12 per day, files retained 7 days → ~50–80 entries) this is sub-millisecond. A more expensive design (separate cron, persistent index, etc.) buys nothing measurable.
+This is intentionally simple: O(n) directory scan once a minute. For <internal-host>-class hosts (n ~ 6–12 per day, files retained 7 days → ~50–80 entries) this is sub-millisecond. A more expensive design (separate cron, persistent index, etc.) buys nothing measurable.
 
-### Migration: shipped statusline + visits-01 hook + tests + docs
+### Migration: shipped statusline + <internal-host> hook + tests + docs
 
 Every reader must apply the same filename derivation rule defined in the **Per-session filename derivation rule** section above.
 
@@ -116,8 +116,8 @@ Every reader must apply the same filename derivation rule defined in the **Per-s
 | `tools/cache-test.sh` | Update `QUOTA_FILE` to `~/.claude/quota-status/account.json`. |
 | `README.md` (and translated copies `README.zh.md`, `README.ko.md`, `README.pt-br.md`) | Sweep references to `~/.claude/quota-status.json` and update to the new layout. Don't introduce migration-instruction prose into the README itself — point at CHANGELOG. |
 | `docs/TRACKED_ISSUES.md`, in-tree code-review docs that reference the path | Same sweep. References that describe past behaviour (changelog-style historical notes) may stay; references that describe present behaviour update. |
-| `~/.claude/skills/coffee/SKILL.md` (visits-01) | Out of scope for this directive — handled at coffee#1. |
-| `~/.claude/hooks/quota-statusline.sh` (visits-01) | Out of scope for this directive — visits-01-only artifact, updated by Lead/AI-Team-Lead alongside the merge. |
+| `~/.claude/skills/coffee/SKILL.md` (<internal-host>) | Out of scope for this directive — handled at coffee#1. |
+| `~/.claude/hooks/quota-statusline.sh` (<internal-host>) | Out of scope for this directive — <internal-host>-only artifact, updated by Lead/AI-Team-Lead alongside the merge. |
 | `preload.mjs:2651,2758,2776` | Leave as-is. Preload-mode is single-session by construction (one CC instance imports `preload.mjs`), so the global path semantically matches; preload users don't see the bug, and the path is shrinking. |
 
 ### CHANGELOG
@@ -242,7 +242,7 @@ The Python heredoc inside the shell script implements the same filename derivati
 ## Out of scope
 
 - Migrating `~/.claude/skills/coffee/SKILL.md` — tracked at coffee#1; lives in a different repo.
-- Migrating the visits-01-only `~/.claude/hooks/quota-statusline.sh` — Lead/AI-Team-Lead handles that on the visits-01 host alongside the merge.
+- Migrating the <internal-host>-only `~/.claude/hooks/quota-statusline.sh` — Lead/AI-Team-Lead handles that on the <internal-host> host alongside the merge.
 - Updating community dashboards / Web Manager / npm-side consumers — none read the local file (verified by Lead in #104). No external migration required.
 - preload.mjs — single-session path by construction; bug doesn't apply; deprecated and shrinking.
 - A "last-request snapshot" backwards-compat alias at `~/.claude/quota-status.json`. Direction (2) was rejected; don't reintroduce it via a side door.

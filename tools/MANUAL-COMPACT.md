@@ -56,7 +56,7 @@ Always:
 ```
 
 ```
-Project directory: /home/manager/git_repos/kanfei_nowcast_e3b
+Project directory: ~/git_repos/your-project
 Auto-detected session: db11f377-4ca8-4fc3-9b6d-1069da58c1b2.jsonl
   Modified: 2026-04-19 13:26:42
   Size: 4.8M

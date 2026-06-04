@@ -118,7 +118,7 @@ curl -fs http://127.0.0.1:9801/health
 
 ### 1. `~/bin/claude` wrapper hardcodes `ANTHROPIC_BASE_URL=:9801`
 
-The wrapper at `/home/manager/bin/claude` runs `export ANTHROPIC_BASE_URL="http://127.0.0.1:9801"` unconditionally. Any value you set in your shell gets clobbered.
+The wrapper at `~/bin/claude` runs `export ANTHROPIC_BASE_URL="http://127.0.0.1:9801"` unconditionally. Any value you set in your shell gets clobbered.
 
 **Always invoke the CC binary directly for harness testing**: `$HOME/.npm-global/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe` (Bun binary) or via `node $HOME/.npm-global/lib/node_modules/@anthropic-ai/claude-code/cli.js` (legacy Node path).
 

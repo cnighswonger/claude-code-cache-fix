@@ -112,8 +112,8 @@ test("extractCwdFromSystem: returns null on missing/empty inputs", () => {
 });
 
 test("extractCwdFromSystem: parses cwd from CC's # Environment block", () => {
-  const sys = makeSystem("/home/manager/git_repos/myproject");
-  assert.equal(extractCwdFromSystem(sys), "/home/manager/git_repos/myproject");
+  const sys = makeSystem("/home/USER/git_repos/myproject");
+  assert.equal(extractCwdFromSystem(sys), "/home/USER/git_repos/myproject");
 });
 
 test("extractCwdFromSystem: also accepts string system prompt", () => {

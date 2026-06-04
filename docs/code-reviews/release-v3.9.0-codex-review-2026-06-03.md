@@ -18,7 +18,7 @@ Label applied: `changes-requested`
 
 ## Blockers
 
-- `CHANGELOG.md:45` publishes an internal dashboard address (`http://192.168.1.201:8091/index.html`) in a public tracked file. Repo policy explicitly forbids literal IPs and internal service ports in tracked files, including `CHANGELOG.md` (`CLAUDE.md:102-120`). This needs to be replaced with a placeholder plus a pointer to internal deployment notes before the release can be approved.
+- `CHANGELOG.md:45` publishes an internal dashboard address (`http://<internal-dashboard:port>/index.html`) in a public tracked file. Repo policy explicitly forbids literal IPs and internal service ports in tracked files, including `CHANGELOG.md` (`CLAUDE.md:102-120`). This needs to be replaced with a placeholder plus a pointer to internal deployment notes before the release can be approved.
 
 ## What Needs Attention
 

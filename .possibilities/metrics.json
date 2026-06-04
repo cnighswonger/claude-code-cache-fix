@@ -1,0 +1,13 @@
+{
+  "lifetime": {
+    "total_extractions": 0,
+    "total_surfacings": 0,
+    "total_engaged": 0,
+    "total_dismissed": 0,
+    "total_ignored": 0
+  },
+  "session_history": {},
+  "last_extraction_at": null,
+  "last_surfacing_at": null,
+  "last_evaluated_at": "2026-04-23T11:54:15.224Z"
+}

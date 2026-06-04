@@ -50,7 +50,7 @@ const FIX_SKILLS = blockText(
 
 // Real CC fixture #4: project CLAUDE.md
 const FIX_CLAUDE_MD = blockText(
-  "<system-reminder>Contents of /home/manager/git_repos/claude-code-cache-fix/CLAUDE.md (project instructions, checked into the codebase):\n\n# CLAUDE.md — claude-code-cache-fix\n## Git Workflow\n- Do not push directly to main</system-reminder>",
+  "<system-reminder>Contents of /repo/CLAUDE.md (project instructions, checked into the codebase):\n\n# CLAUDE.md — claude-code-cache-fix\n## Git Workflow\n- Do not push directly to main</system-reminder>",
 );
 
 // Real CC fixture #5: deferred-tools

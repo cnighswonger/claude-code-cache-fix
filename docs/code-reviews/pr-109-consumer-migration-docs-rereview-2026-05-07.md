@@ -6,9 +6,9 @@ Label applied: reviewed-by-codex-agent
 
 ## What Is Correct
 
-- The bash `session_filename()` helper in [`README.md`](/home/manager/git_repos/claude-code-cache-fix_codex/README.md:357) now mirrors `proxy/extensions/cache-telemetry.mjs:sessionFilename()` on the important semantics: trim leading and trailing whitespace, map empty results to `unknown`, pass through ids matching `^[A-Za-z0-9_-]{1,128}$`, and hash everything else to `inv-<sha256-prefix>`.
-- The Node `sessionFilename()` snippet in [`README.md`](/home/manager/git_repos/claude-code-cache-fix_codex/README.md:405) matches the writer exactly, including the non-negotiable 128-character boundary and the `createHash("sha256").update(s).digest("hex").slice(0, 16)` derivation.
-- The same reader-side fix landed cleanly in [`README.zh.md`](/home/manager/git_repos/claude-code-cache-fix_codex/README.zh.md:219) and the translated comments still describe the same canonical rule.
+- The bash `session_filename()` helper in [`README.md`](README.md#L357) now mirrors `proxy/extensions/cache-telemetry.mjs:sessionFilename()` on the important semantics: trim leading and trailing whitespace, map empty results to `unknown`, pass through ids matching `^[A-Za-z0-9_-]{1,128}$`, and hash everything else to `inv-<sha256-prefix>`.
+- The Node `sessionFilename()` snippet in [`README.md`](README.md#L405) matches the writer exactly, including the non-negotiable 128-character boundary and the `createHash("sha256").update(s).digest("hex").slice(0, 16)` derivation.
+- The same reader-side fix landed cleanly in [`README.zh.md`](README.zh.md#L219) and the translated comments still describe the same canonical rule.
 - The surrounding migration prose and markdown formatting remain intact. The new helpers sit cleanly inside the existing snippets, and the surrounding explanation, reference links, and fallback logic were not regressed.
 - I cross-checked the implementation and snippet behavior on representative edge cases, including null, undefined, empty string, whitespace-only input, a 128-character safe id, a 129-character safe-looking id, a malformed `../foo` id, and a whitespace-padded safe id. The Node snippet matched the exported writer implementation on all cases, and the bash helper produced the same canonical outputs for the boundary and malformed-id checks.
 
