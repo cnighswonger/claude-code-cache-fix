@@ -656,3 +656,176 @@ test("v2 mode also runs v1's omitted drop (v2 is strict superset of on)", async 
     assert.deepEqual(ctx2.body.messages[0].content, [text("a")]);
   });
 });
+
+// --- Codex follow-ups: 3 directive-plan scenarios he manually verified in
+// PR #192 review but asked us to pin in automated coverage. Adding here so
+// behaviors are locked into the suite, not just spot-checked at review time.
+
+// (1) Two pipelined requests with the same new hash — both should strip
+// (the second sees the SAME pre-advance baseline as the first, because the
+// baseline only advances on the first request's response success), and
+// the final in-memory baseline ends at the new hash.
+test("v2 pipelined: two requests with the same new hash both strip; baseline ends at new hash", async () => {
+  await withV2(async () => {
+    const initial = { headers: sid("PIPE"), body: { tools: [{ name: "a" }], messages: [] }, meta: {} };
+    await fireRequest({ ctx: initial, status: 200 });
+
+    // Now fire two requests with NEW hash, BEFORE either advances the baseline.
+    // Real pipeline: both call onRequest before either's onResponseStart.
+    const newTools = [{ name: "a" }, { name: "b" }];
+    const ctxA = {
+      headers: sid("PIPE"),
+      body: { tools: newTools, messages: [{ role: "assistant", content: [realSigned()] }] },
+      meta: {},
+    };
+    const ctxB = {
+      headers: sid("PIPE"),
+      body: { tools: newTools, messages: [{ role: "assistant", content: [realSigned()] }] },
+      meta: {},
+    };
+    // Both onRequest's fire against the original baseline → both strip.
+    await ext.onRequest(ctxA);
+    await ext.onRequest(ctxB);
+    assert.equal(ctxA.meta._thinkingSanitizeV2.thinking_blocks_dropped_v2, 1);
+    assert.equal(ctxB.meta._thinkingSanitizeV2.thinking_blocks_dropped_v2, 1);
+
+    // Now both responses complete in order — both advance to the SAME new hash.
+    // Acceptable; the final baseline state matches what we want.
+    await ext.onResponseStart({ status: 200, meta: ctxA.meta });
+    await ext.onResponseStart({ status: 200, meta: ctxB.meta });
+
+    // Verify: subsequent same-hash request → no strip (baseline now at newTools).
+    const ctxC = {
+      headers: sid("PIPE"),
+      body: { tools: newTools, messages: [{ role: "assistant", content: [realSigned()] }] },
+      meta: {},
+    };
+    await fireRequest({ ctx: ctxC, status: 200 });
+    assert.equal(ctxC.meta._thinkingSanitizeV2.thinking_blocks_dropped_v2, 0);
+  });
+});
+
+// (2) Proxy-restart re-seed from disk: after _resetV2State() simulates a
+// restart, the next request reads the persisted tools_hash_baseline from
+// disk and uses it for comparison. Without re-seeding, a restart would
+// silently lose the baseline and a same-hash next request would incorrectly
+// be treated as a "first observe" → no strip on a real mismatch.
+test("v2 restart re-seed: after _resetV2State, next request reads tools_hash_baseline from sessions/<sid>.json", async () => {
+  await withV2(async () => {
+    // Establish baseline at H1 via cache-telemetry's full write pipeline.
+    const ctx1 = {
+      headers: sid("RESTART"),
+      body: { tools: [{ name: "a" }], messages: [] },
+      meta: {},
+    };
+    await fireRequest({ ctx: ctx1, status: 200 });
+    // Persist the session JSON to disk by running cache-telemetry's onRequest
+    // (populates _sessionId), onResponseStart (populates _quotaData from a
+    // synthetic response header set), and onStreamEvent (writes the file).
+    const cacheTelExt = (await import("../proxy/extensions/cache-telemetry.mjs")).default;
+    // Simulate cache-telemetry's request/response/stream cycle on the SAME meta.
+    // cache-telemetry.onRequest reads `ctx.headers` to resolve session id.
+    await cacheTelExt.onRequest({ headers: ctx1.headers, meta: ctx1.meta });
+    // Synthetic response headers with the minimum fields parseHeaders needs.
+    const respHeaders = {
+      "anthropic-ratelimit-unified-5h-utilization": "0.1",
+      "anthropic-ratelimit-unified-5h-reset": "1700000000",
+      "anthropic-ratelimit-unified-7d-utilization": "0.05",
+      "anthropic-ratelimit-unified-7d-reset": "1700100000",
+    };
+    await cacheTelExt.onResponseStart({ headers: respHeaders, meta: ctx1.meta });
+    // Stream event sequence: message_start (cache stats), message_delta (writes file).
+    await cacheTelExt.onStreamEvent({
+      event: { type: "message_start", message: { usage: { cache_read_input_tokens: 1, cache_creation_input_tokens: 0, input_tokens: 0 } } },
+      telemetry: {},
+      meta: ctx1.meta,
+    });
+    await cacheTelExt.onStreamEvent({
+      event: { type: "message_delta", usage: { output_tokens: 1 } },
+      telemetry: {},
+      meta: ctx1.meta,
+    });
+
+    const persistedBaseline = ctx1.meta._thinkingSanitizeV2.tools_hash_baseline;
+    assert.match(persistedBaseline, /^[0-9a-f]{16}$/);
+
+    // Now simulate a proxy restart: clear in-memory state. Disk persists.
+    _resetV2State();
+
+    // New request with the SAME tools hash. If re-seed didn't work, the
+    // restart-cleared map would treat this as a fresh observe → no strip
+    // even if we tried a mismatch. To prove the re-seed: fire a DIFFERENT
+    // tools hash and verify the strip fires (which only happens if the
+    // baseline was loaded from disk).
+    const ctx2 = {
+      headers: sid("RESTART"),
+      body: { tools: [{ name: "different" }], messages: [{ role: "assistant", content: [realSigned()] }] },
+      meta: {},
+    };
+    await fireRequest({ ctx: ctx2, status: 200 });
+    // If re-seed worked: baseline was loaded as `persistedBaseline`, ctx2 has
+    // a different hash → mismatch → strip fires.
+    assert.equal(ctx2.meta._thinkingSanitizeV2.thinking_blocks_dropped_v2, 1);
+  });
+});
+
+// (3) End-to-end v2 session-file merge: drive a full request through both
+// thinking-block-sanitize v2 AND cache-telemetry's write path. Verify that
+// the on-disk sessions/<sid>.json contains BOTH the cache-telemetry fields
+// (cache_read, cache_creation, etc.) AND the v2 spread fields
+// (thinking_blocks_dropped_v2, tools_hash_baseline) — proves the spread
+// block at cache-telemetry.mjs:247 is wired correctly.
+test("v2 session-file merge: cache-telemetry spread writes v2 fields to sessions/<sid>.json", async () => {
+  await withV2(async () => {
+    const ctx = {
+      headers: sid("MERGE-E2E"),
+      body: {
+        tools: [{ name: "a" }, { name: "b" }],
+        messages: [{ role: "assistant", content: [realSigned()] }],
+      },
+      meta: {},
+    };
+    // Establish v2 baseline first so this request will actually strip.
+    const seed = { headers: sid("MERGE-E2E"), body: { tools: [{ name: "a" }], messages: [] }, meta: {} };
+    await fireRequest({ ctx: seed, status: 200 });
+    // Now drive the test request through the full pipeline.
+    await ext.onRequest(ctx);
+    assert.equal(ctx.meta._thinkingSanitizeV2.thinking_blocks_dropped_v2, 1);
+
+    const cacheTelExt = (await import("../proxy/extensions/cache-telemetry.mjs")).default;
+    await cacheTelExt.onRequest({ headers: ctx.headers, meta: ctx.meta });
+    const respHeaders = {
+      "anthropic-ratelimit-unified-5h-utilization": "0.2",
+      "anthropic-ratelimit-unified-5h-reset": "1700000000",
+      "anthropic-ratelimit-unified-7d-utilization": "0.1",
+      "anthropic-ratelimit-unified-7d-reset": "1700100000",
+    };
+    await cacheTelExt.onResponseStart({ headers: respHeaders, meta: ctx.meta });
+    await ext.onResponseStart({ status: 200, meta: ctx.meta });
+    await cacheTelExt.onStreamEvent({
+      event: { type: "message_start", message: { usage: { cache_read_input_tokens: 100, cache_creation_input_tokens: 50, input_tokens: 10 } } },
+      telemetry: {},
+      meta: ctx.meta,
+    });
+    await cacheTelExt.onStreamEvent({
+      event: { type: "message_delta", usage: { output_tokens: 5 } },
+      telemetry: {},
+      meta: ctx.meta,
+    });
+
+    // Read back the persisted file from the temp HOME.
+    const { sessionFilePath: sfp } = await import("../proxy/extensions/cache-telemetry.mjs");
+    const { readFileSync: rfs } = await import("node:fs");
+    const sessionFileContents = JSON.parse(rfs(sfp("MERGE-E2E"), "utf8"));
+
+    // Verify cache-telemetry fields are present.
+    assert.equal(sessionFileContents.cache.cache_read, 100);
+    assert.equal(sessionFileContents.cache.cache_creation, 50);
+
+    // Verify v2 fields are present (the merge worked).
+    assert.equal(sessionFileContents.thinking_blocks_dropped_v2, 1);
+    assert.match(sessionFileContents.tools_hash_baseline, /^[0-9a-f]{16}$/);
+    // The persisted baseline should equal the new hash (post-2xx advance).
+    assert.equal(sessionFileContents.tools_hash_baseline, ctx.meta._thinkingSanitizeV2.tools_hash_baseline);
+  });
+});
