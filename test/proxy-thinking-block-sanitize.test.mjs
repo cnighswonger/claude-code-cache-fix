@@ -183,3 +183,476 @@ test("onRequest: opt-in on with nothing to drop emits a zero count and leaves th
     assert.deepEqual(ctx.body.messages[0].content, [realThinking(), text("a")]);
   });
 });
+
+// ==========================================================================
+// v2 test suite — tools-hash-mismatch drop (directive proxy-thinking-block-sanitize-v2.md)
+// ==========================================================================
+
+import {
+  isSignedThinkingForV2,
+  modeFromEnv,
+  _resetV2State,
+} from "../proxy/extensions/thinking-block-sanitize.mjs";
+import {
+  canonicalStringify,
+  computeSignatureSurfaceHash,
+} from "../proxy/extensions/signature-surface-hash.mjs";
+import { tmpdir } from "node:os";
+import { mkdtempSync, rmSync } from "node:fs";
+import { join as joinPath } from "node:path";
+
+const redacted = () => ({ type: "redacted_thinking", data: "OPAQUE" });
+const realSigned = () => ({ type: "thinking", thinking: "real", signature: "SIG==" });
+const realThinkingNoSig = () => ({ type: "thinking", thinking: "real", signature: "" });
+const sid = (id) => ({ "x-claude-code-session-id": id });
+
+// --- modeFromEnv ---
+
+test("modeFromEnv: off / on / v2 / unknown", () => {
+  assert.equal(modeFromEnv({ CACHE_FIX_THINKING_SANITIZE: undefined }), "off");
+  assert.equal(modeFromEnv({}), "off");
+  assert.equal(modeFromEnv({ CACHE_FIX_THINKING_SANITIZE: "off" }), "off");
+  assert.equal(modeFromEnv({ CACHE_FIX_THINKING_SANITIZE: "on" }), "on");
+  assert.equal(modeFromEnv({ CACHE_FIX_THINKING_SANITIZE: "v2" }), "v2");
+  assert.equal(modeFromEnv({ CACHE_FIX_THINKING_SANITIZE: "v3" }), "off");
+  assert.equal(modeFromEnv({ CACHE_FIX_THINKING_SANITIZE: "true" }), "off");
+});
+
+// --- isSignedThinkingForV2 ---
+
+test("isSignedThinkingForV2: signed non-empty thinking → true", () => {
+  assert.equal(isSignedThinkingForV2(realSigned()), true);
+});
+
+test("isSignedThinkingForV2: redacted_thinking → true", () => {
+  assert.equal(isSignedThinkingForV2(redacted()), true);
+});
+
+test("isSignedThinkingForV2: omitted (empty-text) thinking → false (that's v1's case)", () => {
+  assert.equal(isSignedThinkingForV2(omitted()), false);
+});
+
+test("isSignedThinkingForV2: non-empty thinking WITHOUT a signature → false", () => {
+  assert.equal(isSignedThinkingForV2(realThinkingNoSig()), false);
+});
+
+test("isSignedThinkingForV2: text / tool_use / null → false", () => {
+  assert.equal(isSignedThinkingForV2(text()), false);
+  assert.equal(isSignedThinkingForV2(toolUse()), false);
+  assert.equal(isSignedThinkingForV2(null), false);
+});
+
+// --- canonicalStringify ---
+
+test("canonicalStringify: top-level key order doesn't affect output", () => {
+  assert.equal(
+    canonicalStringify({ b: 1, a: 2 }),
+    canonicalStringify({ a: 2, b: 1 }),
+  );
+});
+
+test("canonicalStringify: nested-key order doesn't affect output (recursive sort)", () => {
+  assert.equal(
+    canonicalStringify({ a: { y: 1, x: 2 } }),
+    canonicalStringify({ a: { x: 2, y: 1 } }),
+  );
+});
+
+test("canonicalStringify: array order IS load-bearing (preserves array order)", () => {
+  assert.notEqual(
+    canonicalStringify([1, 2]),
+    canonicalStringify([2, 1]),
+  );
+});
+
+test("canonicalStringify: primitives pass through", () => {
+  assert.equal(canonicalStringify(null), "null");
+  assert.equal(canonicalStringify(42), "42");
+  assert.equal(canonicalStringify("s"), "\"s\"");
+  assert.equal(canonicalStringify(true), "true");
+});
+
+// --- computeSignatureSurfaceHash ---
+
+test("computeSignatureSurfaceHash: 16 hex chars", () => {
+  const h = computeSignatureSurfaceHash({ tools: [{ name: "x", input_schema: {} }] });
+  assert.match(h, /^[0-9a-f]{16}$/);
+});
+
+test("computeSignatureSurfaceHash: shuffled top-level keys → same hash", () => {
+  const t1 = [{ name: "x", description: "d", input_schema: { type: "object" } }];
+  const t2 = [{ input_schema: { type: "object" }, name: "x", description: "d" }];
+  assert.equal(
+    computeSignatureSurfaceHash({ tools: t1 }),
+    computeSignatureSurfaceHash({ tools: t2 }),
+  );
+});
+
+test("computeSignatureSurfaceHash: shuffled nested-schema keys → same hash", () => {
+  const t1 = [{ name: "x", input_schema: { type: "object", properties: { a: {}, b: {} } } }];
+  const t2 = [{ name: "x", input_schema: { properties: { b: {}, a: {} }, type: "object" } }];
+  assert.equal(
+    computeSignatureSurfaceHash({ tools: t1 }),
+    computeSignatureSurfaceHash({ tools: t2 }),
+  );
+});
+
+test("computeSignatureSurfaceHash: tools[] array reorder → different hash", () => {
+  const t1 = [{ name: "a" }, { name: "b" }];
+  const t2 = [{ name: "b" }, { name: "a" }];
+  assert.notEqual(
+    computeSignatureSurfaceHash({ tools: t1 }),
+    computeSignatureSurfaceHash({ tools: t2 }),
+  );
+});
+
+test("computeSignatureSurfaceHash: undefined/null/[] → 'none' sentinel (all same hash)", () => {
+  const a = computeSignatureSurfaceHash({ tools: undefined });
+  const b = computeSignatureSurfaceHash({ tools: null });
+  const c = computeSignatureSurfaceHash({ tools: [] });
+  assert.equal(a, b);
+  assert.equal(b, c);
+});
+
+test("computeSignatureSurfaceHash: empty sentinel differs from a tools-array containing one empty object", () => {
+  const empty = computeSignatureSurfaceHash({ tools: [] });
+  const oneEmpty = computeSignatureSurfaceHash({ tools: [{}] });
+  assert.notEqual(empty, oneEmpty);
+});
+
+test("computeSignatureSurfaceHash: forward-compat — passing system/anthropic_beta in v2 is silently ignored", () => {
+  const a = computeSignatureSurfaceHash({ tools: [{ name: "x" }] });
+  const b = computeSignatureSurfaceHash({
+    tools: [{ name: "x" }],
+    system: "anything",
+    anthropic_beta: "context-1m",
+  });
+  assert.equal(a, b); // v2 ignores those inputs
+});
+
+// --- v2 onRequest predicate (integration) ---
+//
+// These tests use a temp HOME to keep the seed-from-file path isolated, and
+// reset the in-memory v2 state between cases. Each test calls _resetV2State()
+// at the start and clobbers HOME so seedV2FromFile reads from an empty disk.
+
+function withV2(fn) {
+  const oldEnv = process.env.CACHE_FIX_THINKING_SANITIZE;
+  const oldHome = process.env.HOME;
+  const dir = mkdtempSync(joinPath(tmpdir(), "thinking-v2-"));
+  process.env.CACHE_FIX_THINKING_SANITIZE = "v2";
+  process.env.HOME = dir;
+  _resetV2State();
+  return Promise.resolve(fn()).finally(() => {
+    if (oldEnv === undefined) delete process.env.CACHE_FIX_THINKING_SANITIZE;
+    else process.env.CACHE_FIX_THINKING_SANITIZE = oldEnv;
+    process.env.HOME = oldHome;
+    rmSync(dir, { recursive: true, force: true });
+    _resetV2State();
+  });
+}
+
+// Simulate a full request → response cycle with the given status code.
+async function fireRequest({ ctx, status = 200 }) {
+  await ext.onRequest(ctx);
+  // onResponseStart receives a separate context object in the real pipeline,
+  // but it shares the same `meta`. Simulate that by reusing meta.
+  await ext.onResponseStart({ status, meta: ctx.meta });
+}
+
+test("v2 onRequest: first request in a session — observe-and-establish, no strip", async () => {
+  await withV2(async () => {
+    const ctx = {
+      headers: sid("S1"),
+      body: {
+        tools: [{ name: "a" }],
+        messages: [
+          { role: "assistant", content: [realSigned(), text("hello")] },
+          { role: "user", content: "hi" },
+          { role: "assistant", content: [realSigned()] },
+        ],
+      },
+      meta: {},
+    };
+    await fireRequest({ ctx, status: 200 });
+    // No strip — signed thinking still present in BOTH assistant turns.
+    assert.deepEqual(ctx.body.messages[0].content, [realSigned(), text("hello")]);
+    assert.deepEqual(ctx.body.messages[2].content, [realSigned()]);
+    // Counters present, both zero.
+    assert.equal(ctx.meta._thinkingSanitize.thinking_blocks_dropped, 0);
+    assert.equal(ctx.meta._thinkingSanitizeV2.thinking_blocks_dropped_v2, 0);
+    // Baseline now populated (post-2xx).
+    assert.match(ctx.meta._thinkingSanitizeV2.tools_hash_baseline, /^[0-9a-f]{16}$/);
+  });
+});
+
+test("v2 onRequest: same hash on next request — no strip, baseline unchanged", async () => {
+  await withV2(async () => {
+    const tools = [{ name: "a" }];
+    const ctx1 = { headers: sid("S2"), body: { tools, messages: [] }, meta: {} };
+    await fireRequest({ ctx: ctx1, status: 200 });
+    const baseline = ctx1.meta._thinkingSanitizeV2.tools_hash_baseline;
+
+    const ctx2 = {
+      headers: sid("S2"),
+      body: {
+        tools,
+        messages: [
+          { role: "assistant", content: [realSigned(), text("a1")] },
+        ],
+      },
+      meta: {},
+    };
+    await fireRequest({ ctx: ctx2, status: 200 });
+    // Same hash → no strip.
+    assert.deepEqual(ctx2.body.messages[0].content, [realSigned(), text("a1")]);
+    assert.equal(ctx2.meta._thinkingSanitizeV2.thinking_blocks_dropped_v2, 0);
+    assert.equal(ctx2.meta._thinkingSanitizeV2.tools_hash_baseline, baseline);
+  });
+});
+
+test("v2 onRequest: tools-hash mismatch — strip signed thinking + redacted_thinking from prior turns", async () => {
+  await withV2(async () => {
+    const ctx1 = {
+      headers: sid("S3"),
+      body: { tools: [{ name: "a" }], messages: [] },
+      meta: {},
+    };
+    await fireRequest({ ctx: ctx1, status: 200 });
+
+    const ctx2 = {
+      headers: sid("S3"),
+      body: {
+        tools: [{ name: "a" }, { name: "b" }], // ToolSearch added a tool
+        messages: [
+          {
+            role: "assistant",
+            content: [realSigned(), redacted(), text("keep this")],
+          },
+          { role: "user", content: "next" },
+          { role: "assistant", content: [realSigned(), text("latest")] },
+        ],
+      },
+      meta: {},
+    };
+    await fireRequest({ ctx: ctx2, status: 200 });
+    // Strip happened on both signed thinking + redacted_thinking; text preserved.
+    assert.deepEqual(ctx2.body.messages[0].content, [text("keep this")]);
+    // Latest assistant turn ALSO stripped (no active tool-continuation guard).
+    assert.deepEqual(ctx2.body.messages[2].content, [text("latest")]);
+    // Counter reflects 3 drops (signed + redacted + signed-latest).
+    assert.equal(ctx2.meta._thinkingSanitizeV2.thinking_blocks_dropped_v2, 3);
+  });
+});
+
+test("v2 onRequest: active-tool-continuation latest turn protected even on mismatch", async () => {
+  await withV2(async () => {
+    const ctx1 = {
+      headers: sid("S4"),
+      body: { tools: [{ name: "a" }], messages: [] },
+      meta: {},
+    };
+    await fireRequest({ ctx: ctx1, status: 200 });
+
+    const ctx2 = {
+      headers: sid("S4"),
+      body: {
+        tools: [{ name: "a" }, { name: "b" }],
+        messages: [
+          { role: "assistant", content: [realSigned(), text("prior")] },
+          { role: "user", content: "next" },
+          { role: "assistant", content: [realSigned(), toolUse("t1")] },
+          { role: "user", content: [toolResult("t1")] },
+        ],
+      },
+      meta: {},
+    };
+    await fireRequest({ ctx: ctx2, status: 200 });
+    // Prior turn stripped, latest active-continuation turn preserved.
+    assert.deepEqual(ctx2.body.messages[0].content, [text("prior")]);
+    assert.deepEqual(ctx2.body.messages[2].content, [realSigned(), toolUse("t1")]);
+    assert.equal(ctx2.meta._thinkingSanitizeV2.thinking_blocks_dropped_v2, 1);
+  });
+});
+
+test("v2 onRequest: 4xx response leaves baseline unchanged", async () => {
+  await withV2(async () => {
+    // Establish a baseline at hash(tools=[a]).
+    const ctx1 = { headers: sid("S5"), body: { tools: [{ name: "a" }], messages: [] }, meta: {} };
+    await fireRequest({ ctx: ctx1, status: 200 });
+    const baseline = ctx1.meta._thinkingSanitizeV2.tools_hash_baseline;
+
+    // Fire a request with a different tools hash, response 400.
+    const ctx2 = {
+      headers: sid("S5"),
+      body: { tools: [{ name: "b" }], messages: [{ role: "assistant", content: [realSigned()] }] },
+      meta: {},
+    };
+    await fireRequest({ ctx: ctx2, status: 400 });
+
+    // Strip DID happen in the request body (the mismatch fires unconditionally).
+    assert.equal(ctx2.meta._thinkingSanitizeV2.thinking_blocks_dropped_v2, 1);
+
+    // But the baseline should NOT have advanced — the next request should
+    // still compare against the original baseline. Verify by firing a 3rd
+    // request with the same hash as the original ctx1.
+    const ctx3 = { headers: sid("S5"), body: { tools: [{ name: "a" }], messages: [] }, meta: {} };
+    await fireRequest({ ctx: ctx3, status: 200 });
+    // Same hash as ctx1 → no strip.
+    assert.equal(ctx3.meta._thinkingSanitizeV2.thinking_blocks_dropped_v2, 0);
+    assert.equal(ctx3.meta._thinkingSanitizeV2.tools_hash_baseline, baseline);
+  });
+});
+
+test("v2 onRequest: 5xx response leaves baseline unchanged (same as 4xx; HTTP 2xx is the gate)", async () => {
+  await withV2(async () => {
+    const ctx1 = { headers: sid("S6"), body: { tools: [{ name: "a" }], messages: [] }, meta: {} };
+    await fireRequest({ ctx: ctx1, status: 200 });
+    const baseline = ctx1.meta._thinkingSanitizeV2.tools_hash_baseline;
+
+    const ctx2 = {
+      headers: sid("S6"),
+      body: { tools: [{ name: "b" }], messages: [{ role: "assistant", content: [realSigned()] }] },
+      meta: {},
+    };
+    await fireRequest({ ctx: ctx2, status: 503 });
+
+    const ctx3 = { headers: sid("S6"), body: { tools: [{ name: "a" }], messages: [] }, meta: {} };
+    await fireRequest({ ctx: ctx3, status: 200 });
+    assert.equal(ctx3.meta._thinkingSanitizeV2.tools_hash_baseline, baseline);
+  });
+});
+
+test("v2 onRequest: oscillation-over-strip-is-deliberate — A → B → A both transitions strip", async () => {
+  await withV2(async () => {
+    const toolsA = [{ name: "a" }];
+    const toolsB = [{ name: "a" }, { name: "b" }];
+
+    // Establish at A.
+    const ctx1 = { headers: sid("S7"), body: { tools: toolsA, messages: [] }, meta: {} };
+    await fireRequest({ ctx: ctx1, status: 200 });
+
+    // A → B: strip prior signed thinking (mismatch).
+    const ctx2 = {
+      headers: sid("S7"),
+      body: { tools: toolsB, messages: [{ role: "assistant", content: [realSigned()] }] },
+      meta: {},
+    };
+    await fireRequest({ ctx: ctx2, status: 200 });
+    assert.equal(ctx2.meta._thinkingSanitizeV2.thinking_blocks_dropped_v2, 1);
+
+    // B → A (reversion): strip again, because Option C treats ANY hash change
+    // as invalidating. This is the deliberate false-positive class — even
+    // though A's prior signatures would have re-validated, the single-baseline
+    // contract doesn't track history.
+    const ctx3 = {
+      headers: sid("S7"),
+      body: { tools: toolsA, messages: [{ role: "assistant", content: [realSigned()] }] },
+      meta: {},
+    };
+    await fireRequest({ ctx: ctx3, status: 200 });
+    assert.equal(ctx3.meta._thinkingSanitizeV2.thinking_blocks_dropped_v2, 1);
+  });
+});
+
+test("v2 onRequest: 'unknown' canonical session id — extension no-ops for v2 (v1 still runs)", async () => {
+  await withV2(async () => {
+    // No session-id header → resolves to null → canonical "unknown".
+    const ctx = {
+      headers: {},
+      body: {
+        tools: [{ name: "a" }],
+        messages: [
+          {
+            role: "assistant",
+            content: [omitted(), realSigned(), redacted(), text("a")],
+          },
+        ],
+      },
+      meta: {},
+    };
+    await fireRequest({ ctx, status: 200 });
+    // v1's omitted-text drop still ran.
+    assert.equal(ctx.meta._thinkingSanitize.thinking_blocks_dropped, 1);
+    // v2 did NOT run — signed + redacted are still present after the v1 strip.
+    assert.equal(ctx.meta._thinkingSanitizeV2, undefined);
+    assert.deepEqual(ctx.body.messages[0].content, [realSigned(), redacted(), text("a")]);
+  });
+});
+
+test("v2 onRequest: first-strip-then-stable — baseline advances on success, subsequent same-hash request doesn't strip", async () => {
+  await withV2(async () => {
+    const ctx1 = { headers: sid("S8"), body: { tools: [{ name: "a" }], messages: [] }, meta: {} };
+    await fireRequest({ ctx: ctx1, status: 200 });
+
+    // Mismatch + 200 → strip + baseline advances to H1.
+    const ctx2 = {
+      headers: sid("S8"),
+      body: { tools: [{ name: "b" }], messages: [{ role: "assistant", content: [realSigned()] }] },
+      meta: {},
+    };
+    await fireRequest({ ctx: ctx2, status: 200 });
+    assert.equal(ctx2.meta._thinkingSanitizeV2.thinking_blocks_dropped_v2, 1);
+    const newBaseline = ctx2.meta._thinkingSanitizeV2.tools_hash_baseline;
+
+    // Next request with the SAME hash as ctx2 (= new baseline) → no strip.
+    const ctx3 = {
+      headers: sid("S8"),
+      body: { tools: [{ name: "b" }], messages: [{ role: "assistant", content: [realSigned()] }] },
+      meta: {},
+    };
+    await fireRequest({ ctx: ctx3, status: 200 });
+    assert.equal(ctx3.meta._thinkingSanitizeV2.thinking_blocks_dropped_v2, 0);
+    assert.equal(ctx3.meta._thinkingSanitizeV2.tools_hash_baseline, newBaseline);
+  });
+});
+
+test("v2 onRequest: two concurrent unknown-session requests don't cross-contaminate", async () => {
+  await withV2(async () => {
+    // Both requests have no session id → both canonicalize to "unknown" → no-op.
+    // The shared in-memory state isn't touched, so neither leaks anything to the other.
+    const ctx_a = {
+      headers: {},
+      body: { tools: [{ name: "a" }], messages: [{ role: "assistant", content: [realSigned()] }] },
+      meta: {},
+    };
+    const ctx_b = {
+      headers: {},
+      body: { tools: [{ name: "b" }], messages: [{ role: "assistant", content: [realSigned()] }] },
+      meta: {},
+    };
+    await fireRequest({ ctx: ctx_a, status: 200 });
+    await fireRequest({ ctx: ctx_b, status: 200 });
+    // Both kept their signed thinking — neither acted on the other's tools shape.
+    assert.equal(ctx_a.meta._thinkingSanitizeV2, undefined);
+    assert.equal(ctx_b.meta._thinkingSanitizeV2, undefined);
+    assert.deepEqual(ctx_a.body.messages[0].content, [realSigned()]);
+    assert.deepEqual(ctx_b.body.messages[0].content, [realSigned()]);
+  });
+});
+
+test("v2 mode also runs v1's omitted drop (v2 is strict superset of on)", async () => {
+  await withV2(async () => {
+    const ctx1 = { headers: sid("S9"), body: { tools: [{ name: "a" }], messages: [] }, meta: {} };
+    await fireRequest({ ctx: ctx1, status: 200 });
+
+    const ctx2 = {
+      headers: sid("S9"),
+      body: {
+        tools: [{ name: "a" }, { name: "b" }],
+        messages: [
+          {
+            role: "assistant",
+            content: [omitted(), realSigned(), text("a")],
+          },
+        ],
+      },
+      meta: {},
+    };
+    await fireRequest({ ctx: ctx2, status: 200 });
+    // v1 dropped 1 (omitted), v2 dropped 1 (signed). text("a") preserved.
+    assert.equal(ctx2.meta._thinkingSanitize.thinking_blocks_dropped, 1);
+    assert.equal(ctx2.meta._thinkingSanitizeV2.thinking_blocks_dropped_v2, 1);
+    assert.deepEqual(ctx2.body.messages[0].content, [text("a")]);
+  });
+});

@@ -56,7 +56,12 @@ export function sessionFilePath(rawId) {
   return join(paths().sessionsDir, `${sessionFilename(rawId)}.json`);
 }
 
-function resolveSessionId(headers) {
+// Exported so sibling extensions can read the canonical session id from
+// REQUEST headers at their own onRequest time — they can't rely on
+// ctx.meta._sessionId being set, because this writer's onRequest is the
+// thing that populates it (and runs at order 600, after most extensions).
+// thinking-block-sanitize v2 (order 550) uses this for the same reason.
+export function resolveSessionId(headers) {
   if (!headers) return null;
   const sid =
     headers["x-claude-code-session-id"] ||
@@ -236,6 +241,10 @@ export default {
           // Additive thinking-block-sanitize drop count (order 550, opt-in).
           // Optional — absent unless CACHE_FIX_THINKING_SANITIZE=on.
           ...(ctx.meta._thinkingSanitize || {}),
+          // Additive thinking-block-sanitize v2 fields (order 550, opt-in via
+          // CACHE_FIX_THINKING_SANITIZE=v2). Optional — absent unless v2 is
+          // enabled. Keys: thinking_blocks_dropped_v2 / tools_hash_baseline.
+          ...(ctx.meta._thinkingSanitizeV2 || {}),
           // Additive auto-1m-guard annotation (order 520). Optional — absent
           // unless the outbound request carried context-1m-2025-08-07 and the
           // mode wasn't off. Keys: auto_1m_detected / auto_1m_action /
