@@ -40,7 +40,7 @@ export async function loadExtensions(dir, configPath) {
       // what to do — the underlying Node ESM cache problem can't be fixed
       // in-process (you can't evict cached transitive imports), so a full
       // process restart is the only path to recover the extension graph.
-      const msg = `[CRITICAL] extension load failed: ${file}: ${err.message} — restart cache-fix-proxy.service to recover (in-process reload cannot fix stale ESM cache)\n`;
+      const msg = `[CRITICAL] extension load failed: ${file}: ${err.message} — restart the proxy via your supervisor to recover (in-process reload cannot fix stale ESM cache; see #196)\n`;
       process.stderr.write(msg);
       newlyFailed.push({ file, error: String(err.message || err), lastAttempt: new Date().toISOString() });
     }

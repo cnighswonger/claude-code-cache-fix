@@ -329,7 +329,12 @@ describe("proxy server /health degraded (#196)", () => {
     assert.equal(parsed.status, "degraded");
     assert.equal(parsed.failed_extensions.length, 1);
     assert.equal(parsed.failed_extensions[0].file, "broken.mjs");
-    assert.match(parsed.hint, /restart cache-fix-proxy/);
+    // Hint must point at "restart via supervisor" (supervisor-neutral wording —
+    // operator runs systemd-user on Linux, launchd on macOS, etc.) and cite #196.
+    assert.match(parsed.hint, /restart the proxy via your supervisor/);
     assert.match(parsed.hint, /#196/);
+    // Guard against regression to a Linux-specific hint that would mislead
+    // macOS operators (the round-1 Codex finding on this PR).
+    assert.ok(!/cache-fix-proxy\.service/.test(parsed.hint), "hint must not be systemd-specific");
   });
 });

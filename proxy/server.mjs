@@ -249,7 +249,7 @@ function handleHealth(_req, res) {
     res.end(JSON.stringify({
       status: "degraded",
       failed_extensions: failed,
-      hint: "restart cache-fix-proxy.service to recover (in-process reload cannot fix stale ESM cache; #196)",
+      hint: "restart the proxy via your supervisor to recover (in-process reload cannot fix stale ESM cache; #196)",
     }));
     return;
   }
