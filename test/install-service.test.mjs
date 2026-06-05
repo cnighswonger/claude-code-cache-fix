@@ -112,6 +112,48 @@ test("renderLaunchdTemplate: omits CACHE_FIX_PROXY_UPSTREAM/DEBUG when not set",
   assert.ok(!out.includes("CACHE_FIX_DEBUG"));
 });
 
+// #196 / #198: CACHE_FIX_HOT_RELOAD env-capture rendering. install-service
+// reads CACHE_FIX_HOT_RELOAD from the env at install time and bakes it into
+// the generated unit/plist when set to the literal "on", omits the slot
+// entirely otherwise. Matches the existing PORT/UPSTREAM/DEBUG precedent.
+
+test("renderSystemdTemplate: omits CACHE_FIX_HOT_RELOAD when not set", async () => {
+  const tpl = await readFile(join(TEMPLATE_DIR, "cache-fix-proxy.service.template"), "utf-8");
+  const out = renderSystemdTemplate(tpl, sampleVars);
+  assert.ok(!out.includes("CACHE_FIX_HOT_RELOAD"));
+});
+
+test("renderSystemdTemplate: includes CACHE_FIX_HOT_RELOAD=on when set", async () => {
+  const tpl = await readFile(join(TEMPLATE_DIR, "cache-fix-proxy.service.template"), "utf-8");
+  const out = renderSystemdTemplate(tpl, { ...sampleVars, hotReload: "on" });
+  assert.ok(out.includes("Environment=CACHE_FIX_HOT_RELOAD=on"));
+});
+
+test("renderLaunchdTemplate: omits CACHE_FIX_HOT_RELOAD when not set", async () => {
+  const tpl = await readFile(
+    join(TEMPLATE_DIR, "com.cnighswonger.cache-fix-proxy.plist.template"),
+    "utf-8",
+  );
+  const out = renderLaunchdTemplate(tpl, { ...sampleVars, logDir: "/tmp/logs" });
+  assert.ok(!out.includes("CACHE_FIX_HOT_RELOAD"));
+});
+
+test("renderLaunchdTemplate: includes CACHE_FIX_HOT_RELOAD=on when set", async () => {
+  const tpl = await readFile(
+    join(TEMPLATE_DIR, "com.cnighswonger.cache-fix-proxy.plist.template"),
+    "utf-8",
+  );
+  const out = renderLaunchdTemplate(tpl, {
+    ...sampleVars,
+    logDir: "/tmp/logs",
+    hotReload: "on",
+  });
+  assert.ok(out.includes("<key>CACHE_FIX_HOT_RELOAD</key>"));
+  assert.ok(out.includes("<string>on</string>"));
+  // Plist must remain well-formed: no stray template tags.
+  assert.ok(!out.includes("{{"));
+});
+
 // --- Port validation (shell-injection guard) ---
 
 test("validatePort: accepts valid numeric strings", () => {

@@ -147,6 +147,7 @@ All proxy settings are controlled via environment variables. Set them before sta
 | `CACHE_FIX_EXTENSIONS_DIR` | `proxy/extensions/` | Directory for extension `.mjs` files |
 | `CACHE_FIX_EXTENSIONS_CONFIG` | `proxy/extensions.json` | Extension configuration file |
 | `CACHE_FIX_DEBUG` | `0` | Enable debug logging |
+| `CACHE_FIX_HOT_RELOAD` | unset | Set to `on` to enable in-process extension hot-reload. Off by default as of v4.0.0 — see [Upgrading from v3.x](#upgrading-from-v3x) for details and the supervisor restart flow. |
 
 ### Corporate environments (proxies, custom CAs)
 
@@ -209,6 +210,66 @@ Options (all optional; all fall back to the same env vars used by the CLI):
 **CLI invocation is unchanged.** `node proxy/server.mjs`, `cache-fix-proxy server`, and the wrapper's child-fork path all auto-listen and install SIGTERM/SIGINT handlers as before. Library imports never trigger that behavior — the auto-listen is gated behind a main-module check.
 
 *The embeddable factory was contributed by [@bilby91](https://github.com/bilby91) at [Crunchloop DAP](https://dap.crunchloop.ai) — see [PR #123](https://github.com/cnighswonger/claude-code-cache-fix/pull/123).*
+
+## Upgrading from v3.x
+
+v4.0.0 changes two long-standing defaults. Both flips are deliberate — see the linked issues for the rationale.
+
+**Behavior changes in v4.0.0:**
+
+- **`thinking-block-sanitize` is now on by default.** Was opt-in via `CACHE_FIX_THINKING_SANITIZE=on` in v3.8.0–v3.9.x. After seven days of dogfood traffic across 37 sessions (zero `cannot be modified` 400s, cache hit-rate aggregate 94.66% vs. 92.44% baseline, sanitize firing on ~35% of sessions with ~800 blocks dropped per day) the mitigation is now safe to default on. See [#63147](https://github.com/anthropics/claude-code/issues/63147) and [#171](https://github.com/cnighswonger/claude-code-cache-fix/issues/171).
+- **In-process extension hot-reload is now off by default.** Was on in v3.x. Set `CACHE_FIX_HOT_RELOAD=on` to restore the prior behavior. Off-by-default eliminates the Node ESM stale-import race documented in [#196](https://github.com/cnighswonger/claude-code-cache-fix/issues/196), where the watcher silently failed to load a newly-merged extension for 17 hours after a hot-reload trigger. The race fires when the file watcher re-imports an extension whose transitive dependencies are already cached by Node's loader; cold starts are unaffected.
+
+Picking up a new extension or a code change to an existing one in v4.0.0 requires a supervisor-level proxy restart. There are two upgrade flows depending on whether you also want to opt back into hot-reload.
+
+### Flow 1 — code-only npm upgrade (recommended default)
+
+Your existing systemd unit / launchd plist is unchanged; only the proxy code on disk is updated by npm. Restart the running process to pick up the new code.
+
+**Linux (systemd user unit):**
+
+```
+npm install -g cache-fix-proxy@4
+systemctl --user restart cache-fix-proxy
+```
+
+No `daemon-reload` required — the unit file content is unchanged.
+
+**macOS (launchd user agent):**
+
+```
+npm install -g cache-fix-proxy@4
+launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
+```
+
+`kickstart` re-execs the agent under the existing plist.
+
+### Flow 2 — opt back into hot-reload at the supervisor layer
+
+Run if you actively use hot-reload (e.g., you drop custom extensions into the extensions dir on a live proxy and want them picked up without restart). This rewrites the unit / plist so `CACHE_FIX_HOT_RELOAD=on` is set every time the supervisor starts the proxy.
+
+**Linux (systemd user unit):**
+
+```
+CACHE_FIX_HOT_RELOAD=on cache-fix-proxy install-service
+systemctl --user daemon-reload
+systemctl --user restart cache-fix-proxy
+```
+
+`daemon-reload` is required because the unit file content changed.
+
+**macOS (launchd user agent):**
+
+```
+CACHE_FIX_HOT_RELOAD=on cache-fix-proxy install-service
+launchctl bootout gui/$(id -u)/com.cnighswonger.cache-fix-proxy
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cnighswonger.cache-fix-proxy.plist
+launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
+```
+
+`bootout` + `bootstrap` is required because the plist contents changed — `kickstart` alone does not pick up plist changes.
+
+**Note on the hot-reload tradeoff:** even on the opt-in path, the ESM stale-import race remains possible on long-running processes. If you hit a degraded `/health` (returns 503 + `{status:"degraded",...}`), a process restart is the only recovery; the proxy logs a `[CRITICAL]` hint when this happens. See [#197](https://github.com/cnighswonger/claude-code-cache-fix/pull/197) for the observability layer.
 
 ## What this proxy defends against
 

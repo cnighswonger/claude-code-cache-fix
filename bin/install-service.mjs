@@ -23,6 +23,11 @@ function getDefaults() {
     port: validatePort(process.env.CACHE_FIX_PROXY_PORT || "9801"),
     upstream: process.env.CACHE_FIX_PROXY_UPSTREAM || "",
     debug: process.env.CACHE_FIX_DEBUG || "",
+    // Hot-reload is opt-in as of v4.0.0 (#196). Capture from env at install
+    // time so the operator can bake `CACHE_FIX_HOT_RELOAD=on` into the
+    // generated unit/plist via `CACHE_FIX_HOT_RELOAD=on cache-fix-proxy
+    // install-service`. Strict "on" match — anything else renders nothing.
+    hotReload: process.env.CACHE_FIX_HOT_RELOAD === "on" ? "on" : "",
     workingDir: resolve(__dirname, ".."),
   };
 }
@@ -93,6 +98,9 @@ function renderSystemdTemplate(template, vars) {
   const debugLine = vars.debug
     ? `Environment=CACHE_FIX_DEBUG=${vars.debug}`
     : "";
+  const hotReloadLine = vars.hotReload
+    ? `Environment=CACHE_FIX_HOT_RELOAD=${vars.hotReload}`
+    : "";
   // Allow callers to wire a Requires= line (e.g. another service the proxy
   // chains to). Empty string by default so the unit has no extra deps.
   const requiresLine = vars.requires
@@ -104,6 +112,7 @@ function renderSystemdTemplate(template, vars) {
     .replaceAll("{{PORT}}", vars.port)
     .replaceAll("{{UPSTREAM_LINE}}", upstreamLine)
     .replaceAll("{{DEBUG_LINE}}", debugLine)
+    .replaceAll("{{HOT_RELOAD_LINE}}", hotReloadLine)
     .replaceAll("{{REQUIRES_LINE}}", requiresLine)
     .replaceAll("{{WORKING_DIR}}", vars.workingDir)
     // Collapse triple newlines from empty optional lines down to single blank
@@ -117,12 +126,16 @@ function renderLaunchdTemplate(template, vars) {
   const debugPlist = vars.debug
     ? `        <key>CACHE_FIX_DEBUG</key>\n        <string>${vars.debug}</string>`
     : "";
+  const hotReloadPlist = vars.hotReload
+    ? `        <key>CACHE_FIX_HOT_RELOAD</key>\n        <string>${vars.hotReload}</string>`
+    : "";
   return template
     .replaceAll("{{NODE}}", vars.node)
     .replaceAll("{{SERVER_PATH}}", vars.serverPath)
     .replaceAll("{{PORT}}", vars.port)
     .replaceAll("{{UPSTREAM_PLIST}}", upstreamPlist)
     .replaceAll("{{DEBUG_PLIST}}", debugPlist)
+    .replaceAll("{{HOT_RELOAD_PLIST}}", hotReloadPlist)
     .replaceAll("{{WORKING_DIR}}", vars.workingDir)
     .replaceAll("{{LOG_DIR}}", vars.logDir)
     .replace(/\n\n+/g, "\n");

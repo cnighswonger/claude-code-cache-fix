@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Behavior changes
+
+- **In-process extension hot-reload is now off by default (#196, #198).** Was on in v3.x. Set `CACHE_FIX_HOT_RELOAD=on` in the proxy's runtime environment (or in the install-service environment if using `cache-fix-proxy install-service`) to restore the prior behavior. Off-by-default eliminates the Node ESM stale-import race that silently broke `thinking-block-sanitize v2` for 17 hours after PR #192's merge — the watcher re-imports an extension whose transitive dependencies are already cached by Node's loader, and Node cannot evict cached transitive modules in-process. Cold starts are unaffected.
+- **A supervisor-level proxy restart is now required after `npm install -g cache-fix-proxy@4`** to pick up extension changes. See [Upgrading from v3.x](README.md#upgrading-from-v3x) for per-platform restart commands.
+
 ## [3.9.0] - 2026-06-03
 
 Two upstream-CC-bug workarounds routed through our new cc-triage pipeline: **`auto-1m-guard`** (proxy extension, the *intercept* side) for the auto-1M-context overage case (upstream `anthropics/claude-code#64919`), and **`worktree-edit-guard`** (client-side hook, the *boundary-enforcement* side) for the worktree parent-checkout corruption case (upstream `anthropics/claude-code#59628`).

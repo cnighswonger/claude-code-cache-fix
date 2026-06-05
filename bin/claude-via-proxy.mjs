@@ -55,6 +55,7 @@ async function dispatch() {
         "  CACHE_FIX_PROXY_PORT     Port for the proxy server\n" +
         "  CACHE_FIX_PROXY_UPSTREAM Upstream URL\n" +
         "  CACHE_FIX_DEBUG=1        Verbose proxy logging\n" +
+        "  CACHE_FIX_HOT_RELOAD=on  Enable in-process extension hot-reload (off by default; see #196)\n" +
         "  CACHE_FIX_CLAUDE_CMD     Override the `claude` command for the wrapper\n",
     );
     return 0;

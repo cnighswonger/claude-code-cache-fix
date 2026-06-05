@@ -290,7 +290,27 @@ export async function startProxy(options = {}) {
   const bind = options.bind ?? config.bind;
   const extensionsDir = options.extensionsDir ?? config.extensionsDir;
   const extensionsConfig = options.extensionsConfig ?? config.extensionsConfig;
-  const watch = options.watch !== false;
+  // Hot-reload is opt-in as of v4.0.0 (#196). The in-process watcher is the
+  // only code path that triggers the Node ESM stale-import race; cold starts
+  // have an empty module cache and load extensions cleanly. Strict `=== "on"`
+  // matches the existing CACHE_FIX_THINKING_SANITIZE precedent — any other
+  // value (including "true"/"1"/"yes") is treated as off.
+  const hotReloadOptIn = process.env.CACHE_FIX_HOT_RELOAD === "on";
+  const watch = options.watch !== false && hotReloadOptIn;
+
+  // Boot banner on stderr so the active hot-reload mode is visible in the
+  // supervisor's log (journalctl --user / ~/Library/Logs/) without being
+  // noisy for monitoring tools that line-grep stderr. Supervisor-neutral
+  // wording — no version pin (lives in CHANGELOG/README instead).
+  if (hotReloadOptIn) {
+    process.stderr.write(
+      "[cache-fix] hot-reload: on (CACHE_FIX_HOT_RELOAD=on) — long-running processes can hit a Node ESM stale-import race; see #196. Restart the proxy via your supervisor to recover.\n",
+    );
+  } else {
+    process.stderr.write(
+      "[cache-fix] hot-reload: off (set CACHE_FIX_HOT_RELOAD=on to enable). Extension changes require a supervisor-level proxy restart.\n",
+    );
+  }
 
   let watcher = null;
   try {

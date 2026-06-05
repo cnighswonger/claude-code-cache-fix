@@ -11,6 +11,7 @@ RestartSec=5
 Environment=CACHE_FIX_PROXY_PORT={{PORT}}
 {{UPSTREAM_LINE}}
 {{DEBUG_LINE}}
+{{HOT_RELOAD_LINE}}
 WorkingDirectory={{WORKING_DIR}}
 
 [Install]
