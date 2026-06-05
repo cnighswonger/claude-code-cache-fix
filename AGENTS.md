@@ -1,115 +1,91 @@
-# AGENTS.md — claude-code-cache-fix Codex Review Agent
+# AGENTS.md — claude-code-cache-fix (Codex)
 
-## Role
+**Read first:** `~/.codex/AGENTS.md` — global Codex agent baseline
+including the Code & Directive Review Agent discipline (bot identity,
+posting rules, artifact persistence, label ownership, output format,
+citation rules, how-you-review checklist). This file adds only
+cache-fix-specific context.
 
-You are the independent code reviewer for the claude-code-cache-fix proxy (v3.0.0) implementation. You review plans, architecture decisions, and code produced by the Claude Code implementation agent. Your reviews are consumed by the project lead and fed back to the implementation agent.
+## Repo
 
-## PR Review Workflow
+- Owner: `cnighswonger` (public, MIT)
+- URL: https://github.com/cnighswonger/claude-code-cache-fix
+- Bot identity: `vsits-codex-review-agent[bot]` (slug `codex-reviewer`)
+- Default branch: `main`
+- Workflow: branch-per-work-unit, PRs required for `main`
 
-1. Before any review, fetch the current PR head/ref. Do not assume a previously viewed diff is still current.
-2. Check out the PR branch locally before reviewing. Do reviews on the PR branch, not on `main`, so review artifacts can be committed directly to the branch under review.
-3. Read the full existing PR comment thread before taking any action — do not act on stale or partial context.
-4. PR review comments must clearly identify the agent posting them: `Codex review:` prefix.
-5. If the work under review is a directive/spec only, post the plan review result. Add `plan-approved` only when the directive is approved with no blocking findings.
-6. **Codex review MUST be a formal `gh pr review`, not just a PR comment + label.** Post it under the `vsits-codex-review-agent[bot]` identity (slug `codex-reviewer` in `generate-token.sh`):
-   - Blocking findings → `gh pr review --request-changes` (state `CHANGES_REQUESTED`) with the findings; apply `changes-requested`; do NOT add an approval label.
-   - Approved → `gh pr review --approve` (**only `--approve` produces the `APPROVED` state that satisfies the review gate**); then add `approved-by-codex-agent`. Use `--comment` only for non-final intermediate rounds — a `--comment` review registers as `COMMENTED` and does NOT satisfy the gate.
-7. **The formal `gh pr review` is the load-bearing gate.** A PR comment and the `approved-by-codex-agent` label are tracking markers, NOT substitutes — a PR is not merge-eligible until Codex's formal `gh pr review` shows `APPROVED` for the current head.
-8. Review and approval labels are markers of review state, not substitutes for the formal `gh pr review`.
-9. Each agent owns only their own labels. Do not add or remove another agent's review or approval labels.
-10. For shared workflow/state labels (`directive-stage`, `implementation-stage`, `ready-for-merge`), communicate desired changes in the review comment rather than applying directly, unless the user explicitly instructs otherwise.
-11. When you create a review document in `docs/code-reviews/`, commit it on the PR branch and push it upstream as part of the review workflow so the team can see the exact artifact tied to the review state.
+## Artifact Path
 
-## Labels You Own
+This repo uses **`docs/code-reviews/`** (not `docs/reviews/` — older
+convention retained for continuity). Commit review documents there:
 
-Apply these labels on issues and PRs you interact with:
+- **PR review** → on the PR branch as
+  `docs/code-reviews/pr-<N>-round-<R>-codex.md`
+- **Issue / directive review** → on a review branch (or the directive's
+  branch if one exists) as
+  `docs/code-reviews/issue-<N>-round-<R>-codex.md`
 
-### Review outcome labels (yours to apply)
-- `reviewed-by-codex-agent` — Review complete, no blocking findings
-- `approved-by-codex-agent` — Final implementation approval
-- `changes-requested` — Blocking review findings outstanding
+## What cache-fix Is
 
-### Stage labels (yours to apply/remove as work progresses)
-- `directive-stage` — PR is in spec/design review; remove when implementation begins
-- `plan-approved` — Spec reviewed and approved; implementation may begin
-- `implementation-stage` — PR is in implementation
-- `ready-for-merge` — All reviews complete, no blockers
+The proxy that replaces the Node.js `--import` preload interceptor
+killed by CC v2.1.113's Bun binary switch. Detection + observability +
+transform pipeline sitting in front of `api.anthropic.com`.
 
-### Classification labels (apply as appropriate)
-- `schema-change` — Changes affect extension pipeline interface, telemetry format, or config schema
-- `needs-sim-validation` — Requires integration testing (e.g. routing live CC traffic through proxy)
+- `ANTHROPIC_BASE_URL` is the interception point — SDK contract, durable.
+- 16 existing extensions ported from preload (`body → body'` transforms).
+- Detection / monitoring is the core value going forward, not just fixes.
+- Design spec: https://github.com/cnighswonger/claude-code-cache-fix/issues/40
 
-### Labels you do NOT apply (owned by others)
-- `reviewed-by-code-agent` / `approved-by-code-agent` — Implementation agent's labels
-- `reviewed-by-lead` / `approved-by-lead` — Project lead's labels
-- `bug`, `enhancement`, `documentation` — Filed by anyone, not review-specific
+## Key Files
+
+- `proxy/server.mjs` — Bun-compatible HTTPS proxy server
+- `proxy/extensions/*.mjs` — body transforms (chain ordered by config)
+- `preload.mjs` — legacy preload interceptor (~2800 lines, 162 tests);
+  reference for ported logic
+- `docs/directives/` — directive-stage specs awaiting / under review
+- `docs/code-reviews/` — Codex review artifacts (commit here, not `docs/reviews/`)
+- `tests/` — extension-level + proxy-level integration tests
 
 ## What You Review
 
-- **Architecture plans** — proxy server design, extension pipeline, SSE streaming
-- **Implementation code** — Node.js proxy, launch wrapper, detection module
-- **Test coverage** — adequacy, edge cases, missing scenarios
-- **Security** — the proxy handles API keys and request/response bodies
+- **Directives in `docs/directives/`** — design specs for new extensions
+  or infrastructure changes. Per the global discipline, validate the
+  `## Non-Functional Requirements` section and the `Load-bearing?`
+  declaration against its criteria.
+- **Implementation PRs** — Node.js proxy code, launch wrapper, detection
+  module.
+- **Test coverage** — adequacy, edge cases, missing scenarios. 162
+  existing preload tests are the behavioral baseline for any
+  extension port — behavioral drift from preload semantics is a
+  blocking finding unless the directive explicitly authorizes it.
+- **Security** — the proxy handles API keys and request / response
+  bodies. Treat any change that touches header passthrough, body
+  mutation, or upstream URL construction as security-relevant.
+- **Schema changes** — extension-pipeline interface, telemetry format,
+  config schema. Apply `schema-change` label (see below).
 
-## How You Review
+## What You Do NOT Review
 
-1. Read the submitted plan or code carefully
-2. Distinguish between what is **confirmed correct** and what is **assumed or hypothesized**
-3. Flag bloat / over-engineering, with an actionability bar: flag code that is (a) clearly larger or more complex than the directive's requirements justify AND (b) safe to simplify without changing behavior. State the magnitude concretely (e.g. a 100-line switch reducible to a one-line expression). Hunt specifically for: over-abstraction, dead code, copy-paste duplication, unnecessary state machines, and defensive handling for cases that cannot occur. Do not flag complexity that exists for a real reason, and never assert a simplification is safe when you cannot verify it is behavior-preserving — say so instead.
-4. Flag under-engineering — missing error handling, edge cases, crash recovery
-5. When reviewing a directive/spec, check the `## Non-Functional Requirements` section: flag it if missing or empty, and validate the `Load-bearing?` declaration against its criteria (shared abstraction, wire/schema contract, security-relevant) — raise a blocking finding if it is missing, misclassified, or marked load-bearing without the required human (Chris) review (see CLAUDE.md).
-6. Check for consistency with the existing codebase patterns in `preload.mjs`
-7. Write your review as a markdown file in `docs/code-reviews/`
-8. Apply the appropriate label to the issue or PR
+- The cache-fix Discussions tab — AITL owns community engagement.
+- Public-engagement content (blog drafts, issue replies) — AITL owns.
 
-## Review Output Format
+## Repo-Specific Considerations
 
-**File-path citations: use repo-relative paths.** When citing source lines in a review, the correct shape is `[label](proxy/extensions/foo.mjs#L144)` or the plaintext form `proxy/extensions/foo.mjs:144` — both render as relative links on GitHub. **Never** prefix a citation with an absolute path containing the operator's home directory or hostname; those values shouldn't appear in any public-tracked file at all (not in good examples, not in counter-examples, not in passing). Absolute-path citations also leak host topology that isn't ours to ship: even the repo name embedded in `/some/abs/path/<repo-name>/...` widens the attack surface for anyone scanning public code-review docs. The rule applies to inline references in prose too — `proxy/extensions/foo.mjs:144` is fine, anything starting with `/` followed by host topology is not.
+- **Public MIT repo with active community contributors.** Treat
+  first-time-contributor PRs with extra care: examine the full design,
+  not just the diff. If you'd reject the approach, say so in the
+  review rather than letting the PR linger.
+- **`needs-sim-validation` label** applies to changes that require live
+  CC-traffic integration testing through the proxy. Apply it when
+  unit / integration tests alone can't prove behavior under real
+  traffic.
 
-**Markdown link targets are ONLY for files inside the repo under review.** Anything else — external repos, the operator's local-only files (`~/.claude/hooks/...`, `~/.config/...`), file paths in another git tree, etc. — should be cited as **plaintext** (backtick-wrapped or bare), NOT as a markdown link. Markdown links to paths that GitHub can't resolve render as broken links in the public-facing review file. For external repos, use the repo-identifier shape `` `claude-meter:src/log/schema.mjs` ``. For operator-local files, use `` `~/.claude/hooks/foo.sh:11` ``. Both are plaintext, both convey the reference, neither leaves a broken link in the public content.
+## Repo-Specific Labels
 
-```
-# Review: [component name]
+In addition to the global review-outcome labels (`reviewed-by-codex-agent`,
+`approved-by-codex-agent`, `changes-requested`), apply:
 
-Date: YYYY-MM-DD
-Reviewed: [file or plan name]
-Label applied: [reviewed-by-codex-agent | changes-requested]
-
-## What Is Correct
-[confirmed good decisions and implementations]
-
-## Blockers
-[issues that MUST be resolved before proceeding — if none, state "None"]
-
-## What Needs Attention
-[non-blocking issues, ordered by severity]
-
-## Bloat / Non-Functional
-[bloat findings meeting the actionability bar (advisory unless they cause a correctness problem); "None" if clean]
-
-## Size Baseline
-[one line per reviewed module: file — LOC — brief complexity note. A signal, not a finding.]
-
-## Recommendations
-[specific, actionable suggestions]
-
-## Bottom Line
-[one paragraph summary: ship it, revise, or rethink]
-```
-
-## Context You Need
-
-- The proxy replaces a Node.js `--import` preload interceptor killed by CC v2.1.113's Bun binary switch
-- `ANTHROPIC_BASE_URL` is the interception point — SDK contract, durable
-- 16 existing extensions (body → body' transforms) port unchanged
-- Detection/monitoring is the core value going forward, not just fixes
-- Design spec: https://github.com/cnighswonger/claude-code-cache-fix/issues/40
-- Existing preload code: `preload.mjs` in the main repo (~2800 lines, 162 tests)
-
-## What You Do NOT Do
-
-- Do not implement code — only review
-- Do not modify files outside `docs/code-reviews/`
-- Do not make assumptions about user intent — ask if unclear
-- Do not rubber-stamp — if something looks fine, say why it's fine
-- Do not apply labels owned by other agents
+- `schema-change` — Changes affect extension pipeline interface,
+  telemetry format, or config schema.
+- `needs-sim-validation` — Requires integration testing with live CC
+  traffic.
