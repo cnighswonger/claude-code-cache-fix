@@ -60,23 +60,25 @@ test("renderSystemdTemplate: omits empty optional Environment lines", async () =
   const tpl = await readFile(join(TEMPLATE_DIR, "cache-fix-proxy.service.template"), "utf-8");
   const out = renderSystemdTemplate(tpl, sampleVars);
   assert.ok(!out.includes("CACHE_FIX_PROXY_UPSTREAM"));
+  assert.ok(!out.includes("CACHE_FIX_PROXY_CA_FILE"));
+  assert.ok(!out.includes("CACHE_FIX_PROXY_REJECT_UNAUTHORIZED"));
   assert.ok(!out.includes("CACHE_FIX_DEBUG"));
   // No leftover empty placeholders
   assert.ok(!out.includes("{{"));
   assert.ok(!out.includes("}}"));
 });
 
-test("renderSystemdTemplate: includes UPSTREAM, DEBUG, CA_FILE and REJECT_UNAUTHORIZED when set", async () => {
+test("renderSystemdTemplate: includes UPSTREAM, CA_FILE, REJECT_UNAUTHORIZED and DEBUG when set", async () => {
   const tpl = await readFile(join(TEMPLATE_DIR, "cache-fix-proxy.service.template"), "utf-8");
   const out = renderSystemdTemplate(tpl, {
     ...sampleVars,
     upstream: "http://127.0.0.1:8080",
-    caFile: "/etc/ssl/ca.pem",
+    caFile: "/etc/ssl/ca \" file.pem", // with space and "
     rejectUnauthorized: "0",
     debug: "1",
   });
   assert.ok(out.includes("Environment=CACHE_FIX_PROXY_UPSTREAM=http://127.0.0.1:8080"));
-  assert.ok(out.includes("Environment=CACHE_FIX_PROXY_CA_FILE=/etc/ssl/ca.pem"));
+  assert.ok(out.includes("Environment=CACHE_FIX_PROXY_CA_FILE=\"/etc/ssl/ca \\\" file.pem\""));
   assert.ok(out.includes("Environment=CACHE_FIX_PROXY_REJECT_UNAUTHORIZED=0"));
   assert.ok(out.includes("Environment=CACHE_FIX_DEBUG=1"));
 });
@@ -105,7 +107,31 @@ test("renderLaunchdTemplate: substitutes core fields and renders valid plist", a
   assert.ok(!out.includes("{{"));
 });
 
-test("renderLaunchdTemplate: omits CACHE_FIX_PROXY_UPSTREAM/DEBUG when not set", async () => {
+test("renderLaunchdTemplate: includes UPSTREAM, CA_FILE, REJECT_UNAUTHORIZED and DEBUG when set", async () => {
+  const tpl = await readFile(
+    join(TEMPLATE_DIR, "com.cnighswonger.cache-fix-proxy.plist.template"),
+    "utf-8",
+  );
+  const out = renderLaunchdTemplate(tpl, {
+    ...sampleVars,
+    upstream: "http://127.0.0.1:8080",
+    caFile: "/etc/ssl/ca & < > ' \" file.pem", // with XLM spec symbols
+    rejectUnauthorized: "0",
+    debug: "1",
+    logDir: "/Users/test/Library/Logs",
+  });
+  assert.ok(out.includes("<string>com.cnighswonger.cache-fix-proxy</string>"));
+  assert.ok(out.includes("<string>/usr/local/bin/node</string>"));
+  assert.ok(out.includes("<string>/opt/cache-fix/proxy/server.mjs</string>"));
+  assert.ok(out.includes("<string>9801</string>"));
+  assert.ok(out.includes("<string>http://127.0.0.1:8080</string>"));
+  assert.ok(out.includes("<string>/etc/ssl/ca &amp; &lt; &gt; &apos; &quot; file.pem</string>"));
+  assert.ok(out.includes("<string>0</string>"));
+  assert.ok(out.includes("<string>/Users/test/Library/Logs/cache-fix-proxy.log</string>"));
+  assert.ok(!out.includes("{{"));
+});
+
+test("renderLaunchdTemplate: omits CACHE_FIX_PROXY_UPSTREAM/CA_FILE/REJECT_UNAUTHORIZED/DEBUG when not set", async () => {
   const tpl = await readFile(
     join(TEMPLATE_DIR, "com.cnighswonger.cache-fix-proxy.plist.template"),
     "utf-8",
@@ -115,6 +141,8 @@ test("renderLaunchdTemplate: omits CACHE_FIX_PROXY_UPSTREAM/DEBUG when not set",
     logDir: "/tmp/logs",
   });
   assert.ok(!out.includes("CACHE_FIX_PROXY_UPSTREAM"));
+  assert.ok(!out.includes("CACHE_FIX_PROXY_CA_FILE"));
+  assert.ok(!out.includes("CACHE_FIX_PROXY_REJECT_UNAUTHORIZED"));
   assert.ok(!out.includes("CACHE_FIX_DEBUG"));
 });
 

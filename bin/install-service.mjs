@@ -13,6 +13,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
 import { homedir, platform } from "node:os";
+import { systemdEscape, xmlEscape } from "../proxy/helpers.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const TEMPLATE_DIR = resolve(__dirname, "..", "templates");
@@ -95,16 +96,16 @@ function getPaths(plat = platform()) {
 
 function renderSystemdTemplate(template, vars) {
   const upstreamLine = vars.upstream
-    ? `Environment=CACHE_FIX_PROXY_UPSTREAM=${vars.upstream}`
+    ? `Environment=CACHE_FIX_PROXY_UPSTREAM=${systemdEscape(vars.upstream)}`
     : "";
   const caFileLine = vars.caFile
-    ? `Environment=CACHE_FIX_PROXY_CA_FILE=${vars.caFile}`
+    ? `Environment=CACHE_FIX_PROXY_CA_FILE=${systemdEscape(vars.caFile)}`
     : "";
   const rejectUnauthorizedLine = vars.rejectUnauthorized
-    ? `Environment=CACHE_FIX_PROXY_REJECT_UNAUTHORIZED=${vars.rejectUnauthorized}`
+    ? `Environment=CACHE_FIX_PROXY_REJECT_UNAUTHORIZED=${systemdEscape(vars.rejectUnauthorized)}`
     : "";
   const debugLine = vars.debug
-    ? `Environment=CACHE_FIX_DEBUG=${vars.debug}`
+    ? `Environment=CACHE_FIX_DEBUG=${systemdEscape(vars.debug)}`
     : "";
   const hotReloadLine = vars.hotReload
     ? `Environment=CACHE_FIX_HOT_RELOAD=${vars.hotReload}`
@@ -131,16 +132,16 @@ function renderSystemdTemplate(template, vars) {
 
 function renderLaunchdTemplate(template, vars) {
   const upstreamPlist = vars.upstream
-    ? `        <key>CACHE_FIX_PROXY_UPSTREAM</key>\n        <string>${vars.upstream}</string>`
+    ? `        <key>CACHE_FIX_PROXY_UPSTREAM</key>\n        <string>${xmlEscape(vars.upstream)}</string>`
     : "";
   const caFilePlist = vars.caFile
-    ? `        <key>CACHE_FIX_PROXY_CA_FILE</key>\n        <string>${vars.caFile}</string>`
+    ? `        <key>CACHE_FIX_PROXY_CA_FILE</key>\n        <string>${xmlEscape(vars.caFile)}</string>`
     : "";
   const rejectUnauthorizedPlist = vars.rejectUnauthorized
-    ? `        <key>CACHE_FIX_PROXY_REJECT_UNAUTHORIZED</key>\n        <string>${vars.rejectUnauthorized}</string>`
+    ? `        <key>CACHE_FIX_PROXY_REJECT_UNAUTHORIZED</key>\n        <string>${xmlEscape(vars.rejectUnauthorized)}</string>`
     : "";
   const debugPlist = vars.debug
-    ? `        <key>CACHE_FIX_DEBUG</key>\n        <string>${vars.debug}</string>`
+    ? `        <key>CACHE_FIX_DEBUG</key>\n        <string>${xmlEscape(vars.debug)}</string>`
     : "";
   const hotReloadPlist = vars.hotReload
     ? `        <key>CACHE_FIX_HOT_RELOAD</key>\n        <string>${vars.hotReload}</string>`
