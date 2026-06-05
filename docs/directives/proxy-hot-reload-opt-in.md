@@ -1,8 +1,8 @@
 # Directive: hot-reload opt-in (default off via envvar)
 
-**Status:** DRAFT — Proxy Builder, 2026-06-05. Pending Codex directive-stage review + AITL sign-off. Targets v3.10.0 alongside the `thinking-block-sanitize` default-on flip.
+**Status:** DRAFT — Proxy Builder, 2026-06-05. Round 2 after Codex directive-stage review (CHANGES_REQUESTED on commit `3015cc7`). Pending re-review + AITL sign-off. **Targets v4.0.0** as a major release, not v3.10.0 — per `docs/release-workflow.md`, default-behavior changes warrant a major bump. Bundles with the `thinking-block-sanitize` default-on flip (also a defaults change) into a single v4.0.0 "Behavior changes" release.
 
-**References:** [#196](https://github.com/cnighswonger/claude-code-cache-fix/issues/196) (tracking issue — silent v2 load failure on hot reload). [#197](https://github.com/cnighswonger/claude-code-cache-fix/pull/197) (observability layer — `/health` returns 503 + degraded when extensions fail to load; complements but does not fix this directive's class). Watcher source: `proxy/watcher.mjs`. Pipeline load path: `proxy/pipeline.mjs:8-53`. Startup wiring: `proxy/server.mjs:7,308,313,333`. Existing extension activation pattern (per memory `feedback_extension_activation_pattern`): `enabled:true` in config + runtime env-gate.
+**References:** [#196](https://github.com/cnighswonger/claude-code-cache-fix/issues/196) (tracking issue — silent v2 load failure on hot reload). [#197](https://github.com/cnighswonger/claude-code-cache-fix/pull/197) (observability layer — `/health` returns 503 + degraded when extensions fail to load; complements but does not fix this directive's class). [#199](https://github.com/cnighswonger/claude-code-cache-fix/issues/199) (i18n follow-up — `README.zh.md` and `README.ko.md` updates tagged to @VictorSun92 and @ArkNill). Watcher source: `proxy/watcher.mjs`. Pipeline load path: `proxy/pipeline.mjs:8-53`. Startup wiring: `proxy/server.mjs:7,308,313,333`. `install-service` renderers (in-scope for this directive — see "What changes" below): `bin/install-service.mjs:21,89`, `templates/cache-fix-proxy.service.template:11`, `templates/com.cnighswonger.cache-fix-proxy.plist.template:12`. Existing extension activation pattern (per memory `feedback_extension_activation_pattern`): `enabled:true` in config + runtime env-gate. Release-policy reference: `docs/release-workflow.md:11` (default-behavior changes → major bump).
 
 ## Goal
 
@@ -10,23 +10,29 @@ Make the in-process file watcher / hot-reload behavior **opt-in** behind a new e
 
 This is the root-cause fix for the #196 failure class. PR #197 adds observability so a load failure can't hide silently; this directive eliminates the conditions under which the class occurs at all on the safe default.
 
-## Actual impact scope (refined)
+## Actual impact scope (refined, round 2)
 
-The directive's earlier draft overstated the impact. In practice, the #196 race is reachable only for users whose upgrade flow **does NOT include a service restart**:
+Round-1 draft claimed "npm + restart bypasses the race" as a general statement. Codex's review correctly flagged this as too strong — distinguishing two separate sub-claims that don't both hold:
 
-- **npm-installed users following the documented upgrade flow** (`npm install -g cache-fix-proxy@new && sudo systemctl restart cache-fix-proxy`) are NOT affected by the race on upgrade. The restart gives the new process an empty ESM cache; the race needs a long-running process to fire.
-- **Affected populations:**
-  1. Users running the proxy from a local source checkout that they update via `git pull` without restarting (which is how our dogfood proxy hit #196 — PR #192's files appeared in the watched dir of a process that had been running since June 2).
-  2. Sysadmins who drop a custom extension into the extensions dir on a live proxy expecting the watcher to pick it up.
-  3. Anyone running `npm install` of a new version without then restarting — possible but contrary to the documented flow.
+- **Sub-claim A (true): a cold restart on the new version clears the stale ESM cache.** Once the operator runs `systemctl restart cache-fix-proxy`, the new process starts with an empty module cache and the race cannot fire on that boot.
+- **Sub-claim B (NOT demonstrated): the `npm install -g` step itself is immune to triggering hot-reload before the operator's manual restart.** The running proxy starts directly out of the installed package tree (per `README.md:17`); the default watched paths are that same tree's `proxy/extensions/` and `proxy/extensions.json` (per `proxy/config.mjs:18`); and `startProxy()` enables watching by default today. So `npm install -g` rewriting those files on a still-running proxy CAN trigger the watcher in the install window — before the operator's later restart — and that's exactly the failure mode of #196's class. The "npm flow bypasses the race" framing in round 1 was wrong.
 
-Even though the affected population is narrower than the directive originally implied, default-off still wins on three independent grounds:
+Separately, round 1 referenced a "documented upgrade flow with explicit restart step." That documentation **does not currently exist in the repo at HEAD** (verified — `README.md` does not contain an upgrade-flow restart instruction). Adding that documentation is in scope for this directive; treating it as already-present was incorrect.
+
+**Revised affected population:**
+
+1. Anyone running `npm install -g cache-fix-proxy@new` (or `git pull` against a local checkout) on a host where the cache-fix proxy is currently running, regardless of whether they later restart the service. The install/pull step alone is sufficient to trigger the watcher and the race.
+2. Sysadmins who drop a custom extension into the extensions dir on a live proxy expecting the watcher to pick it up.
+
+This is functionally close to "all current users on long-running processes who upgrade in place." Cold-restart-on-upgrade does not bypass the race; it only recovers after the install step has already fired the watcher.
+
+Default-off wins on the same three grounds as before, but now with a stronger urgency framing:
 
 - It eliminates a footgun rather than mitigating it. The observability layer in #197 catches the failure within seconds, but "catch fast" is strictly weaker than "cannot occur."
-- It removes an implicit assumption from the upgrade flow (npm + restart is documented, but the directive should not silently depend on every operator following it).
-- The cost of the change is trivial — one gate, one banner, one docs page — and the opt-in path preserves the feature for users who actually want it.
+- It closes the install-window race that the round-1 framing missed.
+- The cost of the change is small and the opt-in path preserves the feature for users who actually want it.
 
-So: scope of the *bug* is narrower than originally framed; scope of the *fix* (defaults change for everyone) is unchanged.
+So: scope of the *bug* is wider than the round-1 refinement suggested; scope of the *fix* (defaults change for everyone, plus install-service surface) covers it cleanly.
 
 ## Background — why this is the right shape
 
@@ -51,20 +57,37 @@ C aligns with the existing cache-fix convention for behavior gating: extensions 
    const watch = options.watch !== false && hotReloadOptIn;
    ```
 
-   Truthy values other than the literal string `"on"` (e.g. `"true"`, `"1"`, `"yes"`) are NOT accepted — consistent with the existing `CACHE_FIX_THINKING_SANITIZE` precedent (`thinking-block-sanitize.mjs` checks `=== "on"` specifically; matching that convention here avoids documenting two different "how to enable" rules in the README). `options.watch === false` still overrides regardless of envvar — embedded callers (tests, `startProxy` consumers) should keep their explicit control.
+   Truthy values other than the literal string `"on"` (e.g. `"true"`, `"1"`, `"yes"`) are NOT accepted — consistent with the existing `CACHE_FIX_THINKING_SANITIZE` precedent (`thinking-block-sanitize.mjs` checks `=== "on"` specifically; matching that convention here avoids documenting two different "how to enable" rules in the README). Codex's round-1 review explicitly recommended keeping strict `=== "on"` over a generic `truthy()` helper; that recommendation is adopted. `options.watch === false` still overrides regardless of envvar — embedded callers (tests, `startProxy` consumers) keep their explicit control.
 
-2. **Boot banner on stderr** unconditionally at startup:
+2. **Boot banner on stderr** unconditionally at startup, version-pin removed per Codex round-1 feedback (version framing belongs in CHANGELOG/README, not in long-lived service logs):
 
-   - When opt-in active: `[cache-fix] hot-reload: on (CACHE_FIX_HOT_RELOAD=on) — note: long-running processes can hit a Node ESM stale-import race (see #196). systemctl restart is the recovery path.`
-   - When default: `[cache-fix] hot-reload: off (default since v3.10.0; set CACHE_FIX_HOT_RELOAD=on to restore prior behavior). Extension changes require a service restart.`
+   - When opt-in active: `[cache-fix] hot-reload: on (CACHE_FIX_HOT_RELOAD=on) — long-running processes can hit a Node ESM stale-import race; see #196. systemctl restart is the recovery path.`
+   - When default: `[cache-fix] hot-reload: off (set CACHE_FIX_HOT_RELOAD=on to enable). Extension changes require a service restart.`
 
    One line each, no formatting, ends in a newline. Hard to miss in `journalctl -u cache-fix-proxy` without being noisy for monitoring tools that line-grep stderr.
 
-3. **README** — new "Behavior change in v3.10.0" callout at the top of the proxy section linking to a deeper note in the extensions docs explaining the race, the envvar, and the upgrade flow. README is the only user-visible surface most downstream users will actually read; the rest is belt-and-suspenders.
+3. **`install-service` surface — first-class envvar support.** Per Codex's round-1 review, since `install-service` is the documented recommended deployment path (per `README.md:50,82`), the new envvar must be surfaced through it. Without this, opt-in users on the recommended install path would have to hand-edit the generated systemd unit / launchd plist after every upgrade, which is a documentation footgun in its own right.
 
-4. **CHANGELOG** — lead bullet for v3.10.0: `Hot-reload is now opt-in (#196). Default behavior loads extensions once at startup; set CACHE_FIX_HOT_RELOAD=on to restore the prior watcher-based behavior. systemctl restart cache-fix-proxy is now required to pick up extension changes.`
+   Specific changes:
 
-5. **Upgrade runbook** (if one exists; otherwise a paragraph in the README upgrade section) — explicit "you must `systemctl restart cache-fix-proxy.service` after `npm install -g cache-fix-proxy@3.10.0`" note. The npm package itself doesn't carry a postinstall script that restarts the service (and shouldn't — postinstalls that touch system services are an anti-pattern in npm packaging), so this step must be in human-readable docs.
+   - **`bin/install-service.mjs`** — extend the renderer's accepted-envvar list to include `CACHE_FIX_HOT_RELOAD` alongside the existing `CACHE_FIX_PROXY_PORT` / `CACHE_FIX_PROXY_UPSTREAM` / `CACHE_FIX_DEBUG`. CLI flag: `--hot-reload` (boolean, defaults to off; presence emits the envvar binding in the unit/plist). When absent, the generated config does not set `CACHE_FIX_HOT_RELOAD` at all (preserves the safe default; the proxy code's strict `=== "on"` check treats unset and any other value identically).
+   - **`templates/cache-fix-proxy.service.template`** — add an `Environment=` slot for `CACHE_FIX_HOT_RELOAD` (rendered conditionally, omitted entirely when `--hot-reload` was not passed). Per the systemd directives memory, the existing `Environment=` precedent in this template already covers the rendering shape — no new escaping concerns specific to this envvar.
+   - **`templates/com.cnighswonger.cache-fix-proxy.plist.template`** — add a `<key>CACHE_FIX_HOT_RELOAD</key><string>on</string>` slot under `EnvironmentVariables`, rendered conditionally. Same escaping precedent as the rest of the plist.
+   - **Install-service `--help` text** — document `--hot-reload` with a one-line description plus the #196 / #199 cross-reference for context.
+
+4. **README** — new "Upgrading from v3.x" section (NOT a callout at the top of the proxy section — Codex round-1 recommended this scales better as future behavior changes accumulate). The section covers:
+
+   - The hot-reload defaults change with the new envvar
+   - The `thinking-block-sanitize` default-on flip (bundled into v4.0.0)
+   - **The explicit upgrade flow that does NOT yet exist in the repo:** `npm install -g cache-fix-proxy@4 && sudo systemctl restart cache-fix-proxy` (or `launchctl unload/load` on macOS). Adding this documentation is itself in scope for the implementation PR.
+   - A note pointing `install-service` users at `cache-fix-proxy install-service --hot-reload` if they want to restore prior behavior at the supervisor layer.
+
+5. **CHANGELOG** — `## v4.0.0 — Behavior changes`:
+   - `thinking-block-sanitize` now on by default (see #63147, #171)
+   - Hot-reload now off by default. Set `CACHE_FIX_HOT_RELOAD=on` (or pass `--hot-reload` to `install-service`) to restore prior behavior. (See #196.)
+   - Note: `systemctl restart cache-fix-proxy` is now required after `npm install -g` to pick up extension changes.
+
+6. **i18n READMEs** — `README.zh.md` and `README.ko.md` updates tracked separately in [#199](https://github.com/cnighswonger/claude-code-cache-fix/issues/199), tagged to @VictorSun92 (zh) and @ArkNill (ko). Not in scope for this directive's implementation PR; will land as separate translation contributions after the English `README.md` change is in `main`.
 
 ### What stays the same
 
@@ -82,35 +105,54 @@ C aligns with the existing cache-fix convention for behavior gating: extensions 
 
 ## Non-Functional Requirements
 
-- **Size/complexity budget.** ~10 LOC in `proxy/server.mjs` (gate + banner). ~30–50 LOC of README/CHANGELOG/runbook prose. ~20 LOC of test plumbing covering both the default-off and opt-in-on branches. Total touched LOC budget: ≤ 100, ≤ 4 files (`proxy/server.mjs`, `README.md`, `CHANGELOG.md`, one new test or additions to `test/proxy-server.test.mjs`).
-- **Threat model.** Envvar is a behavior switch, not a privilege boundary. No new attack surface — the watcher already existed; this change reduces the surface available to a default-installed proxy. No secret material crosses any new boundary. No request/response body is touched.
-- **Maintainability constraints.** No new abstractions. The gate is two lines at one call site, in the existing convention. No back-compat shim needed for embedded callers because `options.watch === false` already exists for that use case. No new files apart from possibly the test file. The legacy hot-reload path is preserved (not deprecated) so we are not committing to a future removal.
+- **Size/complexity budget (revised round 2).** Round-1 budget understated install-service work and direct `startWatcher` test coverage gap (both Codex round-1 findings). Revised:
+  - `proxy/server.mjs` — ~15 LOC (gate + dual-mode banner)
+  - `bin/install-service.mjs` — ~30 LOC (CLI flag, accepted-envvar list, help text)
+  - `templates/cache-fix-proxy.service.template` + `templates/com.cnighswonger.cache-fix-proxy.plist.template` — ~5 LOC each (conditional envvar slot)
+  - `README.md` — new "Upgrading from v3.x" section, ~40 LOC of prose
+  - `CHANGELOG.md` — `v4.0.0` "Behavior changes" entry, ~10 LOC
+  - Tests — ~60 LOC covering: default-off (no watcher), opt-in-on (watcher starts), `options.watch === false` overrides envvar, non-`"on"` envvar values treated as off, install-service rendering with and without `--hot-reload`, boot banner stderr capture, and a fresh direct `startWatcher` smoke test (currently no direct coverage per Codex round-1 finding). Probably 1–2 new test cases in `test/proxy-server.test.mjs` and additions to `test/install-service.test.mjs`.
+
+  Total touched LOC budget: ≤ 200, ≤ 8 files. Materially larger than round-1's ≤ 100 / ≤ 4 because the install-service expansion adds real surface. Still small enough that the change reviews cleanly as one PR.
+
+- **Threat model.** Envvar is a behavior switch, not a privilege boundary. No new attack surface — the watcher already existed; this change reduces the surface available to a default-installed proxy. No secret material crosses any new boundary. No request/response body is touched. The new `Environment=` slot in the systemd unit and the new `EnvironmentVariables` entry in the launchd plist follow the existing escape/quote precedent in their respective templates; no new injection surface.
+- **Maintainability constraints.** No new abstractions. The gate is two lines at one call site in the existing convention. No back-compat shim for embedded callers (`options.watch === false` already covers them). The install-service changes are mechanical additions to existing renderer lists — no new architecture. The legacy hot-reload path is preserved (not deprecated) so we are not committing to a future removal.
 - **Performance/reliability.** Default-off eliminates the only known code path that produces a silent-failure mode in long-running proxies. No perf delta on the request path (the watcher only ran on file events anyway). Boot banner is one stderr write; negligible.
 - **Load-bearing? Yes.** This changes default behavior of the proxy on upgrade for every downstream user — a wire-adjacent contract by the spirit of "anything security-relevant or behavior-affecting at the system boundary." Requires Chris's human review before merge in addition to Lead + Codex per the AGENTS.md load-bearing rule.
 
-## Test plan
+## Test plan (revised round 2)
 
 - **Default off (no envvar).** `startProxy()` does not start a watcher. File mutations in the extensions dir do NOT trigger `loadExtensions`. Verify by writing a new `.mjs` into the test extensions dir after startup, waiting past the debounce window, and asserting the registry is unchanged.
-- **Opt-in on (`CACHE_FIX_HOT_RELOAD=on`).** Watcher starts, file mutations trigger reload, behavior matches the legacy pre-3.10.0 path. (This case may already be covered by existing watcher tests — re-use rather than duplicate.)
-- **Explicit `options.watch: false` still wins.** Even with `CACHE_FIX_HOT_RELOAD=on` set, `startProxy({ watch: false })` must NOT start a watcher. This is the embedded-caller escape hatch.
+- **Opt-in on (`CACHE_FIX_HOT_RELOAD=on`).** Watcher starts, file mutations trigger reload, behavior matches the legacy pre-v4.0.0 path. Codex round-1 noted no direct `startWatcher` coverage exists today (existing server/embeddable/bootstrap suites all force `watch: false`) — so this case adds genuinely new coverage, not duplication.
+- **Explicit `options.watch: false` still wins.** Even with `CACHE_FIX_HOT_RELOAD=on` set, `startProxy({ watch: false })` must NOT start a watcher. The embedded-caller escape hatch.
 - **Envvar non-`"on"` values are treated as off.** `"true"`, `"1"`, `"yes"`, `""` → watcher does not start. Codifies the `=== "on"` strictness.
-- **Boot banner content.** stderr capture asserts the off-banner and on-banner strings are emitted at the right time.
-- **Existing 985-test suite.** Must remain green. Existing tests that pass `watch: false` explicitly are unaffected.
+- **Boot banner content.** stderr capture asserts the off-banner and on-banner strings are emitted at the right time, and neither pins a version.
+- **install-service `--hot-reload` rendering.** Both the systemd unit template and the launchd plist template emit the `CACHE_FIX_HOT_RELOAD=on` envvar slot when `--hot-reload` is passed; omit it entirely when absent. Existing `test/install-service.test.mjs` patterns already cover the analogous `--port` / `--upstream` / `--debug` rendering — new cases follow the same shape.
+- **Existing 986-test suite.** Must remain green. Existing tests that pass `watch: false` explicitly are unaffected.
 
 ## Release coordination
 
-Bundles into **v3.10.0** alongside the `thinking-block-sanitize` default-on flip (per the 7-day dogfood draft at `~/drafts/63147-7day-dogfood-post-draft.md`). Both are "behavioral defaults adjustment" changes; combining them into one CHANGELOG entry under a single "Behavior changes" header is clearer for users reading the release notes than splitting across two minors.
+**Bundles into v4.0.0** (major release) alongside the `thinking-block-sanitize` default-on flip (per the 7-day dogfood draft at `~/drafts/63147-7day-dogfood-post-draft.md`). Both are default-behavior changes; per `docs/release-workflow.md:11` default-behavior changes warrant a major bump, so v4.0.0 — not v3.10.0 — is the right vehicle. Combining them into one CHANGELOG entry under a single "Behavior changes" header is clearer for users reading the release notes than splitting across separate releases.
 
-- v3.10.0 CHANGELOG lead section will be **Behavior changes**:
+- v4.0.0 CHANGELOG lead section will be **Behavior changes**:
   1. `thinking-block-sanitize` is now **on by default** (was opt-in; see #63147 and #171).
-  2. **Hot-reload** is now **off by default** (was on; see #196). Set `CACHE_FIX_HOT_RELOAD=on` to restore.
+  2. **Hot-reload** is now **off by default** (was on; see #196). Set `CACHE_FIX_HOT_RELOAD=on` (or pass `--hot-reload` to `install-service`) to restore prior behavior.
+  3. `systemctl restart cache-fix-proxy` is now required after `npm install -g cache-fix-proxy@4` to pick up extension changes.
 
-- v3.10.0 README upgrade note must call out both defaults flips and the `systemctl restart` requirement.
+- v4.0.0 README upgrade section must call out all three points and the `install-service --hot-reload` flag.
 
-## Open questions for review
+## Round-1 review disposition
 
-1. **Envvar truthiness convention.** Directive specifies strict `=== "on"` matching the `CACHE_FIX_THINKING_SANITIZE` precedent. Codex / AITL: agree, or do you want to broaden to a `truthy(value)` helper (`"on" | "true" | "1" | "yes"`) for friendlier UX, accepting a one-time convention divergence?
-2. **Boot banner verbosity.** The off-banner currently says "default since v3.10.0; set CACHE_FIX_HOT_RELOAD=on to restore prior behavior." That version pin will rot. Acceptable rot (it's a release-notes pointer, not a contract), or strip the version and just say "default since v3.10.0" elsewhere?
-3. **README placement of the behavior-change callout.** Top of the proxy section, or a dedicated "Upgrading from v3.9.x" section? Both work; the latter scales better as future minor releases accumulate behavior changes.
+Codex's round-1 review flagged three blockers and several "needs attention" items. Disposition:
+
+- **Blocker 1 (semver mismatch — minor vs major release).** Accepted. Retargeted to v4.0.0.
+- **Blocker 2 (npm + restart bypass overstated).** Accepted. "Actual impact scope (refined, round 2)" rewritten to distinguish sub-claim A (true: cold restart clears stale cache) from sub-claim B (NOT demonstrated: install step itself is immune). Affected population widened accordingly. Documentation of the upgrade flow is now explicitly in scope.
+- **Blocker 3 (install-service opt-in path underspecified).** Accepted. Scope expanded: `bin/install-service.mjs` adds `--hot-reload` flag, both templates get conditional envvar slots, install-service tests get new coverage. LOC budget revised upward.
+- **Needs attention (i18n READMEs).** Accepted but out of scope for this directive's implementation PR. Tracking issue #199 opened, tagged to @VictorSun92 (zh) and @ArkNill (ko).
+- **Needs attention (no direct startWatcher test coverage).** Accepted. Test budget revised; test plan explicitly calls out the new direct startWatcher case.
+- **Needs attention (boot banner version pin).** Accepted. Version pin removed from the default-mode banner; version framing lives in CHANGELOG/README only.
+- **Open question 1 (`=== "on"` vs `truthy()` helper).** Codex recommended strict `=== "on"`. Adopted.
+- **Open question 2 (banner version pin).** Codex recommended strip version, keep in CHANGELOG. Adopted.
+- **Open question 3 (README placement).** Codex recommended dedicated "Upgrading from v3.x" section over top-of-proxy callout. Adopted.
 
 — Proxy Builder
