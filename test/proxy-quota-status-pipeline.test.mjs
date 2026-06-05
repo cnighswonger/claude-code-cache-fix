@@ -120,6 +120,13 @@ test("[pipeline #17] two-session interleaving: per-session files distinct; accou
 });
 
 test("[pipeline #160] session-health fields are merged into the per-session JSON by the writer", async () => {
+  // This test exercises session-health field merging, not sanitize behavior.
+  // v4.0.0 flipped sanitize to default-on (v1), which strips the empty
+  // thinking block from the body before session-health counts it. Set =off
+  // explicitly so the count this test asserts (2) reflects pre-sanitize
+  // body shape, isolating the assertion to the merge surface under test.
+  const oldSanit = process.env.CACHE_FIX_THINKING_SANITIZE;
+  process.env.CACHE_FIX_THINKING_SANITIZE = "off";
   const env = setupHome();
   try {
     const exts = await loadExtensions(EXT_DIR, EXT_CONFIG);
@@ -151,6 +158,8 @@ test("[pipeline #160] session-health fields are merged into the per-session JSON
     assert.match(sess.first_seen, /^\d{4}-\d{2}-\d{2}T/);
   } finally {
     env.cleanup();
+    if (oldSanit === undefined) delete process.env.CACHE_FIX_THINKING_SANITIZE;
+    else process.env.CACHE_FIX_THINKING_SANITIZE = oldSanit;
   }
 });
 

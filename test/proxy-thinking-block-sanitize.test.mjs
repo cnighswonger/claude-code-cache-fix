@@ -127,7 +127,7 @@ test("planSanitize: deterministic — same input twice yields identical output",
   assert.deepEqual(planSanitize(mk()), planSanitize(mk()));
 });
 
-// --- onRequest (opt-in gating) ---
+// --- onRequest gating (v4.0.0: v1 default-on) ---
 
 function withSanitize(value, fn) {
   const old = process.env.CACHE_FIX_THINKING_SANITIZE;
@@ -141,19 +141,38 @@ function withSanitize(value, fn) {
   }
 }
 
-test("onRequest: default (opt-in off) is a no-op — body unchanged, no telemetry", async () => {
+test("onRequest (v4.0.0): default (envvar unset) runs v1 — body mutated, telemetry emitted", async () => {
   await withSanitize(undefined, async () => {
+    const ctx = {
+      body: {
+        messages: [
+          { role: "assistant", content: [omitted(), text("a1")] },
+          { role: "user", content: [text("q")] },
+          { role: "assistant", content: [omitted(), text("a2")] },
+        ],
+      },
+      meta: {},
+    };
+    await ext.onRequest(ctx);
+    assert.deepEqual(ctx.body.messages[0].content, [text("a1")], "v1 strips omitted on default-on");
+    assert.deepEqual(ctx.body.messages[2].content, [text("a2")]);
+    assert.deepEqual(ctx.meta._thinkingSanitize, { thinking_blocks_dropped: 2 });
+  });
+});
+
+test("onRequest (v4.0.0): explicit =off is a no-op — body unchanged, no telemetry", async () => {
+  await withSanitize("off", async () => {
     const ctx = {
       body: { messages: [{ role: "assistant", content: [omitted(), text("a")] }] },
       meta: {},
     };
     await ext.onRequest(ctx);
-    assert.deepEqual(ctx.body.messages[0].content, [omitted(), text("a")], "body untouched when off");
+    assert.deepEqual(ctx.body.messages[0].content, [omitted(), text("a")], "body untouched when explicitly off");
     assert.equal(ctx.meta._thinkingSanitize, undefined, "no telemetry when off");
   });
 });
 
-test("onRequest: opt-in on mutates the body and emits the drop count", async () => {
+test("onRequest: explicit =on matches the default (back-compat)", async () => {
   await withSanitize("on", async () => {
     const ctx = {
       body: {
@@ -208,14 +227,19 @@ const sid = (id) => ({ "x-claude-code-session-id": id });
 
 // --- modeFromEnv ---
 
-test("modeFromEnv: off / on / v2 / unknown", () => {
-  assert.equal(modeFromEnv({ CACHE_FIX_THINKING_SANITIZE: undefined }), "off");
-  assert.equal(modeFromEnv({}), "off");
+// v4.0.0: v1 default-on flip. Unset/unknown → "on" (was "off"). Only the
+// literal "off" is an explicit disable; "v2" stays as before.
+test("modeFromEnv (v4.0.0 default-on): defaults to on; off is explicit; v2 unchanged", () => {
+  assert.equal(modeFromEnv({ CACHE_FIX_THINKING_SANITIZE: undefined }), "on");
+  assert.equal(modeFromEnv({}), "on");
   assert.equal(modeFromEnv({ CACHE_FIX_THINKING_SANITIZE: "off" }), "off");
   assert.equal(modeFromEnv({ CACHE_FIX_THINKING_SANITIZE: "on" }), "on");
   assert.equal(modeFromEnv({ CACHE_FIX_THINKING_SANITIZE: "v2" }), "v2");
-  assert.equal(modeFromEnv({ CACHE_FIX_THINKING_SANITIZE: "v3" }), "off");
-  assert.equal(modeFromEnv({ CACHE_FIX_THINKING_SANITIZE: "true" }), "off");
+  // Unknown values fall through to "on" (the default), not to "off".
+  // We treat "off" as the sole explicit disable; everything else is on-path.
+  assert.equal(modeFromEnv({ CACHE_FIX_THINKING_SANITIZE: "v3" }), "on");
+  assert.equal(modeFromEnv({ CACHE_FIX_THINKING_SANITIZE: "true" }), "on");
+  assert.equal(modeFromEnv({ CACHE_FIX_THINKING_SANITIZE: "" }), "on");
 });
 
 // --- isSignedThinkingForV2 ---

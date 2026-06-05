@@ -41,7 +41,7 @@ On every `/v1/messages` request, 9 extensions run in order (one opt-in):
 | `cache-control-normalize` | Normalizes cache_control markers across messages |
 | `cache-telemetry` | Extracts cache stats from response headers → `~/.claude/quota-status/{account.json,sessions/<id>.json}` |
 | `session-health` | Observes per-session thinking-desync risk (context size + thinking-block count) and warns before a session reaches the danger zone. Read-only |
-| `thinking-block-sanitize` | Drops omitted (empty-text) thinking blocks to head off the CC thinking-desync `400` (#63147). **Opt-in** (`CACHE_FIX_THINKING_SANITIZE=on`) |
+| `thinking-block-sanitize` | Drops omitted (empty-text) thinking blocks to head off the CC thinking-desync `400` (#63147). **On by default as of v4.0.0** (v1 mode). Set `CACHE_FIX_THINKING_SANITIZE=off` to disable, `=v2` for additional tools-hash-mismatch drop (opt-in). |
 
 Extensions live as `.mjs` files in `proxy/extensions/` with configuration in `proxy/extensions.json`. As of v4.0.0 the proxy loads them once at startup; adding, removing, or modifying an extension requires a supervisor-level proxy restart (see [Upgrading from v3.x](#upgrading-from-v3x)). Hot-reload is available as opt-in via `CACHE_FIX_HOT_RELOAD=on` for users who want the v3.x behavior back; that path is subject to the Node ESM stale-import race documented in [#196](https://github.com/cnighswonger/claude-code-cache-fix/issues/196).
 
@@ -213,9 +213,10 @@ Options (all optional; all fall back to the same env vars used by the CLI):
 
 ## Upgrading from v3.x
 
-**Behavior change in v4.0.0:**
+**Behavior changes in v4.0.0:**
 
-**In-process extension hot-reload is now off by default.** Was on in v3.x. Set `CACHE_FIX_HOT_RELOAD=on` to restore the prior behavior. Off-by-default eliminates the Node ESM stale-import race documented in [#196](https://github.com/cnighswonger/claude-code-cache-fix/issues/196), where the watcher silently failed to load a newly-merged extension for 17 hours after a hot-reload trigger. The race fires when the file watcher re-imports an extension whose transitive dependencies are already cached by Node's loader; cold starts are unaffected.
+- **`thinking-block-sanitize` v1 is now on by default.** Was opt-in via `CACHE_FIX_THINKING_SANITIZE=on` in v3.8.0–v3.9.x. After seven days of prod dogfood across 37 sessions (zero `cannot be modified` 400s, cache hit-rate aggregate 94.66% vs. 92.44% baseline, sanitize firing on ~35% of sessions with ~800 blocks dropped per day) the v1 mitigation is the new default. Set `CACHE_FIX_THINKING_SANITIZE=off` to explicitly disable. v2 (additional tools-hash-mismatch drop) stays opt-in via `=v2`. See [#63147](https://github.com/anthropics/claude-code/issues/63147) and [#162](https://github.com/cnighswonger/claude-code-cache-fix/issues/162).
+- **In-process extension hot-reload is now off by default.** Was on in v3.x. Set `CACHE_FIX_HOT_RELOAD=on` to restore the prior behavior. Off-by-default eliminates the Node ESM stale-import race documented in [#196](https://github.com/cnighswonger/claude-code-cache-fix/issues/196), where the watcher silently failed to load a newly-merged extension for 17 hours after a hot-reload trigger. The race fires when the file watcher re-imports an extension whose transitive dependencies are already cached by Node's loader; cold starts are unaffected.
 
 Picking up a new extension or a code change to an existing one in v4.0.0 requires a supervisor-level proxy restart. There are two upgrade flows depending on whether you also want to opt back into hot-reload.
 
@@ -823,17 +824,17 @@ Token thresholds are anchored to the observed ~382K-token trip with margin; the 
 | `CACHE_FIX_THINKING_RISK_HIGH_TOKENS` | `340000` | Context-token level at which risk becomes `high` and the one-time stderr warn fires. |
 | `CACHE_FIX_THINKING_RISK` | unset (on) | Set to `off` to suppress the warning signal (stderr line + `thinking_desync_risk` field). Raw count telemetry keeps recording. |
 
-## Thinking-block sanitize (proxy mode, opt-in, thinking-desync mitigation)
+## Thinking-block sanitize (proxy mode, on by default, thinking-desync mitigation)
 
 The *mitigate* half of the thinking-desync response (the *warn-before* half is session-health above). On history-replay paths (resume / `--continue` / auto-compaction / parallel-tool-cancel), Claude Code re-sends prior assistant turns' extended thinking in the **omitted** shape `{ "type":"thinking", "thinking":"", "signature":"<intact>" }`. The API rejects modified thinking in the **latest** assistant message with a permanent `400 … thinking … blocks cannot be modified`, which wedges the session on every subsequent turn (upstream root cause: [anthropics/claude-code#63147](https://github.com/anthropics/claude-code/issues/63147)).
 
 The `thinking-block-sanitize` extension drops those omitted blocks — which the API treats as optional history — from the request before it is forwarded. Empirically-resolved turn-selection rule: drop omitted thinking from **all prior assistant turns and the latest assistant turn, unless the latest turn is an active tool-continuation** (its last block is a `tool_use` answered by a following `tool_result`). In that one case the API requires the signed thinking intact and the proxy cannot restore the emptied text, so it leaves the turn untouched. **No env var both preserves thinking and avoids the wedge for that case:** `CLAUDE_CODE_DISABLE_THINKING=1` / `MAX_THINKING_TOKENS=0` stop the wedge only by disabling thinking entirely (lossy — no reasoning), and `DISABLE_INTERLEAVED_THINKING=1` does *not* stop the `400` — so there the answer is don't-resume + heal/retire the session. That is exactly why the proxy mitigation matters: **it is the only path that preserves reasoning while avoiding the wedge** for the history-replay paths it covers. Non-empty thinking is never touched; `redacted_thinking` is out of scope for v1.
 
-**Opt-in.** v1 ships behind `CACHE_FIX_THINKING_SANITIZE=on` (default off): it mutates request bodies and full live-coverage validation is pending. The transform is deterministic and cache-prefix-stable, and emits a per-request `thinking_blocks_dropped` count into the per-session JSON (counts only — never content) that complements the session-health signal.
+**On by default as of v4.0.0.** v1 was opt-in via `CACHE_FIX_THINKING_SANITIZE=on` in v3.8.0–v3.9.x. After seven days of prod dogfood across 37 sessions (zero `cannot be modified` 400s, cache hit-rate aggregate 94.66% vs. 92.44% baseline, sanitize firing on ~35% of sessions with ~800 blocks dropped per day, max 938K context healthy) the v1 mitigation is the new default. The transform is deterministic and cache-prefix-stable, and emits a per-request `thinking_blocks_dropped` count into the per-session JSON (counts only — never content) that complements the session-health signal. v2 stays opt-in pending its own prod-dogfood window after [#196](https://github.com/cnighswonger/claude-code-cache-fix/issues/196) closes the silent-load failure mode that prevented v2 from running in prior testing.
 
 | Env var | Default | Purpose |
 |---------|---------|---------|
-| `CACHE_FIX_THINKING_SANITIZE` | unset (off) | Set to `on` to enable the request-path drop of omitted thinking blocks. Off = no-op (no mutation, no telemetry). |
+| `CACHE_FIX_THINKING_SANITIZE` | unset (= v1) | v4.0.0+: v1 omitted-block drop is the default. Set to `off` to explicitly disable (returns to v3.x default-off behavior). Set to `v2` to additionally enable the v2 tools-hash-mismatch drop. Set to `on` for v1 (back-compat — same as unset). |
 
 ## System prompt rewrite (preload mode, optional)
 

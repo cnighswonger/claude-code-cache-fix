@@ -45,12 +45,21 @@
 //     v2 no-ops entirely. The shared sessions/unknown.json would cross-
 //     contaminate baselines across unrelated agents otherwise.
 //
-// Modes via CACHE_FIX_THINKING_SANITIZE:
-//   "off" (or unset, or any other value) — extension no-ops (default)
-//   "on"                                  — v1 only (omitted-text drop)
+// Modes via CACHE_FIX_THINKING_SANITIZE (as of v4.0.0 — v1 default-on flip):
+//   unset (or "on")                       — v1 only (omitted-text drop). DEFAULT.
+//   "off"                                 — extension no-ops (explicit disable)
 //   "v2"                                  — v1 + v2 (omitted-text drop AND
 //                                           tools-hash-mismatch drop). v2 is
-//                                           strict superset of "on".
+//                                           strict superset of v1.
+//   any other value                       — treated as v1 (the default), not off.
+//                                           Matches the precedent of being
+//                                           permissive about the on-path.
+//
+// v1 default-on rationale: 7-day prod dogfood across 37 sessions (2026-05-29
+// → 2026-06-05) on `=on`: zero `cannot be modified` 400s, cache hit-rate
+// aggregate 94.66% vs 92.44% baseline (no prefix degradation), sanitize fired
+// on ~35% of sessions, ~800 blocks dropped per day, max 938K context healthy.
+// v2 stays opt-in via `=v2` because the dogfood only ran v1.
 //
 // Order 550: after the request-body mutators (ttl-management 500) and before
 // session-health (590), so #160's thinking_block_count reflects the forwarded
@@ -183,11 +192,18 @@ export function planSanitize(messages, { v2StripSigned = false } = {}) {
 
 // --- v2 mode + state ---
 
-// "off" | "on" | "v2". Unknown values → "off" (fail-open, no extension activity).
+// "off" | "on" | "v2". As of v4.0.0 the default flipped from "off" to "on" —
+// v1 (omitted-text drop) is the new default behavior. Set
+// CACHE_FIX_THINKING_SANITIZE=off to explicitly disable; =v2 to additionally
+// enable the v2 tools-hash-mismatch drop (still opt-in pending its own
+// prod-dogfood window after #200 closes the silent-load failure mode).
+// Unknown values fall through to "on" — we are permissive about the on-path
+// and only treat the literal "off" as a disable.
 export function modeFromEnv(env = process.env) {
   const v = env.CACHE_FIX_THINKING_SANITIZE;
-  if (v === "on" || v === "v2") return v;
-  return "off";
+  if (v === "off") return "off";
+  if (v === "v2") return "v2";
+  return "on";
 }
 
 // Per-session state, in memory. Keyed by canonical session filename
@@ -218,7 +234,7 @@ export function _resetV2State() {
 export default {
   name: "thinking-block-sanitize",
   description:
-    "Drop omitted (empty-text) thinking blocks from prior assistant turns and the latest non-continuation turn, to head off the CC thinking-desync 400 (#63147). v1 mode: omitted-text drop only. v2 mode: also drop signed thinking + redacted_thinking on cross-request tools-hash mismatch (ToolSearch surface). Opt-in via CACHE_FIX_THINKING_SANITIZE=on (v1) or =v2 (v1+v2).",
+    "Drop omitted (empty-text) thinking blocks from prior assistant turns and the latest non-continuation turn, to head off the CC thinking-desync 400 (#63147). v1 mode: omitted-text drop only. v2 mode: also drop signed thinking + redacted_thinking on cross-request tools-hash mismatch (ToolSearch surface). v1 is now ON by default as of v4.0.0; set CACHE_FIX_THINKING_SANITIZE=off to disable, =v2 to additionally opt into v2.",
   order: 550,
 
   async onRequest(ctx) {

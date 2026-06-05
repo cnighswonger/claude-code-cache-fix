@@ -4,6 +4,7 @@
 
 ### Behavior changes
 
+- **`thinking-block-sanitize` v1 is now on by default (#162, #63147).** Was opt-in via `CACHE_FIX_THINKING_SANITIZE=on` in v3.8.0–v3.9.x. Seven days of prod dogfood (2026-05-29 → 2026-06-05) across 37 sessions: zero `cannot be modified` 400s, cache hit-rate aggregate 94.66% vs. 92.44% baseline (no prefix degradation), sanitize fired on ~35% of sessions with ~800 blocks dropped per day, max 938K context healthy. Set `CACHE_FIX_THINKING_SANITIZE=off` to explicitly disable. v2 (additional tools-hash-mismatch drop) stays opt-in via `=v2` pending its own prod-dogfood window after #196 closes the silent-load failure mode.
 - **In-process extension hot-reload is now off by default (#196, #198).** Was on in v3.x. Set `CACHE_FIX_HOT_RELOAD=on` in the proxy's runtime environment (or in the install-service environment if using `cache-fix-proxy install-service`) to restore the prior behavior. Off-by-default eliminates the Node ESM stale-import race that silently broke `thinking-block-sanitize v2` for 17 hours after PR #192's merge — the watcher re-imports an extension whose transitive dependencies are already cached by Node's loader, and Node cannot evict cached transitive modules in-process. Cold starts are unaffected.
 - **A supervisor-level proxy restart is now required after `npm install -g cache-fix-proxy@4`** to pick up extension changes. See [Upgrading from v3.x](README.md#upgrading-from-v3x) for per-platform restart commands.
 
