@@ -210,6 +210,19 @@ describe("hot-reload opt-in (#196)", () => {
               captured.some((s) => s.includes("hot-reload: off")),
               `expected off-mode banner for envvar=${JSON.stringify(v)}`,
             );
+            // Banner is observable; also assert the watcher actually didn't
+            // start by dropping a file and confirming the registry is stable.
+            const initial = getRegistry().length;
+            await writeFile(
+              join(dir, "strict-gate.mjs"),
+              `export default { name: "strict-gate", order: 1000, onRequest(ctx) {} };`,
+            );
+            await new Promise((r) => setTimeout(r, 250));
+            assert.equal(
+              getRegistry().length,
+              initial,
+              `envvar=${JSON.stringify(v)} must NOT trigger reload (gate is === "on")`,
+            );
           } finally {
             await handle.close();
           }
@@ -217,6 +230,31 @@ describe("hot-reload opt-in (#196)", () => {
       });
     });
   }
+
+  it("banner is keyed off effective watch state — options.watch:false + envvar=on reports off", async () => {
+    await withHotReloadEnv("on", async (captured) => {
+      await withExtDir(async ({ dir, cfg }) => {
+        const handle = await startProxy({
+          port: 0,
+          watch: false,
+          extensionsDir: dir,
+          extensionsConfig: cfg,
+        });
+        try {
+          assert.ok(
+            captured.some((s) => s.includes("hot-reload: off")),
+            "banner must reflect effective watcher state, not raw envvar",
+          );
+          assert.ok(
+            !captured.some((s) => s.includes("hot-reload: on")),
+            "banner must not say 'on' when the watcher is suppressed",
+          );
+        } finally {
+          await handle.close();
+        }
+      });
+    });
+  });
 
   // Direct startWatcher smoke test — codifies that the watcher itself still
   // works the same way it always did. Per Codex round-1 review, no direct

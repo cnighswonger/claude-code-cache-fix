@@ -298,11 +298,14 @@ export async function startProxy(options = {}) {
   const hotReloadOptIn = process.env.CACHE_FIX_HOT_RELOAD === "on";
   const watch = options.watch !== false && hotReloadOptIn;
 
-  // Boot banner on stderr so the active hot-reload mode is visible in the
+  // Boot banner on stderr so the EFFECTIVE hot-reload mode is visible in the
   // supervisor's log (journalctl --user / ~/Library/Logs/) without being
-  // noisy for monitoring tools that line-grep stderr. Supervisor-neutral
-  // wording — no version pin (lives in CHANGELOG/README instead).
-  if (hotReloadOptIn) {
+  // noisy for monitoring tools that line-grep stderr. Keyed off the effective
+  // `watch` value, not the raw envvar, so an embedder calling startProxy({
+  // watch: false }) with the envvar set sees "off" (which is the truth — the
+  // watcher is suppressed regardless of envvar in that case). Supervisor-
+  // neutral wording — no version pin (lives in CHANGELOG/README instead).
+  if (watch) {
     process.stderr.write(
       "[cache-fix] hot-reload: on (CACHE_FIX_HOT_RELOAD=on) — long-running processes can hit a Node ESM stale-import race; see #196. Restart the proxy via your supervisor to recover.\n",
     );

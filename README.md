@@ -12,7 +12,7 @@ Cache optimization proxy for [Claude Code](https://github.com/anthropics/claude-
 
 ## Quick Start: Proxy (recommended)
 
-The proxy works with any CC version — Node.js or Bun binary. It sits between Claude Code and the Anthropic API, applying cache fixes as hot-reloadable extensions.
+The proxy works with any CC version — Node.js or Bun binary. It sits between Claude Code and the Anthropic API, applying cache fixes as composable extensions.
 
 ```bash
 # Install
@@ -43,7 +43,7 @@ On every `/v1/messages` request, 9 extensions run in order (one opt-in):
 | `session-health` | Observes per-session thinking-desync risk (context size + thinking-block count) and warns before a session reaches the danger zone. Read-only |
 | `thinking-block-sanitize` | Drops omitted (empty-text) thinking blocks to head off the CC thinking-desync `400` (#63147). **Opt-in** (`CACHE_FIX_THINKING_SANITIZE=on`) |
 
-Extensions are hot-reloadable — add, remove, or modify `.mjs` files in `proxy/extensions/` and changes apply to the next request without restarting. Configuration in `proxy/extensions.json`.
+Extensions live as `.mjs` files in `proxy/extensions/` with configuration in `proxy/extensions.json`. As of v4.0.0 the proxy loads them once at startup; adding, removing, or modifying an extension requires a supervisor-level proxy restart (see [Upgrading from v3.x](#upgrading-from-v3x)). Hot-reload is available as opt-in via `CACHE_FIX_HOT_RELOAD=on` for users who want the v3.x behavior back; that path is subject to the Node ESM stale-import race documented in [#196](https://github.com/cnighswonger/claude-code-cache-fix/issues/196).
 
 **Developing a new extension?** See [docs/parallel-proxy-test-harness.md](docs/parallel-proxy-test-harness.md) for the pattern we use to test extensions end-to-end against real `claude -p` traffic without disturbing the production proxy.
 
@@ -213,12 +213,9 @@ Options (all optional; all fall back to the same env vars used by the CLI):
 
 ## Upgrading from v3.x
 
-v4.0.0 changes two long-standing defaults. Both flips are deliberate — see the linked issues for the rationale.
+**Behavior change in v4.0.0:**
 
-**Behavior changes in v4.0.0:**
-
-- **`thinking-block-sanitize` is now on by default.** Was opt-in via `CACHE_FIX_THINKING_SANITIZE=on` in v3.8.0–v3.9.x. After seven days of dogfood traffic across 37 sessions (zero `cannot be modified` 400s, cache hit-rate aggregate 94.66% vs. 92.44% baseline, sanitize firing on ~35% of sessions with ~800 blocks dropped per day) the mitigation is now safe to default on. See [#63147](https://github.com/anthropics/claude-code/issues/63147) and [#171](https://github.com/cnighswonger/claude-code-cache-fix/issues/171).
-- **In-process extension hot-reload is now off by default.** Was on in v3.x. Set `CACHE_FIX_HOT_RELOAD=on` to restore the prior behavior. Off-by-default eliminates the Node ESM stale-import race documented in [#196](https://github.com/cnighswonger/claude-code-cache-fix/issues/196), where the watcher silently failed to load a newly-merged extension for 17 hours after a hot-reload trigger. The race fires when the file watcher re-imports an extension whose transitive dependencies are already cached by Node's loader; cold starts are unaffected.
+**In-process extension hot-reload is now off by default.** Was on in v3.x. Set `CACHE_FIX_HOT_RELOAD=on` to restore the prior behavior. Off-by-default eliminates the Node ESM stale-import race documented in [#196](https://github.com/cnighswonger/claude-code-cache-fix/issues/196), where the watcher silently failed to load a newly-merged extension for 17 hours after a hot-reload trigger. The race fires when the file watcher re-imports an extension whose transitive dependencies are already cached by Node's loader; cold starts are unaffected.
 
 Picking up a new extension or a code change to an existing one in v4.0.0 requires a supervisor-level proxy restart. There are two upgrade flows depending on whether you also want to opt back into hot-reload.
 
@@ -414,7 +411,7 @@ Additionally, images read via the Read tool persist as base64 in conversation hi
 
 ## How it works
 
-**Proxy mode** (v3.0.0+): An HTTP server on `localhost:9801` intercepts `POST /v1/messages` requests. Seven extension modules process each request through a pipeline — normalizing block order, stripping fingerprints, stabilizing tool sort, managing TTL markers. Extensions are hot-reloadable `.mjs` files configured in `proxy/extensions.json`. All other traffic passes through untouched.
+**Proxy mode** (v3.0.0+): An HTTP server on `localhost:9801` intercepts `POST /v1/messages` requests. Seven extension modules process each request through a pipeline — normalizing block order, stripping fingerprints, stabilizing tool sort, managing TTL markers. Extensions live as `.mjs` files configured in `proxy/extensions.json` and load once at proxy startup (hot-reload is opt-in as of v4.0.0 — see [Upgrading from v3.x](#upgrading-from-v3x)). All other traffic passes through untouched.
 
 **Preload mode** (v2.x): A Node.js `--import` module that patches `globalThis.fetch` before Claude Code makes API calls. Applies the same fixes inline — scans user messages for relocated blocks, sorts tools, recomputes fingerprints, injects TTL markers.
 

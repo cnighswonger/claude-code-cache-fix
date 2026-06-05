@@ -189,6 +189,7 @@ async function installSystemd({ paths, defaults, force = false } = {}) {
     port: defaults.port,
     upstream: defaults.upstream,
     debug: defaults.debug,
+    hotReload: defaults.hotReload,
     workingDir: defaults.workingDir,
     requires: "",
   });
@@ -288,6 +289,7 @@ async function installLaunchd({ paths, defaults, force = false } = {}) {
     port: defaults.port,
     upstream: defaults.upstream,
     debug: defaults.debug,
+    hotReload: defaults.hotReload,
     workingDir: defaults.workingDir,
     logDir: paths.logDir,
   });

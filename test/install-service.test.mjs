@@ -282,6 +282,111 @@ test("installSystemd: writes file to configDir; uninstall removes it", async () 
   }
 });
 
+// #196 / #198 end-to-end: installSystemd / installLaunchd must thread the
+// hotReload field through to the on-disk unit / plist. Earlier rounds of
+// this change tested only the renderer helpers and missed this path.
+
+test("installSystemd: hotReload from defaults reaches the written file", async () => {
+  const dir = await newTmp();
+  try {
+    const paths = {
+      kind: "systemd",
+      configDir: dir,
+      configFile: "cache-fix-proxy.service",
+      healthcheckServiceFile: "cache-fix-proxy-healthcheck.service",
+      healthcheckTimerFile: "cache-fix-proxy-healthcheck.timer",
+    };
+    const r = await installSystemd({
+      paths,
+      defaults: { port: "9801", upstream: "", debug: "", hotReload: "on", workingDir: "/tmp" },
+    });
+    assert.ok(r.ok);
+    const onDisk = await readFile(join(dir, "cache-fix-proxy.service"), "utf-8");
+    assert.ok(
+      onDisk.includes("Environment=CACHE_FIX_HOT_RELOAD=on"),
+      "installSystemd must write the CACHE_FIX_HOT_RELOAD=on Environment= line when defaults.hotReload is 'on'",
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("installSystemd: hotReload empty/unset omits the line from the written file", async () => {
+  const dir = await newTmp();
+  try {
+    const paths = {
+      kind: "systemd",
+      configDir: dir,
+      configFile: "cache-fix-proxy.service",
+      healthcheckServiceFile: "cache-fix-proxy-healthcheck.service",
+      healthcheckTimerFile: "cache-fix-proxy-healthcheck.timer",
+    };
+    const r = await installSystemd({
+      paths,
+      defaults: { port: "9801", upstream: "", debug: "", hotReload: "", workingDir: "/tmp" },
+    });
+    assert.ok(r.ok);
+    const onDisk = await readFile(join(dir, "cache-fix-proxy.service"), "utf-8");
+    assert.ok(
+      !onDisk.includes("CACHE_FIX_HOT_RELOAD"),
+      "installSystemd must NOT write a CACHE_FIX_HOT_RELOAD line when defaults.hotReload is empty",
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("installLaunchd: hotReload from defaults reaches the written plist", async () => {
+  const dir = await newTmp();
+  try {
+    const paths = {
+      kind: "launchd",
+      configDir: dir,
+      configFile: "com.cnighswonger.cache-fix-proxy.plist",
+      label: "com.cnighswonger.cache-fix-proxy",
+      logDir: "/tmp/logs",
+    };
+    const r = await installLaunchd({
+      paths,
+      defaults: { port: "9801", upstream: "", debug: "", hotReload: "on", workingDir: "/tmp" },
+    });
+    assert.ok(r.ok);
+    const onDisk = await readFile(join(dir, "com.cnighswonger.cache-fix-proxy.plist"), "utf-8");
+    assert.ok(
+      onDisk.includes("<key>CACHE_FIX_HOT_RELOAD</key>"),
+      "installLaunchd must write the CACHE_FIX_HOT_RELOAD key into the plist when defaults.hotReload is 'on'",
+    );
+    assert.ok(onDisk.includes("<string>on</string>"));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("installLaunchd: hotReload empty/unset omits the key from the written plist", async () => {
+  const dir = await newTmp();
+  try {
+    const paths = {
+      kind: "launchd",
+      configDir: dir,
+      configFile: "com.cnighswonger.cache-fix-proxy.plist",
+      label: "com.cnighswonger.cache-fix-proxy",
+      logDir: "/tmp/logs",
+    };
+    const r = await installLaunchd({
+      paths,
+      defaults: { port: "9801", upstream: "", debug: "", hotReload: "", workingDir: "/tmp" },
+    });
+    assert.ok(r.ok);
+    const onDisk = await readFile(join(dir, "com.cnighswonger.cache-fix-proxy.plist"), "utf-8");
+    assert.ok(
+      !onDisk.includes("CACHE_FIX_HOT_RELOAD"),
+      "installLaunchd must NOT write a CACHE_FIX_HOT_RELOAD key when defaults.hotReload is empty",
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("installSystemd: refuses overwrite without force", async () => {
   const dir = await newTmp();
   try {
