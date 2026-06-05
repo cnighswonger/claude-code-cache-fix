@@ -8,7 +8,25 @@
 
 Make the in-process file watcher / hot-reload behavior **opt-in** behind a new envvar `CACHE_FIX_HOT_RELOAD`. Default (unset or any value other than `on`) → watcher does not start; extensions load once at proxy boot and remain stable for the life of the process. Picking up a new extension or a code change to an existing one then requires `systemctl restart cache-fix-proxy.service` (or whatever supervisor is in use).
 
-This is the root-cause fix for #196 for the vast majority of users. PR #197 adds observability so a load failure can't hide for 17 hours; this directive removes the conditions under which that class of failure occurs at all for everyone on the safe default.
+This is the root-cause fix for the #196 failure class. PR #197 adds observability so a load failure can't hide silently; this directive eliminates the conditions under which the class occurs at all on the safe default.
+
+## Actual impact scope (refined)
+
+The directive's earlier draft overstated the impact. In practice, the #196 race is reachable only for users whose upgrade flow **does NOT include a service restart**:
+
+- **npm-installed users following the documented upgrade flow** (`npm install -g cache-fix-proxy@new && sudo systemctl restart cache-fix-proxy`) are NOT affected by the race on upgrade. The restart gives the new process an empty ESM cache; the race needs a long-running process to fire.
+- **Affected populations:**
+  1. Users running the proxy from a local source checkout that they update via `git pull` without restarting (which is how our dogfood proxy hit #196 — PR #192's files appeared in the watched dir of a process that had been running since June 2).
+  2. Sysadmins who drop a custom extension into the extensions dir on a live proxy expecting the watcher to pick it up.
+  3. Anyone running `npm install` of a new version without then restarting — possible but contrary to the documented flow.
+
+Even though the affected population is narrower than the directive originally implied, default-off still wins on three independent grounds:
+
+- It eliminates a footgun rather than mitigating it. The observability layer in #197 catches the failure within seconds, but "catch fast" is strictly weaker than "cannot occur."
+- It removes an implicit assumption from the upgrade flow (npm + restart is documented, but the directive should not silently depend on every operator following it).
+- The cost of the change is trivial — one gate, one banner, one docs page — and the opt-in path preserves the feature for users who actually want it.
+
+So: scope of the *bug* is narrower than originally framed; scope of the *fix* (defaults change for everyone) is unchanged.
 
 ## Background — why this is the right shape
 
