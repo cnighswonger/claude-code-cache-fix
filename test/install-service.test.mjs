@@ -38,6 +38,8 @@ const sampleVars = {
   serverPath: "/opt/cache-fix/proxy/server.mjs",
   port: "9801",
   upstream: "",
+  caFile: "",
+  rejectUnauthorized: "",
   debug: "",
   workingDir: "/opt/cache-fix",
   requires: "",
@@ -64,14 +66,18 @@ test("renderSystemdTemplate: omits empty optional Environment lines", async () =
   assert.ok(!out.includes("}}"));
 });
 
-test("renderSystemdTemplate: includes UPSTREAM and DEBUG when set", async () => {
+test("renderSystemdTemplate: includes UPSTREAM, DEBUG, CA_FILE and REJECT_UNAUTHORIZED when set", async () => {
   const tpl = await readFile(join(TEMPLATE_DIR, "cache-fix-proxy.service.template"), "utf-8");
   const out = renderSystemdTemplate(tpl, {
     ...sampleVars,
     upstream: "http://127.0.0.1:8080",
+    caFile: "/etc/ssl/ca.pem",
+    rejectUnauthorized: "0",
     debug: "1",
   });
   assert.ok(out.includes("Environment=CACHE_FIX_PROXY_UPSTREAM=http://127.0.0.1:8080"));
+  assert.ok(out.includes("Environment=CACHE_FIX_PROXY_CA_FILE=/etc/ssl/ca.pem"));
+  assert.ok(out.includes("Environment=CACHE_FIX_PROXY_REJECT_UNAUTHORIZED=0"));
   assert.ok(out.includes("Environment=CACHE_FIX_DEBUG=1"));
 });
 
@@ -268,10 +274,12 @@ test("installSystemd: writes file to configDir; uninstall removes it", async () 
       healthcheckServiceFile: "cache-fix-proxy-healthcheck.service",
       healthcheckTimerFile: "cache-fix-proxy-healthcheck.timer",
     };
-    const r1 = await installSystemd({ paths, defaults: { port: "9999", upstream: "", debug: "", workingDir: "/tmp" } });
+    const r1 = await installSystemd({ paths, defaults: { port: "9999", upstream: "", caFile: "/etc/ssl/ca.pem", rejectUnauthorized: "0", debug: "", workingDir: "/tmp" } });
     assert.ok(r1.ok);
     const onDisk = await readFile(join(dir, "cache-fix-proxy.service"), "utf-8");
     assert.ok(onDisk.includes("CACHE_FIX_PROXY_PORT=9999"));
+    assert.ok(onDisk.includes("CACHE_FIX_PROXY_CA_FILE=/etc/ssl/ca.pem"));
+    assert.ok(onDisk.includes("CACHE_FIX_PROXY_REJECT_UNAUTHORIZED=0"));
 
     const r2 = await uninstallSystemd({ paths });
     assert.ok(r2.ok);
