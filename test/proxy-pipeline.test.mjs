@@ -163,4 +163,80 @@ describe("extension pipeline", () => {
       assert.ok(!getRegistry().find((e) => e.name === "injected"));
     });
   });
+
+  // Regression coverage for #196: when an extension fails to import (e.g.,
+  // because of a Node ESM cache stale-import race against a transitive
+  // dependency), it must surface via getFailedExtensions() so that operator-
+  // facing observability (/health) can report the degraded state. The prior
+  // behavior was to silently stderr-log and proceed; #192's v2 extension
+  // was broken in production for 17 hours through exactly this silence.
+  describe("getFailedExtensions (#196)", () => {
+    it("returns empty array when all extensions load successfully", async () => {
+      const goodExt = `export default { name: "good", order: 100, onRequest(ctx) {} };`;
+      await writeFile(join(testDir, "good-ext.mjs"), goodExt);
+      await writeFile(configPath, JSON.stringify({}));
+
+      const { loadExtensions, getFailedExtensions } = await freshImport();
+      await loadExtensions(testDir, configPath);
+
+      assert.deepEqual(getFailedExtensions(), []);
+
+      await rm(join(testDir, "good-ext.mjs"));
+    });
+
+    it("records an extension whose import throws (broken syntax)", async () => {
+      const brokenExt = `import { nonexistent } from "./nonexistent-helper.mjs"; export default { name: "broken" };`;
+      await writeFile(join(testDir, "broken-ext.mjs"), brokenExt);
+      await writeFile(configPath, JSON.stringify({}));
+
+      const { loadExtensions, getFailedExtensions } = await freshImport();
+      await loadExtensions(testDir, configPath);
+
+      const failed = getFailedExtensions();
+      assert.equal(failed.length, 1);
+      assert.equal(failed[0].file, "broken-ext.mjs");
+      assert.ok(failed[0].error.length > 0);
+      assert.match(failed[0].lastAttempt, /^\d{4}-\d{2}-\d{2}T/); // ISO timestamp
+
+      await rm(join(testDir, "broken-ext.mjs"));
+    });
+
+    it("clears failed entries on a subsequent successful reload", async () => {
+      // First load: broken extension
+      const brokenExt = `throw new Error("intentional load failure for test");`;
+      await writeFile(join(testDir, "fix-me.mjs"), brokenExt);
+      await writeFile(configPath, JSON.stringify({}));
+
+      const { loadExtensions, getFailedExtensions } = await freshImport();
+      await loadExtensions(testDir, configPath);
+      assert.equal(getFailedExtensions().length, 1);
+
+      // Reload after fixing the extension on disk
+      const fixedExt = `export default { name: "fixed", order: 100, onRequest(ctx) {} };`;
+      await writeFile(join(testDir, "fix-me.mjs"), fixedExt);
+      await loadExtensions(testDir, configPath);
+      assert.equal(getFailedExtensions().length, 0);
+
+      await rm(join(testDir, "fix-me.mjs"));
+    });
+
+    it("returns independent copy so callers cannot mutate internal state", async () => {
+      const brokenExt = `throw new Error("test failure");`;
+      await writeFile(join(testDir, "test-mutation.mjs"), brokenExt);
+      await writeFile(configPath, JSON.stringify({}));
+
+      const { loadExtensions, getFailedExtensions } = await freshImport();
+      await loadExtensions(testDir, configPath);
+
+      const failed = getFailedExtensions();
+      failed[0].error = "tampered";
+      failed.push({ file: "injected", error: "x", lastAttempt: "y" });
+
+      const stillTrueState = getFailedExtensions();
+      assert.equal(stillTrueState.length, 1);
+      assert.ok(stillTrueState[0].error !== "tampered");
+
+      await rm(join(testDir, "test-mutation.mjs"));
+    });
+  });
 });

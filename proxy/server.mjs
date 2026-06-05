@@ -3,7 +3,7 @@ import { pathToFileURL, URL } from "node:url";
 import config from "./config.mjs";
 import { forwardRequest } from "./upstream.mjs";
 import { streamResponse, createTelemetryRecord } from "./stream.mjs";
-import { loadExtensions, snapshotRegistry, runOnRequest, runOnResponseStart, runOnResponse } from "./pipeline.mjs";
+import { loadExtensions, snapshotRegistry, runOnRequest, runOnResponseStart, runOnResponse, getFailedExtensions } from "./pipeline.mjs";
 import { startWatcher } from "./watcher.mjs";
 
 function collectBody(req) {
@@ -238,6 +238,21 @@ async function handleBootstrap(clientReq, clientRes) {
 }
 
 function handleHealth(_req, res) {
+  // Surface extension-load failures so callers (operators, monitoring) see
+  // a degraded proxy state instead of a misleading "ok". See #196: a Node
+  // ESM cache stale-import race silently broke thinking-block-sanitize v2
+  // for 17 hours post-merge before anyone noticed. /health returning "ok"
+  // through that window was load-bearing in the silence.
+  const failed = getFailedExtensions();
+  if (failed.length > 0) {
+    res.writeHead(503, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      status: "degraded",
+      failed_extensions: failed,
+      hint: "restart cache-fix-proxy.service to recover (in-process reload cannot fix stale ESM cache; #196)",
+    }));
+    return;
+  }
   res.writeHead(200, { "content-type": "application/json" });
   res.end(JSON.stringify({ status: "ok" }));
 }

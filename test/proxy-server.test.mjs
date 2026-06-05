@@ -279,3 +279,57 @@ describe("hot-reload opt-in (#196)", () => {
     });
   });
 });
+
+// Regression coverage for #196: when extensions fail to load, /health must
+// surface the degraded state so monitoring can page instead of the proxy
+// silently running with a broken extension graph for 17 hours.
+describe("proxy server /health degraded (#196)", () => {
+  const extDir = join(tmpdir(), `server-health-degraded-${Date.now()}`);
+  const extConfig = join(extDir, "extensions.json");
+  let degradedHandle;
+  let degradedPort;
+
+  before(async () => {
+    await mkdir(extDir, { recursive: true });
+    await writeFile(extConfig, JSON.stringify({}));
+    await writeFile(
+      join(extDir, "broken.mjs"),
+      `throw new Error("simulated load failure for #196 test");`
+    );
+    degradedHandle = await startProxy({
+      port: 0,
+      watch: false,
+      extensionsDir: extDir,
+      extensionsConfig: extConfig,
+    });
+    degradedPort = degradedHandle.port;
+  });
+
+  after(async () => {
+    await degradedHandle.close();
+    await rm(extDir, { recursive: true, force: true });
+  });
+
+  it("GET /health returns 503 + degraded when an extension failed to load", async () => {
+    const res = await new Promise((resolve, reject) => {
+      const req = http.request(
+        { hostname: "127.0.0.1", port: degradedPort, method: "GET", path: "/health" },
+        (r) => {
+          const chunks = [];
+          r.on("data", (c) => chunks.push(c));
+          r.on("end", () => resolve({ status: r.statusCode, body: Buffer.concat(chunks).toString() }));
+        }
+      );
+      req.on("error", reject);
+      req.end();
+    });
+
+    assert.equal(res.status, 503);
+    const parsed = JSON.parse(res.body);
+    assert.equal(parsed.status, "degraded");
+    assert.equal(parsed.failed_extensions.length, 1);
+    assert.equal(parsed.failed_extensions[0].file, "broken.mjs");
+    assert.match(parsed.hint, /restart cache-fix-proxy/);
+    assert.match(parsed.hint, /#196/);
+  });
+});

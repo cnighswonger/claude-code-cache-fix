@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 let registry = [];
+let failedExtensions = []; // [{ file, error, lastAttempt }]
 
 export async function loadExtensions(dir, configPath) {
   let config = {};
@@ -15,6 +16,7 @@ export async function loadExtensions(dir, configPath) {
   const mjsFiles = files.filter((f) => f.endsWith(".mjs")).sort();
 
   const extensions = [];
+  const newlyFailed = [];
   for (const file of mjsFiles) {
     try {
       const mod = await import(pathToFileURL(join(dir, file)).href + "?t=" + Date.now());
@@ -29,12 +31,24 @@ export async function loadExtensions(dir, configPath) {
         extensions.push({ ...ext, order, _file: file });
       }
     } catch (err) {
-      process.stderr.write(`[pipeline] failed to load ${file}: ${err.message}\n`);
+      // Load-bearing observability: this branch is the only signal that the
+      // proxy is running with a degraded extension graph. See #196: a Node
+      // ESM cache stale-import race silently broke thinking-block-sanitize
+      // v2 for 17 hours post-merge before AITL grepped the journal. The
+      // [CRITICAL] prefix is harder to miss than the prior [pipeline] one,
+      // and the explicit "restart proxy to recover" hint tells the operator
+      // what to do — the underlying Node ESM cache problem can't be fixed
+      // in-process (you can't evict cached transitive imports), so a full
+      // process restart is the only path to recover the extension graph.
+      const msg = `[CRITICAL] extension load failed: ${file}: ${err.message} — restart cache-fix-proxy.service to recover (in-process reload cannot fix stale ESM cache)\n`;
+      process.stderr.write(msg);
+      newlyFailed.push({ file, error: String(err.message || err), lastAttempt: new Date().toISOString() });
     }
   }
 
   extensions.sort((a, b) => a.order - b.order);
   registry = extensions;
+  failedExtensions = newlyFailed;
   return extensions;
 }
 
@@ -44,6 +58,13 @@ export function getRegistry() {
 
 export function snapshotRegistry() {
   return [...registry];
+}
+
+// Exposed for /health and any operator-facing tool that wants to surface
+// extension-load failures. Returns a fresh array per call so callers can't
+// mutate internal state.
+export function getFailedExtensions() {
+  return failedExtensions.map((f) => ({ ...f }));
 }
 
 // Route scoping: extensions default to messages-only so that adding a new
