@@ -112,7 +112,7 @@ Annotated tags only (`-a`), not lightweight tags. The tag message can mirror the
 npm publish
 ```
 
-The npm token lives at `~/.claude/.npm/.npmrc` for the `vsitsllc` org (see `~/.claude/memory/shared/reference_npm_token.md` for current expiry — token rotates roughly every 90 days). If publish fails on auth, the token may have expired; ask Chris to rotate before retrying.
+The npm token lives at `~/.npmrc` for the `vsitsllc` org (the default npm config path). The memory note `~/.claude/memory/shared/reference_npm_token.md` is the source of truth for current expiry and rotation history (token rotates roughly every 90 days). If publish fails on auth, the token may have expired; ask Chris to rotate before retrying.
 
 Verify the publish landed:
 
