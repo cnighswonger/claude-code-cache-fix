@@ -236,7 +236,7 @@ Your existing systemd unit / launchd plist is unchanged; only the proxy code on 
 **Linux (systemd user unit):**
 
 ```
-npm install -g cache-fix-proxy@4
+npm install -g claude-code-cache-fix@4
 systemctl --user restart cache-fix-proxy
 ```
 
@@ -245,7 +245,7 @@ No `daemon-reload` required — the unit file content is unchanged.
 **macOS (launchd user agent):**
 
 ```
-npm install -g cache-fix-proxy@4
+npm install -g claude-code-cache-fix@4
 launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 ```
 
