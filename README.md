@@ -218,6 +218,15 @@ Options (all optional; all fall back to the same env vars used by the CLI):
 - **`thinking-block-sanitize` v1 is now on by default.** Was opt-in via `CACHE_FIX_THINKING_SANITIZE=on` in v3.8.0–v3.9.x. After seven days of prod dogfood across 37 sessions (zero `cannot be modified` 400s, cache hit-rate aggregate 94.66% vs. 92.44% baseline, sanitize firing on ~35% of sessions with ~800 blocks dropped per day) the v1 mitigation is the new default. Set `CACHE_FIX_THINKING_SANITIZE=off` to explicitly disable. v2 (additional tools-hash-mismatch drop) stays opt-in via `=v2`. See [#63147](https://github.com/anthropics/claude-code/issues/63147) and [#162](https://github.com/cnighswonger/claude-code-cache-fix/issues/162).
 - **In-process extension hot-reload is now off by default.** Was on in v3.x. Set `CACHE_FIX_HOT_RELOAD=on` to restore the prior behavior. Off-by-default eliminates the Node ESM stale-import race documented in [#196](https://github.com/cnighswonger/claude-code-cache-fix/issues/196), where the watcher silently failed to load a newly-merged extension for 17 hours after a hot-reload trigger. The race fires when the file watcher re-imports an extension whose transitive dependencies are already cached by Node's loader; cold starts are unaffected.
 
+### Embedder note (Bun hosts, DAP-style integrations using `createProxyServer()` / `startProxy()`)
+
+v4.0.0 flips `CACHE_FIX_THINKING_SANITIZE` from default-off to default-on. The v1 omitted-text drop will run on every request body passing through the embedded proxy. If your host depends on the prior no-sanitization behavior (e.g., your downstream code expects empty `thinking` blocks to survive the proxy round-trip), preserve it by either:
+
+- Setting `CACHE_FIX_THINKING_SANITIZE=off` in your host's environment, OR
+- Setting `process.env.CACHE_FIX_THINKING_SANITIZE = "off"` in your code at any point before request handling — the mode is read per-request via `modeFromEnv()`, not cached at module load.
+
+The flip is backed by 7 days of prod dogfood (37 sessions, zero `cannot be modified` 400s, cache hit-rate aggregate 94.66% vs 92.44% baseline). See [PR #201](https://github.com/cnighswonger/claude-code-cache-fix/pull/201) for the validation data and [#63147](https://github.com/anthropics/claude-code/issues/63147) for upstream context.
+
 Picking up a new extension or a code change to an existing one in v4.0.0 requires a supervisor-level proxy restart. There are two upgrade flows depending on whether you also want to opt back into hot-reload.
 
 ### Flow 1 — code-only npm upgrade (recommended default)
@@ -886,6 +895,7 @@ We monitor 30+ upstream Claude Code issues related to cache, quota, and context 
 - **[@deafsquad](https://github.com/deafsquad)** — Universal smoosh_split un-smoosh fix (PR #26), source-level function attribution of resume scatter bug (anthropics/claude-code#43657), OTEL telemetry discovery, proposed and built proxy architecture for v3.0.0
 - **[@vmfarms](https://github.com/vmfarms)** — Concurrent multi-runner production validation, surfaced proxy-mode resume-marker regex no-op (#96), TTL tier detection gap (#97), and image-strip stderr leak (#98)
 - **[@ojura](https://github.com/ojura)** — Opus 4.7 thinking-summaries root-cause analysis: filed [anthropics/claude-code#59844](https://github.com/anthropics/claude-code/issues/59844) with the CLI-binary decode (`!getIsNonInteractiveSession()` gate at offset 230510599 in v2.1.142) and the two-stacked-special-cases framing, which made the `thinking-display` extension (v3.6.1) a clean proxy-side complement to the proposed upstream fix
+- **[@yurukusa](https://github.com/yurukusa)** — [Cluster taxonomy](https://yurukusa.github.io/cc-safe-setup/cluster-tracker.html#cluster-extended-thinking-wedge) for [anthropics/claude-code#63147](https://github.com/anthropics/claude-code/issues/63147) thinking-desync wedge; the 13E (ToolSearch) sub-pattern synthesis that made the `thinking-block-sanitize` v2 directive predicate tractable (cache-fix #171, shipped behind `=v2` opt-in in v4.0.0)
 - **[@schuay](https://github.com/schuay)** — `quota-statusline.sh` enhancements: 10-cell quota bar with elapsed-time tick and exhaust-vs-reset projection replacing the prior `%/min` burn-rate display (PR #140, v3.6.2), and d/h vs h/m time-format autoselect plus named time-unit and burn-warmup constants (PR #143, v3.7.0)
 
 If you contributed to the community effort on these issues and aren't listed here, please open an issue or PR — we want to credit everyone properly.
