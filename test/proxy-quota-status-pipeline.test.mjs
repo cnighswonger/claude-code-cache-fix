@@ -188,7 +188,7 @@ test("[pipeline #160] degraded path: no quota headers → no per-session write, 
   }
 });
 
-test("[pipeline #162] thinking-block-sanitize drop count merges into the per-session JSON (opt-in)", async () => {
+test("[pipeline #162] thinking-block-sanitize drop count merges into the per-session JSON", async () => {
   const env = setupHome();
   const old = process.env.CACHE_FIX_THINKING_SANITIZE;
   process.env.CACHE_FIX_THINKING_SANITIZE = "on";

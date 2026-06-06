@@ -308,8 +308,12 @@ export async function startProxy(options = {}) {
   // Hot-reload is opt-in as of v4.0.0 (#196). The in-process watcher is the
   // only code path that triggers the Node ESM stale-import race; cold starts
   // have an empty module cache and load extensions cleanly. Strict `=== "on"`
-  // matches the existing CACHE_FIX_THINKING_SANITIZE precedent — any other
-  // value (including "true"/"1"/"yes") is treated as off.
+  // means any other value (including "true"/"1"/"yes") is treated as off —
+  // the safe default. Note this is the opposite stance from
+  // CACHE_FIX_THINKING_SANITIZE (default-on; only literal "off" disables):
+  // a hot-reload enable is a footgun, so we require the operator to type the
+  // exact opt-in token; a sanitize disable is also a footgun (loses the
+  // wedge mitigation), so we require the exact disable token there.
   const hotReloadOptIn = process.env.CACHE_FIX_HOT_RELOAD === "on";
   const watch = options.watch !== false && hotReloadOptIn;
 

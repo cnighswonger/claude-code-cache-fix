@@ -29,7 +29,7 @@ That's it. The proxy applies all 7 cache-fix extensions automatically. No wrappe
 
 ### What the proxy does
 
-On every `/v1/messages` request, 9 extensions run in order (one opt-in):
+On every `/v1/messages` request, 9 extensions run in order:
 
 | Extension | What it fixes |
 |-----------|--------------|
