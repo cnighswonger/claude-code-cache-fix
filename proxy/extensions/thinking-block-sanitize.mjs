@@ -1,7 +1,7 @@
 // thinking-block-sanitize — request-path mitigation for the CC thinking-desync
 // wedge (anthropics/claude-code#63147).
 //
-// v1 (CACHE_FIX_THINKING_SANITIZE=on): On replay paths (resume / --continue /
+// v1 (default since v4.0.0; CACHE_FIX_THINKING_SANITIZE unset or =on): On replay paths (resume / --continue /
 // auto-compaction / parallel-tool-cancel), CC re-sends prior assistant turns'
 // thinking in the OMITTED shape `{ type:"thinking", thinking:"", signature }`.
 // The API rejects modified thinking in the *latest* assistant message with a

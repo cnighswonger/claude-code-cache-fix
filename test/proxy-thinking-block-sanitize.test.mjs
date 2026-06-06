@@ -191,7 +191,7 @@ test("onRequest: explicit =on matches the default (back-compat)", async () => {
   });
 });
 
-test("onRequest: opt-in on with nothing to drop emits a zero count and leaves the body intact", async () => {
+test("onRequest: =on with nothing to drop emits a zero count and leaves the body intact", async () => {
   await withSanitize("on", async () => {
     const ctx = {
       body: { messages: [{ role: "assistant", content: [realThinking(), text("a")] }] },
