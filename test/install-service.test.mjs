@@ -90,6 +90,40 @@ test("renderSystemdTemplate: requires line wires both Requires and After", async
   assert.ok(out.includes("After=llm-relay.service"));
 });
 
+// PR #189 regression — bare % triggers systemd specifier expansion and
+// silently drops the variable. Verified 2026-06-07 against `systemctl --user`:
+// the unit line `Environment=X=a%%20b` delivers `a%20b` to the spawned
+// process, while `Environment=X=a%20b` (unescaped) delivers an empty string
+// after a "Failed to resolve specifiers ... Invalid slot" log entry.
+test("renderSystemdTemplate: bare % in upstream URL is escaped to %% (PR #189)", async () => {
+  const tpl = await readFile(join(TEMPLATE_DIR, "cache-fix-proxy.service.template"), "utf-8");
+  const out = renderSystemdTemplate(tpl, {
+    ...sampleVars,
+    upstream: "http://10.0.0.1:8080/path%20with%20encoded",
+  });
+  assert.ok(
+    out.includes("Environment=CACHE_FIX_PROXY_UPSTREAM=http://10.0.0.1:8080/path%%20with%%20encoded"),
+    "bare % must be escaped to %% in the rendered Environment= line",
+  );
+  assert.ok(!/=http:\/\/10\.0\.0\.1:8080\/path%20/.test(out), "no unescaped %20 should appear");
+});
+
+// PR #189 regression — bare \ triggers systemd C-string unescape and
+// produces a control byte. Verified 2026-06-07: `Environment=X=/path/with\backslash.pem`
+// delivers /path/with<0x08>ackslash.pem to the process; the quoted form
+// `Environment=X="/path/with\\backslash.pem"` delivers the literal value.
+test("renderSystemdTemplate: backslash in CA file path is escaped to \\\\ (PR #189)", async () => {
+  const tpl = await readFile(join(TEMPLATE_DIR, "cache-fix-proxy.service.template"), "utf-8");
+  const out = renderSystemdTemplate(tpl, {
+    ...sampleVars,
+    caFile: "/etc/ssl/with\\backslash.pem",
+  });
+  assert.ok(
+    out.includes('Environment=CACHE_FIX_PROXY_CA_FILE="/etc/ssl/with\\\\backslash.pem"'),
+    "bare \\ must be escaped to \\\\ inside the quoted Environment= value",
+  );
+});
+
 test("renderLaunchdTemplate: substitutes core fields and renders valid plist", async () => {
   const tpl = await readFile(
     join(TEMPLATE_DIR, "com.cnighswonger.cache-fix-proxy.plist.template"),
