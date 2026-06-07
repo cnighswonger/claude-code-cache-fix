@@ -183,11 +183,23 @@ function getAgent(isHTTPS, hostname) {
   return agent;
 }
 
+// Build the upstream URL by concatenating the configured base (with any path
+// component preserved) with the client request URL. The historical
+// `new URL(clientReq.url, base)` approach is RFC 3986 relative-resolution,
+// which drops the base's path component when the relative is path-absolute
+// (`/v1/messages`). That breaks corp-proxy / mirror setups where the
+// configured upstream is `https://corp-proxy.example.net/anthropic-mirror`
+// — the request would land at `https://corp-proxy.example.net/v1/messages`
+// with `/anthropic-mirror` silently dropped. See PR #188 / @nisqatsi.
+export function buildUpstreamUrl(base, clientUrl) {
+  const trimmedBase = base.endsWith("/") ? base.slice(0, -1) : base;
+  const relative = clientUrl.startsWith("/") ? clientUrl : "/" + clientUrl;
+  return new URL(trimmedBase + relative);
+}
+
 export function forwardRequest(clientReq, body, signal) {
   return new Promise((resolve, reject) => {
-    const base = config.upstream.endsWith('/') ? config.upstream.slice(0, -1) : config.upstream;
-    const relative = clientReq.url.startsWith('/') ? clientReq.url : '/' + clientReq.url;
-    const upstreamUrl = new URL(base + relative);
+    const upstreamUrl = buildUpstreamUrl(config.upstream, clientReq.url);
 
     const headers = buildUpstreamHeaders(clientReq.headers, upstreamUrl.hostname);
     if (body) {

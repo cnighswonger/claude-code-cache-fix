@@ -65,6 +65,72 @@ test("selectProxyUrl: lowercase env vars are honored", async () => {
   }
 });
 
+test("buildUpstreamUrl: preserves base-path component (PR #188 regression)", async () => {
+  // The blocker @nisqatsi caught: `new URL(clientReq.url, base)` is RFC 3986
+  // relative-resolution, which drops the base's path component when the
+  // relative URL is path-absolute (`/v1/messages`). For mirror / corp-proxy
+  // setups the base path is load-bearing — losing it routes the request to
+  // the wrong host path. Table-test the fixed concatenation logic so
+  // future refactors don't regress this case.
+  const { buildUpstreamUrl } = await import("../proxy/upstream.mjs");
+
+  const cases = [
+    // [base, clientUrl, expectedHref, label]
+    [
+      "https://api.anthropic.com",
+      "/v1/messages",
+      "https://api.anthropic.com/v1/messages",
+      "no-path base behaves as before",
+    ],
+    [
+      "https://api.anthropic.com/",
+      "/v1/messages",
+      "https://api.anthropic.com/v1/messages",
+      "trailing slash on base is normalized",
+    ],
+    [
+      "https://corp-proxy.example.net/anthropic-mirror",
+      "/v1/messages",
+      "https://corp-proxy.example.net/anthropic-mirror/v1/messages",
+      "base-path preserved (the bug @nisqatsi caught)",
+    ],
+    [
+      "https://corp-proxy.example.net/anthropic-mirror/",
+      "/v1/messages",
+      "https://corp-proxy.example.net/anthropic-mirror/v1/messages",
+      "base-path preserved AND trailing slash idempotent",
+    ],
+    [
+      "https://corp-proxy.example.net/deep/nested/path",
+      "/v1/messages",
+      "https://corp-proxy.example.net/deep/nested/path/v1/messages",
+      "multi-segment base path preserved",
+    ],
+    [
+      "https://api.anthropic.com",
+      "/v1/messages?beta=true&x=y",
+      "https://api.anthropic.com/v1/messages?beta=true&x=y",
+      "query string flows through cleanly",
+    ],
+    [
+      "https://corp-proxy.example.net/mirror",
+      "/v1/messages?beta=true",
+      "https://corp-proxy.example.net/mirror/v1/messages?beta=true",
+      "query string preserved across the base-path fix",
+    ],
+    [
+      "http://localhost:9802/anthropic",
+      "/v1/messages",
+      "http://localhost:9802/anthropic/v1/messages",
+      "http + non-standard port + base-path",
+    ],
+  ];
+
+  for (const [base, clientUrl, expected, label] of cases) {
+    assert.equal(buildUpstreamUrl(base, clientUrl).href, expected, label);
+  }
+});
+
 test("forwardRequest is exported and module loads cleanly with no proxy env vars (no regression)", async () => {
   const saved = {
     HTTPS_PROXY: process.env.HTTPS_PROXY, https_proxy: process.env.https_proxy,
