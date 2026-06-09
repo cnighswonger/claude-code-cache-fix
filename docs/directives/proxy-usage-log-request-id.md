@@ -64,12 +64,20 @@ This directive spans **two repositories** with a hard ordering requirement (same
 
 ### Release ordering (mandatory)
 
-1. **First:** `claude-code-cache-fix` v4.1.0 ships the new field. Existing meter installs fail to validate rows carrying the field; this is acceptable IF AND ONLY IF the meter-side update lands in the same week. Document in CHANGELOG that the field is opt-in for now: gated behind `CACHE_FIX_USAGE_LOG_REQUEST_ID=on` for the v4.1.0 release ONLY, becoming the default in v4.2.0 once meter has shipped. (See below for why this gate is needed.)
+1. **First:** `claude-code-cache-fix` v4.1.0 ships the new field. Existing meter installs fail to validate rows carrying the field; this is acceptable IF AND ONLY IF the meter-side update lands in the same week. Document in CHANGELOG that the field is opt-in for now: gated behind `CACHE_FIX_USAGE_LOG_REQID=on` for the v4.1.0 release ONLY, becoming the default in v4.2.0 once meter has shipped. (See below for why this gate is needed.)
 2. **Then:** `claude-code-meter` ships its schema update accepting the new optional field. Once released, the gate flips to default-on in cache-fix v4.2.0.
 
 ### Why the env-gate for v4.1.0
 
 Without the gate, anyone on cache-fix v4.1.0 + an unpatched meter ingestor would see every row rejected by the strict-object validation. The gate gives operators (and us, on visits-01) a way to ship the cache-fix change without breaking meter ingestion until the meter side catches up. Users running cache-fix without meter (the common case) have no reason to care, and can leave it off.
+
+### Gate env var: `CACHE_FIX_USAGE_LOG_REQID`
+
+Naming follows the brevity of `CACHE_FIX_THINKING_SANITIZE`, `CACHE_FIX_IMAGE_GUARD`, `CACHE_FIX_AUTO_1M_GUARD` (noun/feature without subfield qualifier). `REQID` over `REQUEST_ID` matches the project's preference for compact env names; the docstring, CHANGELOG, and README carry the full word.
+
+### Note for the v4.2.0 follow-up directive
+
+When v4.2.0 ships default-on, any operator running v4.2.0 + a pre-v0.5.0 (or whatever-the-meter-min-version-becomes-by-then) meter sees row rejection on every meter row. The follow-up directive's reviewer checklist must call out this upgrade coupling explicitly ("v4.2.0 requires meter >= v0.5.0; upgrade meter first") and the v4.2.0 CHANGELOG must front-load it.
 
 ### Repo 1: `claude-code-cache-fix` (this PR)
 
@@ -78,7 +86,7 @@ Files to modify:
 - `proxy/extensions/usage-log.mjs` — capture `request-id` response header in `onResponseStart`, stash on `ctx.meta._upstreamRequestId`, emit in `assembleRecord` when the gate env var is on AND the header was present
 - `test/proxy-usage-log.test.mjs` — add cases: header present + gate on → field emitted; header absent + gate on → field absent (optional); gate off → field never emitted; field is a string of expected shape
 - `CHANGELOG.md` — `### Added` entry under the v4.1.0 section explaining the field, the gate, and the release-ordering pair with claude-meter
-- `README.md` — extend the existing usage-log section (which currently shows the `MeterRowSchema` field table) with the `request_id` row + a one-line note that it's the join key against CC's per-session JSONL transcripts
+- `README.md` — extend the existing usage-log section (which currently shows the `MeterRowSchema` field table) with the `request_id` row, document its semantics in the same style as the other field rows, and include a one- or two-line operational example showing the post-hoc join against CC's per-session JSONL transcripts. The directive's earlier "do not disclose join details" framing was misjudged — the README already documents every other field's semantics, and the join recipe IS the field's value.
 
 ### Repo 2: `claude-code-meter` (separate PR in that repo, not this PR)
 
@@ -105,7 +113,7 @@ if (upstreamReqId && typeof upstreamReqId === "string" && upstreamReqId.length <
 }
 
 // Inside assembleRecord, after the optional-fields block:
-const enabled = process.env.CACHE_FIX_USAGE_LOG_REQUEST_ID === "on";
+const enabled = process.env.CACHE_FIX_USAGE_LOG_REQID === "on";
 if (enabled && _upstreamRequestId) {
   record.request_id = _upstreamRequestId;
 }
@@ -145,10 +153,10 @@ The env-read happens per-call (matching the `image-strip` debug-gate pattern) so
 - [ ] Field name is `request_id` (snake_case, matching the rest of the schema)
 - [ ] Field is optional, max length 64
 - [ ] Source is upstream `request-id` response header (not request-side `x-request-id`)
-- [ ] Gate env var is `CACHE_FIX_USAGE_LOG_REQUEST_ID` and ships default-off in v4.1.0
+- [ ] Gate env var is `CACHE_FIX_USAGE_LOG_REQID` and ships default-off in v4.1.0
 - [ ] Existing rows (gate off, or gate on but header missing) still validate against the unmodified `MeterRowSchema v:1`
 - [ ] CHANGELOG explicitly calls out the release-ordering requirement with claude-meter
-- [ ] README extension does NOT disclose how the join works in operational detail beyond "join key against CC transcripts" — keep the deep dive in an internal note, not the public README
+- [ ] README extension documents `request_id` semantics in the same style as the rest of the `MeterRowSchema` field table, including a brief operational example of the post-hoc join against CC's per-session JSONL transcripts (per AITL review of the directive: the rest of the README documents every other field's semantics; hiding only this one's recipe would be inconsistent)
 - [ ] Tests cover all four cells: (gate on, header present) / (gate on, header absent) / (gate off, header present) / (gate off, header absent)
 
 ## Out of scope (explicit)
