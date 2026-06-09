@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Optional `request_id` field on usage-log rows.** Sources from the upstream `request-id` response header. Gated default-off via `CACHE_FIX_USAGE_LOG_REQID=on` for the v4.1.0 release window. When enabled, every `~/.claude/usage.jsonl` row gains the field, recovering per-CC-session attribution that the proxy-boot-sticky `sid` field alone cannot provide. The field is the natural post-hoc join key against CC's per-session JSONL transcripts at `~/.claude/projects/<project>/<session-uuid>.jsonl` (which already carry `requestId` for every API call). **Cross-repo contract:** `claude-code-meter >= v0.5.0` is required to ingest rows that carry the field — older meter installs reject unknown keys via the strict-object schema. The gate is therefore default-off in this release and will flip default-on in v4.2.0 once meter has shipped. Schema stays at `v: 1` (pure addition; no consumer's reading of existing fields changes). See [`docs/directives/proxy-usage-log-request-id.md`](docs/directives/proxy-usage-log-request-id.md) for the full design and the release-ordering contract.
+
 ## [4.0.0] - 2026-06-07
 
 A major release because two long-standing defaults change. Both flips are backed by empirical data; both have explicit opt-out paths.

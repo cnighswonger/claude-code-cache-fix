@@ -855,6 +855,52 @@ The preload interceptor includes monitoring for microcompact degradation, false 
 
 See [docs/monitoring.md](docs/monitoring.md) for full details, debug mode, prefix diffing, environment variables, and the bundled quota analysis tool.
 
+### `usage-log` extension and the `MeterRowSchema v:1` wire format
+
+The `usage-log` extension (opt-in via `proxy/extensions.json`) appends one JSON line per API response to `~/.claude/usage.jsonl`. The row shape is `MeterRowSchema v:1` — the cross-repo contract validated by [`claude-code-meter`](https://github.com/cnighswonger/claude-code-meter)'s strict schema. Every field below is captured per call:
+
+| Field | Type | Source |
+|---|---|---|
+| `v` | literal `1` | constant |
+| `ts` | ISO-8601 datetime | server time at row emission |
+| `sid` | 8-char lowercase hex | proxy session id, sticky for the proxy's lifetime |
+| `model` | string ≤64 | `message_start.message.model` from the response stream |
+| `requested_model` | string ≤64 (optional) | request body `model` field |
+| `model_mismatch` | bool (optional) | true when `requested_model && model && requested_model !== model` |
+| `speed` | `"standard"` / `"fast"` / `""` | response `usage.speed` |
+| `service_tier` | string ≤32 | response `usage.service_tier` |
+| `input_tokens` | int ≥0 | response usage |
+| `output_tokens` | int ≥0 | response usage |
+| `cache_creation_input_tokens` | int ≥0 | response usage |
+| `cache_read_input_tokens` | int ≥0 | response usage |
+| `ephemeral_1h_input_tokens` | int ≥0 | response usage |
+| `ephemeral_5m_input_tokens` | int ≥0 | response usage |
+| `web_search_requests` | int ≥0 | response usage |
+| `q5h` / `q7d` | float 0–2 | `anthropic-ratelimit-unified-{5h,7d}-utilization` headers |
+| `q5h_reset` / `q7d_reset` | int (unix sec) | corresponding reset headers |
+| `qstatus`, `qoverage`, `qclaim` | lowercase enums | unified status / overage / claim headers |
+| `qfallback_pct` | float 0–1 | unified fallback percentage |
+| `qoverage_util` | float ≥0 (optional) | overage utilization header |
+| `qrepresentative_claim` | string ≤16 (optional) | representative-claim header |
+| `org_id` | 16-char hex (optional) | `sha256(anthropic-organization-id).slice(0, 16)` — never raw |
+| `overage_disabled_reason` | string ≤64 (optional) | overage-disabled-reason header |
+| `cache_hit_rate` | float 0–1 | `cache_read_input_tokens / (input + cache_creation + cache_read)` |
+| `q5h_delta`, `q7d_delta` | float | per-call delta from the previous row's q5h/q7d; 0 on first call after restart |
+| `request_id` | string ≤64 (optional, gated) | upstream `request-id` response header. Default-off; enable with `CACHE_FIX_USAGE_LOG_REQID=on`. **Cross-repo gate:** older `claude-code-meter` installs reject unknown keys; the field is gated default-off until meter v0.5.0+ ships. |
+
+**Why `request_id` matters operationally.** The `sid` field is generated once at proxy boot and shared across every CC session that proxy serves. On hosts running multiple concurrent CC sessions through one proxy (common in agent fleets), every session's rows collapse into the same `sid` — there's no way to ask "which session burned 80% of today's Opus tokens?" from `usage.jsonl` alone. CC's per-session JSONL transcripts at `~/.claude/projects/<project>/<session-uuid>.jsonl` already carry `requestId` for every API call. Capturing the same value in the meter row makes the post-hoc join trivial:
+
+```bash
+# Find which CC session each usage.jsonl row belongs to:
+for row in $(jq -c . < ~/.claude/usage.jsonl); do
+  req=$(jq -r '.request_id // empty' <<< "$row")
+  [ -z "$req" ] && continue
+  grep -l "\"requestId\":\"$req\"" ~/.claude/projects/*/*.jsonl
+done
+```
+
+The filename of the matching transcript is the CC session UUID, recovering per-session attribution for every meter row that was emitted with the field on.
+
 ## Limitations
 
 - **Proxy requires a running process** — The proxy must be started before Claude Code. If it's not running and `ANTHROPIC_BASE_URL` points to it, CC will fail to connect. We recommend running it as a systemd service or with a health-checking wrapper script.
