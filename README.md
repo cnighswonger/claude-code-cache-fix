@@ -29,7 +29,7 @@ That's it. The proxy applies its default extension pipeline automatically. No wr
 
 ### What the proxy does
 
-On every `/v1/messages` request, the pipeline runs an ordered chain of extensions. The default-enabled set covers cache stability, observability, and the thinking-desync mitigation; opt-in modules cover image, microcompact, breakpoint, and bootstrap-channel surfaces (documented in their own sections below). The headliners:
+On every `/v1/messages` request, the pipeline runs an ordered chain of extensions covering cache stability, observability, thinking-desync mitigation, image, microcompact, breakpoint, bootstrap-channel, and other surfaces. Several are gated behind env vars documented in their own sections below; bootstrap-channel handling defaults to `audit` mode. The headliners:
 
 | Extension | What it fixes |
 |-----------|--------------|
@@ -401,7 +401,7 @@ For manual VS Code wrapper setup (without the VSIX), see [docs/preload-setup.md]
 
 **What it does NOT do:** No network calls from the proxy or interceptor. All telemetry is written to local files under `~/.claude/`. No data leaves your machine.
 
-**Supply chain:** Proxy mode: small focused extension modules in `proxy/extensions/` (most under a few hundred lines; the pipeline is composable, you can read any single one in isolation). Preload mode: single unminified file (`preload.mjs`, ~1,700 lines). One dev dependency (`zod` for schema validation in tests only). Review before installing. Published builds carry npm's default registry signatures; sigstore provenance attestation is not currently published — tracked as a follow-up.
+**Supply chain:** Proxy mode: small focused extension modules in `proxy/extensions/` (most under a few hundred lines; the pipeline is composable, you can read any single one in isolation). Preload mode: single unminified file (`preload.mjs`). One dev dependency (`zod` for schema validation in tests only). Review before installing. Published builds carry npm's default registry signatures; sigstore provenance attestation is not currently published — tracked as a follow-up.
 
 **Independent audit:** [Assessed as "LEGITIMATE TOOL"](https://github.com/anthropics/claude-code/issues/38335#issuecomment-4244413605) by @TheAuditorTool (2026-04-14).
 
