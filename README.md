@@ -6,7 +6,7 @@ English | [中文](./README.zh.md) | [한국어](./README.ko.md) | [Português](
 
 Cache optimization proxy for [Claude Code](https://github.com/anthropics/claude-code). Fixes prompt cache bugs that cause excessive quota burn, stabilizes the request prefix, and monitors for silent regressions. Works with all CC versions including the v2.1.113+ Bun binary.
 
-> **v3.0.3** — Local HTTP proxy with 7 hot-reloadable extensions. A/B tested on v2.1.117: **95.5% cache hit rate through proxy vs 82.3% direct** on first warm turn. [Full release notes →](https://github.com/cnighswonger/claude-code-cache-fix/releases/tag/v3.0.0)
+> **v4.0.0** — Local HTTP proxy with a pipeline of cost-impact and observability extensions. Two long-standing defaults flipped: `thinking-block-sanitize` v1 is on by default (mitigates the thinking-desync `400` wedge — [#63147](https://github.com/anthropics/claude-code/issues/63147)) and in-process extension hot-reload is opt-in (`CACHE_FIX_HOT_RELOAD=on`). A/B baseline (v3.0.0 on v2.1.117): **95.5% cache hit rate through proxy vs 82.3% direct** on first warm turn. [Full release notes →](https://github.com/cnighswonger/claude-code-cache-fix/releases/tag/v4.0.0)
 
 > **Opus 4.7 advisory:** Metered data shows 4.7 burns Q5h quota at **~2.4x the rate of 4.6** for equivalent visible token counts ([independently confirmed by @ArkNill](https://github.com/ArkNill/claude-code-hidden-problem-analysis/blob/main/16_OPUS-47-ADVISORY.md)). Two factors: a new tokenizer (up to 35% more tokens, [documented](https://platform.claude.com/docs/en/about-claude/models/whats-new-claude-4-7)) and adaptive thinking overhead (~105%, not documented in usage response). The Q5h impact compounds into **Q7d** — the weekly quota ceiling that most heavy users will hit first. Workaround: `CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1` reduces burn by ~3.3x but may reduce quality on complex tasks. See [Discussion #25](https://github.com/cnighswonger/claude-code-cache-fix/discussions/25) (initial observation) and [Discussion #42](https://github.com/cnighswonger/claude-code-cache-fix/discussions/42) (controlled A/B data + Q7d analysis).
 
@@ -25,11 +25,11 @@ node "$(npm root -g)/claude-code-cache-fix/proxy/server.mjs" &
 ANTHROPIC_BASE_URL=http://127.0.0.1:9801 claude
 ```
 
-That's it. The proxy applies all 7 cache-fix extensions automatically. No wrapper scripts, no `NODE_OPTIONS`, no preload.
+That's it. The proxy applies its default extension pipeline automatically. No wrapper scripts, no `NODE_OPTIONS`, no preload.
 
 ### What the proxy does
 
-On every `/v1/messages` request, 9 extensions run in order:
+On every `/v1/messages` request, the pipeline runs an ordered chain of extensions. The default-enabled set covers cache stability, observability, and the thinking-desync mitigation; opt-in modules cover image, microcompact, breakpoint, and bootstrap-channel surfaces (documented in their own sections below). The headliners:
 
 | Extension | What it fixes |
 |-----------|--------------|
@@ -116,7 +116,7 @@ docker run -d --name cache-fix-proxy --restart=always -p 9801:9801 \
   ghcr.io/cnighswonger/claude-code-cache-fix:latest
 ```
 
-Image tags: `latest`, `3`, `3.2`, `3.2.1` (semver-ladder, so `3` always points to the newest 3.x). `latest` always tracks the newest tagged release.
+Image tags: `latest`, `4`, `4.0`, `4.0.0` (semver-ladder, so `4` always points to the newest 4.x). `latest` always tracks the newest tagged release.
 
 **Linux note:** the chained-upstream `host.docker.internal` example below is automatic on Docker Desktop (macOS / Windows). On plain Linux Docker Engine you usually need `--add-host=host.docker.internal:host-gateway` so the name resolves to the host bridge. Without it, the container's name lookup fails and the proxy can't reach the upstream service running on the host. Example chaining cache-fix proxy through `llm-relay` running on the host:
 
@@ -282,7 +282,7 @@ launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 
 **Cache-economics regressions.** The original purpose of cache-fix is to absorb the cache-handling behaviors in Claude Code that cost users real money and quota — TTL downgrades, cache-breaking header churn, identity-latching issues, and the rest of the regression catalog documented across our issue history. The proxy sits between CC and the Anthropic API, normalizes the request and response stream, and emits enough observability (via statusline integration and the quota-status files) that users can see what their session is actually doing. This is the load-bearing feature for almost every user today.
 
-**Bootstrap-channel observability.** Claude Code v2.1.150 introduced a prompt-section consumer that fetches a server-supplied string from `/api/claude_cli/bootstrap` and merges it into the agent's behavioral-instructions prompt path. We filed this behavior with Anthropic's security team in May 2026; Anthropic closed the report as *Informative*, treating TLS as the transport-integrity boundary and declining to add application-layer authenticity checks. Cache-fix v3.7.0 added explicit handling for this path. v3.7.1 extends it to also cover the env-var-selected GrowthBook prompt-injection surface that landed in CC v2.1.152 (remote-control mode: `CLAUDE_CODE_SYSTEM_PROMPT_GB_FEATURE` names a flag key whose cached value is used as the system prompt body).
+**Bootstrap-channel observability.** Claude Code v2.1.150 introduced a prompt-section consumer that fetches a server-supplied string from `/api/claude_cli/bootstrap` and merges it into the agent's behavioral-instructions prompt path. We filed this behavior with Anthropic's security team in May 2026; Anthropic closed the report as *Informative*, treating TLS as the transport-integrity boundary and declining to add application-layer authenticity checks. Cache-fix shipped explicit handling for this path in v3.7.0 and extended it in v3.7.1 to also cover the env-var-selected GrowthBook prompt-injection surface that landed in CC v2.1.152 (remote-control mode: `CLAUDE_CODE_SYSTEM_PROMPT_GB_FEATURE` names a flag key whose cached value is used as the system prompt body). Stable in the current v4.x line.
 
 Cache-fix's `bootstrap-defense` extension ships three modes, selected via `CACHE_FIX_BOOTSTRAP_MODE`:
 
@@ -401,7 +401,7 @@ For manual VS Code wrapper setup (without the VSIX), see [docs/preload-setup.md]
 
 **What it does NOT do:** No network calls from the proxy or interceptor. All telemetry is written to local files under `~/.claude/`. No data leaves your machine.
 
-**Supply chain:** Proxy mode: 7 small extension modules in `proxy/extensions/` (each under 200 lines). Preload mode: single unminified file (`preload.mjs`, ~1,700 lines). One dev dependency (`zod` for schema validation in tests only). Review before installing. Published builds carry npm's default registry signatures; sigstore provenance attestation is not currently published — tracked as a follow-up.
+**Supply chain:** Proxy mode: small focused extension modules in `proxy/extensions/` (most under a few hundred lines; the pipeline is composable, you can read any single one in isolation). Preload mode: single unminified file (`preload.mjs`, ~1,700 lines). One dev dependency (`zod` for schema validation in tests only). Review before installing. Published builds carry npm's default registry signatures; sigstore provenance attestation is not currently published — tracked as a follow-up.
 
 **Independent audit:** [Assessed as "LEGITIMATE TOOL"](https://github.com/anthropics/claude-code/issues/38335#issuecomment-4244413605) by @TheAuditorTool (2026-04-14).
 
@@ -421,7 +421,7 @@ Additionally, images read via the Read tool persist as base64 in conversation hi
 
 ## How it works
 
-**Proxy mode** (v3.0.0+): An HTTP server on `localhost:9801` intercepts `POST /v1/messages` requests. Seven extension modules process each request through a pipeline — normalizing block order, stripping fingerprints, stabilizing tool sort, managing TTL markers. Extensions live as `.mjs` files configured in `proxy/extensions.json` and load once at proxy startup (hot-reload is opt-in as of v4.0.0 — see [Upgrading from v3.x](#upgrading-from-v3x)). All other traffic passes through untouched.
+**Proxy mode** (v3.0.0+): An HTTP server on `localhost:9801` intercepts `POST /v1/messages` requests. A pipeline of extension modules processes each request — normalizing block order, stripping fingerprints, stabilizing tool sort, managing TTL markers, sanitizing thinking blocks, recording telemetry, and more. Extensions live as `.mjs` files configured in `proxy/extensions.json` and load once at proxy startup (hot-reload is opt-in as of v4.0.0 — see [Upgrading from v3.x](#upgrading-from-v3x)). All other traffic passes through untouched.
 
 **Preload mode** (v2.x): A Node.js `--import` module that patches `globalThis.fetch` before Claude Code makes API calls. Applies the same fixes inline — scans user messages for relocated blocks, sorts tools, recomputes fingerprints, injects TTL markers.
 
