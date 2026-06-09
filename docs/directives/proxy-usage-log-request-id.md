@@ -86,7 +86,7 @@ Files to modify:
 - `proxy/extensions/usage-log.mjs` — capture `request-id` response header in `onResponseStart`, stash on `ctx.meta._upstreamRequestId`, emit in `assembleRecord` when the gate env var is on AND the header was present
 - `test/proxy-usage-log.test.mjs` — add cases: header present + gate on → field emitted; header absent + gate on → field absent (optional); gate off → field never emitted; field is a string of expected shape
 - `CHANGELOG.md` — `### Added` entry under the v4.1.0 section explaining the field, the gate, and the release-ordering pair with claude-meter
-- `README.md` — extend the existing usage-log section (which currently shows the `MeterRowSchema` field table) with the `request_id` row, document its semantics in the same style as the other field rows, and include a one- or two-line operational example showing the post-hoc join against CC's per-session JSONL transcripts. The directive's earlier "do not disclose join details" framing was misjudged — the README already documents every other field's semantics, and the join recipe IS the field's value.
+- `README.md` — add or restore a usage-log schema subsection that documents the `MeterRowSchema` field set in a field table, including the new `request_id` row. **Codex round-1 directive review correction:** there is no existing usage-log/MeterRowSchema field table in the current README — the implementation PR creates the subsection from scratch in the same documentation style used by other extension sections (see the cache-fix-bootstrap-log table for shape precedent). Include a one- or two-line operational example showing the post-hoc join against CC's per-session JSONL transcripts. (The directive's earlier "do not disclose join details" framing was misjudged — the README already documents every other field's semantics, and the join recipe IS the field's value.)
 
 ### Repo 2: `claude-code-meter` (separate PR in that repo, not this PR)
 
@@ -101,29 +101,42 @@ Flip the default-on. Drop the env-gate. CHANGELOG note: "request_id is now defau
 
 ## Implementation choice (cache-fix side)
 
-Capturing the header at `onResponseStart` mirrors the existing quota-header parse path in the same extension. The header reaches the extension via `ctx.headers` (response headers). Existing `onResponseStart` hook in `cache-telemetry.mjs` is the precedent — same shape.
+**Correction from Codex round-1 directive review:** the current `usage-log.mjs` does NOT have an `onResponseStart` hook for quota-header parsing. It reads `ctx.responseHeaders` inside `onStreamEvent` at the point of final row assembly (`proxy/extensions/usage-log.mjs:230-270`, the path through `proxy/stream.mjs:63-65`). The implementation PR should capture the response header at the same surface — inside `onStreamEvent` before final row assembly — not introduce a new `onResponseStart` hook unless there's a separate reason to.
+
+The precedent for `onResponseStart` quota-header parsing is in `cache-telemetry.mjs`, NOT `usage-log.mjs`. Don't conflate.
 
 Pseudocode for the addition in `usage-log.mjs`:
 
 ```js
-// Inside onResponseStart, alongside existing quota parsing:
-const upstreamReqId = ctx.headers?.["request-id"];
-if (upstreamReqId && typeof upstreamReqId === "string" && upstreamReqId.length <= 64) {
-  ctx.meta._upstreamRequestId = upstreamReqId;
-}
+// Inside onStreamEvent, when ctx.responseHeaders is already in scope
+// (around the existing quota-header read at lines 230-270):
+const upstreamReqId = ctx.responseHeaders?.["request-id"];
+const validReqId =
+  typeof upstreamReqId === "string" &&
+  upstreamReqId.length > 0 &&
+  upstreamReqId.length <= 64;
 
 // Inside assembleRecord, after the optional-fields block:
 const enabled = process.env.CACHE_FIX_USAGE_LOG_REQID === "on";
-if (enabled && _upstreamRequestId) {
-  record.request_id = _upstreamRequestId;
+if (enabled && validReqId) {
+  record.request_id = upstreamReqId;
 }
 ```
 
-The env-read happens per-call (matching the `image-strip` debug-gate pattern) so operators can flip it at runtime without proxy restart.
+The env-read happens per-call (matching the `image-strip` debug-gate pattern) so operators can flip it at runtime without proxy restart. The length validation also guards the new `max(64)` schema constraint against malformed upstream input — see Test plan for the regression case.
 
 ## Test plan (cache-fix side)
 
-- **Unit:** header present + gate on → emitted; header absent + gate on → field omitted from record; gate off → field never emitted regardless of header; field validates against shape (string, ≤64 chars); existing rows without the field still validate against the existing `MeterRowSchema v:1` shape.
+- **Unit (the four-cell matrix):**
+  - gate on + header present → field emitted
+  - gate on + header absent → field omitted (schema-optional)
+  - gate off + header present → field never emitted
+  - gate off + header absent → field never emitted
+- **Unit (negative cases on header content):** Per Codex round-1 directive review — add explicit negative tests for the `max(64)` constraint as a tripwire against future malformed upstream input:
+  - gate on + header is empty string → field omitted
+  - gate on + header is a 65-character string → field omitted (NOT emitted with a value that would fail meter-side validation)
+  - gate on + header is a non-string (defensive — should never happen from a real HTTP response, but exercises the type guard) → field omitted
+- **Schema check:** A row with `request_id` validates against the updated `MeterRowSchema v:1`. A row without `request_id` still validates (back-compat).
 - **Integration (Proxy Test Agent):** live request through proxy with gate on, verify `request_id` field is present in the emitted JSONL row, verify the captured value matches what `gh api` or `curl` would observe on the same request, verify a parallel CC session's JSONL transcript at `~/.claude/projects/...` records the same `requestId` value for the same request.
 - **Regression:** existing `proxy-usage-log.test.mjs` cases pass unchanged with gate off.
 
@@ -158,6 +171,7 @@ The env-read happens per-call (matching the `image-strip` debug-gate pattern) so
 - [ ] CHANGELOG explicitly calls out the release-ordering requirement with claude-meter
 - [ ] README extension documents `request_id` semantics in the same style as the rest of the `MeterRowSchema` field table, including a brief operational example of the post-hoc join against CC's per-session JSONL transcripts (per AITL review of the directive: the rest of the README documents every other field's semantics; hiding only this one's recipe would be inconsistent)
 - [ ] Tests cover all four cells: (gate on, header present) / (gate on, header absent) / (gate off, header present) / (gate off, header absent)
+- [ ] Tests cover the three negative-content cases against the `max(64)` constraint: empty string, 65-char string, non-string (per Codex round-1 directive review)
 
 ## Out of scope (explicit)
 
