@@ -10,6 +10,7 @@ import ext, {
   hashOrgId,
   extractMessageStartFields,
   extractMessageDeltaFields,
+  extractRequestId,
   parseQuotaHeaders,
   assembleRecord,
   computeDelta,
@@ -480,4 +481,218 @@ test("end-to-end: two responses → second has non-zero deltas", async () => {
     delete process.env.CACHE_FIX_USAGE_LOG;
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+// --- request_id field (directive: proxy-usage-log-request-id) ---
+//
+// Schema: request_id?: string, max 64 chars, gated on CACHE_FIX_USAGE_LOG_REQID=on.
+// Four-cell matrix (gate × header) + three negative-content cases for the
+// max(64) tripwire per Codex round-1 directive review.
+
+// Sync gate wrapper for assembleRecord-only tests. Restores env in finally
+// AFTER fn() returns synchronously. Do NOT use with async fn — see
+// withReqIdGateAsync below.
+function withReqIdGate(value, fn) {
+  const prior = process.env.CACHE_FIX_USAGE_LOG_REQID;
+  if (value === undefined) delete process.env.CACHE_FIX_USAGE_LOG_REQID;
+  else process.env.CACHE_FIX_USAGE_LOG_REQID = value;
+  try {
+    return fn();
+  } finally {
+    if (prior === undefined) delete process.env.CACHE_FIX_USAGE_LOG_REQID;
+    else process.env.CACHE_FIX_USAGE_LOG_REQID = prior;
+  }
+}
+
+// Async gate wrapper — awaits fn() so the env stays set across the full
+// async lifecycle. Without `await`, the sync `try/finally` restored env
+// before any awaited inner work ran assembleRecord, silently dropping the
+// gate. Bug surfaced in the e2e gate-on test on first run; this is the fix.
+async function withReqIdGateAsync(value, fn) {
+  const prior = process.env.CACHE_FIX_USAGE_LOG_REQID;
+  if (value === undefined) delete process.env.CACHE_FIX_USAGE_LOG_REQID;
+  else process.env.CACHE_FIX_USAGE_LOG_REQID = value;
+  try {
+    return await fn();
+  } finally {
+    if (prior === undefined) delete process.env.CACHE_FIX_USAGE_LOG_REQID;
+    else process.env.CACHE_FIX_USAGE_LOG_REQID = prior;
+  }
+}
+
+function recordWith(requestId, gate) {
+  return withReqIdGate(gate, () =>
+    assembleRecord({
+      start: extractMessageStartFields(mkMessageStart()),
+      delta: { output_tokens: 100 },
+      quota: parseQuotaHeaders(mkHeaders()),
+      sid: "abcdef01",
+      requestId,
+    }),
+  );
+}
+
+// --- extractRequestId helper guards ---
+
+test("extractRequestId: valid string passes through", () => {
+  const reqId = "req_011CbQL6e8qVERUXKwYqUMMi";
+  assert.equal(extractRequestId({ "request-id": reqId }), reqId);
+});
+
+test("extractRequestId: 64-char string passes (boundary)", () => {
+  const reqId = "a".repeat(64);
+  assert.equal(extractRequestId({ "request-id": reqId }), reqId);
+});
+
+test("extractRequestId: 65-char string returns undefined (max(64) tripwire)", () => {
+  assert.equal(extractRequestId({ "request-id": "a".repeat(65) }), undefined);
+});
+
+test("extractRequestId: empty string returns undefined", () => {
+  assert.equal(extractRequestId({ "request-id": "" }), undefined);
+});
+
+test("extractRequestId: missing header returns undefined", () => {
+  assert.equal(extractRequestId({}), undefined);
+});
+
+test("extractRequestId: non-string value returns undefined (defensive)", () => {
+  assert.equal(extractRequestId({ "request-id": 123 }), undefined);
+  assert.equal(extractRequestId({ "request-id": null }), undefined);
+  assert.equal(extractRequestId({ "request-id": ["x"] }), undefined);
+});
+
+test("extractRequestId: missing headers object returns undefined", () => {
+  assert.equal(extractRequestId(null), undefined);
+  assert.equal(extractRequestId(undefined), undefined);
+});
+
+// --- four-cell gate × header matrix ---
+
+test("request_id: gate on + header present → field emitted", () => {
+  const r = recordWith("req_011CbQL6e8qVERUXKwYqUMMi", "on");
+  assert.equal(r.request_id, "req_011CbQL6e8qVERUXKwYqUMMi");
+});
+
+test("request_id: gate on + header absent → field omitted (optional)", () => {
+  const r = recordWith(undefined, "on");
+  assert.ok(!("request_id" in r), "request_id must be absent, not undefined-valued");
+});
+
+test("request_id: gate off + header present → field NEVER emitted", () => {
+  const r = recordWith("req_011CbQL6e8qVERUXKwYqUMMi", undefined);
+  assert.ok(!("request_id" in r));
+});
+
+test("request_id: gate off (explicit) + header present → field NEVER emitted", () => {
+  const r = recordWith("req_011CbQL6e8qVERUXKwYqUMMi", "off");
+  assert.ok(!("request_id" in r));
+});
+
+test("request_id: gate off + header absent → field NEVER emitted", () => {
+  const r = recordWith(undefined, undefined);
+  assert.ok(!("request_id" in r));
+});
+
+// --- negative-content tripwires for max(64) at the assembleRecord seam ---
+// extractRequestId already filters these out before reaching assembleRecord,
+// but we exercise the assembleRecord boundary too so the gate is the
+// last line of defense if anyone refactors and bypasses the extractor.
+
+test("request_id: gate on + caller passes empty string → field omitted", () => {
+  const r = recordWith("", "on");
+  assert.ok(!("request_id" in r));
+});
+
+test("request_id: gate on + caller passes 65-char string → field omitted", () => {
+  // Belt-and-braces: assembleRecord enforces the max(64) constraint too,
+  // so a refactor that bypasses extractRequestId still cannot emit a row
+  // that would fail claude-meter's strict-object validation.
+  const r = recordWith("a".repeat(65), "on");
+  assert.ok(!("request_id" in r));
+});
+
+test("request_id: gate on + 64-char string (boundary) → field emitted", () => {
+  const r = recordWith("a".repeat(64), "on");
+  assert.equal(r.request_id, "a".repeat(64));
+});
+
+test("request_id: gate on + non-string caller value → field omitted", () => {
+  for (const bad of [123, null, undefined, ["x"], { x: 1 }, true]) {
+    const r = recordWith(bad, "on");
+    assert.ok(!("request_id" in r), `non-string ${typeof bad} must not emit`);
+  }
+});
+
+// --- gate runtime-readable ---
+
+test("request_id: gate is read per-call (image-strip pattern)", () => {
+  const reqId = "req_test_runtime";
+  const r1 = recordWith(reqId, "on");
+  assert.equal(r1.request_id, reqId);
+  const r2 = recordWith(reqId, undefined);
+  assert.ok(!("request_id" in r2));
+  // Flip back and forth in the same process — proves the gate isn't cached
+  const r3 = recordWith(reqId, "on");
+  assert.equal(r3.request_id, reqId);
+});
+
+// --- end-to-end: gate + header → field on disk ---
+
+test("request_id end-to-end: gate on + header → field present in jsonl row", async () => {
+  await withReqIdGateAsync("on", async () => {
+    const mod = await freshExt();
+    const dir = await newTmp();
+    const path = join(dir, "usage.jsonl");
+    process.env.CACHE_FIX_USAGE_LOG = path;
+    try {
+      const reqId = "req_011CbQL6e8qVERUXKwYqUMMi";
+      const ctx = {
+        meta: {},
+        event: mkMessageStart(),
+        telemetry: {},
+        responseHeaders: mkHeaders({ "request-id": reqId }),
+      };
+      await mod.default.onStreamEvent(ctx);
+      ctx.event = { type: "message_delta", usage: { output_tokens: 100 } };
+      await mod.default.onStreamEvent(ctx);
+
+      const lines = (await readFile(path, "utf8")).split("\n").filter(Boolean);
+      assert.equal(lines.length, 1);
+      const row = JSON.parse(lines[0]);
+      assert.equal(row.request_id, reqId);
+    } finally {
+      delete process.env.CACHE_FIX_USAGE_LOG;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+test("request_id end-to-end: gate off + header → field absent in jsonl row", async () => {
+  await withReqIdGateAsync(undefined, async () => {
+    const mod = await freshExt();
+    const dir = await newTmp();
+    const path = join(dir, "usage.jsonl");
+    process.env.CACHE_FIX_USAGE_LOG = path;
+    try {
+      const ctx = {
+        meta: {},
+        event: mkMessageStart(),
+        telemetry: {},
+        responseHeaders: mkHeaders({ "request-id": "req_should_not_appear" }),
+      };
+      await mod.default.onStreamEvent(ctx);
+      ctx.event = { type: "message_delta", usage: { output_tokens: 100 } };
+      await mod.default.onStreamEvent(ctx);
+
+      const lines = (await readFile(path, "utf8")).split("\n").filter(Boolean);
+      assert.equal(lines.length, 1);
+      const row = JSON.parse(lines[0]);
+      assert.ok(!("request_id" in row));
+      assert.ok(!lines[0].includes("req_should_not_appear"));
+    } finally {
+      delete process.env.CACHE_FIX_USAGE_LOG;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });

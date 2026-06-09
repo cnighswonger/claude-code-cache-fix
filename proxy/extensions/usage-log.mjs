@@ -26,6 +26,7 @@
 //   overage_disabled_reason?: string ≤64             (optional)
 //   cache_hit_rate: float 0–1
 //   q5h_delta, q7d_delta: float (0 on first call after restart)
+//   request_id?: string ≤64                          (optional, gated)
 //
 // `peak_hour` is NOT in the wire format. It can be derived from `ts` if any
 // consumer needs it.
@@ -35,6 +36,16 @@
 //   "usage-log": { "enabled": true, "order": 650 }
 // CACHE_FIX_USAGE_LOG=<path> overrides the destination path only — it is NOT
 // an enable flag and never has been.
+//
+// CACHE_FIX_USAGE_LOG_REQID=on emits the optional `request_id` field
+// (sourced from the upstream `request-id` response header). Default-off in
+// v4.1.0 to avoid breaking unpatched claude-meter installs whose strict-
+// object schema rejects unknown keys. Flips default-on in v4.2.0 once
+// claude-meter v0.5.0+ ships the schema acceptance. The field is the
+// post-hoc join key against CC's per-session JSONL transcripts
+// (`~/.claude/projects/<project>/<session-uuid>.jsonl` carry `requestId`
+// for every API call), which recovers per-CC-session attribution that
+// `sid` alone cannot provide. See docs/directives/proxy-usage-log-request-id.md.
 //
 // See `docs/directives/proxy-claude-meter-compat.md` for full design.
 
@@ -91,6 +102,17 @@ export function extractMessageDeltaFields(event) {
   return { output_tokens: event.usage.output_tokens || 0 };
 }
 
+// Extract upstream request-id from response headers, guarded against the
+// max(64) MeterRowSchema constraint. Returns the string when valid, or
+// `undefined` so the optional schema field is omitted on bad input rather
+// than emitting a row that would fail meter-side validation.
+export function extractRequestId(headers) {
+  const raw = headers?.["request-id"];
+  if (typeof raw !== "string") return undefined;
+  if (raw.length === 0 || raw.length > 64) return undefined;
+  return raw;
+}
+
 function num(headers, key) {
   const v = headers?.[key];
   if (v === undefined || v === null || v === "") return null;
@@ -134,7 +156,7 @@ export function computeDelta(current, previous) {
   return current - previous;
 }
 
-export function assembleRecord({ start, delta, quota, requestedModel, sid, prevQ5h, prevQ7d, now = new Date() }) {
+export function assembleRecord({ start, delta, quota, requestedModel, sid, prevQ5h, prevQ7d, requestId, now = new Date() }) {
   const s = start || {};
   const d = delta || {};
   const q = quota || {};
@@ -194,6 +216,27 @@ export function assembleRecord({ start, delta, quota, requestedModel, sid, prevQ
     record.overage_disabled_reason = q.overage_disabled_reason;
   }
 
+  // Optional: emit request_id when CACHE_FIX_USAGE_LOG_REQID=on AND the
+  // captured value is a non-empty string within the schema's max(64)
+  // constraint. Belt-and-braces: extractRequestId enforces these guards at
+  // capture time, and assembleRecord re-enforces them here so a future
+  // refactor that bypasses the extractor can't emit a row that would fail
+  // claude-meter's strict-object validation.
+  // Env read happens per-call so operators can flip it at runtime without
+  // proxy restart, matching the image-strip debug-gate pattern.
+  // Cross-repo contract: claude-code-meter v0.5.0+ accepts this optional
+  // field; older meter installs reject rows that carry it, so the gate
+  // stays default-off until the meter side ships. Default flips on in
+  // cache-fix v4.2.0.
+  if (
+    process.env.CACHE_FIX_USAGE_LOG_REQID === "on" &&
+    typeof requestId === "string" &&
+    requestId.length > 0 &&
+    requestId.length <= 64
+  ) {
+    record.request_id = requestId;
+  }
+
   return record;
 }
 
@@ -250,6 +293,7 @@ export default {
       const delta = extractMessageDeltaFields(ctx.event);
       const quota = parseQuotaHeaders(ctx.responseHeaders || {});
       const requestedModel = ctx.telemetry?.requestedModel || undefined;
+      const requestId = extractRequestId(ctx.responseHeaders || {});
 
       const record = assembleRecord({
         start,
@@ -259,6 +303,7 @@ export default {
         sid: _sid,
         prevQ5h: _lastQ5h,
         prevQ7d: _lastQ7d,
+        requestId,
         now: new Date(),
       });
 
