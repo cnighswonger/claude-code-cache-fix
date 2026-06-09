@@ -112,7 +112,7 @@ Annotated tags only (`-a`), not lightweight tags. The tag message can mirror the
 npm publish
 ```
 
-The npm token lives at `~/.claude/.npm/.npmrc` for the `vsitsllc` org (see `~/.claude/memory/shared/reference_npm_token.md` for current expiry — token rotates roughly every 90 days). If publish fails on auth, the token may have expired; ask Chris to rotate before retrying.
+npm credentials for publish live in internal deployment notes (not here). If `npm publish` fails on auth, the token may have expired — ask Chris to rotate before retrying.
 
 Verify the publish landed:
 
@@ -172,7 +172,7 @@ If you hit a `403` on push or release-create, check `playbook_codex_review_push_
 A short list of failure modes seen on past releases:
 
 - **GitHub Release creation fails with 403** — App permissions issue. The team-lead App had `releases:write` granted on 2026-05-02 after a previous failure; the proxy-builder App should have it too, but verify if the publish fails. See `playbook_codex_review_push_403.md`.
-- **npm publish auth fails** — token expired. Rotate per the npm token memory entry; don't try to bypass.
+- **npm publish auth fails** — token expired. Ask Chris to rotate (credential location is in internal deployment notes); don't try to bypass.
 - **Tag pushed but release not created** — incomplete release per the memory rule. Either complete it (preferred) or delete the tag and start over.
 - **CHANGELOG missed an entry** — Codex review catches this in step 6 if you actually run it. Don't skip step 6.
 - **Wrong semver bump** — patch when it should have been minor (e.g., shipped a new env var as a "fix"). Codex review catches this in step 6 if you ask it to verify "version bump matches change scope". Don't skip step 6.
