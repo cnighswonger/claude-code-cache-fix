@@ -40,9 +40,10 @@
 // CACHE_FIX_USAGE_LOG_REQID=on emits the optional `request_id` field
 // (sourced from the upstream `request-id` response header). Default-off in
 // v4.1.0 to avoid breaking unpatched claude-meter installs whose strict-
-// object schema rejects unknown keys. Flips default-on in v4.2.0 once
-// claude-meter v0.5.0+ ships the schema acceptance. The field is the
-// post-hoc join key against CC's per-session JSONL transcripts
+// object schema rejects unknown keys. claude-meter v0.7.0+ accepts the
+// optional field; the v4.2.0 flip to default-on assumes that floor.
+// The field is the post-hoc join key against CC's per-session JSONL
+// transcripts
 // (`~/.claude/projects/<project>/<session-uuid>.jsonl` carry `requestId`
 // for every API call), which recovers per-CC-session attribution that
 // `sid` alone cannot provide. See docs/directives/proxy-usage-log-request-id.md.
@@ -224,10 +225,9 @@ export function assembleRecord({ start, delta, quota, requestedModel, sid, prevQ
   // claude-meter's strict-object validation.
   // Env read happens per-call so operators can flip it at runtime without
   // proxy restart, matching the image-strip debug-gate pattern.
-  // Cross-repo contract: claude-code-meter v0.5.0+ accepts this optional
+  // Cross-repo contract: claude-code-meter v0.7.0+ accepts this optional
   // field; older meter installs reject rows that carry it, so the gate
-  // stays default-off until the meter side ships. Default flips on in
-  // cache-fix v4.2.0.
+  // stays default-off in v4.1.0. Default flips on in cache-fix v4.2.0.
   if (
     process.env.CACHE_FIX_USAGE_LOG_REQID === "on" &&
     typeof requestId === "string" &&

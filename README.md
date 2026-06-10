@@ -886,7 +886,7 @@ The `usage-log` extension (opt-in via `proxy/extensions.json`) appends one JSON 
 | `overage_disabled_reason` | string ≤64 (optional) | overage-disabled-reason header |
 | `cache_hit_rate` | float 0–1 | `cache_read_input_tokens / (input + cache_creation + cache_read)` |
 | `q5h_delta`, `q7d_delta` | float | per-call delta from the previous row's q5h/q7d; 0 on first call after restart |
-| `request_id` | string ≤64 (optional, gated) | upstream `request-id` response header. Default-off; enable with `CACHE_FIX_USAGE_LOG_REQID=on`. **Cross-repo gate:** older `claude-code-meter` installs reject unknown keys; the field is gated default-off until meter v0.5.0+ ships. |
+| `request_id` | string ≤64 (optional, gated) | upstream `request-id` response header. Default-off; enable with `CACHE_FIX_USAGE_LOG_REQID=on`. **Cross-repo gate:** `claude-code-meter >= v0.7.0` accepts the optional field; older meter installs reject unknown keys via the strict-object schema. |
 
 **Why `request_id` matters operationally.** The `sid` field is generated once at proxy boot and shared across every CC session that proxy serves. On hosts running multiple concurrent CC sessions through one proxy (common in agent fleets), every session's rows collapse into the same `sid` — there's no way to ask "which session burned 80% of today's Opus tokens?" from `usage.jsonl` alone. CC's per-session JSONL transcripts at `~/.claude/projects/<project>/<session-uuid>.jsonl` already carry `requestId` for every API call. Capturing the same value in the meter row makes the post-hoc join trivial:
 
