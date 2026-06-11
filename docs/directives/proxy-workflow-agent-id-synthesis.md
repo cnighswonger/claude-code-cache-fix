@@ -289,7 +289,7 @@ Modified:
 - `README.md` — extension docs.
 - `docs/extensions.md` — updated entries for the three touched extensions.
 
-**Companion PR (meter side, MUST land first):** `claude-code-meter` — directive named `meter-agent-id-schema-addition` to be filed before this directive's implementation PR opens. Adds optional `agent_id` (string, max 64) + `agent_id_source` (enum: `"cc-header" | "cache-fix-derived"`) fields to `MeterRowSchema`. Ships in claude-code-meter v0.8.0. **As of the round-3 commit on this directive, the meter directive has not yet been filed.** The cache-fix implementation PR for this directive is BLOCKED until the meter directive is filed; the cache-fix implementation PR cannot merge until meter v0.8.0 is released. The round-2 `#TBD` reference was misleading and is corrected.
+**Companion PR (meter side, MUST land first):** [cnighswonger/claude-code-meter#30](https://github.com/cnighswonger/claude-code-meter/pull/30) (branch `directive/agent-id-schema-addition`, commit `88c7c0c`) — adds optional `agent_id` (string, max 64) + `agent_id_source` (enum: `"cc-header" | "cache-fix-derived"`) fields to `MeterRowSchema`. Ships in claude-code-meter v0.8.0. **The cache-fix implementation PR for this directive cannot merge until meter v0.8.0 is released.**
 
 Out of scope (no changes):
 - `proxy/pipeline.mjs`, `proxy/stream.mjs`, `proxy/server.mjs` — no pipeline modifications. No upstream header emission.
