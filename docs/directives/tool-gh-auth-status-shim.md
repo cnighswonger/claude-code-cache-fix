@@ -36,7 +36,7 @@ The framing is **workaround, not fix**. The README explicitly frames the tool as
 ## Non-Functional Requirements
 
 - **Size/complexity budget:** shim script ~150 LOC bash; classification helper ~80 LOC; install/uninstall ~100 LOC each; bats tests ~250 LOC; README ~300 LOC. Honest total: ~880 LOC. The round-1 budget of 400 LOC was not credible once bats CI infrastructure is included.
-- **bash 3.2 floor** — macOS ships bash 3.2 by default; the script must run on it. Modern features (`mapfile`, `[[ -v ]]`, `;;&` case fall-through, `${var,,}`) are forbidden unless guarded by version detection. Verified by `shellcheck -s sh` plus a real bash 3.2 test target in CI.
+- **bash 3.2 floor** — macOS ships bash 3.2 by default; the script must run on it. Modern features (`mapfile`, `[[ -v ]]`, `;;&` case fall-through, `${var,,}`) are forbidden unless guarded by version detection. Verification (closes round-2 N4): CI explicitly invokes the bats suite under `/bin/bash` on the macOS runner AND every test file asserts `BASH_VERSION` starts with `3.2` inside its setup. `shellcheck` runs as a CI lint pass but in default mode (NOT `-s sh`, which enforces POSIX sh and would reject perfectly legal bash 3.2 constructs); the macOS bash-3.2 run is the actual floor verifier.
 - **Portable timeout** — `timeout` is GNU coreutils, absent on macOS. The shim uses a bash-native timeout pattern (`gh ... &` background, `sleep N &&  kill ...` watchdog, `wait` for outcome) or detects and uses `gtimeout` (Homebrew) / `timeout` whichever is present. Verified across linux + macOS in CI.
 - **No external runtime dependencies beyond `gh` itself.** `jq` is NOT required (round-1 listed it; not needed for shim use case). Verified.
 - **Threat model:** the shim sees gh stderr/stdout for classification purposes but never logs them, never persists credentials, never modifies gh state. Read-only with respect to the auth backend.
@@ -77,34 +77,86 @@ esac
 For `auth status` specifically:
 
 ```bash
-# Run real gh with portable timeout (~10s — longer than CC's 5s
-# so we can DIFFERENTIATE timeout from real expiry, not collide with
-# CC's same 5s window).
-OUTPUT=$(portable_timeout 10 "$REAL_GH" auth status --hostname github.com 2>&1)
+# Run real gh with portable timeout INSIDE CC's 5s window. CC Desktop
+# spawns the shim with timeoutMs: 5e3 and abandons it at t=5s — any
+# verdict the shim renders after that point is invisible to CC. The
+# shim's internal budget must therefore be ~3.5-4s so it can both run
+# the real gh AND classify within CC's window.
+#
+# Capture stdout and stderr SEPARATELY so output stream semantics are
+# preserved (gh has historically moved auth-status output between
+# streams; re-merging would compound that drift).
+STDOUT_FILE=$(mktemp)
+STDERR_FILE=$(mktemp)
+portable_timeout 4 "$REAL_GH" auth status --hostname github.com \
+    > "$STDOUT_FILE" 2> "$STDERR_FILE"
 EXIT=$?
+STDOUT=$(cat "$STDOUT_FILE")
+STDERR=$(cat "$STDERR_FILE")
+rm -f "$STDOUT_FILE" "$STDERR_FILE"
+
+# Normalize timeout exit code. GNU timeout uses 124; bash-native
+# watchdog (kill -TERM) yields 128+SIGTERM = 143. Map both to 124
+# internally so the classifier is platform-agnostic.
+if [ "$EXIT" = "143" ]; then EXIT=124; fi
 
 case "$EXIT" in
-  0)  # Real success — pass through
-      echo "$OUTPUT"; exit 0 ;;
-  124) # Timeout (whatever exit code our portable timeout uses)
-      # Transient — return success to suppress false toast
-      echo "$OUTPUT" >&2; exit 0 ;;
-  *)  # Non-zero — inspect output
-      classify_real_failure "$OUTPUT" "$EXIT"
+  0)  # Real success — pass stdout and stderr through their original streams
+      printf '%s\n' "$STDOUT"
+      printf '%s\n' "$STDERR" >&2
+      exit 0 ;;
+  124) # Timeout (whether GNU timeout or bash-native watchdog)
+      # Transient — return success to suppress false toast. Emit a
+      # diagnostic to stderr so direct-shell callers see what happened;
+      # CC Desktop has already abandoned the shim at t=5s and will
+      # never read this, which is fine.
+      printf '%s\n' "$STDERR" >&2
+      printf '[gh-auth-status-shim] auth status timed out within %ss; treating as transient.\n' "$INTERNAL_TIMEOUT" >&2
+      exit 0 ;;
+  *)  # Non-zero — inspect outputs separately and classify
+      classify_real_failure "$STDOUT" "$STDERR" "$EXIT"
       ;;
 esac
 ```
 
 Where `classify_real_failure` returns 0 (suppress) for transient signals and the original exit code (propagate) for genuine "not logged in" signals.
 
-**Critical prototype-validation step:** before merge, the implementation PR must demonstrate that CC Desktop's PR poller actually resolves `gh` through the user's PATH (vs. an absolute path or its own resolution scheme). This is verified on visits-01 by:
+**Per-feeder-path coverage** (honest disclosure for the README):
 
-1. Installing the shim.
-2. Running a CC Desktop session that triggers PR polling.
-3. Confirming via shim-side logging that the shim received the `auth status` invocation.
-4. Inducing a 6-second `sleep` in the shim's timeout path and confirming the false toast does NOT fire (vs. without the shim, where it does).
+| CC#67055 feeder path | Shim coverage |
+|---|---|
+| Slow `gh` exceeding CC's 5s (Keychain slow-read, event-loop stalls) | **Covered** — shim's 4s internal timeout returns exit 0 before CC's 5s abandonment. |
+| Anonymous-401 from gh's silent Keychain fallback (cli/cli#13317) | **Covered** — fast-failing exit; classifier matches HTTP 401 in stderr and returns 0. |
+| Network transient (timeout, connection refused, resolve failure) | **Covered** — classifier matches stderr signals and returns 0. |
+| Deleted-`cwd` spawn failure (CC#67055 issue update feeder #4) | **NOT covered** — spawn fails before any `gh` (real or shim) executes. Documented limitation. |
+| Genuinely expired token | **Correctly propagates** — classifier matches "not logged in" in stdout and returns the original exit code, letting CC's toast fire as intended. |
 
-If step 3 fails (CC Desktop bypasses PATH), the entire approach is dead and the directive must be withdrawn or rescoped to a different mechanism. This is the load-bearing experimental validation per Fable round 1.
+The previous round-2 directive's "longer than CC's 5s so we can DIFFERENTIATE" rationale was backwards: differentiating timeout-vs-expiry past 5s benefits only non-CC callers, who are not the audience. CC Desktop is the audience, and CC's 5s window is the load-bearing constraint.
+
+**Critical prototype-validation step:** before merge, the implementation PR must demonstrate (a) that CC Desktop's PR poller actually resolves `gh` through the user's PATH on the target platform, AND (b) that the shim renders its verdict within CC's 5-second window.
+
+**Linux (visits-01) validation:**
+
+1. Install the shim.
+2. Run a CC Desktop session that triggers PR polling.
+3. Confirm via shim-side logging that the shim received the `auth status` invocation.
+4. Mock the real `gh` to sleep 8 seconds (longer than CC's 5s window). The shim's 4s internal timeout must fire AND return exit 0 in time for CC to read it. **Verify the false toast does NOT fire.** Baseline without the shim: the false toast DOES fire when the real `gh` is slow.
+5. Measure the shim's actual wall-clock time-to-exit; must be < 5s on the slow-real-gh path.
+
+If step 3 fails (CC Desktop bypasses PATH on Linux), the mechanism is dead on Linux and the directive must be withdrawn or rescoped. If step 4 or 5 fails (shim cannot answer within CC's 5s window), the timeout budget is wrong and must be tightened further.
+
+**macOS validation (separate experiment; closes round-2 B2 residual):**
+
+macOS GUI apps launched from Finder/Dock inherit `launchd`'s PATH (`/usr/bin:/bin:/usr/sbin:/sbin`), NOT the user's shell PATH. A shim installed in `~/.local/bin` may be invisible to CC Desktop even if Linux validation passes. The implementation PR must either:
+
+- **(a) Recruit a macOS validator** from the CC#67055 issue thread, run steps 1-5 above on macOS Desktop, and attach the results to the PR; OR
+- **(b) Scope the support claim** to "Linux validated; macOS PATH resolution unverified" in the README, install instructions, and the CHANGELOG. The shim still ships, but the README is honest that macOS coverage is experimental.
+
+The `install.sh` PATH-ordering check inspects the *shell* PATH, which can give macOS users false confidence (shell PATH is correct, but `launchd`'s PATH is what matters for CC Desktop). The README limitations section MUST say so explicitly.
+
+**Windows validation:** out of scope. Native Windows is NOT covered by a bash shim (see "Coverage scope" below).
+
+If both (a) and (b) are unviable for macOS — no validator available AND we don't want to scope-restrict — the directive is reduced to Linux-only and the macOS-validation prerequisite becomes a follow-up directive.
 
 ## Classification table (closes Fable B1 fiction)
 
@@ -147,8 +199,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: brew install bats-core
-      - run: /bin/bash --version  # confirm bash 3.2 default
-      - run: bats tools/gh-auth-status-shim/tests/
+      - run: /bin/bash --version  # informational only — does NOT pin bats interpreter
+      # Force the suite to run under /bin/bash (3.2) explicitly; without this,
+      # bats's `#!/usr/bin/env bash` shebang may resolve to Homebrew bash and
+      # the floor claim becomes theater (round-2 N4).
+      - run: /bin/bash $(which bats) tools/gh-auth-status-shim/tests/
 ```
 
 shellcheck runs in CI only (not in `install.sh`) per Fable round 1 attention #4.
@@ -166,12 +221,14 @@ shellcheck runs in CI only (not in `install.sh`) per Fable round 1 attention #4.
 4. Prints the sunset notice + CC#67055 link.
 5. Exits 0 only if all steps succeeded.
 
-`uninstall.sh`:
+`uninstall.sh` (closes round-2 N2 — the round-2 restore-from-backup step was inverted logic; install refuses to overwrite non-shim files, so every `.bak` is by construction an older shim version, and "restoring" would silently put an outdated shim back on PATH):
 
 1. Verifies the file at target is a shim (`grep -q '^# gh-auth-status-shim'`); refuses to remove if not.
-2. Removes the file. Backs up to `.bak` before removing.
-3. Restores from `.bak` of the prior install if one exists.
+2. Removes the file.
+3. Removes any `<target>.bak.<timestamp>` shim backups created by prior installs (verifies each is a shim before removing, same predicate as step 1).
 4. Prints confirmation + the export line the user can remove from shell rc.
+
+No restore-from-backup. Installs that fail their own integrity check leave nothing to restore; installs that succeeded created shim backups, which uninstall should clean up, not reinstate.
 
 Idempotent: install twice → no-op the second time; uninstall twice → benign error on the second.
 
@@ -224,15 +281,15 @@ In scope:
 - New directory `tools/gh-auth-status-shim/` per the layout above.
 - bats test suite covering classification table cases + end-to-end shim behavior.
 - Portable timeout implementation (bash-native or detected `gtimeout`/`timeout`).
-- bash 3.2 compatibility (verified by `shellcheck -s sh` + macOS bash 3.2 CI runner).
+- bash 3.2 compatibility (verified by forcing the bats suite under `/bin/bash` on the macOS CI runner + per-test `BASH_VERSION` assertion; NOT by `shellcheck -s sh`, which enforces POSIX sh and would reject legal bash 3.2 constructs).
 - `install.sh` / `uninstall.sh` per the behavior spec above.
-- README citing CC#67055, classification table, limitations, sunset plan.
+- README citing CC#67055, classification table, limitations (per-feeder-path coverage table from above; behavioral-change disclosure; macOS launchd-PATH caveat; native-Windows non-coverage), sunset plan, troubleshooting section documenting the **specific `gh` version range the classification table was validated against** (closes round-1 attention #6 remainder; classification anchors on `gh`'s output strings, which `gh` has historically reworded across versions — a documented version range tells users when the table may need refresh).
 - New CI workflow `.github/workflows/test-shim.yml` (linux + macOS).
 - TRACKED_ISSUES.md entry.
 - Prototype-validation step on visits-01 documented in the PR body before merge.
 
 Out of scope (deferred):
-- Windows PowerShell port — Fable round 1 noted; covered for Windows users on WSL/Git-Bash today; native port is a follow-up if user demand surfaces.
+- Windows PowerShell port. **Native Windows CC Desktop is NOT covered by a bash shim** (closes round-2 N3): CC Desktop on Windows spawns `gh.exe` through Windows PATH resolution; a bash shim on a WSL or Git-Bash PATH is invisible to that spawn. The round-2 directive's "covered for Windows users on WSL/Git-Bash" claim was false for the CC#67055 toast specifically. Windows users running CC Desktop natively must wait for a future PowerShell port or for Anthropic's classifier fix. Windows users running CC inside WSL with CC Desktop also inside WSL would be covered by the bash shim, but that's an uncommon configuration; do not claim it as general Windows support.
 - Telemetry/phone-home of any kind.
 - Caching `gh` auth token to inject as `GH_TOKEN` env var (the issue's third suggested fix from CC#67055's body). Distinct tool with distinct security implications; not bundled here.
 - Modifying CC's classifier directly. Not our code.
@@ -297,7 +354,14 @@ Out of scope (no changes):
 - [ ] Mechanism is documented as PATH shim, not CC hook, throughout.
 - [ ] Prototype validation step (visits-01, mechanism actually intercepts CC Desktop's invocation) ran successfully — results attached as PR comment.
 - [ ] Portable timeout: bash-native, or detected `gtimeout`/`timeout`; works on stock macOS.
-- [ ] bash 3.2 floor: `shellcheck -s sh` clean + macOS-default-bash CI runner passes.
+- [ ] bash 3.2 floor: macOS CI runner explicitly invokes `/bin/bash $(which bats) tests/`; every test asserts `BASH_VERSION` starts with `3.2` in setup. (shellcheck runs in default mode for general lint; `-s sh` is NOT the floor verifier.)
+- [ ] Shim internal timeout ≤ 4s — verified against CC's 5s spawn-timeout window.
+- [ ] Validation experiment passed on Linux: mocked-slow-gh sleep 8s → toast does NOT fire (with shim) but DOES fire (without).
+- [ ] macOS validation: either an external validator's results attached, OR README + CHANGELOG explicitly scope macOS as "unverified" and `install.sh` PATH-check disclaims launchd-PATH.
+- [ ] Windows native CC Desktop NOT claimed as supported; README sunset section says so.
+- [ ] `uninstall.sh` removes shim AND `.bak` shim backups; no restore-from-backup step.
+- [ ] `gh auth status` stdout and stderr preserved separately through the shim (no `2>&1` re-merge).
+- [ ] Timeout exit code normalized (GNU 124 + bash-native 143 → 124).
 - [ ] No `jq` dependency.
 - [ ] Classification table is the conservative posture (ambiguous → return original exit code, let CC see).
 - [ ] Behavioral-change disclosure (`gh auth status` rewritten for every caller in the shim's PATH scope) explicit in README limitations.
