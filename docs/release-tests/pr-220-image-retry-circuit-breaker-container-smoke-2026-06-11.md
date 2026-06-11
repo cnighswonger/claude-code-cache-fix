@@ -1,17 +1,20 @@
-# PR #220 image-retry-circuit-breaker sim validation — 2026-06-11
+# PR #220 image-retry-circuit-breaker — container smoke — 2026-06-11
 
 **Branch:** `feature/image-retry-circuit-breaker`
 **Commit at run time:** `7ce182c` (Codex round-2 APPROVE)
-**Verdict:** **GREEN** — sections A–E pass
+**Verdict:** **GREEN for container-runtime wire-format validation** — sections A–E pass
 **Run host:** Docker Engine 29.5.2 (Linux/amd64), Node 22 Alpine container image
 **Per:** directive § Sim validation requirement (`docs/directives/proxy-image-retry-circuit-breaker.md:182-190`); merge gate via `needs-sim-validation` label
 **Sim script:** `/tmp/cf-sim-pr220/sim.sh` (out-of-tree; reproducible from this report)
+**Renamed from**: `pr-220-image-retry-circuit-breaker-sim-2026-06-11.md` 2026-06-11 to reflect actual scope (container wire-format proof, not the full sim-validation requirement). See `pr-220-image-retry-circuit-breaker-parallel-harness-2026-06-11.md` for the comprehensive sim record including parallel-harness validation on visits-01 and the empirical scope finding on CC binary harness consumption.
 
 ## Scope
 
-Validates the image-retry circuit breaker in a container-runtime environment matching the production deployment shape. The unit + integration suite (1078/1078) covers correctness in-process; this sim catches Node/filesystem/container-isolation assumptions that only surface under `node:22-alpine` and confirms the wire format the proxy emits matches the directive's contract.
+**Narrow scope:** container-runtime wire-format validation. This sim verifies the breaker emits the directive's wire format correctly under `node:22-alpine` using the in-tree `Dockerfile`. It complements the parallel-harness report (`pr-220-image-retry-circuit-breaker-parallel-harness-2026-06-11.md`) which adds direct-source-tree validation on visits-01.
 
-**The CC binary harness is not exercised in this sim.** The fake upstream stubs the canonical Anthropic image-processing-error envelope; the synthesized SSE / JSON responses are captured for byte-mimicry comparison against a real-upstream stream tail. The CC-side consumption of the synth (directive sim #1, #2, #4 in part) requires a separate operator-driven traffic capture against the live CC binary, deferred per the explicit out-of-scope section at bottom.
+The unit + integration suite (1078/1078) covers correctness in-process; this sim catches Node/filesystem/container-isolation assumptions that only surface under `node:22-alpine` and confirms the wire format the proxy emits matches the directive's contract.
+
+**The CC binary harness is not exercised in this sim.** The fake upstream stubs the canonical Anthropic image-processing-error envelope; the synthesized SSE / JSON responses are captured for byte-mimicry comparison against a real-upstream stream tail. The CC-side consumption of the synth (directive sim #1, #2, #4 in part) is addressed in the parallel-harness report: empirically not reproducible at this scope because the canonical CC#66815 retry pattern requires interactive multi-turn with a real-Anthropic-triggering image fixture. The `dry-run` mode + default-off shipping gate cover the consumption-side risk in production.
 
 ## Test rig
 
