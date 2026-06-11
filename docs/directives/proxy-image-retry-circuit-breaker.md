@@ -26,7 +26,7 @@ The framing is **advisory-protective**, not blocking. The proxy returns a wire-f
 - **Size/complexity budget:** extension code ~150 LOC; helpers (image-hash, error-class predicate, SSE synthesis) ~100 LOC; tests ~250 LOC. **Total budget ~500 LOC including SSE synthesis path** — accurate for the actual surface, not extension-code only. Flag at review if it grows past that.
 - **Threat model:** content hashing reads request body. The proxy already does this (e.g., `prefix-diff`, `signature-surface-hash`). The breaker state is in-memory and per-session; nothing persists to disk beyond the optional structured log of cool-off events.
 - **PII discipline (matches `bootstrap-defense`):** the JSONL event log carries hashes, session id, timestamps, remaining-TTL, request_id only — never image bytes, never request bodies, never auth headers. Rotation at 5 MB single-tier (precedent: `bootstrap-defense`'s `rotateIfNeeded`).
-- **Activation model:** `enabled: true` in `extensions.json` (always loaded) with internal env-var gate `CACHE_FIX_IMAGE_RETRY_BREAKER` (`on` / `off` / `dry-run`) per the established `prefix-diff` pattern (`proxy/extensions/prefix-diff.mjs:30`). Default-off in v4.2.0 first ship; default-on after one minor-version validation cycle.
+- **Activation model:** `enabled: true` in `extensions.json` (always loaded) with internal env-var gate `CACHE_FIX_IMAGE_RETRY_BREAKER`. The always-loaded + internal-gate shape follows the established `prefix-diff` pattern (`proxy/extensions/prefix-diff.mjs:30` demonstrates the boolean gate); the breaker extends this to a tri-state (`on` / `off` / `dry-run`) for the production-debug surface. Default-off in v4.2.0 first ship; default-on after one minor-version validation cycle.
 - **Failure mode:** if the breaker misfires (false positive on a legitimately-retryable case), the user can disable the extension with one env-var flip and the proxy falls back to forwarding every request. Log the cool-off events so misfires are diagnosable.
 - **Tunables:** the cool-off window is operator-configurable via `CACHE_FIX_IMAGE_RETRY_COOLOFF_MS` (default 30,000). State map maximum entries via `CACHE_FIX_IMAGE_RETRY_MAX_ENTRIES` (default 4096) — over which the LRU evicts.
 
@@ -100,7 +100,7 @@ A retry is identified by the conjunction of all four conditions:
 1. The previous response on the same session matched the **image-processing-error predicate** (see "Error-class predicate" below).
 2. The current request carries an image content block whose SHA-256 matches an image content block that was on the request that produced the previous failure.
 3. The current request arrives within `CACHE_FIX_IMAGE_RETRY_COOLOFF_MS` (default 30,000 ms) of the previous failure.
-4. The current request is on the same session, resolved via `resolveSessionId(ctx.headers)` from `cache-telemetry.mjs:64-72` (checks `x-claude-code-session-id`, `x-session-id`, and `x-anthropic-session-id`). If no session id resolves, the bucket key is the string `"unknown"` (matching `sessionFilename` convention) and per-session isolation applies only across requests that also have no session id.
+4. The current request is on the same session, resolved via `resolveSessionId(ctx.headers)` from `cache-telemetry.mjs:64-72` (checks `x-claude-code-session-id`, `x-session-id`, and `x-anthropic-session-id`). If no session id resolves, the request is bucketed under the literal key `"unknown"`. **Sessionless requests are NOT isolated from each other by `requestSignature`** — they share the `"unknown"` bucket, and any sessionless request whose image-hash set intersects a recorded `"unknown"`-bucket failure within the cool-off window will be short-circuited. This is an acknowledged limitation: sessionless traffic is uncommon (CC sets the session-id header) and the 30s sliding window bounds cross-contamination. The test plan covers a sessionless request matching another sessionless request's recorded failure (the cross-sessionless case), distinct from the round-2 framing that implied per-request isolation within the unknown bucket.
 
 All four must hold. Any one of them being false routes the request through to upstream normally (fail-open).
 
@@ -114,7 +114,7 @@ This is an explicit acceptance, not a documentation gap. A test covers the repla
 
 ## Error-class predicate (closes Fable B2)
 
-The predicate is **inlined** in the extension. No new shared module is introduced. Following `rate-limit-log.mjs:60-65`'s pattern:
+The predicate is **inlined** in the extension. No new shared module is introduced. Following `rate-limit-log.mjs:68-74`'s `isRateLimitResponse` inline-predicate pattern:
 
 ```js
 function isImageProcessingError(ctx) {
@@ -194,14 +194,14 @@ Sim validation results are attached as a PR comment before reviewer chain progre
 - Unit: `image-hash.mjs` — same image bytes via different base64 encodings produce same hash; different images produce different hashes; non-image content blocks produce no hash.
 - Unit: `isImageProcessingError` — matches the documented envelope; rejects `overloaded_error` (the near-miss class); rejects rate-limit-error 429s; rejects success 200s.
 - Unit: state machine — failure recording, cool-off expiry, per-session isolation, per-hash isolation, retry counter increment, LRU eviction at cap, throttled sweep removes stale entries.
-- Unit: SSE event-sequence builder — produces correctly-formatted SSE bytes matching `proxy/stream.mjs` event-shape expectations (`message_start` → `content_block_start` → `content_block_delta` → `content_block_stop` → `message_delta` → `message_stop` → `[DONE]`); echoes `model` from request; carries short-circuit text in `content_block_delta`.
+- Unit: SSE event-sequence builder — produces correctly-formatted SSE bytes matching `proxy/stream.mjs` event-shape expectations (`message_start` → `content_block_start` → `content_block_delta` → `content_block_stop` → `message_delta` → `message_stop`; `[DONE]` sentinel deferred to sim validation per the wire-format spec); echoes `model` from request; carries short-circuit text in `content_block_delta`.
 - Integration: replay fixture of CC#66815's exact retry pattern (19 consecutive identical-image requests on a streaming session, each preceded by an upstream HTTP-400 "image could not be processed" failure). Assert: first request forwards upstream; failure recorded; second through nineteenth short-circuited with SSE responses; one JSONL event per cool-off; total upstream calls = 1, not 19.
 - Integration: replaced-bad-image + shared-good-image within cool-off window → short-circuits (acknowledged trade-off); same case after 30s window → forwards.
 - Integration: same image, different session → both forward upstream; per-session isolation preserved.
 - Integration: different image, same session → both forward upstream; per-hash isolation preserved.
 - Integration: `stream: false` request short-circuit → produces JSON response, not SSE.
 - Integration: env-var `dry-run` mode → logs events but does not short-circuit; useful for production debugging.
-- Integration: sessionless request (no session-id headers) → keyed as `"unknown"` bucket; isolated from other sessionless requests of different signatures.
+- Integration: sessionless request (no session-id headers) → keyed under `"unknown"` bucket; a sessionless request with image-hash overlap to a previously-recorded `"unknown"`-bucket failure within the cool-off window IS short-circuited (cross-sessionless contamination is the acknowledged trade-off, mitigated by the 30s sliding window).
 - Sim validation: as defined above.
 
 ## Files modified / created
@@ -230,7 +230,7 @@ Out of scope (no changes):
 
 ## Reviewer checklist (cache-fix side)
 
-- [ ] Hook surface uses `onRequest` (returning `{skip: true, status, headers, body, stream}`) and `onResponse` only.
+- [ ] Hook surface uses `onRequest` (returning `{skip: true, status, headers, body}` — no `stream` field, dropped in round 3 per N2) and `onResponse` only.
 - [ ] `stream: true` requests get an SSE event sequence response; `stream: false` requests get JSON.
 - [ ] String-body SSE flows through the existing skip handler unchanged (no `server.mjs` modification was needed; the skip handler's string-vs-object dispatch handles both modes).
 - [ ] Image-processing-error predicate is inlined and tested against `overloaded_error` and rate-limit 429s as negative cases.
