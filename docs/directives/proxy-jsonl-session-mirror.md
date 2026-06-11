@@ -6,7 +6,8 @@
 - [anthropics/claude-code#66486](https://github.com/anthropics/claude-code/issues/66486) — *2.1.169: interactive sessions write no JSONL transcript (only ai-title stub)*
 **Priority:** P1
 **Branch:** `feature/jsonl-session-mirror`
-**Stage:** directive — round 2 (addresses Fable round-1 REQUEST_CHANGES at PR #214)
+**Stage:** directive — round 3 (addresses Codex round-1 REQUEST_CHANGES at PR #214; prior rounds addressed Fable round-1 then Fable round-2 REQUEST_CHANGES)
+**Labels:** `directive-stage`, `schema-change` (mirror file is a new contract for CC-transcript-reader interoperability), `needs-sim-validation` (mandatory merge gate on envelope-shape parity)
 **Milestone:** v4.2.0
 
 ## Goal
@@ -31,12 +32,14 @@ We do not claim the mirror solves CC's bug; CC's bug is upstream and Anthropic's
 - **Disk-cost discipline:** per-session active-file rotation at `CACHE_FIX_SESSION_MIRROR_MAX_BYTES` (default 100 MB) AND a retention sweep at `CACHE_FIX_SESSION_MIRROR_RETENTION_DAYS` (default 30) — rotated files past the retention window are unlinked by a throttled sweep modeled on `cache-telemetry.mjs`'s `sweepStaleSessions`. Worst-case bytes documented as: active sessions × MAX_BYTES × (rotations within retention window).
 - **PII discipline:** the `session-mirror-events.jsonl` writer log carries only session id, timestamps, action (open / rotate / sweep / error), rotation count, and byte counts — never image bytes, never prompt content, never auth headers. Rotation at 5 MB single-tier per `bootstrap-defense.rotateIfNeeded` precedent.
 - **Failure isolation:** the pipeline try/catches every hook (`pipeline.mjs:91-96` and equivalent), so a thrown mirror writer cannot break the response. The directive states this explicitly and the test plan proves it (B5 follow-through). Async writes inside the writer are `.catch`-handled internally — un-awaited rejected promises must not escape into `unhandledRejection`.
+- **Memory tradeoff:** the per-message accumulator on `ctx.meta._mirrorAccumulator` is request-scoped, so memory usage is one full in-flight assistant message buffered per concurrent request. At observed CC concurrency this is acceptable; documented for honest accounting (closes Codex round-1 attention).
+- **Load-bearing? Yes.** This directive introduces a new persisted file contract intended for CC-transcript-reader interoperability AND defines new env-var / config surfaces that affect plaintext-on-disk privacy posture. By CLAUDE.md's rubric (shared abstraction + wire/schema contract + security-relevant), this qualifies as load-bearing. Per CLAUDE.md, load-bearing changes require Chris human review before merge in addition to the routine Lead + Codex review path.
 
 ## Pipeline-hook surface (closes Fable B1)
 
 The pipeline exposes exactly four hooks: `onRequest`, `onResponseStart`, `onStreamEvent`, `onResponse` (`pipeline.mjs:85-141`). For streaming traffic — essentially all `/v1/messages` traffic — `runOnResponse` does NOT fire (`server.mjs:160-188`); `streamResponse` runs `onStreamEvent` per event and then ends the client response. The previously-named `onResponseEnd` does not exist.
 
-The mirror runs as a **stream-event accumulator** with one buffered write at `message_stop`:
+The mirror runs as a **stream-event accumulator** with one buffered file write at `message_stop` — the staged user/tool-result records and the assistant record are concatenated into a single `appendFile` call (NDJSON, one record per line), so a write-time crash either persists all of them or none. This is the batching boundary; "buffered write" and "flush user records first, then the assistant record" refer to the same one file write, not two:
 
 - **`onRequest`** — extracts the resolved session id via `resolveSessionId(ctx.headers)` (`cache-telemetry.mjs:64-72`); stashes it on `ctx.meta._mirrorSessionId`. Examines `ctx.body.messages` for new user/tool-result content not already mirrored for this session (per the dedup state machine; closes B3); stages those as pending records on `ctx.meta._mirrorPendingUserRecords` for emission alongside the response record. The dedup map is module-scope per session.
 - **`onStreamEvent`** — accumulates per-message state across `message_start` → `content_block_start` → `content_block_delta` → `content_block_stop` → `message_delta` → `message_stop`. On `message_stop`, builds the complete assistant record in CC's transcript envelope (B2 fix below), writes it + any staged user/tool-result records, and clears the per-message accumulator. The accumulator handles `text_delta`, `input_json_delta` (for `tool_use` blocks), and `thinking_delta` (with optional exclusion per env var).
@@ -98,25 +101,34 @@ The CHANGELOG must call out three known limitations: the mirror's `cwd` is `null
 
 ## Dedup state (closes Fable B3 round-1 + round-2 NB1 + NB2)
 
-CC re-sends the full conversation history in every request. Without dedup, the mirror would write `O(n²)` records over an `n`-turn session. The fix uses **position-based tracking** (not content-hash matching), with state advancement deferred until **write time** (not stage time) so failed requests do not silently lose user records.
+CC re-sends the full conversation history in every request. Without dedup, the mirror would write `O(n²)` records over an `n`-turn session. The fix uses **user-ordinal position tracking** (not content-hash matching), with state advancement deferred until **write time** (not stage time) so failed requests do not silently lose user records.
 
-Module-scope state: `mirrorState.sessions = Map<sessionId, { mirroredMessageCount: number, mirroredToolResultIds: Set<string> }>`.
+Module-scope state: `mirrorState.sessions = Map<sessionId, { mirroredUserMessageCount: number, mirroredToolResultIds: Set<string> }>`.
 
-`mirroredMessageCount` is the count of user-role messages from `ctx.body.messages` that have been **successfully written to the mirror file** for this session. New user records mirror only messages at index `>= mirroredMessageCount` in the current request's `messages` array.
+`mirroredUserMessageCount` is the count of user-role messages already written to the mirror file for this session. **This is a count in user-role-message coordinates, not in raw `ctx.body.messages` indices** — the round-2 directive conflated the two coordinate systems, which produced incorrect dedup once assistant turns were interleaved (Codex round-1 blocker on PR #214).
 
 `onRequest` logic (staging only — does NOT advance state):
 
 1. Resolve session id; load (or create) the session entry.
-2. Examine `ctx.body.messages`; iterate only entries where `role === "user"` and the index is `>= mirroredMessageCount`. Stage each as a pending user record.
-3. For each `tool_result` content block inside those staged user messages, check its `tool_use_id` against `mirroredToolResultIds`. If already present, omit that block from the staged record (the surrounding user message may still stage if it has other un-mirrored blocks). Otherwise add the id to a `pendingToolResultIds` set carried on `ctx.meta`, NOT yet to the session map.
-4. Stage everything on `ctx.meta._mirrorPendingUserRecords` (the records) + `ctx.meta._mirrorPendingMessageCount` (the new high-water count if these records were to write successfully) + `ctx.meta._mirrorPendingToolResultIds` (the new ids).
+2. **Filter `ctx.body.messages` to user-role entries**, preserving original-array order. Call this filtered list `userMessages` and its length `userMessagesLen`.
+3. For each `userMessages[k]` where `k >= mirroredUserMessageCount`, stage it as a pending user record. (The corresponding raw-array index is recorded only for the synthetic `parentUuid` chain — it is NOT used as a dedup key.)
+4. For each `tool_result` content block inside those staged user messages, check its `tool_use_id` against `mirroredToolResultIds`. If already present, omit that block from the staged record (the surrounding user message may still stage if it has other un-mirrored blocks). Otherwise add the id to a `pendingToolResultIds` set carried on `ctx.meta`, NOT yet to the session map.
+5. Stage everything on `ctx.meta._mirrorPendingUserRecords` (the records) + `ctx.meta._mirrorPendingUserMessageCount` (the value `userMessagesLen` — the new high-water if these records write successfully) + `ctx.meta._mirrorPendingToolResultIds` (the new ids).
 
 `onStreamEvent` (at `message_stop`, after the assistant record is successfully written):
 
-5. Flush the staged user records first, then the assistant record (the linear `parentUuid` chain orders correctly).
-6. **Only after all writes have succeeded:** advance `mirroredMessageCount` to `_mirrorPendingMessageCount` and union `mirroredToolResultIds` with `_mirrorPendingToolResultIds`.
+6. Flush the staged user records first, then the assistant record (the linear `parentUuid` chain orders correctly).
+7. **Only after all writes have succeeded:** advance `mirroredUserMessageCount` to `_mirrorPendingUserMessageCount` and union `mirroredToolResultIds` with `_mirrorPendingToolResultIds`.
 
-If the request never reaches `message_stop` (upstream 529, mid-stream abort, 4xx, client close) the staged records on `ctx.meta` are discarded with the request and the session-map state is unchanged. CC's natural retry re-sends the same `messages` array; the same un-mirrored indices stage again, and the mirror records appear exactly once when the retry succeeds.
+If the request never reaches `message_stop` (upstream 529, mid-stream abort, 4xx, client close) the staged records on `ctx.meta` are discarded with the request and the session-map state is unchanged. CC's natural retry re-sends the same `messages` array; the same un-mirrored user-ordinal positions stage again, and the mirror records appear exactly once when the retry succeeds.
+
+**Walk-through verifying the coordinate fix** (Codex round-1 blocker):
+
+- Request 1 `[u1]` → `userMessages = [u1]`, `userMessagesLen = 1`. `mirroredUserMessageCount` was 0; stages u1 (k=0). On write success: count → 1. ✓
+- Request 2 `[u1, a1, u2]` → `userMessages = [u1, u2]`, `userMessagesLen = 2`. count is 1; stages userMessages[1] = u2 only. On write success: count → 2. ✓
+- Request 3 `[u1, a1, u2, a2, u3]` → `userMessages = [u1, u2, u3]`, `userMessagesLen = 3`. count is 2; stages userMessages[2] = u3 only. On write success: count → 3. **3 user records after 3 turns, not 4.** ✓
+
+The round-2 algorithm produced 4 records on request 3 (because raw array index 2 is u2 and index 4 is u3, both ≥ a count-of-2). The round-3 fix uses the same coordinate system end-to-end and yields the acceptance number.
 
 The session map is bounded by `CACHE_FIX_SESSION_MIRROR_MAX_SESSIONS` (default 1024) with LRU eviction and a periodic 60s throttled sweep removing entries inactive past the retention window.
 
@@ -143,9 +155,9 @@ Mirror storage root: `~/.claude/session-mirrors/` (NOT `~/.cache-fix-proxy/`; pe
 
 ## Retention sweep (closes Fable B5)
 
-`MAX_BYTES` rotation bounds the active file but rotated files would accumulate without bound. The retention sweep closes this:
+`MAX_BYTES` rotation bounds the active file but accumulated files would grow without bound. The retention sweep closes this:
 
-- `CACHE_FIX_SESSION_MIRROR_RETENTION_DAYS` (default 30) — rotated files older than the threshold are unlinked.
+- `CACHE_FIX_SESSION_MIRROR_RETENTION_DAYS` (default 30) — **any mirror file** (active or rotated) whose mtime is older than the threshold is unlinked. For an inactive session whose active file has not rotated for >`RETENTION_DAYS`, the active file itself is unlinked — sweep is not "rotated-files-only" (closes Codex round-1 attention).
 - Sweep runs at a 60s throttled cadence inside the mirror extension's `onResponse`/`onStreamEvent` hooks (lazy, not a separate timer) — modeled on `sweepStaleSessions` in `cache-telemetry.mjs:132-156`.
 - Empty directories are pruned after sweep.
 - A throttled `sweep` event is logged to `session-mirror-events.jsonl` with the count of files unlinked.
@@ -195,12 +207,12 @@ Stream-event accumulator with one buffered write at `message_stop`. Zero pipelin
 ## Test plan
 
 - Unit: envelope shaper — produces records matching CC's verified key set for assistant + user records; image-content blocks become references; synthetic uuid chain is deterministic.
-- Unit: dedup state — same user message hashed twice mirrors once; different tool-result ids mirror separately; session entry LRU eviction.
+- Unit: dedup state — user-ordinal high-water advancement is correct (the round-2 hash-based wording is gone; replaced with position-based); different tool-result ids mirror separately; session entry LRU eviction.
 - Unit: retention sweep — files past `RETENTION_DAYS` unlinked; empty directories pruned.
 - Unit: `sessionFilename` reuse — verify integration with the established helper (no re-implementation).
 - Integration: 3-turn replay — exactly 3 user + 3 assistant records, no duplicates. (Position-based dedup; round-1 hash algorithm produced 5 user records by turn 3.)
 - Integration: 200-turn replay — total records = 400, not 20,400.
-- Integration: failed-request re-stage — turn 3 stages then upstream fails before `message_stop` → `mirroredMessageCount` unchanged. Turn 4 (CC's retry, same history) re-stages and the records appear exactly once. Asserts no record loss AND no duplicates.
+- Integration: failed-request re-stage — turn 3 stages then upstream fails before `message_stop` → `mirroredUserMessageCount` unchanged. Turn 4 (CC's retry, same history) re-stages and the records appear exactly once. Asserts no record loss AND no duplicates.
 - Integration: legitimately-repeated user text — same `"yes"` user text at turns 2 and 9 produces TWO distinct mirror records (position-based dedup; verifies the design choice over hash-set dedup which would collapse them).
 - Integration: stream-abort partial flush — `CACHE_FIX_SESSION_MIRROR_FLUSH_INTERRUPTED=true` (default) and stream aborts mid-message → mirror contains a partial assistant record with `stop_reason: "interrupted"`. With env var false, no partial record written.
 - Integration: writer throws synchronously mid-stream → client still receives complete SSE response.
@@ -243,7 +255,7 @@ Out of scope (no changes):
 - [ ] `restore-claude-history-linux` round-trip test passes against a generated mirror file.
 - [ ] Synthetic uuid chain is deterministic from `(sessionId, timestamp, messageId)`.
 - [ ] Image content blocks mirrored as references; bytes never persisted.
-- [ ] Dedup uses position-based `mirroredMessageCount`, not single-value hash comparison; advances ONLY at `message_stop` write success; failed-request re-stage test passes.
+- [ ] Dedup uses position-based `mirroredUserMessageCount` (user-role-message ordinal coordinates, NOT raw `messages[]` indices); advances ONLY at `message_stop` write success; failed-request re-stage test passes.
 - [ ] Synthetic `uuid` is dash-formatted (`8-4-4-4-12`) so shape-validating parsers accept it.
 - [ ] Per-message accumulator lives on `ctx.meta._mirrorAccumulator` (request-scoped); aborted streams free state via ctx GC; `CACHE_FIX_SESSION_MIRROR_FLUSH_INTERRUPTED` partial-flush behavior tested both directions.
 - [ ] User record key list matches verified 2.1.148 transcript shape: `isMeta` optional, `permissionMode` + `slug` included, `requestId` absent on user records, tool-result records omit `toolUseResult` / `sourceToolAssistantUUID` (CHANGELOG caveat).
