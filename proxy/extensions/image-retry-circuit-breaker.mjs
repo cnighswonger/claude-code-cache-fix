@@ -77,7 +77,16 @@ export function _resetState() {
   state.lastSweepMs = 0;
 }
 
+// Sessionless requests bucket to the "unknown" key WITHOUT requestSignature
+// scoping per directive § Detection logic point 4 — sessionless requests are
+// explicitly NOT isolated from each other by requestSignature; cross-
+// contamination within the cool-off window is the acknowledged trade-off.
+// All "unknown"-bucket entries collapse onto a single key so any sessionless
+// request whose image hashes overlap a recorded "unknown" failure fires the
+// breaker. For real sessions, the per-attempt-per-session granularity is
+// preserved by keying on `${sessionId}:${requestSignature}`.
 function makeKey(sessionId, requestSignature) {
+  if (sessionId === UNKNOWN_SESSION) return `${UNKNOWN_SESSION}:_`;
   return `${sessionId}:${requestSignature}`;
 }
 

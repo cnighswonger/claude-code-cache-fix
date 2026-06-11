@@ -138,8 +138,13 @@ test("different image, same session → forwards (per-hash isolation)", async ()
 
 test("same image, different session → forwards (per-session isolation)", async () => {
   const body1 = makeBody({ messages: [userMessage([imageBlock(IMG_A_B64)])] });
-  await ext.onRequest(ctxFor({ body: body1, sessionId: "session-aaa" }));
-  await ext.onResponse(errorResponseCtx({ meta: ctxFor({ body: body1, sessionId: "session-aaa" }).meta }));
+  const reqCtx1 = ctxFor({ body: body1, sessionId: "session-aaa" });
+  await ext.onRequest(reqCtx1);
+  // Use the SAME mutated meta the onRequest just populated, so the failure
+  // recorder finds the stashed hashes / session / signature.
+  await ext.onResponse(errorResponseCtx({ meta: reqCtx1.meta }));
+  // Verify the failure actually landed (smoke against a vacuous-pass regression).
+  assert.equal(logLines().length, 1, "session-aaa failure must have been recorded");
 
   const reqCtx2 = ctxFor({ body: makeBody({ messages: [userMessage([imageBlock(IMG_A_B64)])] }), sessionId: "session-bbb" });
   const result = await ext.onRequest(reqCtx2);
@@ -248,25 +253,78 @@ test("replaced-bad-image+shared-good-image within cool-off → short-circuits (a
 // Sessionless bucket — cross-contamination is the documented trade-off
 // -----------------------------------------------------------------------------
 
-test("sessionless requests bucket to 'unknown' and can cross-contaminate", async () => {
-  // First sessionless request fails on IMG_A
-  const body1 = makeBody({ messages: [userMessage([imageBlock(IMG_A_B64)])] });
+test("sessionless 'unknown' bucket: cross-signature contamination per directive § Detection #4", async () => {
+  // Per directive: "Sessionless requests are NOT isolated from each other by
+  // requestSignature — they share the 'unknown' bucket, and any sessionless
+  // request whose image-hash set intersects a recorded 'unknown'-bucket
+  // failure within the cool-off window will be short-circuited."
+  //
+  // Exercise this with two STRUCTURALLY DIFFERENT request bodies that share
+  // IMG_A in their image-hash sets — the first fails upstream, the second
+  // arrives with a different `requestSignatureOf` value but is still short-
+  // circuited because the "unknown" bucket ignores signature scoping.
+
+  // Request 1: single user-text + single image. One specific structural shape.
+  const body1 = makeBody({
+    messages: [
+      { role: "user", content: [{ type: "text", text: "first" }, imageBlock(IMG_A_B64)] },
+    ],
+  });
   const reqCtx1 = ctxFor({ body: body1, sessionId: null });
   await ext.onRequest(reqCtx1);
   await ext.onResponse(errorResponseCtx({ meta: reqCtx1.meta }));
 
-  // Second sessionless request shares IMG_A in the hash set — same bucket key,
-  // but a different request signature... so by directive: cross-contamination
-  // happens when image hashes overlap WITHIN the same requestSignature entry.
-  // Here we use the same body shape so the signatures match — directive's
-  // documented "sessionless requests are NOT isolated by requestSignature"
-  // case is exercised by the body identical → same signature path.
-  const body2 = makeBody({ messages: [userMessage([imageBlock(IMG_A_B64)])] });
-  const result = await ext.onRequest(ctxFor({ body: body2, sessionId: null }));
-  assert.equal(result?.skip, true);
+  // Request 2: multi-turn conversation reaching IMG_A in a different position.
+  // Different message count, different block-type sequence → different
+  // requestSignatureOf result. Without the "unknown"-bucket signature bypass,
+  // the breaker would forward this upstream (sig mismatch); WITH the bypass
+  // it short-circuits because IMG_A overlaps the recorded "unknown" failure.
+  const body2 = makeBody({
+    messages: [
+      { role: "user", content: [{ type: "text", text: "earlier turn" }] },
+      { role: "assistant", content: [{ type: "text", text: "ok" }] },
+      { role: "user", content: [
+        { type: "text", text: "follow-up" },
+        { type: "text", text: "with extra block" },
+        imageBlock(IMG_A_B64),
+      ] },
+    ],
+  });
+  const reqCtx2 = ctxFor({ body: body2, sessionId: null });
+  const result = await ext.onRequest(reqCtx2);
+  assert.equal(result?.skip, true, "different signature must still short-circuit in 'unknown' bucket");
 
   const events = logLines();
   assert.ok(events.some((e) => e.event === "breaker_fire" && e.session_id === "unknown"));
+});
+
+test("sessions ARE isolated by requestSignature (named-session control)", async () => {
+  // Control test: with a real session id, different signatures DO isolate —
+  // a request whose IMG_A overlaps a recorded failure but whose body shape
+  // gives a different signature still forwards. Locks in the contrast with
+  // the "unknown"-bucket signature-bypass above.
+  const body1 = makeBody({
+    messages: [
+      { role: "user", content: [{ type: "text", text: "first" }, imageBlock(IMG_A_B64)] },
+    ],
+  });
+  const reqCtx1 = ctxFor({ body: body1, sessionId: "session-xyz" });
+  await ext.onRequest(reqCtx1);
+  await ext.onResponse(errorResponseCtx({ meta: reqCtx1.meta }));
+
+  const body2 = makeBody({
+    messages: [
+      { role: "user", content: [{ type: "text", text: "earlier turn" }] },
+      { role: "assistant", content: [{ type: "text", text: "ok" }] },
+      { role: "user", content: [
+        { type: "text", text: "follow-up" },
+        { type: "text", text: "with extra block" },
+        imageBlock(IMG_A_B64),
+      ] },
+    ],
+  });
+  const result = await ext.onRequest(ctxFor({ body: body2, sessionId: "session-xyz" }));
+  assert.equal(result, undefined, "named session preserves per-signature isolation");
 });
 
 // -----------------------------------------------------------------------------
