@@ -4,7 +4,8 @@
 **Upstream:** [anthropics/claude-code#67055](https://github.com/anthropics/claude-code/issues/67055) — *Desktop: false "GitHub CLI authentication expired" toast — any `gh auth status` failure (incl. its 5s timeout) is classified as expired credentials, frequent during multi-agent workloads* (state: open; multi-platform repro confirmed; 4+ feeder paths into the same classifier)
 **Priority:** P2
 **Branch:** `feature/tool-gh-auth-status-shim`
-**Stage:** directive — round 2 (addresses Fable round-1 REQUEST_CHANGES at PR #216)
+**Stage:** directive — round 4 (addresses Codex round-1 REQUEST_CHANGES at PR #216; prior rounds addressed Fable round-1 REQUEST_CHANGES then Fable round-2 REQUEST_CHANGES)
+**Labels:** `directive-stage`, `tools-contribution`, `needs-prototype-validation` (mandatory Linux experiment described below)
 **Milestone:** v4.2.0
 
 ## Round-1 misattribution acknowledgement
@@ -46,6 +47,7 @@ The framing is **workaround, not fix**. The README explicitly frames the tool as
   - Verifies the directory is on the user's PATH AHEAD of the real `gh` binary (compares `which gh` before and after).
   - Refuses to install if PATH ordering can't be guaranteed; prints instructions for fixing.
   - Does NOT modify the user's shell rc files automatically — prints the export line the user should add.
+- **Load-bearing? Yes.** This tool installs a PATH-intercepting `gh` wrapper that intentionally rewrites `gh auth status` exit-code semantics for every caller in the shim's PATH scope — including non-CC tools that depend on the standard `gh` exit-code contract for security-relevant decisions. Per CLAUDE.md's security-relevant criterion, this qualifies as load-bearing. Per CLAUDE.md, load-bearing changes require Chris human review before merge in addition to the routine Lead + Codex review path.
 
 ## Interception mechanism (closes Fable B2)
 
@@ -171,6 +173,8 @@ This is design, not description. The classification logic the shim implements:
 | Exit non-zero, no clear signal, output empty or ambiguous | **Conservative default: return the original exit code.** Let CC see the failure. This matches Fable round 1's recommended posture — the worst case for the user is a slightly delayed surfacing of a real failure, not a silent loss. |
 
 The table lives in `lib/classify-auth-status.sh` as a sourceable helper with documented function names (`classify_auth_status_exit_code`, `classify_auth_status_output_text`). Contributors extending the table follow the documented sourcing contract per Fable round 1 attention #2.
+
+**Why string matching, not `gh auth status --json hosts`** (closes Codex round-1 attention): the JSON output flag is available on modern `gh` (verified locally), and structural classification would be more durable to upstream wording changes. We chose text-matching for v1 because (a) the `--json hosts` output is intended for `--hostname github.com` queries and its `state` field semantics for the failure cases we care about (timeout, transient network, Keychain anonymous-fallback HTTP 401) are not documented and may not be present on the stderr-stream-only failure paths the shim has to classify — those failures happen before `gh` produces structured output. (b) `gh`'s output format has been stable across recent versions on the specific strings we anchor on ("Logged in to github.com", "not logged in"); the README documents the validated version range. (c) the conservative-default posture (ambiguous → propagate original exit code) means classifier drift produces "slightly delayed surfacing of a real failure," not a security regression. Revisit in v2 if Codex round-2 or sim validation surfaces a structural-output failure path the regex misses.
 
 ## bats CI integration (closes Fable round-1 attention #1)
 
@@ -311,17 +315,19 @@ The mechanism (PATH shim) is OS-level interception. The directive does not use t
   - Portable timeout fires when mock-gh sleeps longer than the shim's timeout.
 - bash 3.2 compatibility: bats suite passes on macOS-latest runner using the default `/bin/bash` (3.2).
 - shellcheck (CI): clean on shim script + classification helper + install/uninstall scripts. CI-only; not bundled with the user-side install.
-- shellcheck `-s sh` (CI): runs against the same scripts to enforce POSIX-superset compatibility for the bash 3.2 floor.
-- Install/uninstall idempotence: install twice → no-op the second time; uninstall twice → benign error.
-- Backup/restore: install over existing different-version shim → backup created at `<target>.bak.<timestamp>`; uninstall → restore from `.bak`.
+- bash 3.2 floor verification (CI): macOS runner explicitly invokes the bats suite under `/bin/bash` (`/bin/bash $(which bats) tests/`); every test asserts `BASH_VERSION` starts with `3.2` in setup. `shellcheck -s sh` is NOT used as the floor verifier (it enforces POSIX sh and would reject legal bash 3.2 constructs).
+- Install idempotence: install twice → no-op the second time.
+- Uninstall behavior: install over existing different-version shim → backup created at `<target>.bak.<timestamp>`; uninstall removes the current shim AND any `<target>.bak.*` shim backups (verifying each is a shim before removing). **No restore-from-backup step** — every `.bak` is by definition an older shim (install refuses to overwrite non-shim files), so "restoring" would silently reinstate an outdated shim. This was the round-2 N2 logic inversion; round-3 corrected it; the round-2 test-plan line for "backup/restore behavior present" is removed accordingly.
 
-**Prototype validation (mandatory merge gate)** — must happen on visits-01 before round-3 / merge:
+**Prototype validation (mandatory merge gate)** — must happen on Linux (visits-01) before implementation PR can merge, matching the rewritten validation experiment in §"Critical prototype-validation step" above:
 
 1. Install the shim on visits-01.
 2. Run a CC Desktop session that triggers PR polling.
 3. Confirm via shim-side debug-logging that the shim received the `auth status` invocation. (If no, mechanism is dead, withdraw directive.)
-4. Induce a transient failure (sleep 6s in the shim's classification path).
-5. Confirm the false toast does NOT fire (vs. baseline without shim where it does).
+4. Mock the real `gh` to sleep 8 seconds (longer than CC's 5s window). Verify the shim's 4s internal timeout fires and exits 0 in time for CC to read it. **The false toast must NOT fire** (vs. baseline without shim where it does at the 5s mark).
+5. Measure the shim's actual wall-clock time-to-exit; must be < 5s on the slow-real-gh path.
+
+(Round-2 directive specified a 6-second sleep + "longer than CC's 5s" rationale that would have failed the experiment by construction. Round-3 inverted the budget; round-4 reconciles this validation block with that inversion.)
 
 Results attached as a comment on the implementation PR before reviewer chain proceeds to merge gate.
 
@@ -366,7 +372,7 @@ Out of scope (no changes):
 - [ ] Classification table is the conservative posture (ambiguous → return original exit code, let CC see).
 - [ ] Behavioral-change disclosure (`gh auth status` rewritten for every caller in the shim's PATH scope) explicit in README limitations.
 - [ ] Install verifies PATH ordering; refuses install if PATH can't be guaranteed; does NOT modify shell rc files automatically.
-- [ ] Uninstall idempotent; backup/restore behavior present.
+- [ ] Uninstall idempotent; removes current shim AND any `.bak.*` shim backups (verifying each is a shim before removing); **no restore-from-backup step** (round-3 corrected the round-2 N2 logic inversion).
 - [ ] `.github/workflows/test-shim.yml` is SEPARATE from `test.yml`; failure does not block proxy Node tests.
 - [ ] shellcheck runs in CI only, not in install.sh.
 - [ ] TRACKED_ISSUES.md entry added.
