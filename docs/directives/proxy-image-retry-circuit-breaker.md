@@ -34,20 +34,20 @@ The framing is **advisory-protective**, not blocking. The proxy returns a wire-f
 
 The pipeline exposes exactly four hooks: `onRequest`, `onResponseStart`, `onStreamEvent`, `onResponse`. The breaker uses:
 
-- **`onRequest`** — inspects the incoming messages request. If the breaker decides to short-circuit, it returns `{ skip: true, status, headers, body, stream }` (see "Synthesized response — wire format" below). The pipeline's `runOnRequest` (`proxy/pipeline.mjs:85-101`) propagates the skip result to `server.mjs:88-95`, which writes the synthesized payload directly to the client.
+- **`onRequest`** — inspects the incoming messages request. If the breaker decides to short-circuit, it returns `{ skip: true, status, headers, body }`. The pipeline's `runOnRequest` (`proxy/pipeline.mjs:85-99`) propagates the skip result to the existing skip handler in `proxy/server.mjs:88-94`, which writes the supplied body verbatim when it's a string (no `JSON.stringify`). The breaker exploits this: for streaming requests, the breaker supplies the SSE event sequence as a pre-formatted **string** body with `content-type: text/event-stream` in headers; for non-streaming, an object body with `content-type: application/json`. **No `server.mjs` modification needed** — the existing string-passthrough behavior handles both modes. This is the N2 simplification from Fable round 2: the prior round-2 directive proposed a `stream` field on the skip-result and a new branch in `server.mjs`; both are unnecessary churn.
 - **`onResponse`** — the non-streaming response branch (`server.mjs:162-187`). The "image could not be processed" error arrives here when upstream returns an HTTP 400 with `content-type: application/json` (the canonical Anthropic error envelope). The breaker records the failure on this branch.
 
 **Out of scope (explicit):** mid-stream SSE `error` events via `onStreamEvent`. Per `rate-limit-log.mjs:60-64`, the canonical Anthropic error envelope arrives as a non-streaming JSON body. If a future Anthropic change moves image-processing errors to mid-stream SSE events, that path is a follow-up.
 
 ## Synthesized response — wire format (closes Fable B3)
 
-The harness sends messages requests with `stream: true` for the interactive path. The skip-path in `server.mjs:88-95` writes a single payload — it currently has no SSE-synthesis branch.
+The harness sends messages requests with `stream: true` for the interactive path. The existing skip handler in `proxy/server.mjs:88-94` writes the skip-result `body` verbatim if it's a string, or `JSON.stringify`s it otherwise. This is enough — no server.mjs change is needed.
 
-The breaker addresses this with a two-mode synthesis decided at `onRequest` time:
+The breaker decides synthesis mode at `onRequest` time:
 
-1. **`request.body.stream === false`** (or undefined): the skip-result is a single JSON body identical in shape to the upstream non-streaming success envelope.
+1. **`request.body.stream === false`** (or undefined): the skip-result is `{ skip: true, status: 200, headers: { "content-type": "application/json" }, body: { ... non-streaming JSON envelope ... } }`. The skip handler `JSON.stringify`s it. Identical in shape to the upstream non-streaming success envelope.
 
-2. **`request.body.stream === true`**: the skip-result is a **minimal valid SSE event sequence** that the harness's SDK consumes as a normal completed message. The required event sequence (per `proxy/stream.mjs` and Anthropic's documented protocol):
+2. **`request.body.stream === true`**: the skip-result is `{ skip: true, status: 200, headers: { "content-type": "text/event-stream" }, body: "<sse-string>" }`. The skip handler writes the string verbatim. The SSE string is a pre-formatted **minimal valid event sequence** that the harness's SDK consumes as a normal completed message:
 
 ```
 event: message_start
@@ -68,23 +68,11 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":
 event: message_stop
 data: {"type":"message_stop"}
 
-data: [DONE]
-
 ```
 
-The skip-result envelope is extended to carry both modes:
+**`[DONE]` trailer decision (N1):** Anthropic's documented Messages stream terminates at `message_stop`. The proxy's own stream handler tolerates the `data: [DONE]` sentinel pass-through (`proxy/stream.mjs:40-44`) but real upstream may not emit it. Sim validation (item 1 below) explicitly compares the synth tail against a captured real-upstream stream to confirm presence/absence of the sentinel; the SSE string above omits `[DONE]` as the default and adds it only if sim validation surfaces evidence that upstream sends it.
 
-```
-{
-  skip: true,
-  status: 200,
-  headers: { "content-type": "text/event-stream" } | { "content-type": "application/json" },
-  body: "<SSE-string>" | { ... non-streaming JSON ... },
-  stream: true | false,
-}
-```
-
-`server.mjs`'s skip handler reads `stream` to decide whether to write `body` as `text/event-stream` bytes (no `JSON.stringify`) or `application/json`. **This is a server.mjs change** (one branch added in the skip-handler block) — call this out explicitly in the Files-modified list.
+**No `server.mjs` modification.** The existing skip handler already writes the string body verbatim when supplied. The prior round-2 directive proposed a new `stream` field on the skip-result and a server.mjs branch — both unnecessary. Confirmed in Fable round-2 N2.
 
 **Short-circuit message text** (kept minimal/stable to limit transcript-pollution surface):
 
@@ -94,7 +82,7 @@ The skip-result envelope is extended to carry both modes:
 
 ## Meter-pipeline observability (closes Fable B4)
 
-The skip path returns `{handled: true}` from `preForward` (`server.mjs:90-96`) before any upstream call is made. **No `onResponseStart`, `onStreamEvent`, or `onResponse` runs for the synthesized response.** Both `usage-log.mjs` and `cache-telemetry.mjs` consume SSE stream events (`usage-log.mjs:273-319`, `cache-telemetry.mjs:190-272`) and therefore see nothing from short-circuited requests.
+The skip path returns `{handled: true}` from `preForward` (`server.mjs:88-94`) before any upstream call is made. **No `onResponseStart`, `onStreamEvent`, or `onResponse` runs for the synthesized response.** Both `usage-log.mjs` and `cache-telemetry.mjs` consume SSE stream events (`usage-log.mjs:273-319`, `cache-telemetry.mjs:190-272`) and therefore see nothing from short-circuited requests.
 
 Implication:
 
@@ -155,11 +143,13 @@ state.failures = new Map(); // key: `${sessionId}:${requestSignature}` → entry
 
 Where `requestSignature` is a stable hash of the failing request (purpose: distinguish per-attempt failures within a session, not just per-session). The map is bounded by `CACHE_FIX_IMAGE_RETRY_MAX_ENTRIES` (default 4096) with LRU eviction; lazy expiry on lookup drops entries past the cool-off window; a throttled sweep (precedent: `sweepStaleSessions`, `cache-telemetry.mjs:132-156`) runs every 60s to bound the resident set.
 
+**Cool-off window semantics (N3 from Fable round 2): sliding.** `lastFailureAt` refreshes on each breaker fire — a fire proves the harness is still in the retry loop, so the cool-off extends from the most recent suppressed attempt rather than from the original upstream failure. This is the load-bearing decision behind the replay-fixture acceptance test ("total upstream calls = 1, not 19"): with a fixed window, a retry storm spanning > 30 s would leak one upstream call per window expiry, and the assertion only holds if all 18 retries land within 30 s of the *first* failure. With sliding, the assertion holds for any harness retry cadence under 30 s per retry, which matches CC's observed behavior in CC#66815. Replay fixture timing should encode an inter-retry gap < 30 s explicitly so the test does not silently bake in the assumption.
+
 ## Order placement (closes Fable attention #1)
 
 Order **370** in `extensions.json`. Stated correctly: this places the breaker **after** `image-strip` (order 150, which may mutate images via Pass 3 resize) and **after** other early request normalization. The breaker hashes images in the form they would actually go upstream — consistent on both the failing request and the retry — so hash matching is stable. The previous "before any mutation" rationale was wrong; the corrected rationale is "after image-strip so we hash the wire form, not the source form."
 
-The closest pre-existing extension by order is `microcompact-stability` at 350 — name it correctly, not as "request-shape normalization."
+The closest pre-existing extension by order is `thinking-display` at 360 — name it correctly. (The previous round-2 directive named `microcompact-stability` at 350; A1 line-correction from Fable round 2.)
 
 ## Scope (v4.2.0)
 
@@ -169,7 +159,7 @@ In scope:
 - Per-session state machine with LRU eviction + throttled sweep.
 - Inlined `isImageProcessingError` predicate.
 - Two-mode synthesized response: SSE event sequence for `stream: true` requests; non-streaming JSON for `stream: false` requests.
-- `server.mjs` skip-handler branch added to read `stream` field on skip-result and write `text/event-stream` bytes vs. `application/json`.
+- (No `server.mjs` modification: the existing skip handler's string-passthrough behavior handles both SSE-string and JSON-object bodies.)
 - Structured event log writer at `~/.claude/image-retry-events.jsonl` with 5 MB rotation matching `bootstrap-defense`.
 - Env-var gates: `CACHE_FIX_IMAGE_RETRY_BREAKER` (on/off/dry-run), `CACHE_FIX_IMAGE_RETRY_COOLOFF_MS` (default 30000), `CACHE_FIX_IMAGE_RETRY_MAX_ENTRIES` (default 4096).
 
@@ -183,7 +173,7 @@ Out of scope (deferred):
 
 The breaker runs in two hooks:
 
-- **`onRequest`** — inspects the request, stashes the request's image hashes on `ctx.meta._imageRetryHashes` (so the failure recorder on the same request's `onResponse` can find them), and checks the failure state map. If a recorded failure exists for the resolved session whose `imageHashes` intersects the current request's hashes within the cool-off window, the breaker returns `{ skip: true, status: 200, headers, body, stream }` per the wire-format spec above.
+- **`onRequest`** — inspects the request, stashes the request's image hashes on `ctx.meta._imageRetryHashes` (so the failure recorder on the same request's `onResponse` can find them), and checks the failure state map. If a recorded failure exists for the resolved session whose `imageHashes` intersects the current request's hashes within the cool-off window, the breaker returns `{ skip: true, status: 200, headers, body }` per the wire-format spec above — string body for streaming, object body for non-streaming. Cool-off `lastFailureAt` is refreshed on this fire (sliding window per N3).
 - **`onResponse`** — checks `isImageProcessingError(ctx)`. If true, records a failure entry keyed by the resolved session + a stable request signature, with the image hashes stashed on `ctx.meta._imageRetryHashes` at `onRequest` time.
 
 The image-hash utility extracts `content[i].source.data` for `type: "image"` blocks with `source.type: "base64"`, decodes the base64, and SHA-256s the decoded bytes (not the base64 string — the harness may re-encode and we want identical-bytes, not identical-strings).
@@ -192,7 +182,7 @@ The image-hash utility extracts `content[i].source.data` for `type: "image"` blo
 
 This PR carries the `needs-sim-validation` label as a **merge gate**, not an advisory. Sim validation must confirm:
 
-1. The SSE-synthesis path produces a response that the CC harness consumes as a normal completed assistant turn — does not retry as a transport error.
+1. The SSE-synthesis path produces a response that the CC harness consumes as a normal completed assistant turn — does not retry as a transport error. **Compare the synthesized SSE byte tail against a captured real-upstream stream tail** (Fable N1): confirm presence/absence of the `data: [DONE]` sentinel matches upstream behavior. If upstream omits `[DONE]`, the synth omits it (this is the default in the SSE string above); if upstream emits it, the synth adds it. Whichever matches reality is the right choice — the test is byte-mimicry of what the harness has already proven to accept.
 2. The harness's transcript receives the synthesized assistant turn correctly (one text content block, no extra structural events).
 3. The synthesized response on `stream: false` (less common but supported) likewise consumes normally.
 4. The error-class predicate matches actual production traffic for the "image could not be processed" family — confirm via captured traffic that the regex covers observed message variants.
@@ -226,7 +216,7 @@ Created:
 - `test/fixtures/replaced-bad-image-multi-image.json` (false-positive test case)
 
 Modified:
-- **`proxy/server.mjs`** — skip-handler block in `preForward` (`server.mjs:88-95`) extended to read `stream` field on skip-result and write `text/event-stream` body unchanged (no `JSON.stringify`) when `stream === true`. Tested in the existing server.mjs unit suite for skip behavior.
+- (No modification to `proxy/server.mjs`. Fable round 2 N2 confirmed the existing skip handler's string-vs-object body detection handles both modes — string bodies for SSE pass through verbatim, object bodies for JSON get `JSON.stringify`'d. The breaker exploits this and no core file changes.)
 - `proxy/extensions.json` — register new extension at order 370, default-disabled-internally pending v4.2.0 validation.
 - `CHANGELOG.md` — v4.2.0 entry referencing CC#66815.
 - `README.md` — extension list addition.
@@ -242,12 +232,12 @@ Out of scope (no changes):
 
 - [ ] Hook surface uses `onRequest` (returning `{skip: true, status, headers, body, stream}`) and `onResponse` only.
 - [ ] `stream: true` requests get an SSE event sequence response; `stream: false` requests get JSON.
-- [ ] Server skip-handler branch correctly writes `text/event-stream` bytes without re-stringifying when `stream === true`.
+- [ ] String-body SSE flows through the existing skip handler unchanged (no `server.mjs` modification was needed; the skip handler's string-vs-object dispatch handles both modes).
 - [ ] Image-processing-error predicate is inlined and tested against `overloaded_error` and rate-limit 429s as negative cases.
 - [ ] `resolveSessionId` from `cache-telemetry.mjs` is reused, not re-implemented; sessionless requests bucket to `"unknown"`.
 - [ ] State map has lazy expiry on lookup, throttled sweep, and LRU eviction at `MAX_ENTRIES`.
 - [ ] Synthesized response `usage: 0` block is present and structurally identical to upstream envelope (harness-facing only — directive explicitly drops the meter-pipeline-signaling claim).
-- [ ] Order 370 explicitly placed AFTER `image-strip` (150) and `microcompact-stability` (350); rationale "hash the wire form."
+- [ ] Order 370 explicitly placed AFTER `image-strip` (150), `microcompact-stability` (350), and `thinking-display` (360); rationale "hash the wire form."
 - [ ] JSONL event log carries hashes, session id, timestamps, remaining-TTL, request_id only — no image bytes, no request bodies, no auth headers. Rotation at 5 MB.
 - [ ] `dry-run` mode does not short-circuit but does log.
 - [ ] Replay fixture matches CC#66815's reported sequence (first upstream call + 18 short-circuited).
