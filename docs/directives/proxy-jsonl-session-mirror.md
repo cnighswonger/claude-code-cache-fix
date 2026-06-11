@@ -6,7 +6,7 @@
 - [anthropics/claude-code#66486](https://github.com/anthropics/claude-code/issues/66486) — *2.1.169: interactive sessions write no JSONL transcript (only ai-title stub)*
 **Priority:** P1
 **Branch:** `feature/jsonl-session-mirror`
-**Stage:** directive — round 3 (addresses Codex round-1 REQUEST_CHANGES at PR #214; prior rounds addressed Fable round-1 then Fable round-2 REQUEST_CHANGES)
+**Stage:** directive — round 4 / `approved-by-codex-agent` (Codex round-2 APPROVE at `8dc14b0` cleared the round-1 blockers; this commit also fixes the non-blocking metadata nit Codex flagged. Prior rounds addressed Fable round-1, Fable round-2, then Codex round-1 REQUEST_CHANGES.)
 **Labels:** `directive-stage`, `schema-change` (mirror file is a new contract for CC-transcript-reader interoperability), `needs-sim-validation` (mandatory merge gate on envelope-shape parity)
 **Milestone:** v4.2.0
 
