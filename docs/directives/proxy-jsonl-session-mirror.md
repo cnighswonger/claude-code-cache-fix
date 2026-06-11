@@ -52,14 +52,14 @@ CC's transcript record shape, verified against `~/.claude/projects/<project>/<se
 
 **`message` nested keys:** `content`, `id`, `model`, `role`, `stop_details`, `stop_reason`, `stop_sequence`, `type`, `usage`.
 
-**User record top-level keys:** as assistant, plus `isMeta`, `promptId`. **`message` nested keys:** `content`, `role`.
+**User record top-level keys** (verified against 9,410 real user records on 2.1.148): same as assistant, plus `isMeta`, `promptId`, `permissionMode`, `slug`. User records do NOT carry `requestId`. `isMeta` appears only on ~13% of records (meta records, e.g. command output); non-meta user records may omit it. **Tool-result user records additionally carry** top-level `toolUseResult` and `sourceToolAssistantUUID` — these are CC-internal enriched-result objects that the proxy cannot reconstruct from request body alone; the mirror omits both and the CHANGELOG must call this out as a known limitation. **`message` nested keys:** `content`, `role`.
 
 The mirror record adopts this envelope with proxy-derived substitutions:
 
 ```json
 {
   "type": "assistant",
-  "uuid": "<sha256(sessionId+timestamp+messageId).slice(0,32)>",
+  "uuid": "<sha256(sessionId+timestamp+messageId).slice(0,32) formatted as 8-4-4-4-12 dashed string (e.g. abcd1234-5678-90ab-cdef-1234567890ab) — same 32 hex chars, UUID-shape so shape-validating parsers accept; version/variant bits won't be RFC-valid which is honest about the synthetic origin>",
   "parentUuid": "<previous mirror record uuid in this session, or null for first>",
   "isSidechain": false,
   "sessionId": "<resolved session id>",
@@ -92,29 +92,44 @@ Three load-bearing properties:
 
 Image content blocks are mirrored as references (`type: "image"` with `source.type: "base64"` replaced by `source: { type: "reference", sha256: "<64-hex>", media_type: "<from-block>" }`). The byte content itself is not stored.
 
-The CHANGELOG must call out that the mirror's `cwd` is null and the `uuid` chain is synthetic; consumers depending on those for recovery should verify their behavior.
+The CHANGELOG must call out three known limitations: the mirror's `cwd` is `null` (proxy does not know caller cwd), the `uuid` chain is synthetic (dash-formatted but not RFC-valid version/variant bits), and tool-result user records omit `toolUseResult`/`sourceToolAssistantUUID` (CC-internal enriched objects the proxy cannot reconstruct). Consumers depending on those for recovery should verify their behavior against mirror files specifically.
 
-## Dedup state (closes Fable B3)
+**Per-message accumulator residence** (closes Fable round-2 nit #5): the accumulator state for the in-flight assistant message lives on `ctx.meta._mirrorAccumulator` (request-scoped), NOT in module-scope state. This means an aborted stream cleans up for free when `ctx` is garbage-collected — no cross-request leak, no eviction story needed for interrupted streams. On stream abort (`server.mjs:113-115`, client close), the proxy may optionally flush a partial assistant record with `stop_reason: "interrupted"` and any content blocks accumulated so far, which is itself a recovery win for the CC#66734 scenario (the user gets the assistant content that was streamed before the abort, not nothing). Partial-flush is in scope as an env-var-gated option `CACHE_FIX_SESSION_MIRROR_FLUSH_INTERRUPTED` (default `true`).
 
-CC re-sends the full conversation history in every request. Without dedup, the mirror would write `O(n²)` records over an `n`-turn session. The fix:
+## Dedup state (closes Fable B3 round-1 + round-2 NB1 + NB2)
 
-Module-scope state: `mirrorState.sessions = Map<sessionId, { lastMirroredUserMessageHash, lastMirroredToolResultIds: Set<string> }>`.
+CC re-sends the full conversation history in every request. Without dedup, the mirror would write `O(n²)` records over an `n`-turn session. The fix uses **position-based tracking** (not content-hash matching), with state advancement deferred until **write time** (not stage time) so failed requests do not silently lose user records.
 
-`onRequest` logic:
+Module-scope state: `mirrorState.sessions = Map<sessionId, { mirroredMessageCount: number, mirroredToolResultIds: Set<string> }>`.
+
+`mirroredMessageCount` is the count of user-role messages from `ctx.body.messages` that have been **successfully written to the mirror file** for this session. New user records mirror only messages at index `>= mirroredMessageCount` in the current request's `messages` array.
+
+`onRequest` logic (staging only — does NOT advance state):
 
 1. Resolve session id; load (or create) the session entry.
-2. For each user-role message in `ctx.body.messages`:
-   - Hash the text content (`sha256(JSON.stringify(content)).slice(0,32)`).
-   - If the hash matches `lastMirroredUserMessageHash`, skip — already mirrored.
-   - Otherwise, stage the record for emission and update `lastMirroredUserMessageHash`.
-3. For each tool-result block in user messages:
-   - Look up its `tool_use_id`. If in `lastMirroredToolResultIds`, skip.
-   - Otherwise, stage and add to the set.
-4. Pending records are stashed on `ctx.meta._mirrorPendingUserRecords` for the response-side accumulator to flush before its assistant record.
+2. Examine `ctx.body.messages`; iterate only entries where `role === "user"` and the index is `>= mirroredMessageCount`. Stage each as a pending user record.
+3. For each `tool_result` content block inside those staged user messages, check its `tool_use_id` against `mirroredToolResultIds`. If already present, omit that block from the staged record (the surrounding user message may still stage if it has other un-mirrored blocks). Otherwise add the id to a `pendingToolResultIds` set carried on `ctx.meta`, NOT yet to the session map.
+4. Stage everything on `ctx.meta._mirrorPendingUserRecords` (the records) + `ctx.meta._mirrorPendingMessageCount` (the new high-water count if these records were to write successfully) + `ctx.meta._mirrorPendingToolResultIds` (the new ids).
+
+`onStreamEvent` (at `message_stop`, after the assistant record is successfully written):
+
+5. Flush the staged user records first, then the assistant record (the linear `parentUuid` chain orders correctly).
+6. **Only after all writes have succeeded:** advance `mirroredMessageCount` to `_mirrorPendingMessageCount` and union `mirroredToolResultIds` with `_mirrorPendingToolResultIds`.
+
+If the request never reaches `message_stop` (upstream 529, mid-stream abort, 4xx, client close) the staged records on `ctx.meta` are discarded with the request and the session-map state is unchanged. CC's natural retry re-sends the same `messages` array; the same un-mirrored indices stage again, and the mirror records appear exactly once when the retry succeeds.
 
 The session map is bounded by `CACHE_FIX_SESSION_MIRROR_MAX_SESSIONS` (default 1024) with LRU eviction and a periodic 60s throttled sweep removing entries inactive past the retention window.
 
-Test fixture: a 3-turn replay must produce exactly 3 user records + 3 assistant records + (any tool result records) — no duplicates.
+**Why position-based, not hash-based** (closes round-2 NB1): a single-value `lastMirroredUserMessageHash` re-iterating each request's full history will re-stage the entire history starting on turn 3 (`u1`'s hash no longer matches the stored `h(u2)`, so `u1` re-stages, then `u2` re-stages, etc.) — exactly the O(n²) failure mode this section exists to close. A Set of hashes would dedup more aggressively but wrongly collapse legitimately-repeated user texts (e.g. the literal `"yes"` sent at turn 2 and again at turn 9 — distinct records in CC's transcripts). Position-based tracking is correct on both axes: distinct positions always mirror, and CC's full-history replay naturally pads the prefix without re-mirroring it.
+
+**Why commit at write time, not stage time** (closes round-2 NB2): committing state in `onRequest` while the actual write happens in `onStreamEvent` creates a silent data-loss path on failed requests — the session-map says "mirrored" while the user record never made it to disk. CC's retry, sending the same history, would then skip the lost message forever. Mirror is a data-loss-defense feature; introducing a data-loss path is incompatible with its mission.
+
+Test fixtures (acceptance):
+
+- **3-turn replay** with single-message-per-turn growth: produces exactly 3 user records + 3 assistant records, no duplicates. (Fails with the round-1 algorithm at 5 user records by turn 3.)
+- **200-turn replay**: produces exactly 200 user + 200 assistant records, not ~20,000.
+- **Failed-request re-stage**: request 3 reaches stage but the upstream fails before `message_stop` → session-map state unchanged. Request 4 (CC's retry) sends the same history → records stage again and the mirror contains them exactly once. Asserts no record loss AND no duplicates.
+- **Legitimately-repeated user text**: `"yes"` at turns 2 and 9 produces two distinct mirror records (position-based dedup preserves them; hash-set dedup would have collapsed them — this fixture verifies the position-based design choice).
 
 ## Session id and path sanitization (closes Fable B4)
 
@@ -183,8 +198,11 @@ Stream-event accumulator with one buffered write at `message_stop`. Zero pipelin
 - Unit: dedup state — same user message hashed twice mirrors once; different tool-result ids mirror separately; session entry LRU eviction.
 - Unit: retention sweep — files past `RETENTION_DAYS` unlinked; empty directories pruned.
 - Unit: `sessionFilename` reuse — verify integration with the established helper (no re-implementation).
-- Integration: 3-turn replay — exactly 3 user + 3 assistant records, no duplicates.
-- Integration: 200-turn replay — total records = 400, not 20,400 (the round-1-shape would have produced).
+- Integration: 3-turn replay — exactly 3 user + 3 assistant records, no duplicates. (Position-based dedup; round-1 hash algorithm produced 5 user records by turn 3.)
+- Integration: 200-turn replay — total records = 400, not 20,400.
+- Integration: failed-request re-stage — turn 3 stages then upstream fails before `message_stop` → `mirroredMessageCount` unchanged. Turn 4 (CC's retry, same history) re-stages and the records appear exactly once. Asserts no record loss AND no duplicates.
+- Integration: legitimately-repeated user text — same `"yes"` user text at turns 2 and 9 produces TWO distinct mirror records (position-based dedup; verifies the design choice over hash-set dedup which would collapse them).
+- Integration: stream-abort partial flush — `CACHE_FIX_SESSION_MIRROR_FLUSH_INTERRUPTED=true` (default) and stream aborts mid-message → mirror contains a partial assistant record with `stop_reason: "interrupted"`. With env var false, no partial record written.
 - Integration: writer throws synchronously mid-stream → client still receives complete SSE response.
 - Integration: writer rejects asynchronously mid-stream → no `unhandledRejection`; client still receives complete SSE response; error logged to `session-mirror-events.jsonl`.
 - Integration: env-var off → no mirror writes occur.
@@ -225,7 +243,10 @@ Out of scope (no changes):
 - [ ] `restore-claude-history-linux` round-trip test passes against a generated mirror file.
 - [ ] Synthetic uuid chain is deterministic from `(sessionId, timestamp, messageId)`.
 - [ ] Image content blocks mirrored as references; bytes never persisted.
-- [ ] Dedup state prevents O(n²) record growth on long sessions.
+- [ ] Dedup uses position-based `mirroredMessageCount`, not single-value hash comparison; advances ONLY at `message_stop` write success; failed-request re-stage test passes.
+- [ ] Synthetic `uuid` is dash-formatted (`8-4-4-4-12`) so shape-validating parsers accept it.
+- [ ] Per-message accumulator lives on `ctx.meta._mirrorAccumulator` (request-scoped); aborted streams free state via ctx GC; `CACHE_FIX_SESSION_MIRROR_FLUSH_INTERRUPTED` partial-flush behavior tested both directions.
+- [ ] User record key list matches verified 2.1.148 transcript shape: `isMeta` optional, `permissionMode` + `slug` included, `requestId` absent on user records, tool-result records omit `toolUseResult` / `sourceToolAssistantUUID` (CHANGELOG caveat).
 - [ ] `sessionFilename` from `cache-telemetry.mjs` reused for directory name; sessionless requests bucket to `"unknown"`.
 - [ ] Retention sweep unlinks files past `RETENTION_DAYS`; empty directories pruned.
 - [ ] `session-mirror-events.jsonl` rotates at 5 MB.
@@ -234,7 +255,7 @@ Out of scope (no changes):
 - [ ] No `proxy/lib/` directory introduced.
 - [ ] Default-off in v4.2.0 AND v4.3.0 (per the privacy-posture argument).
 - [ ] `needs-sim-validation` label present; sim results attached as PR comment before merge.
-- [ ] CHANGELOG cites CC#66734 + CC#66486 explicitly; documents synthetic uuid + null cwd caveats.
+- [ ] CHANGELOG cites CC#66734 + CC#66486 explicitly; documents three caveats: dash-formatted-but-not-RFC-valid uuid, null cwd, omitted toolUseResult on tool-result records.
 
 ## Out of scope (explicit)
 
