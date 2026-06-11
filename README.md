@@ -729,6 +729,42 @@ If `sharp` is missing, Pass 3 skips cleanly (telemetry records `library_missing:
 | `CACHE_FIX_IMAGE_REQUEST_SIZE_MAX` | 31457280 (30 MB) | Pass 2 byte budget. 2 MB headroom from Anthropic's 32 MB ceiling. |
 | `CACHE_FIX_IMAGE_COUNT_MAX` | 100 | Hard image-count cap. Set to 600 for legacy Claude 1/2.x/Instant if needed. |
 
+## Image-retry circuit breaker (proxy mode, opt-in)
+
+When CC encounters a permanent "image could not be processed" error, the harness currently treats it as transient and retries — with full conversation context and the same 34 MB image payload — up to ~19 times per [anthropics/claude-code#66815](https://github.com/anthropics/claude-code/issues/66815). One bad image can consume ~60% of a Max-plan user's 5-hour quota envelope before the storm naturally stops.
+
+The breaker watches every messages-route response. When upstream returns a permanent image-processing error, it records the failure keyed by `(sessionId, requestSignature)` with the request's image SHA-256 hashes. When the next request on the same session carries an image whose hash matches a recorded failure within the 30-second sliding cool-off, the breaker short-circuits the retry locally — emitting a wire-format-correct synthesized response (SSE event sequence for `stream:true`, JSON envelope otherwise) that the harness consumes as a normal completed assistant turn. The synthesized text names the failure and asks the user to drop or replace the image. Bounds the retry storm from "many upstream calls" to one.
+
+Opt-in via env var; default-off in v4.2.0 first ship pending sim-validation:
+
+```bash
+export CACHE_FIX_IMAGE_RETRY_BREAKER=on
+```
+
+| Mode | Behavior |
+|------|----------|
+| `on` | Detect + record + short-circuit retries |
+| `off` (default) | Pass-through, no detection, no logging |
+| `dry-run` | Detect + record + log JSONL events, but **do not** short-circuit (useful for production debugging) |
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `CACHE_FIX_IMAGE_RETRY_BREAKER` | `off` | Mode gate — `on` / `off` / `dry-run` |
+| `CACHE_FIX_IMAGE_RETRY_COOLOFF_MS` | 30000 | Sliding cool-off window per recorded failure |
+| `CACHE_FIX_IMAGE_RETRY_MAX_ENTRIES` | 4096 | LRU cap on the in-memory failure map |
+| `CACHE_FIX_IMAGE_RETRY_LOG_PATH` | `~/.claude/image-retry-events.jsonl` | Structured event log path (5 MB single-tier rotation) |
+
+**Observability surface:** the JSONL event log is the only signal. Short-circuited requests do not produce `usage.jsonl` rows — they bypass `usage-log` and `cache-telemetry` entirely (no upstream call → no SSE stream → no row). Each fire writes `{ event: "breaker_fire", mode, session_id, image_hashes, retry_count, remaining_ms, request_id, ... }`; each first-time failure writes `{ event: "failure_recorded", ... }`. The log carries hashes and metadata only — no image bytes, no request bodies, no auth headers.
+
+**Detection conditions** (all four must hold):
+
+1. Previous response on the same session matched the image-processing-error predicate (HTTP 400 + canonical `invalid_request_error` envelope + image-class message).
+2. Current request carries an image content block whose SHA-256 matches a recorded failure's image hashes.
+3. Current request arrives within the sliding cool-off window.
+4. Current request is on the same session (resolved via `x-claude-code-session-id` / `x-session-id` / `x-anthropic-session-id`).
+
+Sessionless requests bucket to `"unknown"` — they're not isolated from each other by request signature, an acknowledged limitation mitigated by the 30s sliding window.
+
 ## Cache breakpoints (proxy mode, opt-in)
 
 Anthropic's prompt cache supports up to **four** `cache_control` markers per request. Claude Code currently uses three of the four; the third (between auto-injected `messages[0]` content — hooks, skills, project CLAUDE.md, deferred tools, MCP server descriptions — and the first real user content) is missing entirely. Without that marker, every change inside the auto-injected span busts the cache for everything that follows. wadabum projected ~6,500 token savings per fresh-session first turn from adding it ([anthropics/claude-code#47098](https://github.com/anthropics/claude-code/issues/47098)).

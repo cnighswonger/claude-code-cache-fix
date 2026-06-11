@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- **`image-retry-circuit-breaker` extension ([#217](https://github.com/cnighswonger/claude-code-cache-fix/issues/217), refs upstream [anthropics/claude-code#66815](https://github.com/anthropics/claude-code/issues/66815)).** Short-circuits the CC harness retry storm on permanent `image could not be processed` failures. When the same session retries with the same image content (SHA-256 of decoded bytes) within a 30s sliding cool-off window, the proxy returns a wire-format-correct synthesized response — SSE event sequence for `stream:true` requests, JSON envelope otherwise — so the harness consumes the failure as a normal completed turn instead of resubmitting full context 18 more times. Bounds the loss from CC#66815's reported pattern (19 retries × 34 MB of context tokens) to one upstream call. Default-off in v4.2.0 first ship via `CACHE_FIX_IMAGE_RETRY_BREAKER` env var (`on` / `off` / `dry-run`); tunables are `CACHE_FIX_IMAGE_RETRY_COOLOFF_MS` (default 30000) and `CACHE_FIX_IMAGE_RETRY_MAX_ENTRIES` (default 4096). Breaker fires write a structured JSONL event log at `~/.claude/image-retry-events.jsonl` (5 MB single-tier rotation); short-circuited requests bypass `usage-log` / `cache-telemetry` entirely (no row written — the JSONL event log is the sole observability surface). Carries `needs-sim-validation` as a merge gate per the wire-format dependency on real CC harness consumption. See [`docs/directives/proxy-image-retry-circuit-breaker.md`](docs/directives/proxy-image-retry-circuit-breaker.md) for the full design.
+
 ## [4.1.0] - 2026-06-10
 
 ### Added
