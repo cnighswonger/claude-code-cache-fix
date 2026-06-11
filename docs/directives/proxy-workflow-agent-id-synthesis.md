@@ -4,15 +4,15 @@
 **Upstream:** [anthropics/claude-code#66761](https://github.com/anthropics/claude-code/issues/66761) — *Workflow-tool agent() subagents omit x-claude-code-agent-id / parent-agent-id (Task subagents are tagged)* (state: closed; gap remains and the upstream fix will not be retroactive)
 **Priority:** P2
 **Directive branch:** `directive/workflow-agent-id-synthesis` (current PR #215). **Implementation branch (planned):** `feature/workflow-agent-id-synthesis` (round-2 directive accidentally used the implementation branch name as the directive's own branch field — corrected).
-**Stage:** directive — round 2 (addresses Fable round-1 REQUEST_CHANGES at PR #215)
+**Stage:** directive — round 5 / `approved-by-codex-agent` (round-5 applies the cross-repo snake_case migration triggered by Fable round-1 nit #2 on companion meter PR #30; prior rounds addressed Fable round-1, Fable round-2, Codex round-1, Codex round-2 REQUEST_CHANGES, then Codex round-3 APPROVE)
 **Milestone:** v4.2.0 (cache-fix); meter schema change must land FIRST
 
 ## Goal
 
 For CC's `/v1/messages` requests, the synthesis extension's `onRequest` stashes a normalized agent-attribution object on `ctx.meta._workflowAgentId = { id, parentId, source }`. There are exactly three states the request can be in:
 
-1. **Canonical present** (Task subagent) — the extension stashes the canonical `x-claude-code-agent-id` value pass-through with `source: "cc-header"`.
-2. **Workflow-derived** (no canonical header, marker detected, conditions met) — the extension stashes a deterministically-derived id with `source: "cache-fix-derived"`.
+1. **Canonical present** (Task subagent) — the extension stashes the canonical `x-claude-code-agent-id` value pass-through with `source: "cc_header"`.
+2. **Workflow-derived** (no canonical header, marker detected, conditions met) — the extension stashes a deterministically-derived id with `source: "cache_fix_derived"`.
 3. **Neither** (top-level conversation, sessionless request, no marker) — no stash; downstream consumers see no `_workflowAgentId` and emit no agent_id field.
 
 Downstream attribution consumers (`usage-log`, the meter dashboard once schema v0.8.0 is in place) read exactly one meta key — `_workflowAgentId` — and never touch request headers. The derived ids never reach Anthropic upstream; they exist only as in-proxy attribution keys.
@@ -133,7 +133,7 @@ The fix is the established staged-rollout pattern from `request_id` (cache-fix v
 
 **Release ordering (load-bearing):**
 
-1. **Meter directive + PR FIRST.** Companion meter directive filed at [cnighswonger/claude-code-meter#30](https://github.com/cnighswonger/claude-code-meter/pull/30) (branch `directive/agent-id-schema-addition`, commit `88c7c0c`) — adds `agent_id` (string, max 64, optional) AND `agent_id_source` (enum: `"cc-header" | "cache-fix-derived"`, optional) to `MeterRowSchema`. Both fields strict-typed. Ships in claude-code-meter v0.8.0. Round-2 directive referenced this as `#TBD` (Codex correctly flagged that as untracked); the round-3-then-round-4 fix names a concrete PR. The cache-fix implementation PR for THIS directive cannot merge until meter v0.8.0 ships.
+1. **Meter directive + PR FIRST.** Companion meter directive filed at [cnighswonger/claude-code-meter#30](https://github.com/cnighswonger/claude-code-meter/pull/30) (branch `directive/agent-id-schema-addition`, commit `88c7c0c`) — adds `agent_id` (string, max 64, optional) AND `agent_id_source` (enum: `"cc_header" | "cache_fix_derived"`, optional) to `MeterRowSchema`. Both fields strict-typed. Ships in claude-code-meter v0.8.0. Round-2 directive referenced this as `#TBD` (Codex correctly flagged that as untracked); the round-3-then-round-4 fix names a concrete PR. The cache-fix implementation PR for THIS directive cannot merge until meter v0.8.0 ships.
 2. **Cache-fix PR THEN.** The Workflow-derivation extension lands with `usage-log.mjs` emission gated **default-off** via `CACHE_FIX_USAGE_LOG_AGENT_ID=on`. Operators who upgrade meter to v0.8.0+ can flip the env-var; operators on older meter installs MUST NOT flip the env-var (see attestation contract below).
 3. **One minor release later.** Default flip to on, exactly as `request_id` did v4.1.0 → v4.2.0. The flip release MUST validate live emitted rows against a v0.8.0 meter install on real Workflow fan-out traffic — sim-validation precondition, same caution that gated the `request_id` flip (closes Fable round-2 sim/real-traffic recommendation).
 
@@ -175,7 +175,9 @@ The `default-on in v4.2.0` framing applies only to the extension's *evaluation*,
 
 ## Canonical-vs-derived ownership (closes Codex blocker 1 + Fable N1)
 
-Round 2 left an unreachable enum value. The directive promised `agent_id_source: "cc-header"` for Task subagents whose canonical `x-claude-code-agent-id` is present, but specified only a stash of derived ids — and detection condition 2 (canonical header ABSENT) forbids the derivation path from firing when the canonical header IS present. `usage-log` runs at `onStreamEvent` where request headers are no longer in scope (`stream.mjs:63` ctx is `{event, meta, telemetry, responseHeaders}` — verified). With round 2's spec, the `"cc-header"` enum value is unreachable and the canonical-priority test cannot pass.
+Round 2 left an unreachable enum value (the directive used kebab-case `"cc-header"` at that time; see round-5 migration note in this section for the cross-repo casing alignment). The directive promised `agent_id_source` to be the canonical CC `x-claude-code-agent-id` value for Task subagents whose canonical header is present, but specified only a stash of derived ids — and detection condition 2 (canonical header ABSENT) forbids the derivation path from firing when the canonical header IS present. `usage-log` runs at `onStreamEvent` where request headers are no longer in scope (`stream.mjs:63` ctx is `{event, meta, telemetry, responseHeaders}` — verified). With round 2's spec, the canonical-source enum value is unreachable and the canonical-priority test cannot pass.
+
+**Enum casing alignment (round-5 cross-repo migration, closes Fable round-1 nit #2 on meter PR #30):** the `source` field's enum values are snake_case: `cc_header` and `cache_fix_derived` (and `drift_canary` for the event-log-only canary path). Earlier rounds used kebab-case. The meter schema's universal convention is snake_case (`five_hour`, `max_5`, `enterprise`, `standard`/`fast`/`mixed`; the `qstatus`/`qclaim` value regexes are `[a-z_]*` — hyphens aren't representable there), and this is a wire contract: the cache-fix emitter at `proxy/extensions/usage-log.mjs` must emit the exact same byte sequences the meter's `agent_id_source` enum accepts. Both directives migrated to snake_case in the same round. The companion meter directive (PR #30 round 2) carries the matching enum.
 
 **Round-3 fix:** the synthesis extension's `onRequest` stashes a SINGLE normalized attribution object on `ctx.meta` for BOTH cases:
 
@@ -185,13 +187,13 @@ if (canonical_present) {
   ctx.meta._workflowAgentId = {
     id: ctx.headers["x-claude-code-agent-id"],
     parentId: ctx.headers["x-claude-code-parent-agent-id"] || null,
-    source: "cc-header",
+    source: "cc_header",
   };
 } else if (workflow_marker_detected) {
   ctx.meta._workflowAgentId = {
     id: derived_agent_id,
     parentId: derived_parent_agent_id,
-    source: "cache-fix-derived",
+    source: "cache_fix_derived",
   };
 }
 // otherwise undefined — no agent_id emission
@@ -212,7 +214,7 @@ if (attr && process.env.CACHE_FIX_USAGE_LOG_AGENT_ID === "on") {
 }
 ```
 
-The "canonical wins" priority is structural: when both could populate, `canonical_present` is checked first. The Task-subagent integration test asserts the row emits `agent_id_source: "cc-header"` and the canonical id value matches the input header.
+The "canonical wins" priority is structural: when both could populate, `canonical_present` is checked first. The Task-subagent integration test asserts the row emits `agent_id_source: "cc_header"` and the canonical id value matches the input header.
 
 ## Event log + PII discipline (closes Fable round-1 attention #3 + round-2 N2)
 
@@ -226,7 +228,7 @@ Per-record fields:
 {
   "ts": "<ISO8601>",
   "session_id": "<resolved>",
-  "agent_id_source": "cc-header" | "cache-fix-derived",
+  "agent_id_source": "cc_header" | "cache_fix_derived",
   "marker_id": "<catalog id, NOT raw matched text — only on cache-fix-derived records>",
   "marker_position": "system-prompt" | "first-user-message",
   "agent_id": "<id>",
@@ -236,7 +238,7 @@ Per-record fields:
 }
 ```
 
-Drift-canary records (conditions 1+2 hold but no marker matches) carry `agent_id_source: "drift-canary"` with no `agent_id` / `marker_id` fields. The canary surface is what tells operators their marker catalog has gone stale.
+Drift-canary records (conditions 1+2 hold but no marker matches) carry `agent_id_source: "drift_canary"` with no `agent_id` / `marker_id` fields. The canary surface is what tells operators their marker catalog has gone stale.
 
 **Never log:** the matched marker text itself (prompt-derived content), the request body, auth headers.
 
@@ -259,13 +261,13 @@ Mitigations:
 - Unit: derivation — deterministic; same inputs → same id; different per-leg discriminators → different ids; tools-list churn does NOT change the id; `marker_id` (catalog field) is hashed, not raw `marker` string.
 - Unit: markers catalog — every entry has `marker_id` + cc_version + cc_npm_sha256 + marker + position; `position: "first-user-message"` entries additionally require `first_message_authorship: "tool"`.
 - Unit: position-anchored matching — system-prompt-position markers do not match user-message positions and vice versa.
-- Unit: `_workflowAgentId` stash shape — `{ id, parentId, source }` always; `source` is exactly `"cc-header"` for canonical, `"cache-fix-derived"` for derived; no other values.
+- Unit: `_workflowAgentId` stash shape — `{ id, parentId, source }` always; `source` is exactly `"cc_header"` for canonical, `"cache_fix_derived"` for derived; no other values.
 - Integration: `parallel()` fan-out fixture — 3 subagent calls; all three carry distinct derived agent ids with the same derived parent-agent-id. The fixture must be either a real captured Workflow fan-out (preferred, named in the PR) or hand-synthesized with the discriminator field present (acceptable as a fallback if real capture isn't available; PR must state which).
-- **Integration: Task subagent (canonical `x-claude-code-agent-id` header present) — derivation does NOT fire; `ctx.meta._workflowAgentId.source === "cc-header"`; `usage-log` row emits `agent_id: <canonical>` + `agent_id_source: "cc-header"`. (Closes Codex blocker 1 / Fable N1 — this test cannot pass without the round-3 normalized-stash spec.)**
+- **Integration: Task subagent (canonical `x-claude-code-agent-id` header present) — derivation does NOT fire; `ctx.meta._workflowAgentId.source === "cc_header"`; `usage-log` row emits `agent_id: <canonical>` + `agent_id_source: "cc_header"`. (Closes Codex blocker 1 / Fable N1 — this test cannot pass without the round-3 normalized-stash spec.)**
 - Integration: sessionless request → no derivation, no stash, no row field.
 - Integration: marker-text-in-user-content false-positive case → no derivation.
 - Integration: env-var off → no behavior change from current state.
-- Integration: drift canary — request matches conditions 1+2 but no marker → event logged with `agent_id_source: "drift-canary"` to the synthesis extension's own writer (not request-log).
+- Integration: drift canary — request matches conditions 1+2 but no marker → event logged with `agent_id_source: "drift_canary"` to the synthesis extension's own writer (not request-log).
 - Integration: usage-log emission off (default) → no `agent_id` field on rows; meter validation passes against current schema.
 - Integration: usage-log emission on, meter v0.8.0+ → `agent_id` + `agent_id_source` present on rows; meter validation passes against the v0.8.0 schema.
 - Integration: order verification — extension loaded at order 365; runs after `thinking-display` (360) and before `cache-control-normalize` (400).
@@ -289,7 +291,7 @@ Modified:
 - `README.md` — extension docs.
 - `docs/extensions.md` — updated entries for the three touched extensions.
 
-**Companion PR (meter side, MUST land first):** [cnighswonger/claude-code-meter#30](https://github.com/cnighswonger/claude-code-meter/pull/30) (branch `directive/agent-id-schema-addition`, commit `88c7c0c`) — adds optional `agent_id` (string, max 64) + `agent_id_source` (enum: `"cc-header" | "cache-fix-derived"`) fields to `MeterRowSchema`. Ships in claude-code-meter v0.8.0. **The cache-fix implementation PR for this directive cannot merge until meter v0.8.0 is released.**
+**Companion PR (meter side, MUST land first):** [cnighswonger/claude-code-meter#30](https://github.com/cnighswonger/claude-code-meter/pull/30) (branch `directive/agent-id-schema-addition`, commit `88c7c0c`) — adds optional `agent_id` (string, max 64) + `agent_id_source` (enum: `"cc_header" | "cache_fix_derived"`) fields to `MeterRowSchema`. Ships in claude-code-meter v0.8.0. **The cache-fix implementation PR for this directive cannot merge until meter v0.8.0 is released.**
 
 Out of scope (no changes):
 - `proxy/pipeline.mjs`, `proxy/stream.mjs`, `proxy/server.mjs` — no pipeline modifications. No upstream header emission.
@@ -298,7 +300,7 @@ Out of scope (no changes):
 ## Reviewer checklist (cache-fix side)
 
 - [ ] No upstream header emission; derivation lives entirely on `ctx.meta`.
-- [ ] **Single normalized stash** `ctx.meta._workflowAgentId = { id, parentId, source }` for BOTH canonical and derived cases; canonical path stashes too, not only the derived path. Canonical-priority Task-subagent test asserts row emits `agent_id_source: "cc-header"`.
+- [ ] **Single normalized stash** `ctx.meta._workflowAgentId = { id, parentId, source }` for BOTH canonical and derived cases; canonical path stashes too, not only the derived path. Canonical-priority Task-subagent test asserts row emits `agent_id_source: "cc_header"`.
 - [ ] `workflow-markers.mjs` contains at least one binary-verified marker with `marker_id` + cc_version + cc_npm_sha256 + matched string. (Implementation cannot ship without this.)
 - [ ] Any `position: "first-user-message"` entry has `first_message_authorship: "tool"` AND binary inspection proof attached to the PR body. User-authored first messages are NOT eligible.
 - [ ] Per-leg discriminator chosen from a binary-verified marker context field; documented in PR body. (3-distinct-ids acceptance test depends on this.)
@@ -309,7 +311,7 @@ Out of scope (no changes):
 - [ ] Extension registered at order **365** (NOT 360 — collides with `thinking-display`). Verified against mainline `extensions.json`.
 - [ ] `usage-log` emission default-off behind `CACHE_FIX_USAGE_LOG_AGENT_ID`; env-var IS the operator's attestation of meter v0.8.0+ (no runtime version probe). Companion meter v0.8.0 schema PR must be open before this PR opens, and released before this PR merges.
 - [ ] CHANGELOG cites CC#66761 + the meter v0.8.0 floor + the env-var rollout, matching the `request_id` v4.1.0 → v4.2.0 template.
-- [ ] Drift canary logs records with `agent_id_source: "drift-canary"` when conditions 1+2 hold but no marker matches.
+- [ ] Drift canary logs records with `agent_id_source: "drift_canary"` when conditions 1+2 hold but no marker matches.
 - [ ] Sim/real-traffic validation precondition for the v4.3.0 default-on flip: live emitted rows validated against a v0.8.0 meter install on real Workflow fan-out traffic.
 
 ## Out of scope (explicit)
