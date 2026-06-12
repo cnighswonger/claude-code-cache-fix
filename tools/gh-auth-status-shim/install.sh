@@ -72,6 +72,7 @@ fi
 
 TARGET="$TARGET_DIR/gh"
 LIB_TARGET_DIR="$TARGET_DIR/.gh-auth-status-shim-lib"
+LIB_SYMLINK="$TARGET_DIR/lib"
 
 # Ensure the target directory exists.
 if [ ! -d "$TARGET_DIR" ]; then
@@ -90,28 +91,48 @@ is_a_shim() {
     head -5 "$1" 2>/dev/null | grep -q '^# gh-auth-status-shim$'
 }
 
+# Returns 0 if TARGET_DIR/lib correctly points at the managed hidden
+# directory (or IS the managed copy-fallback dir). Closes Codex r2
+# blocker: the IS_SAME_SHIM no-op fast path must NOT trust drift in the
+# live lib link, only in the source/installed-helper byte equality.
+lib_entry_is_managed() {
+    if [ ! -e "$LIB_SYMLINK" ] && [ ! -L "$LIB_SYMLINK" ]; then
+        return 1  # nothing there at all
+    fi
+    if [ -L "$LIB_SYMLINK" ]; then
+        local existing_target
+        existing_target="$(readlink "$LIB_SYMLINK" 2>/dev/null || true)"
+        case "$existing_target" in
+            ".gh-auth-status-shim-lib"|"$LIB_TARGET_DIR") return 0 ;;
+            *) return 1 ;;
+        esac
+    fi
+    # Not a symlink — must be a managed copy-fallback dir (marker file
+    # check) AND contain the expected helper.
+    if [ -d "$LIB_SYMLINK" ] && [ -f "$LIB_SYMLINK/.managed" ] && [ -f "$LIB_SYMLINK/classify-auth-status.sh" ]; then
+        return 0
+    fi
+    return 1
+}
+
 # If a file exists at the target:
 # IS_SAME_SHIM=1 means the on-disk shim and lib are byte-identical to the
-# source — skip the rewrite to honor the directive's no-op contract.
+# source AND the live TARGET_DIR/lib entry resolves to the managed copy —
+# only then is skipping the rewrite truly a no-op that doesn't leave a
+# broken shim on PATH.
 IS_SAME_SHIM=0
 if [ -e "$TARGET" ]; then
     if is_a_shim "$TARGET"; then
-        # Same version? Build what the install would produce and compare
-        # against the installed file. The installed copy has the marker
-        # at line 2, so cmp'ing against the source directly would never
-        # match; build the canonical installed shape into a tmp first.
         canonical_tmp="$(mktemp -t gh-shim-canonical.XXXXXX)"
         {
             head -1 "$SHIM_SOURCE"
             printf '# gh-auth-status-shim\n'
             tail -n +2 "$SHIM_SOURCE"
         } > "$canonical_tmp"
-        # Also compare the lib file; both must match for a true no-op.
-        # (Lib content drift between source and installed is a directive-
-        # violation no-op-claim per Codex r1 attention.)
         lib_installed="$LIB_TARGET_DIR/classify-auth-status.sh"
         if cmp -s "$canonical_tmp" "$TARGET" 2>/dev/null \
-            && cmp -s "$LIB_SOURCE_DIR/classify-auth-status.sh" "$lib_installed" 2>/dev/null; then
+            && cmp -s "$LIB_SOURCE_DIR/classify-auth-status.sh" "$lib_installed" 2>/dev/null \
+            && lib_entry_is_managed; then
             IS_SAME_SHIM=1
         fi
         rm -f "$canonical_tmp"
@@ -158,7 +179,8 @@ fi
 
 if [ "$IS_SAME_SHIM" = "1" ]; then
     # Same-shim no-op — also skip lib-link recreation; assume the
-    # existing setup is correct (the lib-content cmp above confirmed it).
+    # existing setup is correct (the lib-content cmp + lib-entry-is-
+    # managed check above confirmed it).
     :
 else
 # Create a `lib` symlink next to the shim that points at the hidden dir.
@@ -169,7 +191,6 @@ else
 # TARGET_DIR/lib pointing elsewhere will break the shim's source line
 # at runtime, so silently warning + claiming success leaves a broken
 # shim on PATH. We refuse the install in that case.
-LIB_SYMLINK="$TARGET_DIR/lib"
 if [ -e "$LIB_SYMLINK" ] || [ -L "$LIB_SYMLINK" ]; then
     existing_target="$(readlink "$LIB_SYMLINK" 2>/dev/null || true)"
     case "$existing_target" in

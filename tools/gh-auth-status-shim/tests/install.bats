@@ -155,6 +155,38 @@ teardown() {
     [ ! -e "$TARGET_DIR/lib" ]
 }
 
+@test "install: same-shim reinstall on drifted lib symlink → no longer a no-op, refuses or repairs (Codex r2 blocker fix)" {
+    # Install once cleanly.
+    "$SHIM_DIR/install.sh" --target "$TARGET_DIR" >/dev/null
+    [ -L "$TARGET_DIR/lib" ]
+    # Drift: repoint TARGET_DIR/lib at a different directory. This is
+    # exactly the scenario Codex reproduced in round 2: shim+helper match
+    # but the live lib link is broken, so a "no-op" would leave a shim
+    # that fails sourcing at runtime.
+    OTHER_DIR="$TEST_TMP/drifted-lib-target"
+    mkdir -p "$OTHER_DIR"
+    rm "$TARGET_DIR/lib"
+    ln -s "$OTHER_DIR" "$TARGET_DIR/lib"
+
+    run "$SHIM_DIR/install.sh" --target "$TARGET_DIR"
+    # The fixed installer must NOT report "no-op" with a drifted lib.
+    # Either it repairs the lib (exit 0, but it DID work — verify by
+    # checking the link is now correct) OR it refuses (exit 1 with the
+    # foreign-lib FATAL).
+    if [ "$status" = 0 ]; then
+        # If it claimed success, it must have repaired the link OR
+        # refused with FATAL (mutex of the if-branch). Confirm the link
+        # is actually correct now AND no "no-op" claim.
+        [[ "$output" != *"no-op"* ]]
+        # Lib should resolve correctly now.
+        existing="$(readlink "$TARGET_DIR/lib")"
+        [ "$existing" = ".gh-auth-status-shim-lib" ] || [ "$existing" = "$TARGET_DIR/.gh-auth-status-shim-lib" ]
+    else
+        # Refused — verify FATAL message named the foreign-lib problem.
+        [[ "$output" == *"not our managed lib link"* ]]
+    fi
+}
+
 @test "uninstall: leaves un-managed lib directory in place" {
     # User has their own lib/ dir that isn't ours.
     "$SHIM_DIR/install.sh" --target "$TARGET_DIR" >/dev/null
