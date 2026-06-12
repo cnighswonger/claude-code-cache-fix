@@ -37,6 +37,7 @@ while [ -L "$_self_path" ]; do
 done
 _self_dir="$(cd "$(dirname "$_self_path")" && pwd)"
 # shellcheck source=lib/classify-auth-status.sh
+# shellcheck disable=SC1091  # runtime-resolved; CI lints the lib file separately
 . "$_self_dir/lib/classify-auth-status.sh"
 
 # Resolve the real gh binary. Walks PATH for entries named `gh` and skips
@@ -170,6 +171,7 @@ intercept_auth_status() {
 main() {
     local real_gh
     if ! real_gh="$(detect_real_gh)"; then
+        # shellcheck disable=SC2016  # literal backticks around `gh` for user output
         printf '[gh-auth-status-shim] FATAL: cannot find a real `gh` binary on PATH other than this shim.\n' >&2
         printf '[gh-auth-status-shim] Install gh from https://cli.github.com/ or fix PATH ordering.\n' >&2
         return 127
