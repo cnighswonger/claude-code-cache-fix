@@ -11,11 +11,16 @@
 
 Validates the JSONL session-content mirror against real CC harness traffic and real Anthropic upstream. The directive's sim-validation requirement is to "capture real CC traffic on a test session; compare mirror records to CC's canonical transcript records for the same session; assert envelope-shape parity (all expected top-level keys present, `message` nesting correct, content blocks structurally identical)."
 
-This sim covers all three legs:
+**This sim covers what it can at parallel-harness scope; the strict same-session canonical-transcript comparison is honestly framed below.** What's actually proven here:
 
 1. **Real CC harness consumption end-to-end** — `claude.exe` 2.1.148 invoked with `ANTHROPIC_BASE_URL` pointed at the test proxy; CC handles the turn normally; no harness-side regression.
 2. **Mirror records produced under real traffic** — the mirror extension's stream-event accumulator fires for the real CC turn; records land on disk with the right structure.
-3. **Envelope-shape parity** — top-level + message-nested keys checked against the CC 2.1.148 fixture (`test/fixtures/cc-transcript-shape-snapshot.json`, captured from a real transcript) per the directive's verified shape.
+3. **Envelope-shape parity against the CC 2.1.148 fixture** — top-level + message-nested key sets compared against `test/fixtures/cc-transcript-shape-snapshot.json` (captured from a real CC transcript at `~/.claude/projects/<project>/<session-uuid>.jsonl`).
+
+**What this sim does NOT prove** (be precise about the gap vs the directive's strict ask):
+
+- **Same-session canonical-transcript comparison.** The sim uses `--no-session-persistence` so CC does not write its own transcript file for the test session. The envelope-parity check is against the fixture (a snapshot of CC's verified shape), not against a live transcript CC produced for the same session. A future sim that drops `--no-session-persistence` could perform the strict same-session diff against CC's own file; documented as an option below.
+- **Content-block structural identity at field-level granularity.** The parity check verifies key sets and nesting; it does not assert field-by-field semantic equivalence of `content` blocks between mirror and CC. The in-tree unit tests cover the shaper's field semantics; the sim verifies they land on disk in real traffic.
 
 ## Test rig
 
@@ -88,13 +93,15 @@ Future sim runs that want to compare directly against a live CC transcript file 
 
 ## Verdict
 
-**GREEN.** The directive's three-leg sim-validation requirement is satisfied:
+**GREEN on what the sim can prove at parallel-harness scope:**
 
 1. Real CC harness consumption: clean turn against real Anthropic with the mirror extension active. No harness-side regression.
 2. Mirror records produced: 1 user + 1 assistant record on disk, `open` event in the log, parentUuid chain wired correctly.
-3. Envelope-shape parity: all directive-verified top-level + message-nested keys present on both assistant and user records.
+3. Envelope-shape parity against the CC 2.1.148 fixture: all key sets present on both assistant and user records.
 
-The `needs-sim-validation` merge gate is satisfied.
+**Not proven here, per the scope notes above:** strict same-session canonical-transcript comparison (CC's transcript was suppressed) and field-by-field content-block structural identity (key-set parity only). The first can be exercised by dropping `--no-session-persistence` in a future sim; the second is covered by the in-tree unit tests' field semantics checks.
+
+The `needs-sim-validation` merge gate is satisfied for the parallel-harness-reproducible portions of the directive's requirement.
 
 ## Artifacts
 
@@ -108,9 +115,10 @@ Out-of-tree (not committed to the release artifact):
 - Mirror event log: `/tmp/cf-mirror-sim-artifacts/session-mirror-events.jsonl`
 - Sim transcript: `/tmp/cf-mirror-sim-artifacts/sim-run.log`
 
-## Notes on what this sim does NOT cover (deferred per directive)
+## Notes on what this sim does NOT cover
 
-- **Format-round-trip via `restore-claude-history-linux`** — the tool's API isn't programmatically exercisable in CI without vendoring its parser. The envelope-parity test against the fixture is the in-tree proxy; the real round-trip is the operator's option to run manually with `restore-claude-history-linux` against the captured mirror file.
-- **Multi-turn dedup behavior under real traffic** — the in-tree integration suite covers 3-turn, failed-request re-stage, legitimately-repeated user text, tool-result dedup. A multi-turn real-traffic sim is straightforward to extend (drop `--no-session-persistence`, run more turns) but adds no new dedup-correctness signal beyond what the unit suite covers.
-- **Stream-abort partial-flush** — explicitly cut from v4.2.0 ship per Codex round-1 finding; deferred to a follow-up directive that takes the server.mjs change in scope.
+- **Format-round-trip via `restore-claude-history-linux`** — the directive lists this as in-scope (`docs/directives/proxy-jsonl-session-mirror.md` § Test plan + § Reviewer checklist). It is **not exercised in this sim**. The tool's API isn't programmatically reproducible without vendoring the parser, so we don't drive it here. The operator can run the round-trip manually against the captured mirror file at `/tmp/cf-mirror-sim-artifacts/mirrors/<session>/*.jsonl`. The merge gate on this surface is the directive's reviewer-checklist item; it remains the operator's check before clearing `needs-sim-validation`.
+- **Same-session canonical-transcript comparison** — see § Scope above. Future sim option: drop `--no-session-persistence` and diff against `~/.claude/projects/<project>/<session-uuid>.jsonl` directly.
+- **Multi-turn dedup behavior under real traffic** — the in-tree integration suite covers 3-turn, failed-request re-stage, legitimately-repeated user text, tool-result dedup. A multi-turn real-traffic sim is straightforward to extend but adds no new dedup-correctness signal beyond what the unit suite covers.
+- **Stream-abort partial-flush** — explicitly cut from v4.2.0 ship per Codex round-1 finding (PR #221). Directive updated in commit `2a9ebf6` to mark this as deferred to a follow-up directive that takes the server.mjs change in scope.
 - **Disk-pressure / rotation behavior under heavy traffic** — covered by the in-tree writer test suite's rotation + retention sweep tests.
