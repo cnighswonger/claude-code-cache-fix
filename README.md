@@ -765,6 +765,37 @@ export CACHE_FIX_IMAGE_RETRY_BREAKER=on
 
 Sessionless requests bucket to `"unknown"` — they're not isolated from each other by request signature, an acknowledged limitation mitigated by the 30s sliding window.
 
+## Session backup (proxy mode, opt-in)
+
+A belt-and-suspenders backup against CC's transcript regressions per [anthropics/claude-code#66734](https://github.com/anthropics/claude-code/issues/66734) (in-place transcript rewrite to a metadata-only stub) and [anthropics/claude-code#66486](https://github.com/anthropics/claude-code/issues/66486) (missing transcript on interactive sessions). When the proxy is in the path, every assistant message + observed tool result / user input is mirrored into a per-session JSONL file under user control, independent of CC's own transcript writer. CC's transcript remains canonical when it survives; the mirror is the recovery path when it doesn't.
+
+Opt-in via env var; default-off in v4.2.0 and v4.3.0 pending a privacy-posture cycle:
+
+```bash
+export CACHE_FIX_SESSION_MIRROR=on
+```
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `CACHE_FIX_SESSION_MIRROR` | `off` | Master gate — `on` activates mirroring |
+| `CACHE_FIX_SESSION_MIRROR_DIR` | `~/.claude/session-mirrors/` | Storage root |
+| `CACHE_FIX_SESSION_MIRROR_MAX_BYTES` | 100 MB | Per-session active-file rotation threshold |
+| `CACHE_FIX_SESSION_MIRROR_RETENTION_DAYS` | 30 | Retention sweep horizon (files past this are unlinked) |
+| `CACHE_FIX_SESSION_MIRROR_MAX_SESSIONS` | 1024 | LRU cap on the in-memory dedup state map |
+| `CACHE_FIX_SESSION_MIRROR_INCLUDE_THINKING` | `true` | Set `false` to exclude `thinking` content blocks from mirror records |
+
+**Format-parity:** mirror records use CC 2.1.148's verified transcript envelope shape exactly — existing transcript readers (including `restore-claude-history-linux`) parse mirror files unchanged. The single distinguishing field is `source: "cache-fix-proxy-mirror"`. Three known limitations called out at write time:
+
+1. `cwd` is always `null` (proxy does not know caller working directory).
+2. `uuid` is dash-formatted (`8-4-4-4-12`) but the version/variant bits aren't RFC-valid. It's a deterministic hash of `(sessionId, timestamp, messageId)` so the chain is reconstructable; shape-validating parsers accept it.
+3. Tool-result user records omit `toolUseResult` and `sourceToolAssistantUUID` (CC-internal enriched objects the proxy cannot reconstruct).
+
+Storage layout: `<DIR>/<sessionFilename(sessionId)>/<timestamp>.jsonl`. Session ids that don't match `[A-Za-z0-9_-]{1,128}` bucket to `inv-<sha256[:16]>` (path-traversal safe). Sessionless requests share an `unknown/` directory.
+
+**Operational events** (open / rotate / sweep / error) are logged to `~/.claude/session-mirrors/session-mirror-events.jsonl` (5 MB single-tier rotation). The mirror is read-only with respect to upstream traffic; no requests or responses are modified, and writer errors are isolated from the response stream by the pipeline's per-hook try/catch.
+
+See [docs/disk-usage.md](docs/disk-usage.md) for the worst-case disk-footprint accounting.
+
 ## Cache breakpoints (proxy mode, opt-in)
 
 Anthropic's prompt cache supports up to **four** `cache_control` markers per request. Claude Code currently uses three of the four; the third (between auto-injected `messages[0]` content — hooks, skills, project CLAUDE.md, deferred tools, MCP server descriptions — and the first real user content) is missing entirely. Without that marker, every change inside the auto-injected span busts the cache for everything that follows. wadabum projected ~6,500 token savings per fresh-session first turn from adding it ([anthropics/claude-code#47098](https://github.com/anthropics/claude-code/issues/47098)).

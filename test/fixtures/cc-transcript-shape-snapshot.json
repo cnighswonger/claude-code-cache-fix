@@ -1,0 +1,145 @@
+{
+  "source": "CC 2.1.148 transcript: ~/.claude/projects/-home-manager-git-repos-claude-code-cache-fix/95cb9cc1-8f47-46b0-86ea-459fc6060b42.jsonl",
+  "captured": "2026-06-12",
+  "_note": "Content fields redacted; structural keys preserved for envelope-shape tests. Do not consider the values authoritative \u2014 only the key sets and nesting.",
+  "assistant_record_top_level_keys": [
+    "cwd",
+    "entrypoint",
+    "gitBranch",
+    "isSidechain",
+    "message",
+    "parentUuid",
+    "requestId",
+    "sessionId",
+    "timestamp",
+    "type",
+    "userType",
+    "uuid",
+    "version"
+  ],
+  "assistant_message_keys": [
+    "content",
+    "id",
+    "model",
+    "role",
+    "stop_details",
+    "stop_reason",
+    "stop_sequence",
+    "type",
+    "usage"
+  ],
+  "user_record_top_level_keys": [
+    "cwd",
+    "entrypoint",
+    "gitBranch",
+    "isSidechain",
+    "message",
+    "parentUuid",
+    "promptId",
+    "sessionId",
+    "sourceToolAssistantUUID",
+    "timestamp",
+    "toolUseResult",
+    "type",
+    "userType",
+    "uuid",
+    "version"
+  ],
+  "user_message_keys": [
+    "content",
+    "role"
+  ],
+  "assistant_sample": {
+    "parentUuid": "b246b667-7465-4542-8fe2-cfc1fd9fc670",
+    "isSidechain": false,
+    "message": {
+      "model": "claude-opus-4-7",
+      "id": "msg_012o8rYH8dKrXX374xroiJaX",
+      "type": "message",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "thinking",
+          "thinking": " I'm starting the sweep by fetching comments from multiple issues in parallel and batching these calls to check various conditions efficiently.",
+          "signature": "EssCCmMIDhgCKkC2sPppL+7YL+crQO9Vpz+KFRfiHKEktuU98DdLMHUadrceuL8VGlXNsSm2RxxCSB0k9RSmWn1dl2fxuhumG6VFMg9jbGF1ZGUtb3B1cy00LTc4AEIIdGhpbmtpbmcSDBU66lkzvd7Kb3o6gBoMoDpFiv3jRwt5V2llIjAVq1jlF/4BfMHIQ79F8pxRdy/hTL006EiRvzQVCn53Oyj1mH3QgSqT5g1OLqNGa/cqlQGMHnmhp46rW6U6aL90CX+L/QVxfJyBiAqLidxmhZlEymHVQhypvfQDpJ2ZfyzbIkTpYmUqRf5JMsBZyc4rFf2tXyxLlbkCXE5vm/WWfUh2SMvwrlTWxHVhzYLvCeSMPTDpAR8Gmf37s/BAsUTrsJ1ZsuZFVtZuBd2YK21VLqrOaKeglLJD3wNMJITVNnAB2ywmypQj7xgB"
+        }
+      ],
+      "stop_reason": "tool_use",
+      "stop_sequence": null,
+      "stop_details": null,
+      "usage": {
+        "input_tokens": 5,
+        "cache_creation_input_tokens": 57301,
+        "cache_read_input_tokens": 0,
+        "output_tokens": 1109,
+        "server_tool_use": {
+          "web_search_requests": 0,
+          "web_fetch_requests": 0
+        },
+        "service_tier": "standard",
+        "cache_creation": {
+          "ephemeral_1h_input_tokens": 57301,
+          "ephemeral_5m_input_tokens": 0
+        },
+        "inference_geo": "",
+        "iterations": [
+          {
+            "input_tokens": 5,
+            "output_tokens": 1109,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 57301,
+            "cache_creation": {
+              "ephemeral_5m_input_tokens": 0,
+              "ephemeral_1h_input_tokens": 57301
+            },
+            "type": "message"
+          }
+        ],
+        "speed": "standard"
+      }
+    },
+    "requestId": "req_011CbkQdmQJS88YRQ3iU2QVx",
+    "type": "assistant",
+    "uuid": "6d978b0c-2967-453a-840b-f5d9805ece60",
+    "timestamp": "2026-06-05T16:13:08.165Z",
+    "userType": "external",
+    "entrypoint": "sdk-cli",
+    "cwd": "/home/manager/git_repos/claude-code-cache-fix",
+    "sessionId": "95cb9cc1-8f47-46b0-86ea-459fc6060b42",
+    "version": "2.1.148",
+    "gitBranch": "docs/agents-md-slim-to-global"
+  },
+  "user_sample": {
+    "parentUuid": "8e2d0575-91b8-4302-939e-148f1c900133",
+    "isSidechain": false,
+    "promptId": "a9b478dc-c89a-488e-9c72-e36be2dc69ab",
+    "type": "user",
+    "message": {
+      "role": "user",
+      "content": [
+        {
+          "tool_use_id": "toolu_01JMCaPkGsBC4H2FYv7BUPR6",
+          "type": "tool_result",
+          "content": "[{\"author\":{\"login\":\"ThatDragonOverThere\"},\"authorAssociation\":\"NONE\",\"body\":\"Confirmed empirically: default effort is now \\\"high\\\" for BOTH Sonnet and Opus, not just Opus as the changelog implied.\\n\\nAny multi-agent setup that did not explicitly set effort level on each worker got silently upgraded to high effort across every session after the 2.1.117 update. For a 6-8 agent overnight pipeline, that is 6-8x the effort multiplier applied without any user action or notification.\\n\\nUsers need to explicitly set effort to medium (or their preferred level) on every agent window -- there is no way to set a global default. This is not documented anywhere visible.\",\"createdAt\":\"2026-04-23T15:59:03Z\",\"id\":\"IC_kwDON91aY88AAAABAKb9nw\",\"includesCreatedEdit\":false,\"isMinimized\":false,\"minimizedReason\":\"\",\"reactionGroups\":[],\"url\":\"https://github.com/anthropics/claude-code/issues/41930#issuecomment-4305911199\",\"viewerDidAuthor\":false},{\"author\":{\"login\":\"Faved\"},\"authorAssociation\":\"NONE\",\"body\":\"Confirmed, brand new seat on our team account as premium, didnt even have terminal or CC open. I had done earlier in the day with a different account and had used a --resume, i dont know if the was a phantom background runner or something. but i sat and watched my 5 hour session hit 100% within 22 mins.\\nI did find some claude processes running in activity montior, which disappeared once i hit 100% usage\",\"createdAt\":\"2026-04-23T22:15:04Z\",\"id\":\"IC_kwDON91aY88AAAABANB9cw\",\"includesCreatedEdit\":false,\"isMinimized\":false,\"minimizedReason\":\"\",\"reactionGroups\":[{\"content\":\"THUMBS_UP\",\"users\":{\"totalCount\":1}}],\"url\":\"https://github.com/anthropics/claude-code/issues/41930#issuecomment-4308630899\",\"viewerDidAuthor\":false},{\"author\":{\"login\":\"bcherny\"},\"authorAssociation\":\"COLLABORATOR\",\"body\":\"Hey all, we have root caused and fixed this. Detailed technical post-mortem here: https://www.anthropic.com/engineering/april-23-postmortem. If you see any more issues/weirdness, please don't hesitate to run `/feedback` + open an issue.\",\"createdAt\":\"2026-04-24T00:58:47Z\",\"id\":\"IC_kwDON91aY88AAAABAOAk-w\",\"includesCreatedEdit\":false,\"isMinimized\":false,\"minimizedReason\":\"\",\"reactionGroups\":[],\"url\":\"https://github.com/anthropics/claude-code/issues/41930#issuecomment-4309656827\",\"viewerDidAuthor\":false}]",
+          "is_error": false
+        }
+      ]
+    },
+    "uuid": "7df6752e-8f6b-428b-8f0d-ff951e9fd16a",
+    "timestamp": "2026-06-05T16:13:10.477Z",
+    "toolUseResult": {
+      "stdout": "[{\"author\":{\"login\":\"ThatDragonOverThere\"},\"authorAssociation\":\"NONE\",\"body\":\"Confirmed empirically: default effort is now \\\"high\\\" for BOTH Sonnet and Opus, not just Opus as the changelog implied.\\n\\nAny multi-agent setup that did not explicitly set effort level on each worker got silently upgraded to high effort across every session after the 2.1.117 update. For a 6-8 agent overnight pipeline, that is 6-8x the effort multiplier applied without any user action or notification.\\n\\nUsers need to explicitly set effort to medium (or their preferred level) on every agent window -- there is no way to set a global default. This is not documented anywhere visible.\",\"createdAt\":\"2026-04-23T15:59:03Z\",\"id\":\"IC_kwDON91aY88AAAABAKb9nw\",\"includesCreatedEdit\":false,\"isMinimized\":false,\"minimizedReason\":\"\",\"reactionGroups\":[],\"url\":\"https://github.com/anthropics/claude-code/issues/41930#issuecomment-4305911199\",\"viewerDidAuthor\":false},{\"author\":{\"login\":\"Faved\"},\"authorAssociation\":\"NONE\",\"body\":\"Confirmed, brand new seat on our team account as premium, didnt even have terminal or CC open. I had done earlier in the day with a different account and had used a --resume, i dont know if the was a phantom background runner or something. but i sat and watched my 5 hour session hit 100% within 22 mins.\\nI did find some claude processes running in activity montior, which disappeared once i hit 100% usage\",\"createdAt\":\"2026-04-23T22:15:04Z\",\"id\":\"IC_kwDON91aY88AAAABANB9cw\",\"includesCreatedEdit\":false,\"isMinimized\":false,\"minimizedReason\":\"\",\"reactionGroups\":[{\"content\":\"THUMBS_UP\",\"users\":{\"totalCount\":1}}],\"url\":\"https://github.com/anthropics/claude-code/issues/41930#issuecomment-4308630899\",\"viewerDidAuthor\":false},{\"author\":{\"login\":\"bcherny\"},\"authorAssociation\":\"COLLABORATOR\",\"body\":\"Hey all, we have root caused and fixed this. Detailed technical post-mortem here: https://www.anthropic.com/engineering/april-23-postmortem. If you see any more issues/weirdness, please don't hesitate to run `/feedback` + open an issue.\",\"createdAt\":\"2026-04-24T00:58:47Z\",\"id\":\"IC_kwDON91aY88AAAABAOAk-w\",\"includesCreatedEdit\":false,\"isMinimized\":false,\"minimizedReason\":\"\",\"reactionGroups\":[],\"url\":\"https://github.com/anthropics/claude-code/issues/41930#issuecomment-4309656827\",\"viewerDidAuthor\":false}]",
+      "stderr": "",
+      "interrupted": false,
+      "isImage": false,
+      "noOutputExpected": false
+    },
+    "sourceToolAssistantUUID": "8e2d0575-91b8-4302-939e-148f1c900133",
+    "userType": "external",
+    "entrypoint": "sdk-cli",
+    "cwd": "/home/manager/git_repos/claude-code-cache-fix",
+    "sessionId": "95cb9cc1-8f47-46b0-86ea-459fc6060b42",
+    "version": "2.1.148",
+    "gitBranch": "docs/agents-md-slim-to-global"
+  }
+}
