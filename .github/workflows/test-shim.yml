@@ -1,0 +1,52 @@
+name: Test shim
+
+# Tests for tools/gh-auth-status-shim/. Separate from the main Node proxy
+# test workflow (.github/workflows/test.yml) — different language, different
+# test framework, should not gate proxy PRs.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'tools/gh-auth-status-shim/**'
+      - '.github/workflows/test-shim.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'tools/gh-auth-status-shim/**'
+      - '.github/workflows/test-shim.yml'
+
+jobs:
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bats
+        run: sudo apt-get update && sudo apt-get install -y bats
+      - name: Install shellcheck
+        run: sudo apt-get install -y shellcheck
+      - name: shellcheck (default mode)
+        run: |
+          shellcheck \
+            tools/gh-auth-status-shim/gh-auth-status-shim.sh \
+            tools/gh-auth-status-shim/lib/classify-auth-status.sh \
+            tools/gh-auth-status-shim/install.sh \
+            tools/gh-auth-status-shim/uninstall.sh
+      - name: bats unit + integration + install tests
+        run: bats tools/gh-auth-status-shim/tests/
+
+  test-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bats
+        run: brew install bats-core
+      - name: Confirm /bin/bash is 3.2
+        run: |
+          /bin/bash --version
+          /bin/bash -c 'case "$BASH_VERSION" in 3.2*) echo "OK: bash 3.2 floor confirmed";; *) echo "FAIL: expected 3.2.x, got $BASH_VERSION" >&2; exit 1;; esac'
+      - name: bats under /bin/bash (3.2 floor verification)
+        # Force the bats suite to run under /bin/bash (3.2) explicitly.
+        # Without this, bats's `#!/usr/bin/env bash` shebang may resolve to
+        # Homebrew bash and the bash-3.2 floor claim becomes theater.
+        run: /bin/bash "$(which bats)" tools/gh-auth-status-shim/tests/

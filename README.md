@@ -317,6 +317,14 @@ Some Claude Code behaviors live below the request layer — they happen client-s
 |---|---|
 | [`worktree-edit-guard.py`](docs/hooks/worktree-edit-guard.md) | Block `Edit`/`Write`/`MultiEdit`/`NotebookEdit` tool calls whose target path escapes the active git worktree, preventing parent-checkout corruption from worktree sessions. Addresses [CC#59628](https://github.com/anthropics/claude-code/issues/59628). |
 
+## Contributed tools
+
+Standalone scripts that aren't proxy extensions or CC hooks — installable separately, addressing specific upstream issues.
+
+| Tool | What it does |
+|---|---|
+| [`tools/gh-auth-status-shim/`](tools/gh-auth-status-shim/README.md) | PATH-resolved `gh` wrapper that suppresses CC Desktop's false "GitHub CLI authentication expired" toast. Addresses [CC#67055](https://github.com/anthropics/claude-code/issues/67055): CC Desktop's PR poller maps any non-zero return from `gh auth status` (including its 5s spawn timeout) to the `"auth"` toast category. The shim intercepts `gh auth status` calls with a 4s internal timeout, classifies the outcome, and returns exit 0 to suppress the false toast on transient/timeout signals while letting genuine expiry (`not logged in`, `HTTP 401`) propagate normally. Workaround until Anthropic's classifier fix lands; sunset tracked in [`TRACKED_ISSUES.md`](TRACKED_ISSUES.md). **Known limitations:** rewrites `gh auth status` exit-code semantics for every caller in the PATH scope (not just CC); macOS coverage unverified due to launchd PATH inheritance; native Windows CC Desktop not supported. |
+
 ## Recommended CC operational config
 
 The proxy fixes what it can fix at the request layer. A handful of CC client-side env vars and `~/.claude/settings.json` knobs solve adjacent problems the proxy can't reach — silent model swaps on CC update, ambiguous model fallback, schema-strip side effects. Surfacing these here as a recommendation; users decide their own config.

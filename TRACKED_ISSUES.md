@@ -32,6 +32,7 @@ Last updated: 2026-04-23 (v3.0.5 shipped, Max 20x upgrade, three new CC issues f
 | [#44869](https://github.com/anthropics/claude-code/issues/44869) | Prompt cache completely broken — 16-26K on "hello" | Open | Posted root cause explanation (readdir jitter, resume scatter, TTL gating) and interceptor fix. (2026-04-09) |
 | [#43657](https://github.com/anthropics/claude-code/issues/43657) | Resume/continue cache invalidation | **Reopened** | Was closed, simpolism claimed "fixed in 2.1.97" — we posted test data showing scatter still present. Reopened after our comment. (2026-04-09) |
 | [#45756](https://github.com/anthropics/claude-code/issues/45756) | Pro Max 5x quota exhausted in 1.5h — cache_read counting at full rate? | Open | Defended against bot auto-closure. Shared v1.6.1 quota tracking, validated molu0219's analysis, collecting off-peak data. (2026-04-09). **New Apr 21:** nikhilsitaram called out Anthropic's 1h→5m TTL switch contradiction — Boris references 1h windows but server enforces 5m. |
+| [#67055](https://github.com/anthropics/claude-code/issues/67055) | Desktop: false "GitHub CLI authentication expired" toast — `gh auth status` failures (incl. 5s timeout) classified as expired credentials | Open | Shipping [`tools/gh-auth-status-shim/`](tools/gh-auth-status-shim/) as PATH-resolved workaround until Anthropic's classifier fix lands. Sunset on issue close. |
 
 ## Monitoring — Directly relevant
 
