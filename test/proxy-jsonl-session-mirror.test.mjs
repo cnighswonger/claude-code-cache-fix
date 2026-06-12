@@ -423,24 +423,72 @@ test("event log emits an 'open' event on first write per session", async () => {
     "first write should emit an 'open' event");
 });
 
-test("event log carries no file paths, no raw error messages — scalar surface only", async () => {
-  // Force a writer error via the same ENOTDIR trick.
-  const blocker = join(tmpDir, "blocker.file");
-  const { writeFileSync } = await import("node:fs");
-  writeFileSync(blocker, "I am a file");
-  process.env.CACHE_FIX_SESSION_MIRROR_DIR = blocker;
-  const sessionId = "sess-event-pii";
+test("event log scalar surface: contract proof — disallowed fields stripped from serialized events", async () => {
+  // Codex round-2 attention: the prior version pointed the mirror root at an
+  // invalid path so it never read an emitted line, making the test smoke not
+  // contract. The fix forces a SUCCESSFUL event-log write and asserts that
+  // sanitizer-stripped fields really are absent from the serialized JSONL.
+  const sessionId = "sess-scalar-contract";
+  // Drive a normal mirroring cycle so an `open` event lands.
   const body = { model: "claude-opus-4-7", messages: [userTextMsg("hi")] };
   const reqCtx = ctxFor({ body, sessionId });
   await ext.onRequest(reqCtx);
-  await streamAssistantMessage(ext, reqCtx, sessionId, { messageId: "msg_err" });
+  await streamAssistantMessage(ext, reqCtx, sessionId, { messageId: "msg_scalar" });
 
-  // The event log is created under the (now-invalid) blocker path — but the
-  // sanitizer prevents path/error message leakage even from in-memory records.
-  // We can't read the log because it can't be written, but the in-memory
-  // assertion is the contract: callers can't smuggle non-allowlisted fields.
-  // Smoke: the extension's error-handling code path must not have crashed.
-  assert.ok(true);
+  // Read the event log directly and assert all events are allow-list-only.
+  const eventLogPath = process.env.CACHE_FIX_SESSION_MIRROR_EVENT_LOG;
+  assert.ok(existsSync(eventLogPath), "event log must have been written");
+  const events = readFileSync(eventLogPath, "utf8")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  assert.ok(events.length > 0, "must have written at least one event");
+
+  const allowedKeys = new Set([
+    "timestamp", "event", "session_id", "rotation", "bytes", "unlinked", "error_class",
+  ]);
+  for (const evt of events) {
+    for (const key of Object.keys(evt)) {
+      assert.ok(allowedKeys.has(key),
+        `event has disallowed field '${key}': ${JSON.stringify(evt)}`);
+    }
+    // Also belt-and-suspenders: the serialized event must not contain any
+    // path-like or raw-error patterns even if a future caller spreads
+    // something nonstandard.
+    const serialized = JSON.stringify(evt);
+    assert.ok(!serialized.includes("/tmp/"), "no file paths in serialized event");
+    assert.ok(!serialized.match(/Error:|ENOENT|EACCES/i), "no raw error messages in serialized event");
+  }
+});
+
+test("event log scalar surface: writer rejects out-of-allowlist fields when callers spread non-scalar payloads", async () => {
+  // Direct test against the writer's sanitizer. Call _appendEvent with a
+  // record that includes a path, a raw error message, an object, and a
+  // null — assert only allow-list scalars survive.
+  const { _appendEvent } = await import("../proxy/session-mirror-writer.mjs");
+  _appendEvent({
+    event: "open",
+    session_id: "sess-direct-sanitize",
+    file: "/etc/passwd",                // path → must drop
+    message: "Error: ENOENT no such file or directory",  // raw → must drop
+    bytes: 12345,                        // allowed scalar
+    rotation: 2,                         // allowed scalar
+    extra_object: { evil: "data" },      // object → must drop
+    nullField: null,                     // null → must drop
+  });
+
+  const eventLogPath = process.env.CACHE_FIX_SESSION_MIRROR_EVENT_LOG;
+  const lines = readFileSync(eventLogPath, "utf8").trim().split("\n").filter(Boolean);
+  const evt = JSON.parse(lines[lines.length - 1]);
+  assert.deepEqual(new Set(Object.keys(evt)).has("file"), false);
+  assert.deepEqual(new Set(Object.keys(evt)).has("message"), false);
+  assert.deepEqual(new Set(Object.keys(evt)).has("extra_object"), false);
+  assert.deepEqual(new Set(Object.keys(evt)).has("nullField"), false);
+  assert.equal(evt.bytes, 12345);
+  assert.equal(evt.rotation, 2);
+  assert.equal(evt.event, "open");
+  assert.equal(evt.session_id, "sess-direct-sanitize");
 });
 
 test("parentUuid chain links each record to its predecessor in the session", async () => {

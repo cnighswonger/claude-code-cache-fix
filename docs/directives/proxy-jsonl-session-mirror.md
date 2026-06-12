@@ -97,7 +97,9 @@ Image content blocks are mirrored as references (`type: "image"` with `source.ty
 
 The CHANGELOG must call out three known limitations: the mirror's `cwd` is `null` (proxy does not know caller cwd), the `uuid` chain is synthetic (dash-formatted but not RFC-valid version/variant bits), and tool-result user records omit `toolUseResult`/`sourceToolAssistantUUID` (CC-internal enriched objects the proxy cannot reconstruct). Consumers depending on those for recovery should verify their behavior against mirror files specifically.
 
-**Per-message accumulator residence** (closes Fable round-2 nit #5): the accumulator state for the in-flight assistant message lives on `ctx.meta._mirrorAccumulator` (request-scoped), NOT in module-scope state. This means an aborted stream cleans up for free when `ctx` is garbage-collected — no cross-request leak, no eviction story needed for interrupted streams. On stream abort (`server.mjs:113-115`, client close), the proxy may optionally flush a partial assistant record with `stop_reason: "interrupted"` and any content blocks accumulated so far, which is itself a recovery win for the CC#66734 scenario (the user gets the assistant content that was streamed before the abort, not nothing). Partial-flush is in scope as an env-var-gated option `CACHE_FIX_SESSION_MIRROR_FLUSH_INTERRUPTED` (default `true`).
+**Per-message accumulator residence** (closes Fable round-2 nit #5): the accumulator state for the in-flight assistant message lives on `ctx.meta._mirrorAccumulator` (request-scoped), NOT in module-scope state. This means an aborted stream cleans up for free when `ctx` is garbage-collected — no cross-request leak, no eviction story needed for interrupted streams.
+
+**Partial-flush on stream abort — DEFERRED to follow-up directive (post-`0a59247`).** The round-4 directive listed stream-abort partial-flush (with `stop_reason: "interrupted"` and any content blocks accumulated so far) as in scope via `CACHE_FIX_SESSION_MIRROR_FLUSH_INTERRUPTED` (default true). Codex round 1 review on the implementation PR #221 flagged the env var as dead code — the proxy's existing client-close path (`server.mjs:113-115`) only aborts the upstream stream; there is no hook from which the extension could be invoked on client-abort. Wiring this requires a `server.mjs` change that this directive earlier claimed was unnecessary. The env var, helper, and partial-flush mechanics are explicitly cut from the v4.2.0 ship. They are tracked for a follow-up directive that takes the server.mjs change in scope.
 
 ## Dedup state (closes Fable B3 round-1 + round-2 NB1 + NB2)
 
@@ -214,7 +216,7 @@ Stream-event accumulator with one buffered write at `message_stop`. Zero pipelin
 - Integration: 200-turn replay — total records = 400, not 20,400.
 - Integration: failed-request re-stage — turn 3 stages then upstream fails before `message_stop` → `mirroredUserMessageCount` unchanged. Turn 4 (CC's retry, same history) re-stages and the records appear exactly once. Asserts no record loss AND no duplicates.
 - Integration: legitimately-repeated user text — same `"yes"` user text at turns 2 and 9 produces TWO distinct mirror records (position-based dedup; verifies the design choice over hash-set dedup which would collapse them).
-- Integration: stream-abort partial flush — `CACHE_FIX_SESSION_MIRROR_FLUSH_INTERRUPTED=true` (default) and stream aborts mid-message → mirror contains a partial assistant record with `stop_reason: "interrupted"`. With env var false, no partial record written.
+- ~~Integration: stream-abort partial flush — `CACHE_FIX_SESSION_MIRROR_FLUSH_INTERRUPTED=true` (default) and stream aborts mid-message → mirror contains a partial assistant record with `stop_reason: "interrupted"`. With env var false, no partial record written.~~ **DEFERRED — partial-flush feature cut from v4.2.0 ship per Codex round-1 finding on PR #221.**
 - Integration: writer throws synchronously mid-stream → client still receives complete SSE response.
 - Integration: writer rejects asynchronously mid-stream → no `unhandledRejection`; client still receives complete SSE response; error logged to `session-mirror-events.jsonl`.
 - Integration: env-var off → no mirror writes occur.
@@ -257,7 +259,7 @@ Out of scope (no changes):
 - [ ] Image content blocks mirrored as references; bytes never persisted.
 - [ ] Dedup uses position-based `mirroredUserMessageCount` (user-role-message ordinal coordinates, NOT raw `messages[]` indices); advances ONLY at `message_stop` write success; failed-request re-stage test passes.
 - [ ] Synthetic `uuid` is dash-formatted (`8-4-4-4-12`) so shape-validating parsers accept it.
-- [ ] Per-message accumulator lives on `ctx.meta._mirrorAccumulator` (request-scoped); aborted streams free state via ctx GC; `CACHE_FIX_SESSION_MIRROR_FLUSH_INTERRUPTED` partial-flush behavior tested both directions.
+- [ ] Per-message accumulator lives on `ctx.meta._mirrorAccumulator` (request-scoped); aborted streams free state via ctx GC. ~~`CACHE_FIX_SESSION_MIRROR_FLUSH_INTERRUPTED` partial-flush behavior tested both directions.~~ Partial-flush deferred to follow-up directive (cut from v4.2.0 ship per Codex round-1 on PR #221).
 - [ ] User record key list matches verified 2.1.148 transcript shape: `isMeta` optional, `permissionMode` + `slug` included, `requestId` absent on user records, tool-result records omit `toolUseResult` / `sourceToolAssistantUUID` (CHANGELOG caveat).
 - [ ] `sessionFilename` from `cache-telemetry.mjs` reused for directory name; sessionless requests bucket to `"unknown"`.
 - [ ] Retention sweep unlinks files past `RETENTION_DAYS`; empty directories pruned.
