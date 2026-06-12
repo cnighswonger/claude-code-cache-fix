@@ -75,16 +75,21 @@ portable_timeout() {
         gtimeout "$seconds" "$@"
         return $?
     fi
-    # bash-native watchdog
+    # bash-native watchdog. Total budget MUST stay under CC Desktop's 5s
+    # spawn-abandonment window even when the child ignores SIGTERM. We
+    # send TERM at $seconds, give the child a brief grace period (0.5s),
+    # then send KILL. Both 143 (128+SIGTERM) and 137 (128+SIGKILL)
+    # normalize to 124 so the classifier sees a timeout regardless of
+    # which signal succeeded in stopping the child (closes Codex r1
+    # blocker on the TERM-ignoring case).
+    local grace_seconds="0.5"
     "$@" &
     local child=$!
     (
         sleep "$seconds"
-        # Don't kill if already finished; use kill -0 to probe.
         if kill -0 "$child" 2>/dev/null; then
             kill -TERM "$child" 2>/dev/null
-            # Give it 0.5s to exit, then SIGKILL.
-            sleep 1
+            sleep "$grace_seconds"
             kill -KILL "$child" 2>/dev/null
         fi
     ) &
@@ -92,11 +97,15 @@ portable_timeout() {
     local rc=0
     wait "$child" 2>/dev/null
     rc=$?
-    # Normalize 128+SIGTERM=143 to GNU timeout's 124 so the classifier is
-    # platform-agnostic.
-    if [ "$rc" = "143" ]; then
-        rc=124
-    fi
+    # Normalize both TERM-cooperative (143) and KILL-forced (137) exit
+    # codes to GNU timeout's 124 so downstream classification is
+    # platform- and signal-handler-agnostic. Also catch any other
+    # 128+sig signal in the typical kill-signal range as a timeout (we
+    # only invoked the watchdog because the budget expired, so any
+    # signal-induced exit here is by construction a timeout).
+    case "$rc" in
+        143|137|142|139|141|134) rc=124 ;;
+    esac
     kill "$watchdog" 2>/dev/null
     wait "$watchdog" 2>/dev/null
     return "$rc"
@@ -110,8 +119,15 @@ intercept_auth_status() {
     local real_gh="$1"
     shift
     local stdout_file stderr_file stdout stderr exit_code
-    stdout_file="$(mktemp -t gh-shim-stdout.XXXXXX)" || return 1
-    stderr_file="$(mktemp -t gh-shim-stderr.XXXXXX)" || { rm -f "$stdout_file"; return 1; }
+    stdout_file="$(mktemp -t gh-shim-stdout.XXXXXX)" || {
+        printf '[gh-auth-status-shim] FATAL: mktemp failed (cannot create stdout buffer); aborting auth-status intercept and propagating original exit.\n' >&2
+        return 1
+    }
+    stderr_file="$(mktemp -t gh-shim-stderr.XXXXXX)" || {
+        printf '[gh-auth-status-shim] FATAL: mktemp failed (cannot create stderr buffer); aborting auth-status intercept and propagating original exit.\n' >&2
+        rm -f "$stdout_file"
+        return 1
+    }
 
     shim_debug "auth status: invoking real gh at $real_gh (timeout ${INTERNAL_TIMEOUT}s)"
     portable_timeout "$INTERNAL_TIMEOUT" "$real_gh" auth status "$@" \

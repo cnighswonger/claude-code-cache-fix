@@ -91,6 +91,9 @@ is_a_shim() {
 }
 
 # If a file exists at the target:
+# IS_SAME_SHIM=1 means the on-disk shim and lib are byte-identical to the
+# source — skip the rewrite to honor the directive's no-op contract.
+IS_SAME_SHIM=0
 if [ -e "$TARGET" ]; then
     if is_a_shim "$TARGET"; then
         # Same version? Build what the install would produce and compare
@@ -103,13 +106,19 @@ if [ -e "$TARGET" ]; then
             printf '# gh-auth-status-shim\n'
             tail -n +2 "$SHIM_SOURCE"
         } > "$canonical_tmp"
-        if cmp -s "$canonical_tmp" "$TARGET" 2>/dev/null; then
-            rm -f "$canonical_tmp"
+        # Also compare the lib file; both must match for a true no-op.
+        # (Lib content drift between source and installed is a directive-
+        # violation no-op-claim per Codex r1 attention.)
+        lib_installed="$LIB_TARGET_DIR/classify-auth-status.sh"
+        if cmp -s "$canonical_tmp" "$TARGET" 2>/dev/null \
+            && cmp -s "$LIB_SOURCE_DIR/classify-auth-status.sh" "$lib_installed" 2>/dev/null; then
+            IS_SAME_SHIM=1
+        fi
+        rm -f "$canonical_tmp"
+        if [ "$IS_SAME_SHIM" = "1" ]; then
             printf '[install] same shim already installed at %s — no-op.\n' "$TARGET"
-            # Still need to verify PATH and refresh lib (in case the user
-            # nuked the lib dir manually).
+            # Skip rewrite. Still verify PATH below.
         else
-            rm -f "$canonical_tmp"
             ts="$(date -u +%Y%m%dT%H%M%SZ)"
             backup="$TARGET.bak.$ts"
             printf '[install] existing shim differs; backing up to %s\n' "$backup"
@@ -122,49 +131,79 @@ if [ -e "$TARGET" ]; then
     fi
 fi
 
-# Copy shim. The installed copy carries the marker as line 2 (right after
-# the shebang) — added at install time so the source script doesn't get
-# confused for "an installed copy" by an over-eager grep elsewhere.
-{
-    # shebang first
-    head -1 "$SHIM_SOURCE"
-    # marker line
-    printf '# gh-auth-status-shim\n'
-    # rest of file from line 2 onwards
-    tail -n +2 "$SHIM_SOURCE"
-} > "$TARGET" || { printf '[install] FATAL: could not write %s\n' "$TARGET" >&2; exit 1; }
-chmod +x "$TARGET" || { printf '[install] FATAL: could not chmod +x %s\n' "$TARGET" >&2; exit 1; }
+if [ "$IS_SAME_SHIM" = "0" ]; then
+    # Copy shim. The installed copy carries the marker as line 2 (right
+    # after the shebang) — added at install time so the source script
+    # doesn't get confused for "an installed copy" by an over-eager
+    # grep elsewhere.
+    {
+        # shebang first
+        head -1 "$SHIM_SOURCE"
+        # marker line
+        printf '# gh-auth-status-shim\n'
+        # rest of file from line 2 onwards
+        tail -n +2 "$SHIM_SOURCE"
+    } > "$TARGET" || { printf '[install] FATAL: could not write %s\n' "$TARGET" >&2; exit 1; }
+    chmod +x "$TARGET" || { printf '[install] FATAL: could not chmod +x %s\n' "$TARGET" >&2; exit 1; }
 
-# Copy lib/ alongside, into a dot-prefixed subdirectory so it doesn't
-# clutter ~/.local/bin/ listings. The shim resolves lib/ relative to
-# itself, so we use a symlink/copy combo: the shim's `_self_dir/lib`
-# must contain classify-auth-status.sh. Easiest: copy the lib/ dir
-# alongside the shim but renamed; then symlink `lib` → that dir.
-if [ -e "$LIB_TARGET_DIR" ]; then
-    rm -rf "$LIB_TARGET_DIR" || true
+    # Copy lib/ alongside, into a dot-prefixed subdirectory so it
+    # doesn't clutter ~/.local/bin/ listings.
+    if [ -e "$LIB_TARGET_DIR" ]; then
+        rm -rf "$LIB_TARGET_DIR" || true
+    fi
+    mkdir -p "$LIB_TARGET_DIR" || { printf '[install] FATAL: could not create lib dir\n' >&2; exit 1; }
+    cp "$LIB_SOURCE_DIR/classify-auth-status.sh" "$LIB_TARGET_DIR/" \
+        || { printf '[install] FATAL: could not copy lib/classify-auth-status.sh\n' >&2; exit 1; }
 fi
-mkdir -p "$LIB_TARGET_DIR" || { printf '[install] FATAL: could not create lib dir\n' >&2; exit 1; }
-cp "$LIB_SOURCE_DIR/classify-auth-status.sh" "$LIB_TARGET_DIR/" \
-    || { printf '[install] FATAL: could not copy lib/classify-auth-status.sh\n' >&2; exit 1; }
 
+if [ "$IS_SAME_SHIM" = "1" ]; then
+    # Same-shim no-op — also skip lib-link recreation; assume the
+    # existing setup is correct (the lib-content cmp above confirmed it).
+    :
+else
 # Create a `lib` symlink next to the shim that points at the hidden dir.
 # The shim's `. "$_self_dir/lib/classify-auth-status.sh"` then resolves
 # correctly.
+#
+# This must be all-or-nothing per Codex r1 blocker: a pre-existing
+# TARGET_DIR/lib pointing elsewhere will break the shim's source line
+# at runtime, so silently warning + claiming success leaves a broken
+# shim on PATH. We refuse the install in that case.
 LIB_SYMLINK="$TARGET_DIR/lib"
 if [ -e "$LIB_SYMLINK" ] || [ -L "$LIB_SYMLINK" ]; then
-    # If it's already pointing at our hidden dir, leave it alone.
     existing_target="$(readlink "$LIB_SYMLINK" 2>/dev/null || true)"
-    if [ "$existing_target" = "$LIB_TARGET_DIR" ] || [ "$existing_target" = ".gh-auth-status-shim-lib" ]; then
-        : # OK
-    else
-        printf '[install] WARNING: %s exists and points elsewhere. The shim needs %s/lib to point at %s — please reconcile.\n' \
-            "$LIB_SYMLINK" "$TARGET_DIR" "$LIB_TARGET_DIR" >&2
-    fi
+    case "$existing_target" in
+        "$LIB_TARGET_DIR"|".gh-auth-status-shim-lib")
+            : # Already correct — no-op.
+            ;;
+        *)
+            printf '[install] FATAL: %s exists and is not our managed lib link.\n' "$LIB_SYMLINK" >&2
+            if [ -n "$existing_target" ]; then
+                printf '[install] It currently points at: %s\n' "$existing_target" >&2
+            fi
+            printf '[install] The shim needs %s/lib to resolve to its classification helper. Move or remove this entry first.\n' "$TARGET_DIR" >&2
+            # Roll back the shim install so we never leave a broken
+            # shim on PATH.
+            rm -f "$TARGET"
+            rm -rf "$LIB_TARGET_DIR"
+            exit 1
+            ;;
+    esac
 else
-    ln -s ".gh-auth-status-shim-lib" "$LIB_SYMLINK" 2>/dev/null \
-        || cp -r "$LIB_TARGET_DIR" "$LIB_SYMLINK" \
-        || { printf '[install] FATAL: could not link or copy lib/\n' >&2; exit 1; }
+    if ln -s ".gh-auth-status-shim-lib" "$LIB_SYMLINK" 2>/dev/null; then
+        :
+    elif cp -r "$LIB_TARGET_DIR" "$LIB_SYMLINK" 2>/dev/null; then
+        # Mark this so uninstall knows it's a managed copy (not a user
+        # directory of the same name). We use a sentinel file inside.
+        printf 'gh-auth-status-shim managed copy\n' > "$LIB_SYMLINK/.managed"
+    else
+        printf '[install] FATAL: could not link or copy lib/\n' >&2
+        rm -f "$TARGET"
+        rm -rf "$LIB_TARGET_DIR"
+        exit 1
+    fi
 fi
+fi  # end: IS_SAME_SHIM gate for lib link creation
 
 # PATH-ordering check. We resolve `gh` using PATH AFTER install and
 # verify it points at our target. If not, the shim is installed but

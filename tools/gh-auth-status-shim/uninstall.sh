@@ -80,17 +80,31 @@ for f in "$TARGET".bak.*; do
     fi
 done
 
-# Remove the lib directory and symlink if present.
-if [ -L "$LIB_SYMLINK" ] || [ -e "$LIB_SYMLINK" ]; then
+# Remove the lib symlink (or copied directory marked as managed) and
+# the hidden lib dir. Handles both install paths: symlink case (preferred)
+# AND copied-directory fallback (when ln -s fails on filesystems without
+# symlink support — those fallback installs leave a .managed sentinel).
+if [ -L "$LIB_SYMLINK" ]; then
     existing_target="$(readlink "$LIB_SYMLINK" 2>/dev/null || true)"
     case "$existing_target" in
         .gh-auth-status-shim-lib|"$LIB_TARGET_DIR")
             rm -rf "$LIB_SYMLINK" && removed_anything=1
             printf '[uninstall] removed lib symlink at %s\n' "$LIB_SYMLINK" ;;
         *)
-            printf '[uninstall] WARNING: %s points elsewhere (%s); leaving in place.\n' \
-                "$LIB_SYMLINK" "${existing_target:-(non-symlink)}" >&2 ;;
+            printf '[uninstall] WARNING: %s symlink points elsewhere (%s); leaving in place.\n' \
+                "$LIB_SYMLINK" "${existing_target:-?}" >&2 ;;
     esac
+elif [ -d "$LIB_SYMLINK" ]; then
+    # Could be a copied-fallback directory (managed) or a user directory
+    # of the same name. The sentinel disambiguates.
+    if [ -f "$LIB_SYMLINK/.managed" ]; then
+        rm -rf "$LIB_SYMLINK" && removed_anything=1
+        printf '[uninstall] removed managed lib dir at %s (copied-fallback install)\n' "$LIB_SYMLINK"
+    else
+        printf '[uninstall] WARNING: %s is a directory but not marked managed; leaving in place.\n' "$LIB_SYMLINK" >&2
+    fi
+elif [ -e "$LIB_SYMLINK" ]; then
+    printf '[uninstall] WARNING: %s exists and is not a recognized shim artifact; leaving in place.\n' "$LIB_SYMLINK" >&2
 fi
 if [ -d "$LIB_TARGET_DIR" ]; then
     rm -rf "$LIB_TARGET_DIR" && removed_anything=1

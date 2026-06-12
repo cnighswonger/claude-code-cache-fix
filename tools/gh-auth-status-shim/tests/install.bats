@@ -109,3 +109,62 @@ teardown() {
     [ "$status" = 0 ]
     [[ "$output" == *"nothing to do"* ]]
 }
+
+@test "install: refuses when TARGET_DIR/lib already exists pointing elsewhere (Codex r1 blocker fix)" {
+    # Pre-create a `lib` symlink at the target dir pointing somewhere
+    # else. The installer must REFUSE rather than silently leave a
+    # broken shim on PATH.
+    OTHER_DIR="$TEST_TMP/other-lib-target"
+    mkdir -p "$OTHER_DIR"
+    ln -s "$OTHER_DIR" "$TARGET_DIR/lib"
+
+    run "$SHIM_DIR/install.sh" --target "$TARGET_DIR"
+    [ "$status" = 1 ]
+    [[ "$output" == *"not our managed lib link"* ]]
+    # Rollback verified: the shim file must not be left in place.
+    [ ! -e "$TARGET_DIR/gh" ]
+}
+
+@test "install: same shim → truly no-op (does not rewrite target file mtime)" {
+    "$SHIM_DIR/install.sh" --target "$TARGET_DIR" >/dev/null
+    # Capture the mtime of the installed shim.
+    original_mtime=$(stat -c %Y "$TARGET_DIR/gh" 2>/dev/null || stat -f %m "$TARGET_DIR/gh" 2>/dev/null)
+    # Sleep so the next mtime check is observably different IF a rewrite happened.
+    sleep 1.1
+    run "$SHIM_DIR/install.sh" --target "$TARGET_DIR"
+    [ "$status" = 0 ]
+    [[ "$output" == *"already installed"* ]]
+    new_mtime=$(stat -c %Y "$TARGET_DIR/gh" 2>/dev/null || stat -f %m "$TARGET_DIR/gh" 2>/dev/null)
+    # If the install correctly no-op'd, mtime should be unchanged.
+    [ "$original_mtime" = "$new_mtime" ]
+}
+
+@test "uninstall: handles managed copy-fallback dir (sentinel-marked) cleanly" {
+    # Simulate the copy-fallback path: install normally, then convert
+    # the symlink to a copied directory marked as managed.
+    "$SHIM_DIR/install.sh" --target "$TARGET_DIR" >/dev/null
+    # Replace symlink with a copied directory + sentinel.
+    rm -rf "$TARGET_DIR/lib"
+    mkdir -p "$TARGET_DIR/lib"
+    cp "$TARGET_DIR/.gh-auth-status-shim-lib/classify-auth-status.sh" "$TARGET_DIR/lib/"
+    printf 'gh-auth-status-shim managed copy\n' > "$TARGET_DIR/lib/.managed"
+
+    run "$SHIM_DIR/uninstall.sh" --target "$TARGET_DIR"
+    [ "$status" = 0 ]
+    # The managed lib dir should be gone.
+    [ ! -e "$TARGET_DIR/lib" ]
+}
+
+@test "uninstall: leaves un-managed lib directory in place" {
+    # User has their own lib/ dir that isn't ours.
+    "$SHIM_DIR/install.sh" --target "$TARGET_DIR" >/dev/null
+    rm -rf "$TARGET_DIR/lib"
+    mkdir -p "$TARGET_DIR/lib"
+    printf 'user content\n' > "$TARGET_DIR/lib/some-other-file.sh"
+
+    run "$SHIM_DIR/uninstall.sh" --target "$TARGET_DIR"
+    [ "$status" = 0 ]
+    # User's lib dir should be intact (no .managed sentinel).
+    [ -f "$TARGET_DIR/lib/some-other-file.sh" ]
+    [[ "$output" == *"not marked managed"* ]]
+}

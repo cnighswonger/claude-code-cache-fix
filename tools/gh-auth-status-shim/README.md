@@ -181,8 +181,8 @@ Track the issue status: [anthropics/claude-code#67055](https://github.com/anthro
 | CC#67055 feeder path | Shim coverage |
 |---|---|
 | Slow `gh` exceeding CC's 5s (Keychain slow-read, event-loop stalls) | **Covered** — shim's 4s internal timeout returns exit 0 before CC's 5s abandonment. |
-| Anonymous-401 from gh's silent Keychain fallback (cli/cli#13317) | **Covered** — fast-failing exit; classifier matches HTTP 401 in stderr and returns 0. |
 | Network transient (timeout, connection refused, resolve failure) | **Covered** — classifier matches stderr signals and returns 0. |
+| Anonymous-401 from gh's silent Keychain fallback (cli/cli#13317) | **NOT suppressed — propagated as expiry** by the conservative classifier. `HTTP 401` is indistinguishable from a real expired token at the wire level; suppressing it would hide genuine expiry. The user's workflow path here is to re-auth (`gh auth login`). If a future Codex review surfaces a more specific signal that distinguishes the anonymous-fallback case from a real 401, the classifier can suppress that narrower case in v2. |
 | Deleted-`cwd` spawn failure (CC#67055 issue update feeder #4) | **NOT covered** — spawn fails before any `gh` (real or shim) executes. |
 | Genuinely expired token | **Correctly propagates** — classifier matches `"not logged in"` and returns the real exit code, letting CC's toast fire as intended. |
 

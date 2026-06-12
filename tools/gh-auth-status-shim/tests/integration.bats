@@ -131,6 +131,43 @@ teardown() {
 
 # --- Debug log surface ---
 
+@test "integration: TERM-ignoring child still normalizes to 124 within 5s window (Codex r1 blocker fix)" {
+    # Replace the mock with one that ignores SIGTERM. The shim's
+    # bash-native watchdog must escalate to SIGKILL and normalize 137
+    # back to 124, AND the whole operation must complete inside CC's 5s
+    # spawn-abandonment window.
+    cat > "$REAL_GH_DIR/gh" <<'TERMIGNORE'
+#!/usr/bin/env bash
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+    trap '' TERM
+    sleep 30
+    exit 0
+fi
+printf 'mock gh: %s\n' "$*"
+TERMIGNORE
+    chmod +x "$REAL_GH_DIR/gh"
+
+    # Disable GNU `timeout` if present so we exercise the bash-native path.
+    NO_TIMEOUT_DIR="$TEST_TMP/no-timeout"
+    mkdir -p "$NO_TIMEOUT_DIR"
+    for cmd in bash env rm cat head grep readlink dirname basename mktemp date kill sleep tr cmp cp chmod printf; do
+        if command -v "$cmd" >/dev/null 2>&1; then
+            ln -s "$(command -v "$cmd")" "$NO_TIMEOUT_DIR/$cmd" 2>/dev/null || true
+        fi
+    done
+    export PATH="$SHIM_TARGET_DIR:$REAL_GH_DIR:$NO_TIMEOUT_DIR"
+
+    start=$(date +%s)
+    run gh auth status
+    end=$(date +%s)
+    elapsed=$((end - start))
+
+    [ "$status" = 0 ]
+    # Must complete under 5s — CC Desktop's spawn-abandonment window.
+    [ "$elapsed" -lt 5 ]
+    [[ "$output" == *"timed out"* ]]
+}
+
 @test "integration: GH_AUTH_STATUS_SHIM_DEBUG_LOG records each call when set" {
     export GH_MOCK_SCENARIO=success
     export GH_AUTH_STATUS_SHIM_DEBUG_LOG="$TEST_TMP/debug.log"
