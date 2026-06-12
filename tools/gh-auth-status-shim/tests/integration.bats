@@ -1,11 +1,19 @@
 #!/usr/bin/env bats
 # End-to-end integration tests for gh-auth-status-shim.
 
+# Required for `run -<exit_code>` syntax to avoid BW01 warnings (which can
+# escalate to a workflow failure on some bats builds, notably the Homebrew
+# bats-core on macOS-latest).
+bats_require_minimum_version 1.5.0
+
 setup() {
     case "$BASH_VERSION" in
         3.2*|4.*|5.*) ;;
         *) printf 'unexpected BASH_VERSION: %s\n' "$BASH_VERSION" >&2; return 1 ;;
     esac
+
+    # Capture PATH so teardown can restore it after tests that narrow it.
+    ORIGINAL_PATH="$PATH"
 
     HERE="$(cd "$(dirname "$BATS_TEST_FILENAME")" && pwd)"
     SHIM_DIR="$(cd "$HERE/.." && pwd)"
@@ -35,6 +43,13 @@ setup() {
 }
 
 teardown() {
+    # Restore the inherited PATH so bats's own cleanup can find rm/dirname/etc.
+    # Some tests narrow PATH to expose a "no real gh" scenario; without
+    # restoration, bats's bats-exec-test cleanup at line 203 fails to find
+    # rm and emits noise (functionally harmless, but distracts in logs).
+    if [ -n "${ORIGINAL_PATH:-}" ]; then
+        export PATH="$ORIGINAL_PATH"
+    fi
     if [ -n "${TEST_TMP:-}" ] && [ -d "$TEST_TMP" ]; then
         rm -rf "$TEST_TMP"
     fi
@@ -124,8 +139,10 @@ teardown() {
         fi
     done
     export PATH="$SHIM_TARGET_DIR:$NO_GH_DIR"
-    run gh auth status
-    [ "$status" = 127 ]
+    # Use `run -127` to declare the expected exit code so bats doesn't emit
+    # the BW01 warning (which on some bats builds — notably the Homebrew
+    # bats-core on macOS-latest — escalates to a non-zero workflow exit).
+    run -127 gh auth status
     [[ "$output" == *"cannot find a real"* ]]
 }
 

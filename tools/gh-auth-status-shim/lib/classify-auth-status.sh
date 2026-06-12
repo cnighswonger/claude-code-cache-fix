@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # lib/classify-auth-status.sh — classification helper for gh-auth-status-shim.
 #
 # Sourced by gh-auth-status-shim.sh and by bats unit tests. Public functions:

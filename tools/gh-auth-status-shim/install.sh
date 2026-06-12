@@ -231,10 +231,13 @@ fi  # end: IS_SAME_SHIM gate for lib link creation
 # inert — print the export line the user should add.
 resolved_gh="$(command -v gh 2>/dev/null || true)"
 if [ "$resolved_gh" = "$TARGET" ]; then
+    # shellcheck disable=SC2016  # literal backticks around `which gh` for user output
     printf '[install] PATH ordering OK: `which gh` resolves to the shim.\n'
 else
+    # shellcheck disable=SC2016  # literal backticks around `which gh` for user output
     printf '[install] WARNING: `which gh` resolves to %s, NOT the shim at %s.\n' "${resolved_gh:-(none)}" "$TARGET" >&2
     printf '[install] Add this to your shell rc (e.g. ~/.bashrc, ~/.zshrc) and reopen your shell:\n' >&2
+    # shellcheck disable=SC2016  # literal $PATH for the user's shell rc (not for expansion here)
     printf '\n    export PATH="%s:$PATH"\n\n' "$TARGET_DIR" >&2
     printf '[install] The shim file is in place but will not run until PATH ordering is corrected.\n' >&2
 fi
