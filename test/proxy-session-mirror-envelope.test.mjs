@@ -106,7 +106,7 @@ test("shapeAssistantRecord echoes model and id; sets stop_reason from input", ()
 // User envelope shape parity (plain user record)
 // ---------------------------------------------------------------------------
 
-test("shapeUserRecord produces a plain user record with the expected key set", () => {
+test("shapeUserRecord produces a plain user record matching CC 2.1.148 verified user-record key set", () => {
   const rec = shapeUserRecord({
     sessionId: SESSION,
     timestamp: "2026-06-12T00:00:00.000Z",
@@ -117,11 +117,21 @@ test("shapeUserRecord produces a plain user record with the expected key set", (
     ordinalSeed: "0",
   });
 
-  // CC plain user records carry these fields; our shaper must produce them.
-  // (slug + isMeta are optional and not required to be present.)
-  const expected = ["parentUuid", "isSidechain", "promptId", "type", "message", "uuid", "timestamp", "userType", "entrypoint", "cwd", "sessionId", "version"];
-  for (const k of expected) {
-    assert.ok(k in rec, `missing top-level key '${k}'`);
+  // Iterate the captured fixture's user_record_top_level_keys (same way the
+  // assistant parity test does) — plain user records must carry every CC
+  // top-level key the fixture documents, EXCEPT the tool-result-only fields
+  // (toolUseResult + sourceToolAssistantUUID) which are explicitly omitted
+  // per directive caveat.
+  const toolResultOnly = new Set(["toolUseResult", "sourceToolAssistantUUID"]);
+  const ourKeys = new Set(Object.keys(rec));
+  for (const k of FIXTURE.user_record_top_level_keys) {
+    if (toolResultOnly.has(k)) continue;
+    assert.ok(ourKeys.has(k), `missing top-level key '${k}' required for CC user-record parity`);
+  }
+  // message-nested keys must match too.
+  const msgKeys = new Set(Object.keys(rec.message));
+  for (const k of FIXTURE.user_message_keys) {
+    assert.ok(msgKeys.has(k), `missing message-nested key '${k}' for CC user-record parity`);
   }
   assert.equal(rec.type, "user");
   assert.equal(rec.message.role, "user");

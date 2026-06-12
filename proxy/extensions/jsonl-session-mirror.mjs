@@ -31,10 +31,6 @@ function includeThinking() {
   return process.env.CACHE_FIX_SESSION_MIRROR_INCLUDE_THINKING !== "false";
 }
 
-function flushInterrupted() {
-  return process.env.CACHE_FIX_SESSION_MIRROR_FLUSH_INTERRUPTED !== "false";
-}
-
 function maxSessions() {
   const raw = parseInt(process.env.CACHE_FIX_SESSION_MIRROR_MAX_SESSIONS, 10);
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_MAX_SESSIONS;
@@ -65,6 +61,11 @@ function getSession(sessionId) {
       lastUuid: null,
     };
     mirrorState.sessions.set(sessionId, entry);
+    // Enforce the cap at session creation, NOT only at successful-write time.
+    // Otherwise failed/aborted sessions accumulate past MAX_SESSIONS — Codex
+    // round-1 blocker #2: the memory-bounded contract must hold even when the
+    // sessions failing are exactly the ones the extension is meant to tolerate.
+    evictIfOverCap();
   } else {
     // LRU bump on access — re-insert to advance insertion order.
     mirrorState.sessions.delete(sessionId);
@@ -252,7 +253,7 @@ function handleStreamEvent(ctx, sessionId) {
   }
 }
 
-function flushAccumulator(ctx, sessionId, { interrupted = false } = {}) {
+function flushAccumulator(ctx, sessionId) {
   const acc = ctx.meta._mirrorAccumulator;
   if (!acc || !acc.messageId) return;
   const entry = getSession(sessionId);
@@ -276,7 +277,7 @@ function flushAccumulator(ctx, sessionId, { interrupted = false } = {}) {
     messageId: acc.messageId,
     model: acc.model,
     content: acc.contentBlocks.filter(Boolean),
-    stopReason: interrupted ? "interrupted" : acc.stopReason,
+    stopReason: acc.stopReason,
     stopSequence: acc.stopSequence,
     stopDetails: acc.stopDetails,
     usage: mergeUsage(acc.startUsage, acc.deltaUsage),
@@ -296,7 +297,6 @@ function flushAccumulator(ctx, sessionId, { interrupted = false } = {}) {
       }
     }
     entry.lastUuid = assistantRecord.uuid;
-    evictIfOverCap();
   } catch (err) {
     // Failure isolation: writer error logged + reported, but never propagated
     // — the pipeline's try/catch (pipeline.mjs:91-96 etc.) will catch
@@ -305,7 +305,7 @@ function flushAccumulator(ctx, sessionId, { interrupted = false } = {}) {
     _appendEvent({
       event: "error",
       session_id: sessionId,
-      message: err.message,
+      error_class: err?.code || err?.name || "unknown",
     });
   } finally {
     // Clear the accumulator + staged user records; the request meta scopes
@@ -340,8 +340,7 @@ export default {
       _appendEvent({
         event: "error",
         session_id: sessionId,
-        phase: "stage",
-        message: err.message,
+        error_class: err?.code || err?.name || "stage_error",
       });
     }
     // Lazy throttled sweep — runs at most every 60s per cache-telemetry
@@ -356,7 +355,7 @@ export default {
     try {
       shouldFlush = handleStreamEvent(ctx, sessionId);
     } catch (err) {
-      _appendEvent({ event: "error", session_id: sessionId, phase: "accumulate", message: err.message });
+      _appendEvent({ event: "error", session_id: sessionId, error_class: err?.code || err?.name || "accumulate_error" });
       return;
     }
     if (shouldFlush) {
@@ -382,14 +381,5 @@ export default {
     acc.requestId = ctx.headers?.["request-id"] || null;
 
     flushAccumulator(ctx, sessionId);
-  },
-
-  // Called by server.mjs on client-abort if the proxy chooses to flush a
-  // partial assistant record. Optional via env var per directive § Per-
-  // message accumulator residence (default true). Not wired in this PR;
-  // exported for future server.mjs change.
-  _flushInterruptedForTest(ctx, sessionId) {
-    if (!flushInterrupted()) return;
-    flushAccumulator(ctx, sessionId, { interrupted: true });
   },
 };

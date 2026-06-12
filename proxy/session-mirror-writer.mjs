@@ -42,16 +42,24 @@ function sessionDir(sessionId) {
   return join(mirrorRoot(), sessionFilename(sessionId));
 }
 
+let filenameCounter = 0;
 function newActiveFile(sessionId) {
   const ts = new Date().toISOString().replace(/[:.]/g, "-");
-  return join(sessionDir(sessionId), `${ts}.jsonl`);
+  // Counter guards against rapid-succession opens (rotation tests, real
+  // bursts) producing identical millisecond-resolution timestamps that would
+  // collide and silently overwrite the older file.
+  const seq = (filenameCounter++).toString(36);
+  return join(sessionDir(sessionId), `${ts}-${seq}.jsonl`);
 }
 
 function getActiveFile(sessionId) {
   let state = sessionState.get(sessionId);
   if (!state) {
-    state = { activeFile: newActiveFile(sessionId), sweepLastMs: 0 };
+    state = { activeFile: newActiveFile(sessionId), sweepLastMs: 0, rotationCount: 0 };
     sessionState.set(sessionId, state);
+    // Per directive § PII discipline: emit an "open" event when first opening
+    // the file for a session. Scalar surface — session id + event only.
+    logEvent({ event: "open", session_id: sessionId });
   }
   return state.activeFile;
 }
@@ -63,7 +71,11 @@ function rotateIfFull(sessionId) {
   try { size = statSync(state.activeFile).size; } catch { return; }
   if (size < maxBytes()) return;
   state.activeFile = newActiveFile(sessionId);
-  logEvent({ event: "rotate", session_id: sessionId, file: state.activeFile });
+  // Scalar-surface contract: log session id + rotation count + bytes only.
+  // No file paths (operator can infer; carrying them risks leakage to log
+  // consumers and bloats the line). Codex round-1 attention #2 follow-through.
+  state.rotationCount = (state.rotationCount || 0) + 1;
+  logEvent({ event: "rotate", session_id: sessionId, rotation: state.rotationCount, bytes: size });
 }
 
 // Single-tier rotation matching bootstrap-defense.rotateIfNeeded. Any
@@ -76,18 +88,36 @@ function rotateEventLogIfNeeded(path) {
   try { renameSync(path, `${path}.1`); } catch {}
 }
 
+// Allowed scalar fields per the directive's PII discipline: timestamp + event
+// + session_id + rotation + bytes + unlinked + error_class. NEVER paths,
+// raw error messages, image bytes, prompt content, or auth headers. Callers
+// must pass scalar values only; anything outside this allow-list is dropped.
+const EVENT_LOG_ALLOWED_FIELDS = new Set([
+  "timestamp", "event", "session_id", "rotation", "bytes", "unlinked", "error_class",
+]);
+
+function sanitizeEventRecord(record) {
+  const out = { timestamp: new Date().toISOString() };
+  for (const [k, v] of Object.entries(record || {})) {
+    if (!EVENT_LOG_ALLOWED_FIELDS.has(k)) continue;
+    if (v === null || v === undefined) continue;
+    if (typeof v === "object") continue; // scalars only
+    if (typeof v === "string" && v.length > 64) continue; // tight bound; session ids fit
+    out[k] = v;
+  }
+  return out;
+}
+
 // PII-safe event-log writer for session-mirror operational events (open /
 // rotate / sweep / error). Carries session id, timestamps, action, byte
-// counts — never image bytes, never prompt content, never auth headers.
+// counts — never image bytes, never prompt content, never auth headers,
+// never file paths, never raw error messages.
 function logEvent(record) {
   const path = eventLogPath();
   try {
     mkdirSync(dirname(path), { recursive: true });
     rotateEventLogIfNeeded(path);
-    appendFileSync(path, JSON.stringify({
-      timestamp: new Date().toISOString(),
-      ...record,
-    }) + "\n");
+    appendFileSync(path, JSON.stringify(sanitizeEventRecord(record)) + "\n");
   } catch (err) {
     process.stderr.write(`[session-mirror-writer] event-log write failed: ${err.message}\n`);
   }
