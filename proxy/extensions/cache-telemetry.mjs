@@ -369,12 +369,22 @@ export default {
       // proxy-statusline-served-model-divergence). Self-contained try so a
       // bad model string or rehydration disk-read failure can't break the
       // writer.
+      //
+      // Once-per-response guard: `message_delta` can fire multiple times
+      // per response (streamed delta segments). The directive's heuristic
+      // counts TURNS, not deltas — without this guard, a single divergent
+      // response that emits 3 deltas would latch sticky on the third
+      // delta. Mirrors the `_sessionHealthDone` pattern at
+      // session-health.mjs:101-103. (Closes Codex r1 #225 blocker 1.)
       try {
-        const requestedModel = ctx.telemetry?.requestedModel;
-        const servedModel = ctx.meta._servedModel;
-        const div = runDivergenceDetector(rawSid, requestedModel, servedModel, timestamp);
-        if (div) {
-          ctx.meta._modelDivergence = div;
+        if (!ctx.meta._modelDivergenceDone) {
+          ctx.meta._modelDivergenceDone = true;
+          const requestedModel = ctx.telemetry?.requestedModel;
+          const servedModel = ctx.meta._servedModel;
+          const div = runDivergenceDetector(rawSid, requestedModel, servedModel, timestamp);
+          if (div) {
+            ctx.meta._modelDivergence = div;
+          }
         }
       } catch {}
 

@@ -607,6 +607,46 @@ test("13. divergence: matched request/served model → no spread fields in per-s
   }
 });
 
+test("14b. divergence: multiple message_delta events in one response only count as one turn (Codex r1 PR #225 B1)", async () => {
+  // Lifecycle regression: `message_delta` can fire multiple times per
+  // response (streamed segments). Same-family swap × 3 deltas in ONE
+  // response must NOT latch sticky — only 3 TURNS at the same target
+  // should latch.
+  const env = setupTmpHome();
+  try {
+    const sessionsDir = join(env.home, ".claude", "quota-status", "sessions");
+    const meta = {};
+    const telemetry = { requestedModel: "claude-opus-4-7" };
+    const reqH = { "x-claude-code-session-id": "multi-delta" };
+
+    await ext.onRequest({ headers: reqH, meta });
+    await ext.onResponseStart({ headers: QUOTA_HEADERS, meta });
+    await ext.onStreamEvent({
+      event: {
+        type: "message_start",
+        message: {
+          model: "claude-opus-4-8",
+          usage: { cache_read_input_tokens: 0, cache_creation_input_tokens: 100, input_tokens: 5 },
+        },
+      },
+      telemetry,
+      meta,
+    });
+    // THREE message_delta events on the same meta — single response.
+    await ext.onStreamEvent({ event: { type: "message_delta", usage: { output_tokens: 50 } }, telemetry, meta });
+    await ext.onStreamEvent({ event: { type: "message_delta", usage: { output_tokens: 100 } }, telemetry, meta });
+    await ext.onStreamEvent({ event: { type: "message_delta", usage: { output_tokens: 150 } }, telemetry, meta });
+
+    const persisted = JSON.parse(readFileSync(join(sessionsDir, "multi-delta.json"), "utf8"));
+    // One TURN, same-family swap → recent yes, sticky NO. (Would be
+    // sticky=true if the counter incremented per-delta.)
+    assert.equal(persisted.model_divergence_recent, true);
+    assert.equal(persisted.model_divergence_sticky, false);
+  } finally {
+    env.cleanup();
+  }
+});
+
 test("14. divergence: usage-less message_start still captures servedModel for the next message_delta", async () => {
   const env = setupTmpHome();
   try {
