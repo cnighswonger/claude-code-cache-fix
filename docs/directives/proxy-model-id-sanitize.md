@@ -10,8 +10,8 @@
 
 **Priority:** P1
 **Branch (implementation):** `feature/model-id-sanitize`
-**Stage:** directive — round 1
-**Labels:** `directive-stage`, `P1`, `schema-change` (new persisted per-session fields), `safety` (billing-event mitigation)
+**Stage:** directive — round 2 (Codex r1 REQUEST_CHANGES at `bf20dc7` flagged 4 blockers; r2 tightens the validator + recovery order, corrects the family-target rationale, drops the wrong block-mode citations in favor of an explicit `needs-sim-validation` gate, and fixes two file:line anchors).
+**Labels:** `directive-stage`, `P1`, `schema-change` (new persisted per-session fields), `safety` (billing-event mitigation), `needs-sim-validation` (block-mode synthetic-400 path against streaming + non-streaming CC clients).
 **Milestone:** v4.3.0 (next minor after v4.2.0 ships)
 
 ## Goal
@@ -43,15 +43,19 @@ This directive is the natural sibling of:
 
 ### 1. Detect (default behavior when extension is active)
 
-On every outbound request, run the body's `model` field against the canonical model-id regex:
+On every outbound request, run the body's `model` field against the canonical model-id regex.
+
+**The canonical outbound `body.model` shape per `auto-1m-guard.mjs:11-12` is `claude-{family}-{version}[-{date}]`** — `claude-` prefix, hyphen-separated family + version (and an optional date suffix on pinned point releases like `claude-haiku-4-5-20251001`). `auto-1m-guard.mjs:11-12` documents that CC strips `[(1|2)m]` from `body.model` before the wire on the 1M-context path, so **a healthy outbound `body.model` never carries the `[1m]` suffix.** The user-facing convention `Opus 4.7[1m]` is a UI label that gets stripped before the request goes out.
+
+The validator regex therefore is:
 
 ```
-^[a-z][a-z0-9-]+(\[1m\])?$
+^claude-[a-z][a-z0-9]*(-[a-z0-9]+)+$
 ```
 
-Hyphen-separated lowercase alphanumeric prefix, optional literal `[1m]` suffix. The optional `[1m]` allowance preserves CC's documented 1M-context-window suffix (per `auto-1m-guard.mjs:11-12`, CC strips `[(1|2)m]` from `body.model` before the wire on the 1M-context path, but the user-facing convention is the bracketed suffix; canonical model IDs without 1M are bare).
+This requires the `claude-` prefix, a family token, and at least one additional hyphen-separated segment (the version, e.g. `4-7` which the regex parses as two segments `4` then `7`). It accepts `claude-opus-4-7`, `claude-opus-4-7-1m` if Anthropic ever ships that wire shape, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`, `claude-fable-5`, `claude-mythos-2`. It rejects bare family names (`opus`, `claude-`), double-hyphen artifacts (`claude--oops`), uppercase, and any non-`[a-z0-9-]` byte (which catches the ANSI-escape malformation from #68285 / #68279).
 
-If the field doesn't match, the value is malformed. The most common malformation we know about is the ANSI SGR bold escape `\e[1m...\e[0m` wrapping the model name, but the detector treats anything outside the regex as malformed; the family is generative (per the #68285 synthesis comment) and we don't want to scope to one byte pattern.
+If the field doesn't match, the value is malformed. The most common malformation we know about is the ANSI SGR bold escape `\e[1m...\e[22m` wrapping the model name (e.g. `claude-fable-5\e[1m` from #68285, `claude-opus-4-8\e[1m` from #68279), but the detector treats anything outside the canonical regex as malformed; the family is generative (per the #68285 synthesis comment) and we don't want to scope to one byte pattern.
 
 When a malformed value is detected, the extension:
 
@@ -61,21 +65,29 @@ When a malformed value is detected, the extension:
 
 ### 2. Strip (opt-in via env var)
 
-When `CACHE_FIX_MODEL_ID_SANITIZE=strip` and the detector fires:
+When `CACHE_FIX_MODEL_ID_SANITIZE=strip` and the detector fires, attempt recovery in **strict precedence order**. The original malformed value is preserved on `ctx.meta._modelIdSanitize.original` for telemetry in every recovery branch.
 
-- Attempt recovery: extract the largest substring matching the canonical alphabet from inside the malformed value. If that substring is a known model family root (`opus`, `sonnet`, `haiku`, `fable`, `mythos`), rewrite `body.model` to the **cheapest** current variant of that family. The rewrite is deliberately conservative: wrong-but-cheap is strictly better than the bug's current wrong-but-most-expensive behavior.
-- Family → cheapest-current-target map, hardcoded in the extension:
+**Recovery order (closes Codex r1 B1):**
+
+1. **Exact canonical full-ID recovery.** Extract the longest substring of `body.model` that matches the canonical regex from §1. If a complete canonical ID is recoverable from inside the malformed value (e.g. `claude-fable-5\e[1m` → `claude-fable-5`, `claude-opus-4-8\e[1m\e[22m` → `claude-opus-4-8`), rewrite `body.model` to that recovered ID. This is the load-bearing path because it preserves the operator's actual intent. Set `ctx.meta._modelIdSanitize.recovery = "exact-canonical"`.
+
+2. **Family-root fallback.** If exact canonical recovery fails AND a single recognizable family root substring (`opus`, `sonnet`, `haiku`, `fable`, `mythos`) appears in the value, rewrite `body.model` to a pinned safe target per the family-fallback map below. Set `ctx.meta._modelIdSanitize.recovery = "family-fallback"`.
+
+3. **No-confidence fallthrough.** If exact canonical recovery fails AND the family-root substring is missing OR multiple family-root substrings are present, fall through to `block` mode behavior for that request (see §3). Set `ctx.meta._modelIdSanitize.recovery = "no-confidence-blocked"`.
+
+**Family-fallback target map** (used only when exact canonical recovery fails). **Selection rationale: oldest in-family wire ID** — not "cheapest" (Codex r1 B2 correctly noted Anthropic's current pricing puts Opus 4.6/4.7/4.8 at the same `$5/$25` MTok point, so picking 4.6 over 4.8 is a *capability downgrade at the same price*, not a cost saving). The "oldest in-family" rationale is "minimize accidental upgrade from the operator's intent" — if the operator's config got corrupted, they almost certainly intended what they'd been using, which was the variant available before the latest in-family release. Fable / Mythos targets are an **availability** fallback (both currently suspended per Anthropic's 2026-06-12 notice), not cost-driven.
 
   ```
-  opus     → claude-opus-4-6
-  sonnet   → claude-sonnet-4-6
+  opus     → claude-opus-4-6        (oldest current Opus; same price as 4.7/4.8)
+  sonnet   → claude-sonnet-4-6      (oldest current Sonnet; same price as 4.7)
   haiku    → claude-haiku-4-5-20251001
-  fable    → claude-sonnet-4-6   (Fable currently suspended; fall through to Sonnet)
-  mythos   → claude-sonnet-4-6   (Mythos currently suspended; fall through to Sonnet)
+  fable    → claude-sonnet-4-6      (Fable suspended 2026-06-12; cross-family availability fallback)
+  mythos   → claude-sonnet-4-6      (Mythos suspended 2026-06-12; cross-family availability fallback)
   ```
 
-- The original malformed value is preserved on `ctx.meta._modelIdSanitize.original` for telemetry.
-- If recovery cannot identify a family root with confidence (no recognizable substring, OR multiple family-root substrings present), fall through to `block` mode behavior for that request (see §3).
+The wire-format rewrite is deliberately conservative: when the operator's intent is unrecoverable, the family-fallback target prefers staying in the operator's intended family at the oldest available wire ID over guessing the latest. Cross-family availability fallback (Fable/Mythos → Sonnet) is the only path where this directive crosses families; it's a forced choice when the requested family isn't available at all.
+
+**Operator-tradeoff caveat (closes Codex r1 attention).** In `strip` mode, when exact-canonical recovery fails and the family-fallback path fires, the operator may get a materially different model than they intended. This is acceptable only as an explicit opt-in: `strip` mode is not the v1 default precisely because the family-fallback path can choose wrong. Operators flipping `CACHE_FIX_MODEL_ID_SANITIZE=strip` are attesting they prefer wrong-but-bounded over wrong-and-most-expensive. The CHANGELOG must call this out so the attestation contract is explicit.
 
 ### 3. Block (opt-in via env var)
 
@@ -92,9 +104,17 @@ When `CACHE_FIX_MODEL_ID_SANITIZE=block` and the detector fires, **or** when `st
   }
   ```
 
-- The synthetic response is delivered via the existing `pre.handled = true` short-circuit shape from `onRequest`, mirroring `image-retry-circuit-breaker.mjs:236-265` (which returns `{skip: true, status, headers, body}`). For non-streaming requests the body is the JSON envelope above; for `stream: true` requests, the response is an SSE-formatted equivalent (same pattern image-retry uses) so CC's parser doesn't choke. No new pipeline plumbing required.
+- The synthetic response is delivered via the existing `pre.handled = true` short-circuit shape from `onRequest`. **Precedent: `image-retry-circuit-breaker.mjs:249-268`** returns `{skip: true, status, headers, body}` and the server short-circuits via `proxy/server.mjs:88-95` (the actual client write site; `:118` is the outer `if (pre.handled)` guard). For non-streaming requests the body is the JSON envelope above; for `stream: true` requests, the response is an SSE-formatted equivalent (same pattern image-retry uses) so CC's parser doesn't choke. No new pipeline plumbing required.
 
-This converts a billing event into a stuck session, which CC handles badly (see #59843 / #68284) but is strictly safer than letting the malformed call go through.
+**Block-mode honest safety statement (closes Codex r1 B3).** The existing `image-retry-circuit-breaker` precedent at `:249-268` proves the **skip-result plumbing and SSE string passthrough** work, but it synthesizes `200` success envelopes, not HTTP `400`s. We do not have an existing messages-route precedent for a proxy-synthesized streaming `400`. CC's handling of an unexpected proxy-generated 4xx on a streaming request is **untested**, and the prior directive's citation of #59843 / #68284 as evidence was wrong (#59843 is a plan-approval permission bug, #68284 is quota/rate-limit resume — neither documents proxy-synthesized-error behavior).
+
+The block-mode value proposition is "convert a deterministic billing event into a stuck session," which is safer than the bug's current behavior **only if** the stuck session is the strictly-worse outcome (which we believe but have not measured). The implementation PR MUST add `needs-sim-validation` as a merge gate and demonstrate, against real CC traffic on both `stream: true` and `stream: false` paths, that:
+
+1. CC surfaces the `400 model_not_found` to the operator (not silently retry-loop).
+2. The session can be recovered by the operator running `/model <valid-id>` (the path the error message instructs).
+3. The synthetic SSE 400 doesn't trigger a worse failure mode than the underlying billing event (e.g. infinite retry storm, crashed harness).
+
+If sim-validation surfaces a worse failure mode, `block` mode is gated until upstream picker behavior is fixed.
 
 ### 4. Modes summary
 
@@ -126,11 +146,11 @@ When no malformed value has been observed for this session, the spread is undefi
 - `enabled: true` in `extensions.json` (always loaded). Internal env-var gate `CACHE_FIX_MODEL_ID_SANITIZE` controls behavior: `off` (default) / `warn` / `strip` / `block`. Unknown values fall back to `off` with a one-time stderr warning.
 - Reads `ctx.body.model`, runs the canonical regex, emits `ctx.meta._modelIdSanitize = { malformed, original?, rewritten?, mode, spread }` where `.spread` is the pre-shaped object that `cache-telemetry` spreads into the per-session JSON (so `cache-telemetry` doesn't need to know the field-name schema).
 - In `strip` mode, mutates `ctx.body.model` in place. Mutation is the only request-body write in this extension; same idiom as `auto-1m-guard`.
-- In `block` mode (or `strip`-mode no-confidence fallback), the extension returns `{ skip: true, status: 400, headers, body }` from `onRequest`. The server short-circuits via `pre.handled` (`server.mjs:118` checks this, then writes the synthesized response to the client). Mechanism precedent: `image-retry-circuit-breaker.mjs:236-265`.
+- In `block` mode (or `strip`-mode no-confidence fallback), the extension returns `{ skip: true, status: 400, headers, body }` from `onRequest`. The actual client write happens in `proxy/server.mjs:88-95` (the `if (skipResult && skipResult.skip)` branch in `preForward`); `server.mjs:118` is the outer `if (pre.handled)` guard the server checks after `preForward` returns. Mechanism precedent: `image-retry-circuit-breaker.mjs:249-268` (note: that precedent returns `200` success envelopes, not `400`s — the 400 streaming path is gated on `needs-sim-validation` per §3).
 
 ### Writer side — `proxy/extensions/cache-telemetry.mjs`
 
-One-line spread addition to the per-session JSON build at `cache-telemetry.mjs:225-261`, between the `_auto1mGuard` spread and the model-divergence spread:
+One-line spread addition to the per-session JSON build at `cache-telemetry.mjs:392-427` (corrected from r1's wrong `:225-261` anchor per Codex r1 B4; `:225-261` on current `main` is inside header parsing), between the `_auto1mGuard` spread and the model-divergence spread:
 
 ```js
 ...(ctx.meta._modelIdSanitize?.spread || {}),
@@ -155,7 +175,7 @@ Three options for handling the shared concept:
 2. **Shared helper module** `proxy/model-families.mjs` (new flat file, ~30 LOC) exports a single family-roots table (`[{ root: "opus", cheapestTarget: "claude-opus-4-6", knownVariants: [...] }, ...]`). Both extensions import from it. Cleaner; one location updates when Anthropic ships a new model.
 3. **Each keeps its own copy this round, refactor later.** Defer the consolidation to a separate cleanup PR.
 
-**Recommendation: #2.** Add the shared helper as part of this directive's implementation PR; `cache-telemetry.mjs`'s existing inline family map (introduced in PR #225) is refactored on the way in to import the same source of truth. This is a small refactor (~10 LOC delta in `cache-telemetry.mjs`) and the load-bearing maintenance benefit — one place to update on every model-roster change — is worth it.
+**Recommendation: #2.** Add the shared helper as part of this directive's implementation PR; `cache-telemetry.mjs`'s existing inline family map (introduced in PR #225) is refactored on the way in to import the same source of truth. This is a small refactor (~10 LOC delta in `cache-telemetry.mjs`) and the load-bearing maintenance benefit — one place to update on every model-roster change — is worth it. **Preserve the substring-match behavior** of the post-#225 inline map at `cache-telemetry.mjs:48-65`: the current implementation intentionally catches dated variants (e.g. `claude-haiku-4-5-20251001` matched via the shorter `haiku` family token), and the shared helper must keep that semantics so #225's served-model divergence detector continues to classify dated point-release IDs correctly.
 
 If the implementation review surfaces friction with #2 (e.g. circular-import concerns we don't anticipate), the impl PR may fall back to #1 with a tracking issue for the consolidation. Reviewer judgment.
 
@@ -163,20 +183,23 @@ If the implementation review surfaces friction with #2 (e.g. circular-import con
 
 - `test/proxy-model-id-sanitize.test.mjs` (new file):
   - **Mode `off` default:** any body shape (clean OR malformed) → no `_modelIdSanitize` stash, no body mutation, no log, no spread.
-  - **Mode `warn`, clean model id** (`claude-opus-4-7`, `claude-opus-4-7[1m]`, `claude-sonnet-4-6`, etc.) → no `_modelIdSanitize.malformed`, no spread.
-  - **Mode `warn`, `opus\e[1m]\e[22m` (the exact byte sequence from #68285)** → `malformed: true`, original preserved, `body.model` UNCHANGED, stderr line emitted (capture via stream redirect), spread populated.
-  - **Mode `warn`, `fable-5\e[1m]\e[22m`** → same; original preserved on meta.
-  - **Mode `strip`, `opus\e[1m]\e[22m`** → `body.model` rewritten to `claude-opus-4-6`, `original` preserved on meta, `model_id_corrections_count` incremented in the spread.
-  - **Mode `strip`, `fable-5\e[1m]\e[22m`** → rewritten to `claude-sonnet-4-6` (Fable suspended fallback).
-  - **Mode `strip`, unrecoverable malformation** (random bytes, no family-root substring) → falls through to `block` behavior (synthetic 400).
-  - **Mode `strip`, multi-root substring conflict** (e.g. a string containing both `opus` and `sonnet` as substrings) → falls through to `block` (no-confidence path).
+  - **Mode `warn`, clean model id** (`claude-opus-4-7`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`, `claude-fable-5`, `claude-mythos-2`) → no `_modelIdSanitize.malformed`, no spread. Per §1 the validator REJECTS the trailing-`[1m]` form (`auto-1m-guard:11-12` documents CC strips it before the wire), so `claude-opus-4-7[1m]` MUST be treated as malformed if it ever appears on outbound `body.model`.
+  - **Validator boundary cases**: bare family token (`opus`), double-hyphen (`claude--oops`), no `claude-` prefix (`opus-4-7`), uppercase byte (`Claude-Opus-4-7`) all REJECTED.
+  - **Mode `warn`, `claude-fable-5\e[1m\e[22m` (the exact byte sequence from #68285)** → `malformed: true`, original preserved, `body.model` UNCHANGED, stderr line emitted (capture via stream redirect), spread populated.
+  - **Mode `warn`, `claude-opus-4-8\e[1m\e[22m` (from #68279)** → same.
+  - **Mode `strip`, `claude-fable-5\e[1m\e[22m`** → exact-canonical recovery extracts `claude-fable-5`; `body.model` rewritten to `claude-fable-5` (operator intent preserved); `model_id_corrections_count` incremented; `recovery: "exact-canonical"`.
+  - **Mode `strip`, `claude-opus-4-8\e[1m\e[22m`** → recovered to `claude-opus-4-8`; same shape.
+  - **Mode `strip`, recoverable-but-no-canonical** (e.g. `opus\e[1m]` where there is no full canonical ID inside) → family-fallback rewrites to `claude-opus-4-6`; `recovery: "family-fallback"`.
+  - **Mode `strip`, no-confidence multi-root** (string containing both `opus` and `sonnet` substrings, no exact canonical) → falls through to `block` (synthetic 400 short-circuit).
+  - **Mode `strip`, fable family-fallback** (`fable\e[1m]` with no full canonical inside) → rewritten to `claude-sonnet-4-6` (suspended cross-family availability fallback).
+  - **Mode `strip`, unrecoverable malformation** (random bytes, no recognizable substring) → falls through to `block`.
   - **Mode `block`, any malformed input** → `{ skip: true, status: 400, body }` returned from `onRequest`; body shape matches the schema in §3; SSE variant produced for `stream: true` requests.
   - **Mode `block`, clean input** → no short-circuit; pipeline continues normally.
   - **Hex-escape format** in persisted JSON matches `\\x1b\\x5b\\x31\\x6d` shape (NOT raw `\e[1m`).
   - **Failure isolation**: detector wrapped in try/catch; thrown exceptions don't break the pipeline (the regex shouldn't throw, but the catch is mandatory per directive's NFR section).
   - **Unknown mode** (e.g. `CACHE_FIX_MODEL_ID_SANITIZE=lol`) → falls back to `off` behavior, one stderr warning on first invocation.
-- Integration test (extend `test/proxy-cache-telemetry.test.mjs`): synthesize a request with `body.model: "opus\e[1m]"` and the env var set to `warn`, drive through the pipeline, assert the per-session JSON carries the spread fields.
-- Family-map source-of-truth test (`test/model-families.test.mjs`, new file): every family root in the map has a non-empty `cheapestTarget`; targets are well-formed canonical model IDs.
+- Integration test (extend `test/proxy-cache-telemetry.test.mjs`): synthesize a request with `body.model: "claude-fable-5\e[1m"` and the env var set to `warn`, drive through the pipeline, assert the per-session JSON carries the spread fields at the corrected `:392-427` site.
+- Family-map source-of-truth test (`test/model-families.test.mjs`, new file): every family root in the map has a non-empty `cheapestTarget`; targets are well-formed canonical model IDs matching the §1 validator regex.
 
 ## Verification
 
@@ -193,6 +216,20 @@ Per project workflow:
 1. Codex review (Fable is currently unavailable per recent operator decision; skipping that round)
 2. AITL plan-approval (`plan-approved` label on the directive PR)
 3. Owner merges (load-bearing: also requires Chris human review before merge of both this directive PR AND the implementation PR)
+
+## Reviewer checklist (cache-fix side)
+
+- [ ] **Validator regex** matches the canonical wire shape `^claude-[a-z][a-z0-9]*(-[a-z0-9]+)+$` — accepts every current canonical ID, rejects bare family tokens, double-hyphens, uppercase, and the `[1m]` suffix (which `auto-1m-guard:11-12` documents CC strips before the wire).
+- [ ] **Strip recovery precedence** is strictly: (1) exact canonical full-ID recovery, (2) family-root fallback, (3) no-confidence → `block`. Tests pin each branch via `recovery: "exact-canonical" | "family-fallback" | "no-confidence-blocked"` discriminator on `ctx.meta._modelIdSanitize`.
+- [ ] **Family-fallback rationale** in CHANGELOG + code comments calls out **"oldest in-family"** (not "cheapest"), with the Anthropic-pricing-table reality cited so a future reader doesn't re-litigate.
+- [ ] **Block-mode safety**: implementation PR carries `needs-sim-validation` label and demonstrates against real CC traffic on both `stream: true` and `stream: false` paths that (a) CC surfaces the 400 to the operator, (b) the session is recoverable via `/model <valid-id>`, (c) no worse failure mode than the billing event (no retry storm, no harness crash).
+- [ ] **File:line anchors** correct against current `main` HEAD at commit time: `cache-telemetry.mjs:392-427` (per-session JSON build), `server.mjs:88-95` (synthetic-response write site, NOT `:118`), `image-retry-circuit-breaker.mjs:249-268` (200-shape precedent, with the explicit caveat that this directive's 400 path is the first proxy-synthesized streaming 4xx and needs validation).
+- [ ] **Shared family helper** `proxy/model-families.mjs` exists, exports both the canonical-id→family map (consumed by `cache-telemetry.mjs`'s served-model divergence detector, replacing the inline map at the post-#225 site) AND the family-root→fallback-target map (consumed by this extension). One source of truth on every model roster change.
+- [ ] **Hex-escape format** for `model_id_malformed_last_value_hex` is `\\x1b\\x5b\\x31\\x6d` shape; never raw `\e[1m` bytes (terminal-safety hygiene).
+- [ ] **Operator-attestation caveat** for `strip` mode is in the CHANGELOG: family-fallback path can choose wrong; flipping `=strip` is an explicit attestation of preference for wrong-but-bounded over wrong-and-most-expensive.
+- [ ] **Failure isolation** test: regex thrown exception (synthetic) → pipeline continues; `ctx.body.model` unchanged; no `_modelIdSanitize` stash; `[model-id-sanitize] detector error: <msg>` stderr.
+- [ ] **Unknown mode** test: `CACHE_FIX_MODEL_ID_SANITIZE=lol` → falls back to `off`; one stderr warning on first invocation; no per-request warning spam.
+- [ ] **Load-bearing? Yes** — Chris human review required on both this directive PR AND the implementation PR.
 
 ## Out of scope (explicit)
 
