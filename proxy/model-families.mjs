@@ -40,10 +40,18 @@ export const MODEL_FAMILIES = [
   // the appropriate oldest-in-family wire ID at re-enable time.
   { root: "fable",            family: "fable",  fallbackTarget: "claude-sonnet-4-6" },
   { root: "mythos",           family: "mythos", fallbackTarget: "claude-sonnet-4-6" },
+  // Opus variants. `claude-opus-4-6` is the strip-mode fallback target;
+  // it must also classify as `opus` (closes Codex r1 B3).
+  { root: "claude-opus-4-6",  family: "opus",   fallbackTarget: "claude-opus-4-6" },
   { root: "claude-opus-4-7",  family: "opus",   fallbackTarget: "claude-opus-4-6" },
   { root: "claude-opus-4-8",  family: "opus",   fallbackTarget: "claude-opus-4-6" },
+  // Sonnet — `claude-sonnet-4-6` is both the fallback target and a
+  // classifiable wire ID via its own substring.
   { root: "claude-sonnet-4-6", family: "sonnet", fallbackTarget: "claude-sonnet-4-6" },
   { root: "claude-sonnet-4-7", family: "sonnet", fallbackTarget: "claude-sonnet-4-6" },
+  // Haiku — the substring `claude-haiku-4-5` catches the dated point-
+  // release fallback target `claude-haiku-4-5-20251001` too, so no
+  // separate entry needed.
   { root: "claude-haiku-4-5", family: "haiku",  fallbackTarget: "claude-haiku-4-5-20251001" },
 ];
 

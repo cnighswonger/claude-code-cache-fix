@@ -367,6 +367,84 @@ test("hex-escape: empty / non-string input safe", () => {
   assert.equal(e(undefined), "");
 });
 
+test("hex-escape: multi-byte UTF-8 → byte-wise output, NOT one giant code-point escape (Codex r1 B1)", () => {
+  // The 😀 grinning-face code point U+1F600 is 4 UTF-8 bytes:
+  // 0xf0 0x9f 0x98 0x80. The byte-wise rule must emit four separate
+  // \xf0\x9f\x98\x80 escapes, not a single \x1f600.
+  const e = __testOnly.hexEscape;
+  assert.equal(e("😀"), "\\xf0\\x9f\\x98\\x80");
+  // The é (U+00E9) is 2 bytes 0xc3 0xa9.
+  assert.equal(e("é"), "\\xc3\\xa9");
+  // ASCII stays one-byte-per-char.
+  assert.equal(e("a"), "\\x61");
+});
+
+// --- Session persistence (Codex r1 B2) ---
+
+test("session persistence: malformed turn then clean turn → clean turn still carries model_id_* spread", async () => {
+  process.env.CACHE_FIX_MODEL_ID_SANITIZE = "warn";
+
+  // Turn 1: malformed
+  const ctx1 = {
+    headers: { "x-claude-code-session-id": "sess-persist" },
+    body: { model: FABLE_MALFORMED, stream: false },
+    meta: {},
+  };
+  await ext.onRequest(ctx1);
+  assert.equal(ctx1.meta._modelIdSanitize.spread.model_id_malformed, true);
+  const firstSeen = ctx1.meta._modelIdSanitize.spread.model_id_malformed_first_seen;
+
+  // Turn 2: clean — still must carry the session-level summary so
+  // cache-telemetry's per-session JSON re-emits it.
+  const ctx2 = {
+    headers: { "x-claude-code-session-id": "sess-persist" },
+    body: { model: "claude-opus-4-7", stream: false },
+    meta: {},
+  };
+  await ext.onRequest(ctx2);
+  assert.ok(ctx2.meta._modelIdSanitize, "clean turn after malformed must still attach session summary");
+  assert.equal(ctx2.meta._modelIdSanitize.malformed, false);
+  assert.equal(ctx2.meta._modelIdSanitize.spread.model_id_malformed, true);
+  assert.equal(ctx2.meta._modelIdSanitize.spread.model_id_malformed_first_seen, firstSeen);
+});
+
+test("session persistence: distinct sessions don't bleed state", async () => {
+  process.env.CACHE_FIX_MODEL_ID_SANITIZE = "warn";
+
+  const ctxA = {
+    headers: { "x-claude-code-session-id": "sess-A" },
+    body: { model: FABLE_MALFORMED, stream: false },
+    meta: {},
+  };
+  await ext.onRequest(ctxA);
+
+  const ctxB = {
+    headers: { "x-claude-code-session-id": "sess-B" },
+    body: { model: "claude-opus-4-7", stream: false },
+    meta: {},
+  };
+  await ext.onRequest(ctxB);
+  assert.equal(ctxB.meta._modelIdSanitize, undefined, "sess-B's clean turn must NOT inherit sess-A's summary");
+});
+
+// --- Synthetic-throw failure isolation (Codex r1 attention) ---
+
+test("failure isolation: synthetic exception inside onRequest → no throw, stderr line emitted, request unchanged", async () => {
+  process.env.CACHE_FIX_MODEL_ID_SANITIZE = "warn";
+  // Force a throw via a body whose .model is a getter that throws.
+  const ctx = {
+    headers: { "x-claude-code-session-id": "sess-throw" },
+    body: Object.defineProperty({ stream: false }, "model", {
+      get() { throw new Error("synthetic detector failure"); },
+      configurable: true,
+    }),
+    meta: {},
+  };
+  const res = await ext.onRequest(ctx);
+  assert.equal(res, undefined);
+  assert.match(capturedStderr, /\[model-id-sanitize\] detector error: synthetic detector failure/);
+});
+
 // --- Failure isolation ---
 
 test("failure isolation: malformed ctx (no body) → onRequest returns undefined, no throw", async () => {

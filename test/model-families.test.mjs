@@ -58,11 +58,21 @@ test("modelFamily: returns 'unknown' for unmatched + non-string inputs", () => {
 });
 
 test("modelFamily: known canonical IDs classify correctly", () => {
+  assert.equal(modelFamily("claude-opus-4-6"), "opus");  // strip-mode fallback target (Codex r1 B3)
   assert.equal(modelFamily("claude-opus-4-7"), "opus");
   assert.equal(modelFamily("claude-opus-4-8"), "opus");
   assert.equal(modelFamily("claude-sonnet-4-6"), "sonnet");
   assert.equal(modelFamily("claude-sonnet-4-7"), "sonnet");
   assert.equal(modelFamily("claude-haiku-4-5"), "haiku");
+  assert.equal(modelFamily("claude-haiku-4-5-20251001"), "haiku");  // dated point release via substring
   assert.equal(modelFamily("claude-fable-5"), "fable");
   assert.equal(modelFamily("claude-mythos-2"), "mythos");
+});
+
+test("modelFamily: every FAMILY_ROOT_FALLBACKS fallback target classifies into its expected family (Codex r1 B3)", async () => {
+  const { FAMILY_ROOT_FALLBACKS, modelFamily: mf } = await import("../proxy/model-families.mjs");
+  for (const entry of FAMILY_ROOT_FALLBACKS) {
+    const family = mf(entry.fallbackTarget);
+    assert.notEqual(family, "unknown", `fallback target ${entry.fallbackTarget} (from root ${entry.root}) must classify into a real family, not 'unknown'`);
+  }
 });

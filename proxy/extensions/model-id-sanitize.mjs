@@ -40,20 +40,21 @@ const CANONICAL_MODEL_RE = /^claude-[a-z][a-z0-9]*(-[a-z0-9]+)+$/;
 // non-anchored variant for substring search.
 const CANONICAL_SUBSTRING_RE = /claude-[a-z][a-z0-9]*(?:-[a-z0-9]+)+/g;
 
-// Hex-escape every byte of a value for safe logging + persistence. NEVER
-// pass raw control sequences through stderr or JSON — they'll mess up
-// operator terminals and downstream tooling. Matches the `\\x1b\\x5b\\x31\\x6d`
-// shape per directive §5.
+// Hex-escape EVERY BYTE of a value's UTF-8 encoding for safe logging +
+// persistence. NEVER pass raw control sequences through stderr or JSON —
+// they'll mess up operator terminals and downstream tooling. Matches the
+// `\\x1b\\x5b\\x31\\x6d` byte-wise shape per directive §5 reviewer checklist.
+//
+// Implementation: encode to UTF-8 bytes first, then one `\x??` escape per
+// byte. Multi-byte code points like `😀` (4 UTF-8 bytes) produce four
+// separate `\xf0\x9f\x98\x80` escapes, not one `\x1f600` (closes Codex r1 B1).
+const _utf8Encoder = new TextEncoder();
 function hexEscape(value) {
   if (typeof value !== "string") return "";
-  const out = [];
-  for (let i = 0; i < value.length; i++) {
-    const cp = value.codePointAt(i);
-    // \x{2-byte hex} for everything; uniform format is easier for triage
-    // than mixing printable + escaped.
-    out.push("\\x" + cp.toString(16).padStart(2, "0"));
-    // Skip the trailing low surrogate of any astral cp.
-    if (cp > 0xffff) i++;
+  const bytes = _utf8Encoder.encode(value);
+  const out = new Array(bytes.length);
+  for (let i = 0; i < bytes.length; i++) {
+    out[i] = "\\x" + bytes[i].toString(16).padStart(2, "0");
   }
   return out.join("");
 }
@@ -73,17 +74,20 @@ function readMode() {
   return "off";
 }
 
-// First-seen tracker: when the extension fires for a session, we want to
-// stamp the first-seen ISO timestamp on the per-session JSON spread. Map
-// is keyed by sessionFilename and bounded by the same time-based stale-
-// session sweep cache-telemetry runs (the entries naturally evict when
-// the session goes inactive — module-scope map, fine because the proxy
-// is one process per host).
-const _firstSeenAt = new Map();
-
-// Per-session corrections count for `strip` mode (the count of requests
-// where the extension rewrote `body.model`).
-const _correctionsCount = new Map();
+// Session-level summary state. Once a session observes a malformed value,
+// the spread fields persist on EVERY subsequent turn's per-session JSON
+// — clean OR malformed — until the proxy restarts or the session goes
+// stale. This matches the directive §5 contract ("session-level fields
+// once any malformed value has been observed") and closes Codex r1 B2:
+// without this, the next clean turn after a malformed one would rewrite
+// the per-session JSON without any model_id_* fields.
+//
+// Shape: { firstSeenIso, correctionsCount, lastValueHex }.
+// Bounded informally by the same time-based stale-session sweep the
+// cache-telemetry extension runs on its on-disk session files; entries
+// here are small (4 fields) and the proxy is one process per host, so
+// memory pressure isn't a real concern.
+const _sessionState = new Map();
 
 // --- Recovery primitives ---
 
@@ -164,37 +168,59 @@ function buildBlockSkipResult(hexValue, isStream) {
 
 // --- Telemetry stash ---
 
-// Build the normalized `_modelIdSanitize` stash + the per-session JSON
-// spread fragment. The spread is what `cache-telemetry.mjs` will spread
-// into the per-session JSON build site.
-function buildStashAndSpread({ sessionKey, malformed, mode, recovery, original, rewritten }) {
-  const stash = { malformed, mode };
+// Update the session-level summary state on a malformed observation.
+// Returns the spread fragment that should attach to ctx.meta this turn.
+// The spread carries the SESSION-level summary (first-seen, corrections
+// count, last-value-hex), so subsequent clean turns can re-attach it
+// without re-running detection.
+function updateSessionStateOnMalformed({ sessionKey, recovery, original }) {
+  const nowIso = new Date().toISOString();
+  let s = _sessionState.get(sessionKey);
+  if (!s) {
+    s = { firstSeenIso: nowIso, correctionsCount: 0, lastValueHex: "" };
+    _sessionState.set(sessionKey, s);
+  }
+  if (recovery === "exact-canonical" || recovery === "family-fallback") {
+    s.correctionsCount += 1;
+  }
+  s.lastValueHex = hexEscape(original ?? "");
+  return spreadFromSessionState(s);
+}
+
+// Build the per-session JSON spread fragment from a session-state entry.
+// Used both on malformed observations (after state update) AND on clean
+// turns when the session has already observed at least one malformed
+// value (Codex r1 B2 fix — without this, clean turns would reset the
+// per-session JSON to "no model_id_* fields").
+function spreadFromSessionState(state) {
+  return {
+    model_id_malformed: true,
+    model_id_malformed_first_seen: state.firstSeenIso,
+    model_id_corrections_count: state.correctionsCount,
+    model_id_malformed_last_value_hex: state.lastValueHex,
+  };
+}
+
+// Build the normalized `_modelIdSanitize` stash that gets attached to
+// ctx.meta. The .spread field is what `cache-telemetry.mjs` spreads into
+// the per-session JSON build site.
+function buildMalformedStash({ sessionKey, mode, recovery, original, rewritten }) {
+  const stash = { malformed: true, mode };
   if (recovery) stash.recovery = recovery;
   if (original !== undefined) stash.original = original;
   if (rewritten !== undefined) stash.rewritten = rewritten;
-
-  if (!malformed) {
-    stash.spread = undefined;
-    return stash;
-  }
-
-  const nowIso = new Date().toISOString();
-  if (!_firstSeenAt.has(sessionKey)) _firstSeenAt.set(sessionKey, nowIso);
-  const firstSeen = _firstSeenAt.get(sessionKey);
-
-  const correctionsBefore = _correctionsCount.get(sessionKey) || 0;
-  const corrections = recovery === "exact-canonical" || recovery === "family-fallback"
-    ? correctionsBefore + 1
-    : correctionsBefore;
-  if (corrections !== correctionsBefore) _correctionsCount.set(sessionKey, corrections);
-
-  stash.spread = {
-    model_id_malformed: true,
-    model_id_malformed_first_seen: firstSeen,
-    model_id_corrections_count: corrections,
-    model_id_malformed_last_value_hex: hexEscape(original ?? ""),
-  };
+  stash.spread = updateSessionStateOnMalformed({ sessionKey, recovery, original });
   return stash;
+}
+
+// Build a clean-turn stash for a session that has already observed at
+// least one malformed value. Carries only the spread (no .malformed
+// flag because this turn was clean), so downstream consumers can still
+// see the session's accumulated state on the per-session JSON.
+function buildCleanTurnStash(sessionKey) {
+  const state = _sessionState.get(sessionKey);
+  if (!state) return null;
+  return { malformed: false, spread: spreadFromSessionState(state) };
 }
 
 // --- Detection + dispatch ---
@@ -266,16 +292,23 @@ export default {
 
       const result = classify({ rawModel, mode, isStream });
 
-      if (result.decision === "pass") return undefined;
+      if (result.decision === "pass") {
+        // Clean turn. If this session has already observed at least one
+        // malformed value, re-attach the session-level summary spread so
+        // cache-telemetry's per-session JSON keeps carrying the
+        // model_id_* fields (closes Codex r1 B2 — directive §5 defines
+        // these as session-level fields, not per-turn).
+        const cleanStash = buildCleanTurnStash(sessionKey);
+        if (cleanStash) {
+          ctx.meta = ctx.meta || {};
+          ctx.meta._modelIdSanitize = cleanStash;
+        }
+        return undefined;
+      }
 
       if (result.decision === "warn") {
         process.stderr.write(`[model-id-sanitize] malformed model_id detected: ${result.hexValue} (mode=warn)\n`);
-        const stash = buildStashAndSpread({
-          sessionKey,
-          malformed: true,
-          mode,
-          original: result.original,
-        });
+        const stash = buildMalformedStash({ sessionKey, mode, original: result.original });
         ctx.meta = ctx.meta || {};
         ctx.meta._modelIdSanitize = stash;
         return undefined;
@@ -284,10 +317,8 @@ export default {
       if (result.decision === "strip") {
         process.stderr.write(`[model-id-sanitize] malformed model_id detected: ${result.hexValue} (mode=strip; recovery=${result.recovery}; rewritten=${result.rewritten})\n`);
         ctx.body.model = result.rewritten;
-        const stash = buildStashAndSpread({
-          sessionKey,
-          malformed: true,
-          mode,
+        const stash = buildMalformedStash({
+          sessionKey, mode,
           recovery: result.recovery,
           original: result.original,
           rewritten: result.rewritten,
@@ -301,10 +332,8 @@ export default {
       // no-confidence fallthrough.
       const recoveryReason = result.recovery || "no-confidence-blocked";
       process.stderr.write(`[model-id-sanitize] malformed model_id rejected: ${result.hexValue} (mode=${mode}; ${recoveryReason})\n`);
-      const stash = buildStashAndSpread({
-        sessionKey,
-        malformed: true,
-        mode,
+      const stash = buildMalformedStash({
+        sessionKey, mode,
         recovery: recoveryReason,
         original: result.original,
       });
@@ -322,8 +351,7 @@ export default {
 
   // Test-only: reset module state between tests.
   __resetForTests() {
-    _firstSeenAt.clear();
-    _correctionsCount.clear();
+    _sessionState.clear();
     _unknownModeWarned = false;
   },
 };
