@@ -157,7 +157,7 @@ export function computeDelta(current, previous) {
   return current - previous;
 }
 
-export function assembleRecord({ start, delta, quota, requestedModel, sid, prevQ5h, prevQ7d, requestId, now = new Date() }) {
+export function assembleRecord({ start, delta, quota, requestedModel, sid, prevQ5h, prevQ7d, requestId, workflowAgent, now = new Date() }) {
   const s = start || {};
   const d = delta || {};
   const q = quota || {};
@@ -237,6 +237,29 @@ export function assembleRecord({ start, delta, quota, requestedModel, sid, prevQ
     record.request_id = requestId;
   }
 
+  // Optional: emit agent_id + agent_id_source when CACHE_FIX_USAGE_LOG_AGENT_ID=on
+  // AND the synthesis extension stashed a `_workflowAgentId` on ctx.meta.
+  // Cross-repo contract: claude-code-meter v0.8.0+ accepts these fields;
+  // older meter installs reject rows that carry them, so the gate stays
+  // default-off in v4.2.0. The env-var IS the operator's attestation of
+  // meter v0.8.0+ — there is no runtime version probe (see directive
+  // `proxy-workflow-agent-id-synthesis.md` § "Meter compatibility").
+  //
+  // Belt-and-braces: re-enforce the schema's constraints here so a future
+  // refactor to the synthesis extension can't emit a row the meter's
+  // strict-object validation would reject.
+  if (
+    process.env.CACHE_FIX_USAGE_LOG_AGENT_ID === "on" &&
+    workflowAgent &&
+    typeof workflowAgent.id === "string" &&
+    workflowAgent.id.length > 0 &&
+    workflowAgent.id.length <= 64 &&
+    (workflowAgent.source === "cc_header" || workflowAgent.source === "cache_fix_derived")
+  ) {
+    record.agent_id = workflowAgent.id;
+    record.agent_id_source = workflowAgent.source;
+  }
+
   return record;
 }
 
@@ -294,6 +317,7 @@ export default {
       const quota = parseQuotaHeaders(ctx.responseHeaders || {});
       const requestedModel = ctx.telemetry?.requestedModel || undefined;
       const requestId = extractRequestId(ctx.responseHeaders || {});
+      const workflowAgent = ctx.meta?._workflowAgentId || undefined;
 
       const record = assembleRecord({
         start,
@@ -304,6 +328,7 @@ export default {
         prevQ5h: _lastQ5h,
         prevQ7d: _lastQ7d,
         requestId,
+        workflowAgent,
         now: new Date(),
       });
 

@@ -696,3 +696,190 @@ test("request_id end-to-end: gate off + header → field absent in jsonl row", a
     }
   });
 });
+
+// --- agent_id + agent_id_source fields (directive: proxy-workflow-agent-id-synthesis) ---
+//
+// Schema: agent_id?: string max 64; agent_id_source?: enum "cc_header" | "cache_fix_derived".
+// Gated on CACHE_FIX_USAGE_LOG_AGENT_ID=on. Mirrors the request_id rollout
+// pattern at v4.1.0 → v4.2.0. Cross-repo: meter v0.8.0+ accepts these
+// fields; older meter rejects rows that carry them.
+
+function withAgentIdGate(value, fn) {
+  const prior = process.env.CACHE_FIX_USAGE_LOG_AGENT_ID;
+  if (value === undefined) delete process.env.CACHE_FIX_USAGE_LOG_AGENT_ID;
+  else process.env.CACHE_FIX_USAGE_LOG_AGENT_ID = value;
+  try {
+    return fn();
+  } finally {
+    if (prior === undefined) delete process.env.CACHE_FIX_USAGE_LOG_AGENT_ID;
+    else process.env.CACHE_FIX_USAGE_LOG_AGENT_ID = prior;
+  }
+}
+
+test("agent_id gate-off (env unset) + valid workflowAgent → fields OMITTED", () => {
+  withAgentIdGate(undefined, () => {
+    const start = extractMessageStartFields(mkMessageStart());
+    const quota = parseQuotaHeaders(mkHeaders());
+    const record = assembleRecord({
+      start, delta: { output_tokens: 5 }, quota, sid: "abcdef01",
+      workflowAgent: { id: "wf-derived-aabbccdd", source: "cache_fix_derived" },
+    });
+    assert.ok(!("agent_id" in record));
+    assert.ok(!("agent_id_source" in record));
+  });
+});
+
+test("agent_id gate-on + cache_fix_derived workflowAgent → fields PRESENT", () => {
+  withAgentIdGate("on", () => {
+    const start = extractMessageStartFields(mkMessageStart());
+    const quota = parseQuotaHeaders(mkHeaders());
+    const record = assembleRecord({
+      start, delta: { output_tokens: 5 }, quota, sid: "abcdef01",
+      workflowAgent: { id: "wf-derived-aabbccdd", source: "cache_fix_derived" },
+    });
+    assert.equal(record.agent_id, "wf-derived-aabbccdd");
+    assert.equal(record.agent_id_source, "cache_fix_derived");
+  });
+});
+
+test("agent_id gate-on + cc_header workflowAgent (Task subagent) → fields PRESENT with canonical source", () => {
+  withAgentIdGate("on", () => {
+    const start = extractMessageStartFields(mkMessageStart());
+    const quota = parseQuotaHeaders(mkHeaders());
+    const record = assembleRecord({
+      start, delta: { output_tokens: 5 }, quota, sid: "abcdef01",
+      workflowAgent: { id: "task-canonical-id", source: "cc_header" },
+    });
+    assert.equal(record.agent_id, "task-canonical-id");
+    assert.equal(record.agent_id_source, "cc_header");
+  });
+});
+
+test("agent_id gate-on + no workflowAgent on meta → fields OMITTED", () => {
+  withAgentIdGate("on", () => {
+    const start = extractMessageStartFields(mkMessageStart());
+    const quota = parseQuotaHeaders(mkHeaders());
+    const record = assembleRecord({
+      start, delta: { output_tokens: 5 }, quota, sid: "abcdef01",
+      // workflowAgent intentionally omitted
+    });
+    assert.ok(!("agent_id" in record));
+    assert.ok(!("agent_id_source" in record));
+  });
+});
+
+test("agent_id gate-on + 64-char id → accepted; 65-char id → omitted (schema tripwire)", () => {
+  withAgentIdGate("on", () => {
+    const start = extractMessageStartFields(mkMessageStart());
+    const quota = parseQuotaHeaders(mkHeaders());
+    const id64 = "a".repeat(64);
+    const record64 = assembleRecord({
+      start, delta: { output_tokens: 5 }, quota, sid: "abcdef01",
+      workflowAgent: { id: id64, source: "cc_header" },
+    });
+    assert.equal(record64.agent_id, id64);
+    const id65 = "a".repeat(65);
+    const record65 = assembleRecord({
+      start, delta: { output_tokens: 5 }, quota, sid: "abcdef01",
+      workflowAgent: { id: id65, source: "cc_header" },
+    });
+    assert.ok(!("agent_id" in record65), "65-char id must be rejected at emit time");
+    assert.ok(!("agent_id_source" in record65), "agent_id_source must be paired-omitted when agent_id rejects");
+  });
+});
+
+test("agent_id gate-on + unknown source → fields OMITTED (enum strictness)", () => {
+  withAgentIdGate("on", () => {
+    const start = extractMessageStartFields(mkMessageStart());
+    const quota = parseQuotaHeaders(mkHeaders());
+    const record = assembleRecord({
+      start, delta: { output_tokens: 5 }, quota, sid: "abcdef01",
+      workflowAgent: { id: "wf-id", source: "dashboard_manual" }, // not in enum
+    });
+    assert.ok(!("agent_id" in record));
+    assert.ok(!("agent_id_source" in record));
+  });
+});
+
+test("agent_id gate-on + empty id → fields OMITTED", () => {
+  withAgentIdGate("on", () => {
+    const start = extractMessageStartFields(mkMessageStart());
+    const quota = parseQuotaHeaders(mkHeaders());
+    const record = assembleRecord({
+      start, delta: { output_tokens: 5 }, quota, sid: "abcdef01",
+      workflowAgent: { id: "", source: "cc_header" },
+    });
+    assert.ok(!("agent_id" in record));
+  });
+});
+
+test("agent_id gate-on + non-string id → fields OMITTED (defensive type check)", () => {
+  withAgentIdGate("on", () => {
+    const start = extractMessageStartFields(mkMessageStart());
+    const quota = parseQuotaHeaders(mkHeaders());
+    const record = assembleRecord({
+      start, delta: { output_tokens: 5 }, quota, sid: "abcdef01",
+      workflowAgent: { id: 12345, source: "cc_header" },
+    });
+    assert.ok(!("agent_id" in record));
+  });
+});
+
+test("agent_id e2e: gate-on + ctx.meta._workflowAgentId from synthesis → row carries fields", async () => {
+  const mod = await freshExt();
+  const dir = await newTmp();
+  const path = join(dir, "usage.jsonl");
+  process.env.CACHE_FIX_USAGE_LOG = path;
+  process.env.CACHE_FIX_USAGE_LOG_AGENT_ID = "on";
+  try {
+    const ctx = {
+      meta: { _workflowAgentId: { id: "wf-aabbccddeeff0011", parentId: "p-1234567890abcdef", source: "cache_fix_derived" } },
+      event: mkMessageStart(),
+      telemetry: {},
+      responseHeaders: mkHeaders(),
+    };
+    await mod.default.onStreamEvent(ctx);
+    ctx.event = { type: "message_delta", usage: { output_tokens: 100 } };
+    await mod.default.onStreamEvent(ctx);
+
+    const lines = (await readFile(path, "utf8")).split("\n").filter(Boolean);
+    assert.equal(lines.length, 1);
+    const row = JSON.parse(lines[0]);
+    assert.equal(row.agent_id, "wf-aabbccddeeff0011");
+    assert.equal(row.agent_id_source, "cache_fix_derived");
+  } finally {
+    delete process.env.CACHE_FIX_USAGE_LOG;
+    delete process.env.CACHE_FIX_USAGE_LOG_AGENT_ID;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("agent_id e2e: gate-off + ctx.meta._workflowAgentId present → row omits fields (back-compat default-off)", async () => {
+  const mod = await freshExt();
+  const dir = await newTmp();
+  const path = join(dir, "usage.jsonl");
+  process.env.CACHE_FIX_USAGE_LOG = path;
+  // CACHE_FIX_USAGE_LOG_AGENT_ID intentionally unset
+  try {
+    const ctx = {
+      meta: { _workflowAgentId: { id: "wf-aabbccddeeff0011", parentId: "p-1234567890abcdef", source: "cache_fix_derived" } },
+      event: mkMessageStart(),
+      telemetry: {},
+      responseHeaders: mkHeaders(),
+    };
+    await mod.default.onStreamEvent(ctx);
+    ctx.event = { type: "message_delta", usage: { output_tokens: 100 } };
+    await mod.default.onStreamEvent(ctx);
+
+    const lines = (await readFile(path, "utf8")).split("\n").filter(Boolean);
+    assert.equal(lines.length, 1);
+    const row = JSON.parse(lines[0]);
+    assert.ok(!("agent_id" in row));
+    assert.ok(!("agent_id_source" in row));
+    // Sanity: the id is not anywhere else in the line.
+    assert.ok(!lines[0].includes("wf-aabbccddeeff0011"));
+  } finally {
+    delete process.env.CACHE_FIX_USAGE_LOG;
+    await rm(dir, { recursive: true, force: true });
+  }
+});

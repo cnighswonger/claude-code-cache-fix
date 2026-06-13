@@ -1,0 +1,42 @@
+{
+  "_note": "Hand-synthesized 3-leg parallel() fan-out fixture per directive proxy-workflow-agent-id-synthesis.md test plan. Each leg carries the workflow-subagent-default-v1 marker in `system` plus a distinct first-user-message content. The session-id is shared across all three legs (CC reuses the parent session id for Workflow subagents per CC#66761 — the load-bearing distinguisher between Workflow and Task subagents).",
+  "session_id": "wf-fixture-session-7f3a",
+  "legs": [
+    {
+      "leg": "alpha",
+      "headers": {
+        "x-claude-code-session-id": "wf-fixture-session-7f3a"
+      },
+      "body": {
+        "system": "You are a code reviewer.\n\nYou are a subagent spawned by a workflow orchestration script. Use the tools available to complete the task.",
+        "messages": [
+          { "role": "user", "content": "Review proxy/extensions/cache-telemetry.mjs for correctness." }
+        ]
+      }
+    },
+    {
+      "leg": "beta",
+      "headers": {
+        "x-claude-code-session-id": "wf-fixture-session-7f3a"
+      },
+      "body": {
+        "system": "You are a code reviewer.\n\nYou are a subagent spawned by a workflow orchestration script. Use the tools available to complete the task.",
+        "messages": [
+          { "role": "user", "content": "Review proxy/extensions/usage-log.mjs for correctness." }
+        ]
+      }
+    },
+    {
+      "leg": "gamma",
+      "headers": {
+        "x-claude-code-session-id": "wf-fixture-session-7f3a"
+      },
+      "body": {
+        "system": "You are a code reviewer.\n\nYou are a subagent spawned by a workflow orchestration script. Use the tools available to complete the task.",
+        "messages": [
+          { "role": "user", "content": "Review proxy/extensions/bootstrap-defense.mjs for correctness." }
+        ]
+      }
+    }
+  ]
+}

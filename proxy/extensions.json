@@ -11,6 +11,7 @@
   "tool-input-normalize": { "enabled": true, "order": 340 },
   "microcompact-stability": { "enabled": true, "order": 350 },
   "thinking-display": { "enabled": true, "order": 360 },
+  "workflow-agent-id-synthesis": { "enabled": true, "order": 365 },
   "image-retry-circuit-breaker": { "enabled": true, "order": 370 },
   "cache-control-normalize": { "enabled": true, "order": 400 },
   "messages-cache-breakpoint": { "enabled": true, "order": 410 },
@@ -20,3 +21,4 @@
   "request-log": { "enabled": false, "order": 700 },
   "jsonl-session-mirror": { "enabled": true, "order": 720 }
 }
+
