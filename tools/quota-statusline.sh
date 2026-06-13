@@ -199,6 +199,42 @@ peak = acc.get('peak_hour', False)
 if peak:
     label += ' | \033[33mPEAK\033[0m'
 
+# Served-model divergence indicator (issue #223). Renders nothing on the
+# default no-divergence path. Recent-only divergent renders red; sticky
+# renders black-on-yellow for distinction from the red used elsewhere.
+# [1m] suffix on requested side only — `auto_1m_detected` reflects the
+# outbound request header, so the proxy cannot make a served-side claim.
+recent = sess.get('model_divergence_recent', False)
+sticky = sess.get('model_divergence_sticky', False)
+if recent or sticky:
+    one_m = sess.get('auto_1m_detected', False)
+    SHORT_LABELS = (
+        ('claude-opus-4-7', 'Opus 4.7'),
+        ('claude-opus-4-8', 'Opus 4.8'),
+        ('claude-sonnet-4-6', 'Sonnet 4.6'),
+        ('claude-sonnet-4-7', 'Sonnet 4.7'),
+        ('claude-haiku-4-5', 'Haiku 4.5'),
+        ('fable', 'Fable'),
+        ('mythos', 'Mythos'),
+    )
+    def short(model_id):
+        if not model_id:
+            return '?'
+        m = model_id.lower()
+        for substr, label_text in SHORT_LABELS:
+            if substr in m:
+                return label_text
+        return model_id
+    req = short(sess.get('requested_model', ''))
+    serv = short(sess.get('served_model', ''))
+    if one_m:
+        req = req + '[1m]'
+    pair = req + ' → ' + serv
+    if sticky:
+        label += ' | \033[30;43m' + pair + '\033[0m'
+    else:
+        label += ' | \033[31m' + pair + '\033[0m'
+
 print(label)
 PYEOF
 )

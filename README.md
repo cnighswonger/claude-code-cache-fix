@@ -492,6 +492,7 @@ Both modes write quota state on every API call. Proxy mode (v3.5.0+) splits into
 - **PEAK** in yellow during weekday peak hours (13:00–19:00 UTC)
 - **Cache hit rate %**
 - **OVERAGE** flag when active
+- **Served-model divergence indicator** — when the served model differs from the requested model (the classifier-driven swap pattern in [CC#66728](https://github.com/anthropics/claude-code/issues/66728)), the bar gains a red `requested → served` segment, or a black-on-yellow `requested → served` for sticky state once the family-aware heuristic latches. No segment appears on the default no-divergence path. `[1m]` suffix appears on the requested side only when `auto_1m_detected` is set.
 
 Example line (mid-window, healthy state):
 

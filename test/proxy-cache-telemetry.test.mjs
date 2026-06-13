@@ -530,6 +530,100 @@ test("10. CACHE_FIX_QUOTA_STATUS_TTL_DAYS=0 expires every per-session file", asy
   }
 });
 
+// --- Integration test for served-model divergence spread (issue #223) ---
+
+test("12. divergence: requested ≠ served on message_start → per-session JSON carries _modelDivergence spread", async () => {
+  const env = setupTmpHome();
+  try {
+    const sessionsDir = join(env.home, ".claude", "quota-status", "sessions");
+    const meta = {};
+    const telemetry = { requestedModel: "claude-opus-4-7" };
+    const reqH = { "x-claude-code-session-id": "div" };
+
+    await ext.onRequest({ headers: reqH, meta });
+    await ext.onResponseStart({ headers: QUOTA_HEADERS, meta });
+    await ext.onStreamEvent({
+      event: {
+        type: "message_start",
+        message: {
+          model: "claude-opus-4-8",
+          usage: { cache_read_input_tokens: 0, cache_creation_input_tokens: 100, input_tokens: 5 },
+        },
+      },
+      telemetry,
+      meta,
+    });
+    await ext.onStreamEvent({
+      event: { type: "message_delta", usage: { output_tokens: 100 } },
+      telemetry,
+      meta,
+    });
+
+    const persisted = JSON.parse(readFileSync(join(sessionsDir, "div.json"), "utf8"));
+    assert.equal(persisted.requested_model, "claude-opus-4-7");
+    assert.equal(persisted.served_model, "claude-opus-4-8");
+    assert.equal(persisted.model_divergence_recent, true);
+    // Same-family, first occurrence → not yet sticky.
+    assert.equal(persisted.model_divergence_sticky, false);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("13. divergence: matched request/served model → no spread fields in per-session JSON", async () => {
+  const env = setupTmpHome();
+  try {
+    const sessionsDir = join(env.home, ".claude", "quota-status", "sessions");
+    const meta = {};
+    const telemetry = { requestedModel: "claude-opus-4-7" };
+    const reqH = { "x-claude-code-session-id": "matched" };
+
+    await ext.onRequest({ headers: reqH, meta });
+    await ext.onResponseStart({ headers: QUOTA_HEADERS, meta });
+    await ext.onStreamEvent({
+      event: {
+        type: "message_start",
+        message: {
+          model: "claude-opus-4-7",
+          usage: { cache_read_input_tokens: 0, cache_creation_input_tokens: 100, input_tokens: 5 },
+        },
+      },
+      telemetry,
+      meta,
+    });
+    await ext.onStreamEvent({
+      event: { type: "message_delta", usage: { output_tokens: 100 } },
+      telemetry,
+      meta,
+    });
+
+    const persisted = JSON.parse(readFileSync(join(sessionsDir, "matched.json"), "utf8"));
+    assert.equal(persisted.requested_model, undefined);
+    assert.equal(persisted.served_model, undefined);
+    assert.equal(persisted.model_divergence_recent, undefined);
+    assert.equal(persisted.model_divergence_sticky, undefined);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("14. divergence: usage-less message_start still captures servedModel for the next message_delta", async () => {
+  const env = setupTmpHome();
+  try {
+    const meta = {};
+    const telemetry = { requestedModel: "claude-opus-4-7" };
+    // message_start with NO usage block (cancelled response shape).
+    await ext.onStreamEvent({
+      event: { type: "message_start", message: { model: "claude-opus-4-8" } },
+      telemetry,
+      meta,
+    });
+    assert.equal(meta._servedModel, "claude-opus-4-8");
+  } finally {
+    env.cleanup();
+  }
+});
+
 test("11. sweep failure isolation: response completes even if a deletion would fail", async () => {
   // Construct a state that won't actually fail (we don't easily mock unlinkSync
   // without monkey-patching), but verify that with mixed-mtime files, the sweep

@@ -413,6 +413,146 @@ test("T6 (security #108). triple-quote injection payload does NOT execute — he
   }
 });
 
+// --- Served-model divergence indicator (issue #223) ---
+
+function divergenceSession({ requested, served, recent, sticky, firstSeen = null, oneM = false } = {}) {
+  return JSON.stringify({
+    cache: { ttl_tier: "1h", hit_rate: "92.5", timestamp: "2026-05-05T12:00:00.000Z" },
+    requested_model: requested,
+    served_model: served,
+    model_divergence_recent: recent,
+    model_divergence_sticky: sticky,
+    ...(firstSeen ? { model_divergence_first_seen: firstSeen } : {}),
+    ...(oneM ? { auto_1m_detected: true } : {}),
+    timestamp: "2026-05-05T12:00:00.000Z",
+    session_id: "div-test",
+  });
+}
+
+test("T8 (divergence). no divergence fields → no extra label segment", () => {
+  const env = setupHome();
+  try {
+    writeFileSync(env.account, ACCOUNT_JSON);
+    writeFileSync(join(env.sessionsDir, "div-test.json"), SESSION_JSON);
+    const r = runScript(env.home, '{"session_id":"div-test"}');
+    assert.equal(r.status, 0);
+    assert.doesNotMatch(r.stdout, /→/);
+    assert.doesNotMatch(r.stdout, /Opus|Sonnet|Fable|Haiku/);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("T9 (divergence). recent + not sticky → red \"requested → served\"", () => {
+  const env = setupHome();
+  try {
+    writeFileSync(env.account, ACCOUNT_JSON);
+    writeFileSync(
+      join(env.sessionsDir, "div-test.json"),
+      divergenceSession({
+        requested: "claude-opus-4-7",
+        served: "claude-opus-4-8",
+        recent: true,
+        sticky: false,
+      }),
+    );
+    const r = runScript(env.home, '{"session_id":"div-test"}');
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /\x1b\[31mOpus 4\.7 → Opus 4\.8\x1b\[0m/);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("T10 (divergence). sticky → black-on-yellow render", () => {
+  const env = setupHome();
+  try {
+    writeFileSync(env.account, ACCOUNT_JSON);
+    writeFileSync(
+      join(env.sessionsDir, "div-test.json"),
+      divergenceSession({
+        requested: "claude-fable-5",
+        served: "claude-opus-4-8",
+        recent: true,
+        sticky: true,
+        firstSeen: "2026-05-05T11:00:00.000Z",
+      }),
+    );
+    const r = runScript(env.home, '{"session_id":"div-test"}');
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /\x1b\[30;43mFable → Opus 4\.8\x1b\[0m/);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("T11 (divergence). [1m] suffix renders on requested side only", () => {
+  const env = setupHome();
+  try {
+    writeFileSync(env.account, ACCOUNT_JSON);
+    writeFileSync(
+      join(env.sessionsDir, "div-test.json"),
+      divergenceSession({
+        requested: "claude-opus-4-7",
+        served: "claude-opus-4-8",
+        recent: true,
+        sticky: false,
+        oneM: true,
+      }),
+    );
+    const r = runScript(env.home, '{"session_id":"div-test"}');
+    assert.equal(r.status, 0);
+    // Requested side has [1m] suffix; served side does NOT.
+    assert.match(r.stdout, /Opus 4\.7\[1m\] → Opus 4\.8/);
+    assert.doesNotMatch(r.stdout, /Opus 4\.8\[1m\]/);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("T12 (divergence). sticky-only (recent=false) still renders the sticky treatment", () => {
+  const env = setupHome();
+  try {
+    writeFileSync(env.account, ACCOUNT_JSON);
+    writeFileSync(
+      join(env.sessionsDir, "div-test.json"),
+      divergenceSession({
+        requested: "claude-fable-5",
+        served: "claude-fable-5",
+        recent: false,
+        sticky: true,
+        firstSeen: "2026-05-05T11:00:00.000Z",
+      }),
+    );
+    const r = runScript(env.home, '{"session_id":"div-test"}');
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /\x1b\[30;43m/);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("T13 (divergence). unknown model passes through verbatim in the short label", () => {
+  const env = setupHome();
+  try {
+    writeFileSync(env.account, ACCOUNT_JSON);
+    writeFileSync(
+      join(env.sessionsDir, "div-test.json"),
+      divergenceSession({
+        requested: "claude-opus-4-7",
+        served: "claude-future-model-x",
+        recent: true,
+        sticky: false,
+      }),
+    );
+    const r = runScript(env.home, '{"session_id":"div-test"}');
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /Opus 4\.7 → claude-future-model-x/);
+  } finally {
+    env.cleanup();
+  }
+});
+
 test("T7 (security #108). injection in non-session_id fields is also inert", () => {
   // The brief flagged that CC's hook payload has multiple user-controlled
   // string fields (cwd, workspace.current_dir, workspace.project_dir,

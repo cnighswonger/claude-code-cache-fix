@@ -1,5 +1,6 @@
 import {
   writeFileSync,
+  readFileSync,
   renameSync,
   unlinkSync,
   mkdirSync,
@@ -30,6 +31,126 @@ const DEFAULT_TTL_DAYS = 7;
 // --- Module-scope state ---
 let legacyCleanupDone = false;
 let lastSweepMs = 0;
+
+// Per-pair model-divergence state for issue #223 / directive
+// proxy-statusline-served-model-divergence. Key: `${sessionFilename}|${requestedModel}`.
+// Entries hydrate from the per-session JSON on map-miss when the persisted
+// requested_model matches the current turn's requested model; otherwise treated
+// as fresh. Cleared by the same time-based stale-session sweep as the disk files.
+const divergenceState = new Map();
+const SAME_FAMILY_STICKY_THRESHOLD = 3;
+
+// Family map — the only piece of business logic that updates when Anthropic
+// ships new models. Cross-family swap latches sticky immediately; same-family
+// swap latches after SAME_FAMILY_STICKY_THRESHOLD consecutive divergent turns
+// at the same (requestedModel, servedTarget). Unknown models fall through to
+// "unknown" and are treated as same-family for the counter (conservative).
+const MODEL_FAMILY_MAP = [
+  ["fable", "fable"],
+  ["mythos", "mythos"],
+  ["claude-opus-4-7", "opus"],
+  ["claude-opus-4-8", "opus"],
+  ["claude-sonnet-4-6", "sonnet"],
+  ["claude-sonnet-4-7", "sonnet"],
+  ["claude-haiku-4-5", "haiku"],
+];
+
+export function modelFamily(modelId) {
+  if (typeof modelId !== "string" || modelId.length === 0) return "unknown";
+  const lower = modelId.toLowerCase();
+  for (const [substr, family] of MODEL_FAMILY_MAP) {
+    if (lower.includes(substr)) return family;
+  }
+  return "unknown";
+}
+
+// Read the persisted per-session JSON's divergence fields, guarded on
+// requested_model equality. Returns the seed shape for divergenceState, or
+// null if the file doesn't exist, is unparseable, or has a mismatched
+// requested_model. Never throws.
+function rehydrateDivergencePair(rawSid, currentRequestedModel) {
+  try {
+    const raw = readFileSync(sessionFilePath(rawSid), "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed?.requested_model !== currentRequestedModel) return null;
+    return {
+      servedTarget: typeof parsed.served_model === "string" ? parsed.served_model : null,
+      divergentTurnCounter: 0,
+      sticky: parsed.model_divergence_sticky === true,
+      firstSeenIso: typeof parsed.model_divergence_first_seen === "string"
+        ? parsed.model_divergence_first_seen
+        : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Run the family-aware sticky heuristic and return the spread object the
+// per-session JSON writer should include, or null when both requested ===
+// served AND no prior sticky exists for this pair (caller spreads no-op).
+//
+// Mutates divergenceState as a side effect — the map is authoritative for
+// in-process state. Idempotent on the same turn (returns the same shape if
+// called multiple times for the same event).
+export function runDivergenceDetector(rawSid, requestedModel, servedModel, nowIso) {
+  if (!requestedModel || !servedModel) return null;
+
+  const sessionKey = sessionFilename(rawSid);
+  const pairKey = `${sessionKey}|${requestedModel}`;
+  let entry = divergenceState.get(pairKey);
+  if (!entry) {
+    entry = rehydrateDivergencePair(rawSid, requestedModel) || {
+      servedTarget: null,
+      divergentTurnCounter: 0,
+      sticky: false,
+      firstSeenIso: null,
+    };
+    divergenceState.set(pairKey, entry);
+  }
+
+  const matched = requestedModel === servedModel;
+  if (matched) {
+    entry.divergentTurnCounter = 0;
+    entry.servedTarget = null;
+    if (!entry.sticky) {
+      return null;
+    }
+    return {
+      requested_model: requestedModel,
+      served_model: servedModel,
+      model_divergence_recent: false,
+      model_divergence_sticky: true,
+      model_divergence_first_seen: entry.firstSeenIso,
+    };
+  }
+
+  const reqFamily = modelFamily(requestedModel);
+  const servFamily = modelFamily(servedModel);
+  const crossFamily = reqFamily !== servFamily && reqFamily !== "unknown" && servFamily !== "unknown";
+
+  if (entry.servedTarget !== servedModel) {
+    entry.servedTarget = servedModel;
+    entry.divergentTurnCounter = 1;
+  } else {
+    entry.divergentTurnCounter += 1;
+  }
+
+  if (!entry.sticky) {
+    if (crossFamily || entry.divergentTurnCounter >= SAME_FAMILY_STICKY_THRESHOLD) {
+      entry.sticky = true;
+      entry.firstSeenIso = nowIso;
+    }
+  }
+
+  return {
+    requested_model: requestedModel,
+    served_model: servedModel,
+    model_divergence_recent: true,
+    model_divergence_sticky: entry.sticky,
+    model_divergence_first_seen: entry.firstSeenIso,
+  };
+}
 
 // Per directive `proxy-quota-status-per-session.md` — derive a filesystem-safe
 // filename from a raw session id. Both writer (this extension) and readers
@@ -142,6 +263,7 @@ function sweepStaleSessions(ttlDays) {
   } catch {
     return;
   }
+  const survivingSessionFiles = new Set();
   for (const name of entries) {
     const p = join(sessionsDir, name);
     try {
@@ -150,8 +272,22 @@ function sweepStaleSessions(ttlDays) {
         try {
           unlinkSync(p);
         } catch {}
+      } else if (name.endsWith(".json")) {
+        survivingSessionFiles.add(name.slice(0, -".json".length));
       }
     } catch {}
+  }
+
+  // Evict divergence-map entries whose session file got swept (or never
+  // existed). Keys are `${sessionFilename}|${requestedModel}`; the session
+  // segment is the prefix before the first `|`.
+  for (const key of divergenceState.keys()) {
+    const sep = key.indexOf("|");
+    if (sep < 0) continue;
+    const sessionPart = key.slice(0, sep);
+    if (!survivingSessionFiles.has(sessionPart)) {
+      divergenceState.delete(key);
+    }
   }
 }
 
@@ -191,13 +327,20 @@ export default {
     const { event, telemetry } = ctx;
     if (!event || !telemetry) return;
 
-    if (event.type === "message_start" && event.message?.usage) {
-      const usage = event.message.usage;
-      ctx.meta.cacheStats = {
-        cacheRead: usage.cache_read_input_tokens || 0,
-        cacheCreation: usage.cache_creation_input_tokens || 0,
-        inputTokens: usage.input_tokens || 0,
-      };
+    // Capture the served model regardless of whether usage is present, so
+    // cancelled / usage-less responses still record the divergence signal.
+    if (event.type === "message_start") {
+      if (typeof event.message?.model === "string") {
+        ctx.meta._servedModel = event.message.model;
+      }
+      if (event.message?.usage) {
+        const usage = event.message.usage;
+        ctx.meta.cacheStats = {
+          cacheRead: usage.cache_read_input_tokens || 0,
+          cacheCreation: usage.cache_creation_input_tokens || 0,
+          inputTokens: usage.input_tokens || 0,
+        };
+      }
     }
 
     if (event.type === "message_delta" && event.usage) {
@@ -221,6 +364,19 @@ export default {
       const timestamp = new Date().toISOString();
       const rawSid = ctx.meta._sessionId;
       const filename = sessionFilename(rawSid);
+
+      // Run the served-model divergence detector (issue #223 / directive
+      // proxy-statusline-served-model-divergence). Self-contained try so a
+      // bad model string or rehydration disk-read failure can't break the
+      // writer.
+      try {
+        const requestedModel = ctx.telemetry?.requestedModel;
+        const servedModel = ctx.meta._servedModel;
+        const div = runDivergenceDetector(rawSid, requestedModel, servedModel, timestamp);
+        if (div) {
+          ctx.meta._modelDivergence = div;
+        }
+      } catch {}
 
       const accountPayload = JSON.stringify({ ...quota, timestamp }, null, 2);
       const sessionPayload = JSON.stringify(
@@ -253,6 +409,12 @@ export default {
           // mode wasn't off. Keys: auto_1m_detected / auto_1m_action /
           // auto_1m_advice.
           ...(ctx.meta._auto1mGuard || {}),
+          // Additive served-model divergence fields (issue #223). Optional —
+          // absent unless this turn diverged OR the (session, requestedModel)
+          // pair has latched sticky. Keys: requested_model / served_model /
+          // model_divergence_recent / model_divergence_sticky /
+          // model_divergence_first_seen.
+          ...(ctx.meta._modelDivergence || {}),
           timestamp,
           session_id: rawSid,
         },
@@ -275,5 +437,6 @@ export default {
   __resetForTests() {
     legacyCleanupDone = false;
     lastSweepMs = 0;
+    divergenceState.clear();
   },
 };
