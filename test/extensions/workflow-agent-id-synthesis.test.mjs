@@ -246,6 +246,36 @@ test("re-try: same leg fired twice produces the same derived id (deterministic a
 
 // --- Tools-list churn invariance ---
 
+// --- Identical-prompt fan-out collision (Codex r1 attention) ---
+//
+// Documents the known limitation surfaced by Codex r1: a parallel() fan-out
+// where every leg passes the SAME prompt collides on the discriminator
+// because the proxy's only wire-visible leg-distinguishing field is the
+// first user-message text. Operators get one bucketed id rather than wrong
+// attribution.
+
+test("identical-prompt fan-out: 3 legs with same prompt collide on the same derived id (documented limitation)", async () => {
+  const env = setupEnv();
+  try {
+    const ids = [];
+    const sharedBody = {
+      system: WORKFLOW_SYSTEM,
+      messages: [{ role: "user", content: "Process the queue." }],
+    };
+    for (let i = 0; i < 3; i++) {
+      const ctx = makeCtx({ headers: { "x-claude-code-session-id": "sess-collide" }, body: sharedBody });
+      await ext.onRequest(ctx);
+      ids.push(ctx.meta._workflowAgentId.id);
+    }
+    const uniq = new Set(ids);
+    assert.equal(uniq.size, 1, "identical-prompt fan-out is expected to collide");
+  } finally {
+    env.cleanup();
+  }
+});
+
+// --- MCP tools-list churn invariance ---
+
 test("MCP tools churn: same prompt + different tools list → same derived id", async () => {
   const env = setupEnv();
   try {

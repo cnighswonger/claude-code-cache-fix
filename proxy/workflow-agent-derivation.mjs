@@ -36,19 +36,35 @@ export function deriveParentAgentId(sessionId) {
 // "Derivation algorithm" section requires this be sourced from a stable,
 // leg-distinct context field that survives MCP tools-list churn.
 //
-// Choice: sha256 hex of the first user-message text content.
+// Binary-inspection finding (CC 2.1.177, sha256
+// ff41753634b20c869ef6a32a20863521b33d4186ac0d6a49379ab48a48395ee7): CC's
+// workflow factory (`Qy4` function) keeps every per-leg distinguishing
+// field in IN-PROCESS state, NOT in the wire request body. The fields that
+// would be ideal discriminators — CC's internal `agentId` UUID, the
+// `agentType` of the spawned agent, the `spawnedByWorkflowRunId` workflow
+// instance id, and the workflow phase index — are all consumed by CC's
+// progress/journaling system before the message-stream loop builds the
+// upstream HTTP request. The Anthropic Messages API has no slots for them
+// either. From the proxy's wire vantage, the only Workflow-distinguishing
+// content blocks are:
+//   1. The system-prompt suffix marker (already used for DETECTION).
+//   2. The user-supplied `agent(prompt)` argument, surfaced as
+//      `body.messages[0].content`.
 //
-//   - Wire-visible. Survives MCP reconnects because the user prompt is in
-//     the body, not the tools list.
-//   - Deterministic — CC re-sends the same first user message on every
-//     turn of the same Workflow leg.
-//   - Leg-distinct in the realistic `parallel()` case where each leg
-//     passes a different prompt.
+// Choice: sha256 hex of the first user-message text content. This is the
+// only wire-visible discriminator that is stable across CC's stall-retry
+// path (CC re-sends the same first user message on every retry of the
+// same leg — `eH(..., L$+1, O$)` reuses the same prompt) AND leg-distinct
+// for the realistic `parallel()` fan-out where each leg passes a different
+// prompt.
 //
-// Known limit: a `parallel()` fan-out where every leg passes the same
-// prompt collides on the discriminator. Documented in the directive as an
-// accepted edge case (operators get one bucketed id rather than wrong
-// attribution).
+// Known limit, surfaced in the PR body + CHANGELOG: a `parallel()`
+// fan-out where every leg passes the SAME prompt collides on the
+// discriminator. Operators get one bucketed id rather than wrong
+// attribution. Identical-prompt fan-out is uncommon (the canonical use is
+// "do thing X to file Y", "do thing X to file Z", ...); when it does
+// happen, the directive's `cache_fix_derived` source flag tells dashboards
+// the attribution is heuristic.
 export function extractPerLegDiscriminator(body) {
   const text = firstUserMessageText(body);
   if (!text) return null;
