@@ -10,7 +10,7 @@
 
 **Priority:** P1
 **Branch (implementation):** `feature/model-id-sanitize`
-**Stage:** directive — round 2 (Codex r1 REQUEST_CHANGES at `bf20dc7` flagged 4 blockers; r2 tightens the validator + recovery order, corrects the family-target rationale, drops the wrong block-mode citations in favor of an explicit `needs-sim-validation` gate, and fixes two file:line anchors).
+**Stage:** directive — round 3 (Codex r2 REQUEST_CHANGES at `83da7cf` flagged residual "cheapest" terminology drift across 4 sites — r3 replaces with policy-accurate `fallbackTarget` field name and "oldest in-family / availability fallback" rationale end-to-end. Also corrects the threat-model section's wrong `:236-265` image-retry anchor to `:249-268`. Prior: Codex r1 REQUEST_CHANGES at `bf20dc7` addressed in r2 — validator regex, recovery order, family-target rationale, block-mode citations, file:line anchors.)
 **Labels:** `directive-stage`, `P1`, `schema-change` (new persisted per-session fields), `safety` (billing-event mitigation), `needs-sim-validation` (block-mode synthetic-400 path against streaming + non-streaming CC clients).
 **Milestone:** v4.3.0 (next minor after v4.2.0 ships)
 
@@ -34,8 +34,8 @@ This directive is the natural sibling of:
 ## Non-Functional Requirements
 
 - **Size/complexity budget:** ~120-180 LOC core implementation + ~30 LOC for the optional strip mode, schema-spread one-liner in `cache-telemetry.mjs`, plus tests (~100 LOC including the byte-fixture cases from #68285). Reviewers should flag implementations materially larger than ~2× the budget.
-- **Threat model:** the new persisted fields are short string scalars plus a boolean. No user-provided content goes anywhere new. The validator runs against the model-id field that already flows; rewrite is a pure-string transform with no I/O. The block-mode synthetic 400 reuses the existing `pre.handled` short-circuit plumbing (precedent: `image-retry-circuit-breaker.mjs:236-265`); no new wire surface, no new pipeline hook.
-- **Maintainability constraints:** reuses the existing `meta` plumbing and the per-session JSON spread pattern, same as `_thinkingSanitize`, `_auto1mGuard`, `_sessionHealth`. No new CI/config. The family→canonical-target map is one named constant in the extension — the **only** piece of business logic that updates when Anthropic ships new models or rotates the "cheapest current variant" within a family.
+- **Threat model:** the new persisted fields are short string scalars plus a boolean. No user-provided content goes anywhere new. The validator runs against the model-id field that already flows; rewrite is a pure-string transform with no I/O. The block-mode synthetic 400 reuses the existing `pre.handled` short-circuit plumbing (precedent: `image-retry-circuit-breaker.mjs:249-268`); no new wire surface, no new pipeline hook. (Note: the precedent synthesizes `200` envelopes; the `400` streaming path here is the first of its kind and is gated on `needs-sim-validation` per §3.)
+- **Maintainability constraints:** reuses the existing `meta` plumbing and the per-session JSON spread pattern, same as `_thinkingSanitize`, `_auto1mGuard`, `_sessionHealth`. No new CI/config. The family→fallback-target map is one named constant in the extension — the **only** piece of business logic that updates when Anthropic ships new models or rotates the oldest-in-family wire ID (see §2 for the rationale; "oldest in-family" is chosen to minimize accidental upgrade from operator intent, not for cost).
 - **Performance/reliability:** trivial. One regex match per outbound request. Failure isolation: the detector runs inside the existing pipeline try/catch (`pipeline.mjs:91-96`); rewrite is gated by env var and only fires on detected-malformed values. The default-`off` path is a no-op return at the top of `onRequest`.
 - **Load-bearing? Yes.** Adds a new persisted contract on the per-session JSON (`model_id_malformed`, `model_id_malformed_first_seen`, `model_id_corrections_count`, `model_id_malformed_last_value_hex`) AND a new opt-in body-mutation path AND a new opt-in synthetic-400 short-circuit. By CLAUDE.md NFR rubric (wire/schema contract + new mutate path on the request body + new synthetic-response shape), this requires Chris human review before merge in addition to the Lead + Codex review path.
 
@@ -122,7 +122,7 @@ If sim-validation surfaces a worse failure mode, `block` mode is gated until ups
 |---------|------------|-------------------------------------------------------------------|
 | `off`   | yes        | Extension early-returns from `onRequest`. Pipeline unchanged.     |
 | `warn`  | —          | Detect + log + stash, forward unchanged.                          |
-| `strip` | —          | Detect + rewrite to cheapest safe variant.                        |
+| `strip` | —          | Detect + rewrite to recovered canonical ID (or fallback target).  |
 | `block` | —          | Detect + reject with synthetic 400.                               |
 
 The four modes form a ladder of intervention strength. We ship `off` as the v1 default, gather prevalence data via dogfooding `warn` on dev hosts, and decide whether to flip the v2 default to `warn` (same playbook as `_thinkingSanitize` v1 → v2). The `strip` and `block` modes stay opt-in indefinitely; flipping their default requires a separate directive after live-data review of false-positive rate.
@@ -167,12 +167,12 @@ No reader change in v1. The persisted fields are visible via:
 
 ## Composition with PR #225 (served-model divergence) — family-map ownership
 
-PR #225 already shipped a family map at `proxy/extensions/cache-telemetry.mjs:48` (current `main`) that maps **canonical model IDs to family roots** (`claude-opus-4-7 → opus` etc.). This directive needs the **inverse** mapping (`opus → claude-opus-4-6` for the cheapest-fallback target). Same domain, different direction.
+PR #225 already shipped a family map at `proxy/extensions/cache-telemetry.mjs:48` (current `main`) that maps **canonical model IDs to family roots** (`claude-opus-4-7 → opus` etc.). This directive needs the **inverse** mapping (`opus → claude-opus-4-6` for the family-fallback target — oldest in-family per §2's "minimize accidental upgrade" rationale, NOT a cost-driven selection). Same domain, different direction.
 
 Three options for handling the shared concept:
 
 1. **Each extension keeps its own copy** of the map. Simplest; risks drift when a new model ships.
-2. **Shared helper module** `proxy/model-families.mjs` (new flat file, ~30 LOC) exports a single family-roots table (`[{ root: "opus", cheapestTarget: "claude-opus-4-6", knownVariants: [...] }, ...]`). Both extensions import from it. Cleaner; one location updates when Anthropic ships a new model.
+2. **Shared helper module** `proxy/model-families.mjs` (new flat file, ~30 LOC) exports a single family-roots table (`[{ root: "opus", fallbackTarget: "claude-opus-4-6", knownVariants: [...] }, ...]`). The field is `fallbackTarget` (NOT `cheapestTarget` — see §2's "oldest in-family" rationale). Both extensions import from it. Cleaner; one location updates when Anthropic ships a new model.
 3. **Each keeps its own copy this round, refactor later.** Defer the consolidation to a separate cleanup PR.
 
 **Recommendation: #2.** Add the shared helper as part of this directive's implementation PR; `cache-telemetry.mjs`'s existing inline family map (introduced in PR #225) is refactored on the way in to import the same source of truth. This is a small refactor (~10 LOC delta in `cache-telemetry.mjs`) and the load-bearing maintenance benefit — one place to update on every model-roster change — is worth it. **Preserve the substring-match behavior** of the post-#225 inline map at `cache-telemetry.mjs:48-65`: the current implementation intentionally catches dated variants (e.g. `claude-haiku-4-5-20251001` matched via the shorter `haiku` family token), and the shared helper must keep that semantics so #225's served-model divergence detector continues to classify dated point-release IDs correctly.
@@ -199,7 +199,7 @@ If the implementation review surfaces friction with #2 (e.g. circular-import con
   - **Failure isolation**: detector wrapped in try/catch; thrown exceptions don't break the pipeline (the regex shouldn't throw, but the catch is mandatory per directive's NFR section).
   - **Unknown mode** (e.g. `CACHE_FIX_MODEL_ID_SANITIZE=lol`) → falls back to `off` behavior, one stderr warning on first invocation.
 - Integration test (extend `test/proxy-cache-telemetry.test.mjs`): synthesize a request with `body.model: "claude-fable-5\e[1m"` and the env var set to `warn`, drive through the pipeline, assert the per-session JSON carries the spread fields at the corrected `:392-427` site.
-- Family-map source-of-truth test (`test/model-families.test.mjs`, new file): every family root in the map has a non-empty `cheapestTarget`; targets are well-formed canonical model IDs matching the §1 validator regex.
+- Family-map source-of-truth test (`test/model-families.test.mjs`, new file): every family root in the map has a non-empty `fallbackTarget`; targets are well-formed canonical model IDs matching the §1 validator regex.
 
 ## Verification
 
