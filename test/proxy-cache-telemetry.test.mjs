@@ -690,3 +690,64 @@ test("11. sweep failure isolation: response completes even if a deletion would f
     env.cleanup();
   }
 });
+
+// --- Integration: model-id-sanitize spread (issue #227) ---
+
+test("15. model-id-sanitize: spread propagates to per-session JSON", async () => {
+  const env = setupTmpHome();
+  try {
+    const sessionsDir = join(env.home, ".claude", "quota-status", "sessions");
+
+    // Drive a response with `_modelIdSanitize.spread` pre-populated as
+    // the sanitize extension would have done at order 50.
+    const meta = {
+      _modelIdSanitize: {
+        malformed: true,
+        mode: "warn",
+        original: "claude-fable-5\x1b[1m",
+        spread: {
+          model_id_malformed: true,
+          model_id_malformed_first_seen: "2026-06-13T23:00:00.000Z",
+          model_id_corrections_count: 0,
+          model_id_malformed_last_value_hex: "\\x63\\x6c\\x61\\x75\\x64\\x65\\x2d\\x66\\x61\\x62\\x6c\\x65\\x2d\\x35\\x1b\\x5b\\x31\\x6d",
+        },
+      },
+    };
+    const telemetry = { requestedModel: "claude-opus-4-7" };
+    const reqH = { "x-claude-code-session-id": "midsan" };
+
+    await ext.onRequest({ headers: reqH, meta });
+    await ext.onResponseStart({ headers: QUOTA_HEADERS, meta });
+    await ext.onStreamEvent({
+      event: { type: "message_start", message: { model: "claude-opus-4-7", usage: { cache_read_input_tokens: 0, cache_creation_input_tokens: 100, input_tokens: 5 } } },
+      telemetry, meta,
+    });
+    await ext.onStreamEvent({
+      event: { type: "message_delta", usage: { output_tokens: 100 } },
+      telemetry, meta,
+    });
+
+    const persisted = JSON.parse(readFileSync(join(sessionsDir, "midsan.json"), "utf8"));
+    assert.equal(persisted.model_id_malformed, true);
+    assert.equal(persisted.model_id_malformed_first_seen, "2026-06-13T23:00:00.000Z");
+    assert.equal(persisted.model_id_corrections_count, 0);
+    assert.match(persisted.model_id_malformed_last_value_hex, /\\x1b\\x5b\\x31\\x6d/);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("16. model-id-sanitize: spread absent → no model_id_* keys on per-session JSON", async () => {
+  const env = setupTmpHome();
+  try {
+    const sessionsDir = join(env.home, ".claude", "quota-status", "sessions");
+    await driveResponse({ headers: { "x-claude-code-session-id": "nosan" } });
+    const persisted = JSON.parse(readFileSync(join(sessionsDir, "nosan.json"), "utf8"));
+    assert.equal(persisted.model_id_malformed, undefined);
+    assert.equal(persisted.model_id_malformed_first_seen, undefined);
+    assert.equal(persisted.model_id_corrections_count, undefined);
+    assert.equal(persisted.model_id_malformed_last_value_hex, undefined);
+  } finally {
+    env.cleanup();
+  }
+});

@@ -40,29 +40,18 @@ let lastSweepMs = 0;
 const divergenceState = new Map();
 const SAME_FAMILY_STICKY_THRESHOLD = 3;
 
-// Family map — the only piece of business logic that updates when Anthropic
-// ships new models. Cross-family swap latches sticky immediately; same-family
-// swap latches after SAME_FAMILY_STICKY_THRESHOLD consecutive divergent turns
-// at the same (requestedModel, servedTarget). Unknown models fall through to
-// "unknown" and are treated as same-family for the counter (conservative).
-const MODEL_FAMILY_MAP = [
-  ["fable", "fable"],
-  ["mythos", "mythos"],
-  ["claude-opus-4-7", "opus"],
-  ["claude-opus-4-8", "opus"],
-  ["claude-sonnet-4-6", "sonnet"],
-  ["claude-sonnet-4-7", "sonnet"],
-  ["claude-haiku-4-5", "haiku"],
-];
-
-export function modelFamily(modelId) {
-  if (typeof modelId !== "string" || modelId.length === 0) return "unknown";
-  const lower = modelId.toLowerCase();
-  for (const [substr, family] of MODEL_FAMILY_MAP) {
-    if (lower.includes(substr)) return family;
-  }
-  return "unknown";
-}
+// Family classification re-exported from the shared `proxy/model-families.mjs`
+// helper so this file and `proxy/extensions/model-id-sanitize.mjs` both consume
+// the same source of truth on family rosters. See `model-families.mjs` for the
+// substring-match semantics and the "oldest in-family" fallback rationale.
+//
+// Cross-family swap latches sticky immediately in the served-model divergence
+// detector below; same-family swap latches after SAME_FAMILY_STICKY_THRESHOLD
+// consecutive divergent turns at the same (requestedModel, servedTarget).
+// Unknown models fall through to "unknown" and are treated as same-family for
+// the counter (conservative).
+export { modelFamily } from "../model-families.mjs";
+import { modelFamily } from "../model-families.mjs";
 
 // Read the persisted per-session JSON's divergence fields, guarded on
 // requested_model equality. Returns the seed shape for divergenceState, or
@@ -419,6 +408,11 @@ export default {
           // mode wasn't off. Keys: auto_1m_detected / auto_1m_action /
           // auto_1m_advice.
           ...(ctx.meta._auto1mGuard || {}),
+          // Additive model-id-sanitize annotation (issue #227, order 50).
+          // Optional — absent unless `body.model` was malformed in this
+          // session. Keys: model_id_malformed / model_id_malformed_first_seen
+          // / model_id_corrections_count / model_id_malformed_last_value_hex.
+          ...(ctx.meta._modelIdSanitize?.spread || {}),
           // Additive served-model divergence fields (issue #223). Optional —
           // absent unless this turn diverged OR the (session, requestedModel)
           // pair has latched sticky. Keys: requested_model / served_model /
