@@ -6,7 +6,7 @@
 
 **Priority:** P1
 **Branch:** `feature/statusline-served-model-divergence`
-**Stage:** directive — round 3 (Codex r1 REQUEST_CHANGES at `b14d90f`; r3 narrows rehydration to guard on `requested_model` equality (closes Codex B1 — restart + `/model` correctness), removes two contradictory user-facing contracts (closes Codex B2 — `[1m]` rendering + sticky-clear path), corrects LRU→TTL terminology, names the concrete statusline test file. Prior: Fable r1 at `9e0d58a` REQUEST_CHANGES; r2 addressed Fable B1/B2/A1/A2 + 6 nits.)
+**Stage:** directive — round 4 (Codex r2 REQUEST_CHANGES at `b51d690` flagged one residual contradiction in the sticky-clear contract — "requires a new session" wording vs. the also-documented same-session recovery path; both end states are valid, so r4 rewrites all three sites with the technically-honest "delete JSON + evict map" contract and drops the "requires a new session" phrasing. Prior: Codex r1 at `b14d90f` REQUEST_CHANGES (r3 fixed); Fable r1 at `9e0d58a` REQUEST_CHANGES (r2 fixed).)
 **Labels:** `directive-stage`, `P1`, `schema-change` (new persisted per-session fields + new statusline contract)
 **Milestone:** v4.3.0
 
@@ -58,7 +58,7 @@ The issue proposes "3 consecutive divergent turns OR a span of ≥5 minutes, whi
   - A divergence at a different `servedTarget` for the same `(sessionFilename, requestedModel)` resets the counter (or, equivalently, starts a new pair entry under the new target). Cross-target flapping does not accumulate.
   - A `/model` invocation that changes the `requestedModel` for subsequent turns starts a fresh pair entry. **Prior pair entry's state lives only in the in-memory map for the lifetime of the process — it does NOT survive proxy restart.** A return to the original `requestedModel` within the same process resumes from where it left off; a return after restart starts fresh for that pair.
 - **Sticky never auto-unlatches within a session — and the map is authoritative across proxy restarts for the currently-active `requestedModel` pair only** (closes Fable r1 B1; closes Codex r1 B1). The per-session JSON is the rehydration source for ONE pair: on map-miss (first turn after proxy restart, fresh process), the writer reads `sessionFilePath(rawSid).json` (precedent: `sessionFilePath` is exported at `cache-telemetry.mjs:55-57` for exactly this read pattern). **Rehydration only seeds a map entry when the persisted `requested_model` field on disk equals the current turn's `ctx.telemetry.requestedModel`** — if they differ (e.g. the session is now on a different `/model` than when sticky last latched), the writer treats it as a fresh entry for the new pair and does NOT inherit the persisted `sticky` / `served_model` / `first_seen` fields. This narrow rehydration contract avoids the cross-pair pollution Codex r1 flagged: persisted state was always single-tuple, so seeding ANY new pair from it would risk inheriting unrelated sticky into the wrong key. Dormant pair counters explicitly do NOT survive restart; that's documented as a known limitation rather than fixed by persisting per-pair state (which would expand the schema for an edge case unlikely to matter in practice — a session that goes `A → /model B → restart → /model A` is rare and the worst case is "sticky restarts at fresh for `A`," not a wrong indicator).
-- **Clearing sticky requires a new session** — deleting the per-session JSON file clears it AND restarting the proxy (or waiting for the time-based stale-session sweep to drop the in-memory entry) clears the map; otherwise the map will re-emit sticky on the next turn. The directive states this explicitly so operators don't expect file-deletion alone to work.
+- **Clearing sticky requires removing both the persisted JSON record AND the in-memory map entry.** Deleting the per-session JSON file by itself does NOT clear sticky — the in-memory map will re-emit the persisted fields on the next turn. To actually clear sticky within an active session, the operator must (a) delete the per-session JSON file AND (b) cause the in-memory map entry to drop, either by restarting the proxy or by waiting for the time-based stale-session sweep. A new session also works (fresh session id = fresh map key + no prior file). Pick whichever is operationally cheaper; both end states are equivalent. (Closes Codex r2 contradiction: r2 text claimed "requires a new session" alongside the same-session recovery path; both are valid, "requires" was wrong wording.)
 - **The 5-minute span suggestion from the issue is dropped.** Turn-count is the only signal that doesn't require persisting timestamps across stream events on the writer side; introducing a wall-clock branch increases complexity without materially better detection.
 
 The family map is hard-coded in `cache-telemetry.mjs` (or a small adjacent helper):
@@ -225,7 +225,7 @@ Out of scope (no changes):
 - [ ] CHANGELOG entry cites CC#66728 + #223 and calls out the family-map maintenance burden.
 - [ ] Failure isolation: writer-side detector at `message_delta` cannot throw out of cache-telemetry's existing try/catch; `message_start` `_servedModel` stash is a pure assignment that cannot throw.
 - [ ] Restart-rehydration unit test and pair-isolation unit test both present and green.
-- [ ] Documents that clearing sticky requires a new session — file deletion alone does not work because the map will re-emit on the next turn. (Fable r1 B1 follow-through.)
+- [ ] Documents that clearing sticky requires BOTH the persisted JSON file removal AND in-memory map eviction (restart, sweep, or new session). File deletion alone does not work because the map will re-emit on the next turn. (Fable r1 B1 + Codex r2 follow-through.)
 
 ## Out of scope (explicit)
 
@@ -234,7 +234,7 @@ Out of scope (no changes):
 - **Auto-restore** — issuing `/model` to recover from a sticky downgrade is observability, not remediation. Out of scope.
 - **Anything specific to CC#66728's classifier internals.** We observe the divergence as a black-box pattern; we do not try to predict it.
 - **Preload-mode parity** for the indicator. The preload writes the flat `quota-status.json`, not the split layout (filed as cache-fix #219). Preload parity is a separate change that can land once the proxy version is validated; tracking as follow-up.
-- **Sticky-clear UI.** No clear-sticky mechanism inside the statusline. Clearing requires a new session — see §Heuristic for the authoritative recovery contract; file deletion alone does NOT clear sticky because the in-memory map will re-emit on the next turn for that session.
+- **Sticky-clear UI.** No clear-sticky mechanism inside the statusline. Clearing requires the JSON-file-removal + map-eviction pair documented in §Heuristic; file deletion alone does NOT clear sticky because the in-memory map will re-emit on the next turn.
 
 ## Review chain
 
