@@ -40,29 +40,19 @@ let lastSweepMs = 0;
 const divergenceState = new Map();
 const SAME_FAMILY_STICKY_THRESHOLD = 3;
 
-// Family map — the only piece of business logic that updates when Anthropic
-// ships new models. Cross-family swap latches sticky immediately; same-family
-// swap latches after SAME_FAMILY_STICKY_THRESHOLD consecutive divergent turns
-// at the same (requestedModel, servedTarget). Unknown models fall through to
-// "unknown" and are treated as same-family for the counter (conservative).
-const MODEL_FAMILY_MAP = [
-  ["fable", "fable"],
-  ["mythos", "mythos"],
-  ["claude-opus-4-7", "opus"],
-  ["claude-opus-4-8", "opus"],
-  ["claude-sonnet-4-6", "sonnet"],
-  ["claude-sonnet-4-7", "sonnet"],
-  ["claude-haiku-4-5", "haiku"],
-];
-
-export function modelFamily(modelId) {
-  if (typeof modelId !== "string" || modelId.length === 0) return "unknown";
-  const lower = modelId.toLowerCase();
-  for (const [substr, family] of MODEL_FAMILY_MAP) {
-    if (lower.includes(substr)) return family;
-  }
-  return "unknown";
-}
+// Family classification lives in the shared helper at `proxy/model-families.mjs`
+// — the only piece of business logic that updates when Anthropic ships new
+// models. Cross-family swap latches sticky immediately in the divergence
+// detector below; same-family swap latches after SAME_FAMILY_STICKY_THRESHOLD
+// consecutive divergent turns at the same (requestedModel, servedTarget).
+// Unknown models fall through to "unknown" and are treated as same-family for
+// the counter (conservative).
+//
+// `modelFamily` re-exported here for back-compat with any future external
+// reader that imports it from this module; new call sites should import
+// directly from `../model-families.mjs`.
+import { modelFamily } from "../model-families.mjs";
+export { modelFamily } from "../model-families.mjs";
 
 // Read the persisted per-session JSON's divergence fields, guarded on
 // requested_model equality. Returns the seed shape for divergenceState, or

@@ -5,9 +5,9 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import ext, {
   runDivergenceDetector,
-  modelFamily,
   sessionFilePath,
 } from "../proxy/extensions/cache-telemetry.mjs";
+import { modelFamily } from "../proxy/model-families.mjs";
 
 const SID = "sess-divergence-test";
 const NOW = "2026-06-13T15:00:00.000Z";
