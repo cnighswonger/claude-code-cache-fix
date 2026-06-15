@@ -220,6 +220,46 @@ describe("extension pipeline", () => {
       await rm(join(testDir, "fix-me.mjs"));
     });
 
+    it("cache-buster suffix is unique per loadExtensions call (regression for Date.now() collision)", async () => {
+      // Regression for the Date.now() collision: when two loadExtensions
+      // calls land in the same millisecond, the prior `?t=Date.now()`
+      // buster repeated and the second import() returned the already-
+      // cached (broken) module. Surfaced on Node 22's faster ESM loader
+      // in CI on the "clears failed entries on a subsequent successful
+      // reload" test above.
+      //
+      // We pin the fix by mocking `Date.now()` to a constant during the
+      // affected window — that forces the OLD code into the collision
+      // every time and proves the NEW (monotonic-counter) code is
+      // immune. Without the mock, the race is non-deterministic and
+      // depends on whether the test happens to span >1 ms of wall clock.
+      const v1 = `export default { name: "buster-test", order: 100, _version: 1, onRequest(ctx) {} };`;
+      const v2 = `export default { name: "buster-test", order: 100, _version: 2, onRequest(ctx) {} };`;
+      await writeFile(join(testDir, "buster-test.mjs"), v1);
+      await writeFile(configPath, JSON.stringify({}));
+
+      const origDateNow = Date.now;
+      const FROZEN_MS = 1_700_000_000_000;
+      Date.now = () => FROZEN_MS;
+      try {
+        const { loadExtensions, snapshotRegistry } = await freshImport();
+        await loadExtensions(testDir, configPath);
+        const first = snapshotRegistry().find((e) => e.name === "buster-test");
+        assert.equal(first?._version, 1, "first load must observe v1");
+
+        await writeFile(join(testDir, "buster-test.mjs"), v2);
+        // Date.now() is frozen — the OLD buster would now repeat and
+        // import() would return cached v1. The NEW (monotonic counter)
+        // path must still observe v2.
+        await loadExtensions(testDir, configPath);
+        const second = snapshotRegistry().find((e) => e.name === "buster-test");
+        assert.equal(second?._version, 2, "second load must observe v2 even with Date.now() frozen (cache-buster must not depend on wall-clock)");
+      } finally {
+        Date.now = origDateNow;
+        await rm(join(testDir, "buster-test.mjs"));
+      }
+    });
+
     it("returns independent copy so callers cannot mutate internal state", async () => {
       const brokenExt = `throw new Error("test failure");`;
       await writeFile(join(testDir, "test-mutation.mjs"), brokenExt);

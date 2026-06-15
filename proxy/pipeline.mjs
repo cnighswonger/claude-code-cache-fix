@@ -5,6 +5,18 @@ import { pathToFileURL } from "node:url";
 let registry = [];
 let failedExtensions = []; // [{ file, error, lastAttempt }]
 
+// Module-scope monotonic counter for cache-busting dynamic `import()` calls.
+// Previously this used `Date.now()`, which collides when two `loadExtensions`
+// calls land in the same millisecond — the second `import()` returns the
+// already-cached module instead of re-evaluating the file from disk. That
+// race surfaced on Node 22's faster ESM loader in CI (proxy-pipeline.test.mjs
+// "clears failed entries on a subsequent successful reload" — the test
+// rewrites a broken extension to a working one and expects the next load to
+// pick it up; on Node 22 the timestamp collided and the broken module came
+// back from cache). The counter guarantees a fresh URL per call regardless
+// of wall-clock resolution.
+let _loadCounter = 0;
+
 export async function loadExtensions(dir, configPath) {
   let config = {};
   try {
@@ -15,11 +27,16 @@ export async function loadExtensions(dir, configPath) {
   const files = await readdir(dir);
   const mjsFiles = files.filter((f) => f.endsWith(".mjs")).sort();
 
+  // Bump once per call so all files loaded in this invocation share a URL
+  // suffix, but the next invocation gets a different one — same semantics
+  // as the prior `Date.now()` approach, just collision-free.
+  const cacheBuster = ++_loadCounter;
+
   const extensions = [];
   const newlyFailed = [];
   for (const file of mjsFiles) {
     try {
-      const mod = await import(pathToFileURL(join(dir, file)).href + "?t=" + Date.now());
+      const mod = await import(pathToFileURL(join(dir, file)).href + "?t=" + cacheBuster);
       const ext = mod.default;
       if (!ext || !ext.name) continue;
 
