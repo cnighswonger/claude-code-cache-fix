@@ -310,10 +310,6 @@ npm install sharp
 - **시스템 프롬프트 재작성은 실험적입니다** — 프리로드 전용, 선택적. 커뮤니티 보고에서 논의된 동작 차이의 원인으로 입증되지 않았습니다. 사용자 책임하에 사용하십시오.
 - **버전 결합** — 핑거프린트 salt와 블록 감지 휴리스틱은 Claude Code 내부 구현에서 파생됩니다. 대규모 리팩토링 시 이 패키지 업데이트가 필요할 수 있습니다.
 
-## 추적 이슈
-
-캐시, 쿼터, 컨텍스트 버그와 관련된 30개 이상의 upstream Claude Code 이슈를 모니터링하고 있습니다. 전체 목록, 관여 현황, 커뮤니티 리서치, 주요 기여자는 [TRACKED_ISSUES.md](TRACKED_ISSUES.md)를 참조하십시오.
-
 ## 관련 리서치
 
 - **[@ArkNill/claude-code-hidden-problem-analysis](https://github.com/ArkNill/claude-code-hidden-problem-analysis)** — 38,996건 프록시 기반 분석: 7개 버그(마이크로컴팩트, 예산 상한, 가상 속도 제한기, JSONL 중복, 확장 사고), GrowthBook 기능 플래그 인과 테스트, Opus 4.7 소모율 주의보. v1.1.0 모니터링 기능은 이 리서치에 기반합니다.

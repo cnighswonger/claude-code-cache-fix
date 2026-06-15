@@ -324,7 +324,7 @@ Standalone scripts that aren't proxy extensions or CC hooks — installable sepa
 
 | Tool | What it does |
 |---|---|
-| [`tools/gh-auth-status-shim/`](tools/gh-auth-status-shim/README.md) | PATH-resolved `gh` wrapper that suppresses CC Desktop's false "GitHub CLI authentication expired" toast. Addresses [CC#67055](https://github.com/anthropics/claude-code/issues/67055): CC Desktop's PR poller maps any non-zero return from `gh auth status` (including its 5s spawn timeout) to the `"auth"` toast category. The shim intercepts `gh auth status` calls with a 4s internal timeout, classifies the outcome, and returns exit 0 to suppress the false toast on transient/timeout signals while letting genuine expiry (`not logged in`, `HTTP 401`) propagate normally. Workaround until Anthropic's classifier fix lands; sunset tracked in [`TRACKED_ISSUES.md`](TRACKED_ISSUES.md). **Known limitations:** rewrites `gh auth status` exit-code semantics for every caller in the PATH scope (not just CC); macOS coverage unverified due to launchd PATH inheritance; native Windows CC Desktop not supported. |
+| [`tools/gh-auth-status-shim/`](tools/gh-auth-status-shim/README.md) | PATH-resolved `gh` wrapper that suppresses CC Desktop's false "GitHub CLI authentication expired" toast. Addresses [CC#67055](https://github.com/anthropics/claude-code/issues/67055): CC Desktop's PR poller maps any non-zero return from `gh auth status` (including its 5s spawn timeout) to the `"auth"` toast category. The shim intercepts `gh auth status` calls with a 4s internal timeout, classifies the outcome, and returns exit 0 to suppress the false toast on transient/timeout signals while letting genuine expiry (`not logged in`, `HTTP 401`) propagate normally. Workaround until Anthropic's classifier fix lands. **Known limitations:** rewrites `gh auth status` exit-code semantics for every caller in the PATH scope (not just CC); macOS coverage unverified due to launchd PATH inheritance; native Windows CC Desktop not supported. |
 
 ## Recommended CC operational config
 
@@ -985,10 +985,6 @@ The filename of the matching transcript is the CC session UUID, recovering per-s
 - **Microcompact is not preventable** — The monitoring features detect context degradation but cannot prevent it. Microcompact and budget enforcement are server-controlled via GrowthBook flags with no client-side disable option.
 - **System prompt rewrite is experimental** — Preload-only, opt-in. Not proven to be the cause of behavior differences discussed in community reports. Use at your own risk.
 - **Version coupling** — The fingerprint salt and block detection heuristics are derived from Claude Code internals. A major refactor could require an update to this package.
-
-## Tracked issues
-
-We monitor 30+ upstream Claude Code issues related to cache, quota, and context bugs. See [TRACKED_ISSUES.md](TRACKED_ISSUES.md) for the full list with our involvement, community research, and key contributors.
 
 ## Related research
 

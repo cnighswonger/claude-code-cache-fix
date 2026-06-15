@@ -843,12 +843,6 @@ thinking-desync 响应的*缓解*部分（*预警*部分是上面的 session-hea
 
 ---
 
-## 跟踪的 issue
-
-我们监控 30 多个与缓存、额度和上下文 bug 相关的上游 Claude Code issue。参见 [TRACKED_ISSUES.md](TRACKED_ISSUES.md) 了解完整列表及我们的参与情况、社区研究和关键贡献者。
-
----
-
 ## 相关研究
 
 - **[@ArkNill/claude-code-hidden-problem-analysis](https://github.com/ArkNill/claude-code-hidden-problem-analysis)** — 基于 38,996 次请求的代理分析：7 个 bug（微压缩、预算上限、伪速率限制器、JSONL 重复、扩展 thinking）、GrowthBook 功能标志因果测试、Opus 4.7 消耗速率警示。v1.1.0 中的监控功能基于此研究。
