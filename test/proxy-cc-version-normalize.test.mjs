@@ -276,6 +276,81 @@ test("extension order is 90 (before fingerprint-strip at 100)", () => {
     "cc-version-normalize must run before fingerprint-strip");
 });
 
+// --- Codex r1 blocker 1: field-boundary anchoring ---
+
+test("rewriteCcVersion (blocker 1): cc_version embedded in another field's value is NOT rewritten", () => {
+  // Pathological but legal: another field's value happens to contain
+  // `cc_version=` as a substring. The naive regex would rewrite both.
+  const text = "x-anthropic-billing-header: other=prefix_cc_version=zzz.attacker.value; cc_version=2.1.185.real_hash";
+  const { changed, text: out } = rewriteCcVersion(text, { mode: "strip" });
+  assert.equal(changed, true);
+  // The real cc_version (at field boundary) is rewritten
+  assert.match(out, /;\s?cc_version=2\.1\.185/, "real cc_version is stripped");
+  // The embedded occurrence inside `other=...` MUST be preserved verbatim
+  assert.match(out, /other=prefix_cc_version=zzz\.attacker\.value/,
+    "embedded cc_version inside another field's value must NOT be rewritten");
+});
+
+test("rewriteCcVersion (blocker 1): pin mode also does NOT touch embedded cc_version=", () => {
+  const text = "x-anthropic-billing-header: other=prefix_cc_version=zzz.attacker.value; cc_version=2.1.185";
+  const { changed, text: out } = rewriteCcVersion(text, { mode: "pin", value: "2.1.0" });
+  assert.equal(changed, true);
+  assert.match(out, /;\s?cc_version=2\.1\.0/, "real cc_version is pinned");
+  assert.match(out, /other=prefix_cc_version=zzz\.attacker\.value/,
+    "embedded cc_version inside another field's value must NOT be rewritten");
+});
+
+test("rewriteCcVersion: matches at start-of-string boundary", () => {
+  const text = "cc_version=2.1.185.hash";
+  const { changed, text: out } = rewriteCcVersion(text, { mode: "strip" });
+  assert.equal(changed, true);
+  assert.equal(out, "cc_version=2.1.185");
+});
+
+// --- Codex r1 attention item: multiple billing-header blocks ---
+
+test("onRequest: multiple billing-header blocks → ALL get rewritten in one tick", async () => {
+  process.env[ENV] = "strip";
+  const body = {
+    system: [
+      billingBlock("2.1.185.hashA"),
+      { type: "text", text: "You are a helpful assistant." },
+      billingBlock("2.1.185.hashB"),
+    ],
+    messages: [{ role: "user", content: "hi" }],
+  };
+  await ext.onRequest(ctxFor(body));
+  assert.match(body.system[0].text, /cc_version=2\.1\.185;/, "first billing block rewritten");
+  assert.equal(body.system[1].text, "You are a helpful assistant.", "non-billing block untouched");
+  assert.match(body.system[2].text, /cc_version=2\.1\.185;/, "second billing block also rewritten");
+});
+
+// --- Codex r1 blocker 2: atomic fail-open ---
+
+test("onRequest (blocker 2): if iteration throws AFTER a candidate block, the body is byte-intact", async () => {
+  process.env[ENV] = "strip";
+  // First system block: normal billing block (rewrite candidate).
+  // Second system block: a Proxy that throws on `.text` access during
+  // the scan loop. The atomic-staging contract requires the first block
+  // NOT to be mutated when a later scan iteration throws.
+  const realBlock = billingBlock("2.1.185.hashX");
+  const beforeText = realBlock.text;
+  const throwingBlock = new Proxy({}, {
+    get(_target, prop) {
+      if (prop === "text") throw new Error("synthetic-scan-error");
+      return undefined;
+    },
+    has(_target, _prop) { return true; },
+  });
+  const body = {
+    system: [realBlock, throwingBlock],
+    messages: [{ role: "user", content: "hi" }],
+  };
+  await ext.onRequest(ctxFor(body));
+  assert.equal(body.system[0].text, beforeText,
+    "first block must be byte-identical — staged rewrites must NOT be applied when the scan throws");
+});
+
 // --- The motivating scenario: cache-bust across auto-update ---
 
 test("motivating scenario: same base version with different per-build hashes both normalize to the same text (cache stability across auto-update)", async () => {

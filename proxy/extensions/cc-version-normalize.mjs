@@ -59,23 +59,39 @@ export function parseMode(raw) {
   return { mode: "off", reason: `unrecognized_mode: ${JSON.stringify(raw).slice(0, 32)}` };
 }
 
-// Rewrite a single cc_version assignment inside an arbitrary header-text
-// snippet. Returns { changed, text }. The match is anchored on
-// `cc_version=` so it cannot fire on adjacent fields that happen to contain
-// the substring.
+// Rewrite the cc_version assignment(s) inside an arbitrary header-text
+// snippet. Returns { changed, text }.
+//
+// CRITICAL — Codex r1 blocker 1: the rewrite MUST anchor on a field
+// boundary, not just the substring `cc_version=`. The billing-header text
+// is a `;`-separated assignment list, optionally preceded by the
+// `x-anthropic-billing-header:` leader, e.g.:
+//
+//   x-anthropic-billing-header: cc_version=2.1.185.hash; other=stuff
+//
+// A naive regex `/cc_version=([^;]+)/` matches the cc_version EMBEDDED
+// inside another field's value, e.g. `other=prefix_cc_version=2.1.185.hash`
+// would rewrite the inner occurrence and corrupt `other`.
+//
+// Fix: anchor on a field-boundary character — start-of-string, semicolon,
+// colon, or whitespace. The regex captures that boundary in group 1 so
+// the replacement preserves it verbatim. Whitespace divergence note: we
+// terminate the value at the first `;` OR whitespace, matching the
+// original implementation. Realistic cc_version values are alnum+dot and
+// never contain whitespace, so a malformed value with embedded whitespace
+// is treated as ending at the whitespace (defensive — fingerprint-strip
+// uses `[^;]+` which would swallow whitespace, but stopping early is the
+// safer choice for a field that should never contain a space).
+const CC_VERSION_REGEX = /(^|[;\s:])cc_version=([^;\s]+)/g;
+
 export function rewriteCcVersion(text, parsedMode) {
   if (typeof text !== "string" || !text.includes("cc_version=")) {
     return { changed: false, text };
   }
   if (parsedMode.mode === "off") return { changed: false, text };
 
-  // The cc_version assignment runs until the first `;` or end-of-line/string.
-  // (The billing-header text grammar uses `;` as the separator between
-  // assignments — same as `x-anthropic-billing-header:` and how
-  // fingerprint-strip parses it.)
-  const re = /cc_version=([^;\s]+)/g;
   let changed = false;
-  const out = text.replace(re, (match, value) => {
+  const out = text.replace(CC_VERSION_REGEX, (match, boundary, value) => {
     let newValue;
     if (parsedMode.mode === "strip") {
       const parts = value.split(".");
@@ -88,9 +104,10 @@ export function rewriteCcVersion(text, parsedMode) {
     }
     if (newValue === value) return match;
     changed = true;
-    return `cc_version=${newValue}`;
+    return `${boundary}cc_version=${newValue}`;
   });
-  return { changed, text: out };
+  if (!changed) return { changed: false, text };
+  return { changed: true, text: out };
 }
 
 export default {
@@ -125,20 +142,33 @@ export default {
     const body = ctx && ctx.body;
     if (!body || !Array.isArray(body.system)) return;
 
+    // Codex r1 blocker 2: the fail-open guarantee requires the body to be
+    // BYTE-INTACT if any iteration throws. The previous in-loop mutation
+    // could leave earlier blocks rewritten when a later block's access
+    // threw. Stage all replacements first, then apply only after the scan
+    // completes — atomic in the sense that either every planned rewrite
+    // lands or none of them do.
     let mutatedAny = false;
     try {
+      const replacements = []; // [{ index, newBlock }]
       for (let i = 0; i < body.system.length; i += 1) {
         const block = body.system[i];
         if (!block || typeof block.text !== "string") continue;
         if (!block.text.includes("x-anthropic-billing-header:")) continue;
         const { changed, text } = rewriteCcVersion(block.text, parsed);
         if (changed) {
-          body.system[i] = { ...block, text };
-          mutatedAny = true;
+          replacements.push({ index: i, newBlock: { ...block, text } });
         }
       }
+      // Scan succeeded — apply atomically.
+      for (const r of replacements) {
+        body.system[r.index] = r.newBlock;
+      }
+      mutatedAny = replacements.length > 0;
     } catch (err) {
-      // Fail-open: leave body intact, log once per process.
+      // Fail-open: any error during the scan leaves body byte-intact
+      // (no replacements applied because we hadn't reached the apply phase).
+      // Log once per process.
       if (!_firstFireLogged) {
         _firstFireLogged = true;
         try {
