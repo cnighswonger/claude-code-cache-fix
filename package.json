@@ -30,7 +30,8 @@
     "postinstall": "node postinstall.js"
   },
   "dependencies": {
-    "hpagent": "^1.2.0"
+    "hpagent": "^1.2.0",
+    "proper-lockfile": "^4.1.2"
   },
   "peerDependenciesMeta": {
     "sharp": {

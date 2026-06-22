@@ -34,6 +34,15 @@ const config = {
     if (raw === "0" || raw.toLowerCase() === "false") return false;
     return true;
   },
+
+  // Proxy-owned OAuth refresher. Gated default-OFF; the whole subsystem is
+  // inert until CACHE_FIX_OAUTH_REFRESH=on is set and the proxy is restarted.
+  // Contract: docs/directives/proxy-owned-oauth-refresh.md.
+  get oauthRefreshEnabled() { return process.env.CACHE_FIX_OAUTH_REFRESH === "on"; },
+  get oauthRefreshMarginMs() { return envInt("CACHE_FIX_OAUTH_REFRESH_MARGIN_MS", 2 * 60 * 60 * 1000); }, // 2h
+  get oauthTickMs() { return envInt("CACHE_FIX_OAUTH_TICK_MS", 5 * 60 * 1000); }, // 5min
+  // §2a hard deadline — strictly below the client's 10s stale-break.
+  get oauthPostTimeoutMs() { return envInt("CACHE_FIX_OAUTH_POST_TIMEOUT_MS", 8000); },
 };
 
 export default config;

@@ -5,6 +5,7 @@ import { forwardRequest } from "./upstream.mjs";
 import { streamResponse, createTelemetryRecord } from "./stream.mjs";
 import { loadExtensions, snapshotRegistry, runOnRequest, runOnResponseStart, runOnResponse, getFailedExtensions } from "./pipeline.mjs";
 import { startWatcher } from "./watcher.mjs";
+import { startOAuthRefresher, stopOAuthRefresher } from "./oauth/refresher.mjs";
 
 // Debug logging — writes to ~/.claude/cache-fix-debug.log (override path with
 // CACHE_FIX_DEBUG_LOG). Self-gated on CACHE_FIX_DEBUG=1; a no-op otherwise.
@@ -430,6 +431,18 @@ export async function startProxy(options = {}) {
     });
   });
 
+  // Proxy-owned OAuth refresher — default OFF. Started after the server is
+  // listening so a refresher startup failure can never prevent the proxy from
+  // serving requests. try/catch wraps the start call per directive §6.
+  if (config.oauthRefreshEnabled) {
+    try {
+      startOAuthRefresher();
+      process.stderr.write("[cache-fix] oauth-refresh: on (CACHE_FIX_OAUTH_REFRESH=on)\n");
+    } catch (err) {
+      process.stderr.write(`[cache-fix] oauth-refresh start FAILED, continuing without it: ${err && err.message}\n`);
+    }
+  }
+
   const addr = server.address();
   return {
     server,
@@ -437,6 +450,7 @@ export async function startProxy(options = {}) {
     address: addr.address,
     close: () =>
       new Promise((resolve, reject) => {
+        try { stopOAuthRefresher(); } catch {}
         try {
           if (watcher) watcher.close();
         } catch {}
