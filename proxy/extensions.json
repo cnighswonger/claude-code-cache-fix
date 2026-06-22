@@ -18,6 +18,7 @@
   "ttl-management": { "enabled": true, "order": 500 },
   "cache-telemetry": { "enabled": true, "order": 600 },
   "overage-warning": { "enabled": true, "order": 610 },
+  "upstream-error-log": { "enabled": true, "order": 670 },
   "request-log": { "enabled": false, "order": 700 },
   "jsonl-session-mirror": { "enabled": true, "order": 720 }
 }
