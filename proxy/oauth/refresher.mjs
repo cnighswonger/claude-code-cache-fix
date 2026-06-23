@@ -33,7 +33,14 @@ const TOKEN_URL_DEFAULT = "https://platform.claude.com/v1/oauth/token";
 // hard-coding the default keeps the refresher self-contained, and the
 // CACHE_FIX_OAUTH_CLIENT_ID override exists for tests + future binary churn.
 const CLIENT_ID_DEFAULT = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-const SCOPE_DEFAULT = "user:inference user:profile";
+// Last-resort scope set if the credential file is missing the `scopes` array.
+// Real installs always carry the full granted set in claudeAiOauth.scopes;
+// v4.2.1 reads that array and uses it verbatim. This fallback exists only
+// for a malformed-but-otherwise-valid credential file. See the v4.2.1
+// incident post-mortem: hardcoding a narrower scope on the refresh grant
+// caused the server to issue a narrower token, which then 401'd on
+// remote-bridge / code-session calls that required user:sessions:claude_code.
+const SCOPE_FALLBACK = "user:inference user:profile";
 
 // proper-lockfile compatibility settings — must match the client's call shape
 // byte-for-byte. CRITICAL: lockfilePath points at .oauth_refresh.lock (the
@@ -79,8 +86,41 @@ function clientId() {
   return process.env.CACHE_FIX_OAUTH_CLIENT_ID || CLIENT_ID_DEFAULT;
 }
 
-function scope() {
-  return process.env.CACHE_FIX_OAUTH_SCOPE || SCOPE_DEFAULT;
+// Determine the scope string for the refresh-token POST.
+//
+// CRITICAL (v4.2.1): the refresh grant's `scope` field MUST request the same
+// set of scopes the credential currently holds. A NARROWER refresh produces
+// a NARROWER token — the server happily issues it — and any caller that
+// needs a stripped-out scope subsequently 401s. The 2026-06-23 incident hit
+// this: v4.2.0 hardcoded `user:inference user:profile`, the refresh succeeded,
+// `/v1/messages` kept working (only needs user:inference), but remote-bridge
+// / code-session calls 401'd because user:sessions:claude_code was missing
+// from the new token.
+//
+// Resolution order:
+//   1. CACHE_FIX_OAUTH_SCOPE env var (operator override; intentional)
+//   2. credScopes array from the in-lock-re-read credential file (canonical
+//      — the scopes the file already holds is the set we must preserve)
+//   3. SCOPE_FALLBACK (only fires on a malformed cred file without scopes)
+function scope(credScopes) {
+  const envOverride = process.env.CACHE_FIX_OAUTH_SCOPE;
+  if (envOverride) return envOverride;
+  if (Array.isArray(credScopes) && credScopes.length > 0) {
+    // Filter to non-empty strings + dedupe + join space-separated, matching
+    // the OAuth 2.0 RFC 6749 §3.3 scope syntax. The credential file's array
+    // shape is the source of truth; we just serialize it.
+    const valid = [];
+    const seen = new Set();
+    for (const s of credScopes) {
+      if (typeof s !== "string") continue;
+      const t = s.trim();
+      if (!t || seen.has(t)) continue;
+      seen.add(t);
+      valid.push(t);
+    }
+    if (valid.length > 0) return valid.join(" ");
+  }
+  return SCOPE_FALLBACK;
 }
 
 // Validate the credential file before trusting any token material from it.
@@ -161,13 +201,13 @@ function atomicWriteCred(finalPath, content) {
 // IMPORTANT: this function never logs the body. Callers must NOT pass `body`
 // to any generic logger or event writer; only specific parsed fields may be
 // persisted (to the credential file) or summarized (status_code, expires_at).
-async function postRefresh(refreshToken, deadlineMs) {
+async function postRefresh(refreshToken, deadlineMs, credScopes) {
   const url = new URL(tokenUrl());
   const payload = JSON.stringify({
     grant_type: "refresh_token",
     refresh_token: refreshToken,
     client_id: clientId(),
-    scope: scope(),
+    scope: scope(credScopes),
   });
   // CRITICAL (Codex r1 blocker 2): the AbortController must remain armed
   // across both the response-headers wait AND the body read. A server can
@@ -284,7 +324,7 @@ async function runOnce() {
 
       const deadlineMs = config.oauthPostTimeoutMs;
       const startedAt = nowMs();
-      const result = await postRefresh(oauth2.refreshToken, deadlineMs);
+      const result = await postRefresh(oauth2.refreshToken, deadlineMs, oauth2.scopes);
       const elapsedMs = nowMs() - startedAt;
 
       if (result.kind === "timeout") {

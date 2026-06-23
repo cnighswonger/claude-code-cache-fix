@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [4.2.1] - 2026-06-23
+
+### Fixed
+
+- **OAuth refresh narrowed token scopes, causing remote-bridge / code-session 401s (hotfix; affects v4.2.0 only when `CACHE_FIX_OAUTH_REFRESH=on`).** v4.2.0's proxy-owned OAuth refresher hardcoded the refresh-grant `scope` field to `user:inference user:profile`. Real Claude Code credentials hold a wider set (typically `user:file_upload user:inference user:mcp_servers user:profile user:sessions:claude_code`). When the proxy refreshed, the server happily issued the narrower token — `/v1/messages` kept working because it only needs `user:inference`, but **remote-bridge / code-session API calls 401'd because `user:sessions:claude_code` was missing from the rotated token**. Observed end-to-end on 2026-06-23: proxy refreshed at 17:48 UTC, remote-bridge sessions started returning 401 at 20:01 UTC, recovery required an interactive `/login`. The fix reads `claudeAiOauth.scopes` from the credential file inside the in-lock re-read and serializes them verbatim onto the refresh POST (space-separated per RFC 6749 §3.3), with dedupe + filter for malformed entries. `CACHE_FIX_OAUTH_SCOPE` env var is honored as an operator override; a `user:inference user:profile` fallback applies only when the credential file has no `scopes` array (unusual). 6 new regression tests assert scope round-trip, the load-bearing `user:sessions:claude_code` preservation, persisted-credential scope passthrough, env override, fallback, and dedupe behavior. The fix is purely additive to the refresh-POST body; `/v1/messages` upstream traffic was never affected. **Operators on v4.2.0 with `CACHE_FIX_OAUTH_REFRESH=on` should upgrade immediately** — the next proxy-initiated refresh will issue a token that does not work for remote bridges, even though local CC traffic continues.
+
 ## [4.2.0] - 2026-06-23
 
 ### Changed

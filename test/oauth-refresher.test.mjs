@@ -513,3 +513,160 @@ describe("oauth refresher — in-process serialize", () => {
     assert.equal(postCount, 1, "in-process serialize prevented the second POST");
   });
 });
+
+// v4.2.1 regression — scope preservation
+//
+// 2026-06-23 incident: v4.2.0 hardcoded the refresh-grant scope to
+// `user:inference user:profile`. The real CC credential file holds five
+// scopes including `user:sessions:claude_code`. The narrower refresh
+// silently produced a narrower token; /v1/messages kept working because it
+// only needs user:inference, but remote-bridge / code-session calls 401'd.
+// The fix reads `claudeAiOauth.scopes` from the credential file and uses
+// them verbatim on the refresh POST.
+describe("oauth refresher — v4.2.1 scope preservation", () => {
+  function credWithScopes(scopes) {
+    const c = freshCredDueForRefresh();
+    c.claudeAiOauth.scopes = scopes;
+    return c;
+  }
+
+  function parsePostedScopes(postedBody) {
+    const parsed = JSON.parse(postedBody);
+    return (parsed.scope || "").split(" ").filter(Boolean);
+  }
+
+  it("refresh POST body carries the EXACT scopes from the credential file (not a hardcoded subset)", async () => {
+    const FULL_SCOPES = [
+      "user:file_upload",
+      "user:inference",
+      "user:mcp_servers",
+      "user:profile",
+      "user:sessions:claude_code",
+    ];
+    writeCred(credWithScopes(FULL_SCOPES));
+    let postedBody = null;
+    mockHandler = (_req, res, body) => {
+      postedBody = body;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        access_token: FIXTURE.ACCESS_NEW,
+        refresh_token: FIXTURE.REFRESH_NEW,
+        expires_in: 28800,
+      }));
+    };
+    await __runTickForTests();
+    assert.ok(postedBody, "POST did fire");
+    const sent = parsePostedScopes(postedBody);
+    // Order may differ due to dedupe; assert membership not exact-string.
+    assert.deepEqual(sent.sort(), [...FULL_SCOPES].sort(),
+      "every scope from the cred file must be on the refresh POST — narrowing produces a narrower token");
+  });
+
+  it("refresh POST also carries user:sessions:claude_code when present (the load-bearing scope from the incident)", async () => {
+    writeCred(credWithScopes(["user:inference", "user:profile", "user:sessions:claude_code"]));
+    let postedBody = null;
+    mockHandler = (_req, res, body) => {
+      postedBody = body;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        access_token: FIXTURE.ACCESS_NEW,
+        refresh_token: FIXTURE.REFRESH_NEW,
+        expires_in: 28800,
+      }));
+    };
+    await __runTickForTests();
+    const sent = parsePostedScopes(postedBody);
+    assert.ok(sent.includes("user:sessions:claude_code"),
+      "user:sessions:claude_code MUST round-trip — its absence on the rotated token is what caused the 2026-06-23 remote-bridge 401 burst");
+  });
+
+  it("preserves scopes on the persisted credential (passthrough via spread)", async () => {
+    const FULL_SCOPES = [
+      "user:file_upload",
+      "user:inference",
+      "user:mcp_servers",
+      "user:profile",
+      "user:sessions:claude_code",
+    ];
+    writeCred(credWithScopes(FULL_SCOPES));
+    mockHandler = (_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        access_token: FIXTURE.ACCESS_NEW,
+        refresh_token: FIXTURE.REFRESH_NEW,
+        expires_in: 28800,
+      }));
+    };
+    await __runTickForTests();
+    const after = JSON.parse(readFileSync(credPath, "utf8"));
+    assert.deepEqual(after.claudeAiOauth.scopes.sort(), [...FULL_SCOPES].sort(),
+      "persisted credential's scopes array MUST be identical to pre-refresh — preserves auth surface for non-/v1/messages APIs");
+  });
+
+  it("CACHE_FIX_OAUTH_SCOPE env override beats the credential file (intentional operator-control escape hatch)", async () => {
+    writeCred(credWithScopes(["user:inference", "user:profile", "user:sessions:claude_code"]));
+    process.env.CACHE_FIX_OAUTH_SCOPE = "user:inference";
+    let postedBody = null;
+    mockHandler = (_req, res, body) => {
+      postedBody = body;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        access_token: FIXTURE.ACCESS_NEW,
+        refresh_token: FIXTURE.REFRESH_NEW,
+        expires_in: 28800,
+      }));
+    };
+    try {
+      await __runTickForTests();
+      const sent = parsePostedScopes(postedBody);
+      assert.deepEqual(sent, ["user:inference"], "env override is honored verbatim");
+    } finally {
+      delete process.env.CACHE_FIX_OAUTH_SCOPE;
+    }
+  });
+
+  it("falls back to a minimal scope set when the credential file has no scopes array (malformed-but-valid edge case)", async () => {
+    // Build a cred without the scopes field at all (older CC versions?).
+    const cred = freshCredDueForRefresh();
+    delete cred.claudeAiOauth.scopes;
+    writeCred(cred);
+    let postedBody = null;
+    mockHandler = (_req, res, body) => {
+      postedBody = body;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        access_token: FIXTURE.ACCESS_NEW,
+        refresh_token: FIXTURE.REFRESH_NEW,
+        expires_in: 28800,
+      }));
+    };
+    await __runTickForTests();
+    assert.ok(postedBody, "refresh fired even without scopes array");
+    const sent = parsePostedScopes(postedBody);
+    // Fallback is intentional and bounded; assert it's nonempty and OAuth-shaped
+    assert.ok(sent.length > 0, "fallback scope set is non-empty");
+    for (const s of sent) {
+      assert.match(s, /^[a-z]+:[a-z_]+$/, `scope "${s}" matches expected user:foo shape`);
+    }
+  });
+
+  it("dedupes and filters scopes from malformed cred (e.g. duplicates, empty strings, non-strings)", async () => {
+    const cred = freshCredDueForRefresh();
+    cred.claudeAiOauth.scopes = ["user:inference", "user:inference", "", "user:profile", null, "  ", 123];
+    writeCred(cred);
+    let postedBody = null;
+    mockHandler = (_req, res, body) => {
+      postedBody = body;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        access_token: FIXTURE.ACCESS_NEW,
+        refresh_token: FIXTURE.REFRESH_NEW,
+        expires_in: 28800,
+      }));
+    };
+    await __runTickForTests();
+    const sent = parsePostedScopes(postedBody);
+    assert.deepEqual(sent.sort(), ["user:inference", "user:profile"],
+      "duplicates dropped, empty/whitespace-only/non-string entries skipped");
+  });
+});
