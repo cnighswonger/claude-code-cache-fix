@@ -485,7 +485,11 @@ test("end-to-end: two responses → second has non-zero deltas", async () => {
 
 // --- request_id field (directive: proxy-usage-log-request-id) ---
 //
-// Schema: request_id?: string, max 64 chars, gated on CACHE_FIX_USAGE_LOG_REQID=on.
+// Schema: request_id?: string, max 64 chars.
+// v4.2.0 flipped the default from off to on. The env-var
+// CACHE_FIX_USAGE_LOG_REQID=off is now a kill-switch (omits the field)
+// for operators stuck on a pre-meter-v0.7.0 install. Any other value
+// (including unset) emits the field when the header is present.
 // Four-cell matrix (gate × header) + three negative-content cases for the
 // max(64) tripwire per Codex round-1 directive review.
 
@@ -569,28 +573,28 @@ test("extractRequestId: missing headers object returns undefined", () => {
 
 // --- four-cell gate × header matrix ---
 
-test("request_id: gate on + header present → field emitted", () => {
+test("request_id: gate unset (v4.2.0 default-on) + header present → field emitted", () => {
+  const r = recordWith("req_011CbQL6e8qVERUXKwYqUMMi", undefined);
+  assert.equal(r.request_id, "req_011CbQL6e8qVERUXKwYqUMMi");
+});
+
+test("request_id: gate on (explicit) + header present → field emitted", () => {
   const r = recordWith("req_011CbQL6e8qVERUXKwYqUMMi", "on");
   assert.equal(r.request_id, "req_011CbQL6e8qVERUXKwYqUMMi");
 });
 
-test("request_id: gate on + header absent → field omitted (optional)", () => {
-  const r = recordWith(undefined, "on");
+test("request_id: gate unset + header absent → field omitted (optional)", () => {
+  const r = recordWith(undefined, undefined);
   assert.ok(!("request_id" in r), "request_id must be absent, not undefined-valued");
 });
 
-test("request_id: gate off + header present → field NEVER emitted", () => {
-  const r = recordWith("req_011CbQL6e8qVERUXKwYqUMMi", undefined);
-  assert.ok(!("request_id" in r));
-});
-
-test("request_id: gate off (explicit) + header present → field NEVER emitted", () => {
+test("request_id: gate=off (kill-switch) + header present → field NEVER emitted", () => {
   const r = recordWith("req_011CbQL6e8qVERUXKwYqUMMi", "off");
-  assert.ok(!("request_id" in r));
+  assert.ok(!("request_id" in r), "explicit off must suppress the field even when header is present");
 });
 
-test("request_id: gate off + header absent → field NEVER emitted", () => {
-  const r = recordWith(undefined, undefined);
+test("request_id: gate=off + header absent → field NEVER emitted", () => {
+  const r = recordWith(undefined, "off");
   assert.ok(!("request_id" in r));
 });
 
@@ -627,13 +631,14 @@ test("request_id: gate on + non-string caller value → field omitted", () => {
 // --- gate runtime-readable ---
 
 test("request_id: gate is read per-call (image-strip pattern)", () => {
+  // v4.2.0: default is on; only =off suppresses. Flip between on/off in
+  // the same process to prove the gate isn't cached at module load.
   const reqId = "req_test_runtime";
   const r1 = recordWith(reqId, "on");
   assert.equal(r1.request_id, reqId);
-  const r2 = recordWith(reqId, undefined);
+  const r2 = recordWith(reqId, "off");
   assert.ok(!("request_id" in r2));
-  // Flip back and forth in the same process — proves the gate isn't cached
-  const r3 = recordWith(reqId, "on");
+  const r3 = recordWith(reqId, undefined); // default-on
   assert.equal(r3.request_id, reqId);
 });
 
@@ -668,8 +673,8 @@ test("request_id end-to-end: gate on + header → field present in jsonl row", a
   });
 });
 
-test("request_id end-to-end: gate off + header → field absent in jsonl row", async () => {
-  await withReqIdGateAsync(undefined, async () => {
+test("request_id end-to-end: gate=off (v4.2.0 kill-switch) + header → field absent in jsonl row", async () => {
+  await withReqIdGateAsync("off", async () => {
     const mod = await freshExt();
     const dir = await newTmp();
     const path = join(dir, "usage.jsonl");

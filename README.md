@@ -775,6 +775,28 @@ export CACHE_FIX_IMAGE_RETRY_BREAKER=on
 
 Sessionless requests bucket to `"unknown"` — they're not isolated from each other by request signature, an acknowledged limitation mitigated by the 30s sliding window.
 
+## `cc_version` normalize (proxy mode, opt-in)
+
+Some Claude Code distribution channels — notably the VS Code extension under auto-update — emit a `cc_version` value in the system prompt's `x-anthropic-billing-header` that includes a per-build hash on top of `MAJOR.MINOR.PATCH` (e.g. `2.1.185.<buildhash>`). When the build hash mutates mid-session (the binary auto-updates between turns), that value lives inside the cacheable prefix, so every subsequent turn pays full `cache_creation` cost until the suffix stabilizes — Anthropic's prefix cache is byte-exact and the field is in scope.
+
+The existing `fingerprint-strip` does NOT cover this case: it only rewrites suffixes whose value matches a CC-generated fingerprint of the user message text. A binary build-hash fails that verification and `fingerprint-strip` returns null without rewriting.
+
+Opt-in via env var; default-off:
+
+```bash
+export CACHE_FIX_NORMALIZE_CC_VERSION=strip          # collapses X.Y.Z.<suffix> → X.Y.Z
+# or
+export CACHE_FIX_NORMALIZE_CC_VERSION=pin:2.1.185    # operator-supplied literal
+```
+
+| Mode | Behavior |
+|------|----------|
+| `off` (default) | No mutation |
+| `strip` | Collapses `cc_version=X.Y.Z(.suffix)+` to `cc_version=X.Y.Z` |
+| `pin:<value>` | Replaces `cc_version=<anything>` with the operator literal. Validation: `^[A-Za-z0-9.\-]+$`, max 64 chars (anything that would break the surrounding header grammar fails-open to `off` with a one-shot stderr warning). |
+
+The extension runs at order 90, before `fingerprint-strip` at order 100. After normalization the `cc_version` has at most 3 segments, so `fingerprint-strip`'s `dotParts.length < 4` guard makes it a no-op — the two cooperate cleanly with no other ordering hazards. Field-boundary anchored regex `(^|[;\s:])cc_version=([^;\s]+)` so a `cc_version=` substring embedded in another field's value cannot be accidentally rewritten. Atomic fail-open: planned rewrites stage in a local array and apply only after the scan completes; any error during the scan leaves the body byte-intact.
+
 ## Session backup (proxy mode, opt-in)
 
 A belt-and-suspenders backup against CC's transcript regressions per [anthropics/claude-code#66734](https://github.com/anthropics/claude-code/issues/66734) (in-place transcript rewrite to a metadata-only stub) and [anthropics/claude-code#66486](https://github.com/anthropics/claude-code/issues/66486) (missing transcript on interactive sessions). When the proxy is in the path, every assistant message + observed tool result / user input is mirrored into a per-session JSONL file under user control, independent of CC's own transcript writer. CC's transcript remains canonical when it survives; the mirror is the recovery path when it doesn't.
@@ -963,7 +985,7 @@ The `usage-log` extension (opt-in via `proxy/extensions.json`) appends one JSON 
 | `overage_disabled_reason` | string ≤64 (optional) | overage-disabled-reason header |
 | `cache_hit_rate` | float 0–1 | `cache_read_input_tokens / (input + cache_creation + cache_read)` |
 | `q5h_delta`, `q7d_delta` | float | per-call delta from the previous row's q5h/q7d; 0 on first call after restart |
-| `request_id` | string ≤64 (optional, gated) | upstream `request-id` response header. Default-off; enable with `CACHE_FIX_USAGE_LOG_REQID=on`. **Cross-repo gate:** `claude-code-meter >= v0.7.0` accepts the optional field; older meter installs reject unknown keys via the strict-object schema. |
+| `request_id` | string ≤64 (optional) | upstream `request-id` response header. **Default-on as of v4.2.0.** `CACHE_FIX_USAGE_LOG_REQID=off` is a kill-switch (omits the field) for operators stuck on a pre-meter-v0.7.0 install. **Cross-repo gate:** `claude-code-meter >= v0.7.0` accepts the optional field; older meter installs reject unknown keys via the strict-object schema. |
 
 **Why `request_id` matters operationally.** The `sid` field is generated once at proxy boot and shared across every CC session that proxy serves. On hosts running multiple concurrent CC sessions through one proxy (common in agent fleets), every session's rows collapse into the same `sid` — there's no way to ask "which session burned 80% of today's Opus tokens?" from `usage.jsonl` alone. CC's per-session JSONL transcripts at `~/.claude/projects/<project>/<session-uuid>.jsonl` already carry `requestId` for every API call. Capturing the same value in the meter row makes the post-hoc join trivial:
 
@@ -977,6 +999,62 @@ done
 ```
 
 The filename of the matching transcript is the CC session UUID, recovering per-session attribution for every meter row that was emitted with the field on.
+
+### `upstream-error-log` extension (non-200 response capture)
+
+The `usage-log` extension above only records successful (200) responses. Non-200s (429 capacity throttling, 5xx errors) leave only an unstructured line in the debug log, so server-side throttling has been effectively invisible to any analysis built on `usage.jsonl`.
+
+`upstream-error-log` (opt-in, new in v4.2.0) emits a structured record for every `status >= 400` to `~/.claude/usage-log/upstream-errors.jsonl`. Two distinct 429 classes look identical to a user — **account/usage-limit** carries `anthropic-ratelimit-unified-*` headers + `retry-after`; **infrastructure/capacity** is Cloudflare-fronted, carries `x-should-retry: true` only, NO ratelimit headers (the "Server is temporarily limiting requests, not your usage limit" case). The discriminator is `has_ratelimit_headers` (bool): with headers → usage limit; without → capacity event.
+
+Opt-in via env var; default-off:
+
+```bash
+export CACHE_FIX_UPSTREAM_ERROR_LOG=on
+```
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `CACHE_FIX_UPSTREAM_ERROR_LOG` | `off` | Master gate — `on` activates capture |
+| `CACHE_FIX_UPSTREAM_ERROR_LOG_PATH` | `~/.claude/usage-log/upstream-errors.jsonl` | Log path override |
+
+Record fields per row: `schema_version`, `ts`, `type`, `session_id`, `requested_model`, `request_path`, `response_status`, `upstream_message`, `has_ratelimit_headers`, `ratelimit_status`, `ratelimit_overage_status`, `x_should_retry` (normalized to bool from string), `retry_after`, `upstream_request_id`, `upstream_connection_id`.
+
+This is a SUPERSET of the existing `rate-limit-log` extension — `rate-limit-log` only triggers on the canonical `rate_limit_error` body envelope and misses capacity-class 429s whose body shape differs; `upstream-error-log` triggers on every `status >= 400` regardless of body shape. Independent JSONL streams; analysts join on `session_id + ts`. Both can be enabled simultaneously without interference.
+
+### Proxy-owned OAuth refresh (opt-in)
+
+Default-off subsystem that makes the cache-fix proxy the single, proactive, lock-cooperative refresher of the OAuth credential at `~/.claude/.credentials.json`. Closes the refresh-token rotation race that can revoke the whole token family and 401 every concurrent Claude Code client running as the same OS user — a failure that no client-side restart recovers (only an interactive `/login` does).
+
+The race: Anthropic's refresh tokens rotate on every use. Each successful refresh returns a new access token AND a new refresh token, invalidating the prior one; reusing a consumed refresh token is treated as theft and revokes the whole family. When N clients share one `~/.claude/.credentials.json` and the access token expires (~8h cadence), two clients can race to POST the same refresh token — the server sees the reuse and revokes both. After that, the file's refresh token is dead; only interactive `/login` recovers.
+
+Recent Claude Code binaries (2.1.148+) ship a cross-process `~/.claude/.oauth_refresh.lock` via `proper-lockfile`, but with a 10-second stale-break window. A refresh POST that runs longer than 10s lets a waking client proceed lock-less and POST the same token — the race fires anyway.
+
+This extension makes the proxy the proactive single-refresher: it keeps the shared token fresh AND holds the client's own `.oauth_refresh.lock` during its refresh, so a waking client finds a fresh token and short-circuits without POSTing. Exactly one party reaches the token endpoint → no double-spend → no family revocation.
+
+Opt-in via env var; default-off:
+
+```bash
+export CACHE_FIX_OAUTH_REFRESH=on
+```
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `CACHE_FIX_OAUTH_REFRESH` | `off` | Master gate — `on` activates the refresher |
+| `CACHE_FIX_OAUTH_CRED_PATH` | `~/.claude/.credentials.json` | Credential file path |
+| `CACHE_FIX_OAUTH_TOKEN_URL` | `https://platform.claude.com/v1/oauth/token` | Token endpoint (test override) |
+| `CACHE_FIX_OAUTH_REFRESH_MARGIN_MS` | 7200000 (2h) | Refresh when expiry is within this window |
+| `CACHE_FIX_OAUTH_TICK_MS` | 300000 (5min) | Check interval |
+| `CACHE_FIX_OAUTH_POST_TIMEOUT_MS` | 8000 | Hard refresh-POST deadline; **must stay below the client's 10000 ms stale-break** |
+
+The `CACHE_FIX_OAUTH_POST_TIMEOUT_MS` ceiling is load-bearing. The refresh POST has an `AbortController` timer covering both headers AND the response body read. On timeout the outcome is UNKNOWN — the server may or may not have rotated the token — so the proxy does NOT write, does NOT retry, emits a distinct `oauth_refresh_timeout` event, and backs off for at least one full stale window before any next attempt. The ordering guarantees that if the proxy ever loses the timing race, it loses by *not POSTing again*, never by POSTing concurrently.
+
+Adds `proper-lockfile` as a runtime dependency (the only other runtime dep is `hpagent`).
+
+Operational events go to `~/.claude/cache-fix-oauth-events.jsonl`. Seven event classes: `oauth_refreshed` (routine), `oauth_family_revoked` (loud — requires human `/login`; also writes a stderr banner), `oauth_refresh_timeout` (UNKNOWN outcome — no write, no retry), `oauth_refresh_error` (clean failure — leave file, try next tick), `oauth_refresh_skipped` (already-rotated or no-longer-due), `oauth_lock_contended` (another writer holds the lock), `oauth_cred_*` (validation failures: symlink rejected, mode warning, unreadable). Records carry only `{event, outcome, status_code, expires_at, err_class, elapsed_ms}` — never token strings, never raw POST bodies, never raw response bodies.
+
+Validation gates on every credential read: not a symlink, mode `0600`, owner-matches-uid, JSON-shape valid. Atomic persist: temp-write (mode 0600) + fsync FD + rename + fsync parent dir, preserving every other credential field across the rotation.
+
+Backout: gate off + proxy restart → clients self-manage exactly as today (they always read the file, so the fallback is automatic).
 
 ## Limitations
 
@@ -1010,7 +1088,7 @@ The filename of the matching transcript is the CC session UUID, recovering per-s
 - **[@arjansingh](https://github.com/arjansingh)** — nvm-compatible wrapper script with dynamic `npm root -g` path resolution (PR #15)
 - **[@beekamai](https://github.com/beekamai)** — Windows URL-encoding fix for `claude-fixed.bat` when npm root contains spaces (PR #17)
 - **[@JEONG-JIWOO](https://github.com/JEONG-JIWOO)** — VS Code extension investigation: discovered `claudeCode.claudeProcessWrapper` as the working integration path, wrote the C wrapper for Windows (#16)
-- **[@X-15](https://github.com/X-15)** — VS Code extension validation, per-fix health status analysis confirming safety check behavior on v2.1.105 (#16)
+- **[@X-15](https://github.com/X-15)** — VS Code extension validation, per-fix health status analysis confirming safety check behavior on v2.1.105 (#16); surfaced the per-build `cc_version` cache-bust pattern from VS Code extension auto-update (#238), which became the `cc-version-normalize` extension in v4.2.0
 - **[@deafsquad](https://github.com/deafsquad)** — Universal smoosh_split un-smoosh fix (PR #26), source-level function attribution of resume scatter bug (anthropics/claude-code#43657), OTEL telemetry discovery, proposed and built proxy architecture for v3.0.0
 - **[@vmfarms](https://github.com/vmfarms)** — Concurrent multi-runner production validation, surfaced proxy-mode resume-marker regex no-op (#96), TTL tier detection gap (#97), and image-strip stderr leak (#98)
 - **[@ojura](https://github.com/ojura)** — Opus 4.7 thinking-summaries root-cause analysis: filed [anthropics/claude-code#59844](https://github.com/anthropics/claude-code/issues/59844) with the CLI-binary decode (`!getIsNonInteractiveSession()` gate at offset 230510599 in v2.1.142) and the two-stacked-special-cases framing, which made the `thinking-display` extension (v3.6.1) a clean proxy-side complement to the proposed upstream fix

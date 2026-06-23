@@ -37,16 +37,17 @@
 // CACHE_FIX_USAGE_LOG=<path> overrides the destination path only — it is NOT
 // an enable flag and never has been.
 //
-// CACHE_FIX_USAGE_LOG_REQID=on emits the optional `request_id` field
-// (sourced from the upstream `request-id` response header). Default-off in
-// v4.1.0 to avoid breaking unpatched claude-meter installs whose strict-
-// object schema rejects unknown keys. claude-meter v0.7.0+ accepts the
-// optional field; the v4.2.0 flip to default-on assumes that floor.
-// The field is the post-hoc join key against CC's per-session JSONL
-// transcripts
-// (`~/.claude/projects/<project>/<session-uuid>.jsonl` carry `requestId`
-// for every API call), which recovers per-CC-session attribution that
-// `sid` alone cannot provide. See docs/directives/proxy-usage-log-request-id.md.
+// The `request_id` field (sourced from the upstream `request-id` response
+// header) is emitted by default in v4.2.0. v4.1.0 shipped it default-off
+// via CACHE_FIX_USAGE_LOG_REQID=on while claude-meter <v0.7.0 still
+// rejected unknown keys; with meter v0.7.0/0.7.1/0.8.0 all published, the
+// v4.2.0 flip is safe. The env-var is now a kill-switch:
+// CACHE_FIX_USAGE_LOG_REQID=off omits the field for operators stuck on a
+// pre-v0.7.0 meter install. The field is the post-hoc join key against
+// CC's per-session JSONL transcripts (`~/.claude/projects/<project>/<session-uuid>.jsonl`
+// carry `requestId` for every API call), which recovers per-CC-session
+// attribution that `sid` alone cannot provide.
+// See docs/directives/proxy-usage-log-request-id.md.
 //
 // See `docs/directives/proxy-claude-meter-compat.md` for full design.
 
@@ -217,19 +218,23 @@ export function assembleRecord({ start, delta, quota, requestedModel, sid, prevQ
     record.overage_disabled_reason = q.overage_disabled_reason;
   }
 
-  // Optional: emit request_id when CACHE_FIX_USAGE_LOG_REQID=on AND the
-  // captured value is a non-empty string within the schema's max(64)
-  // constraint. Belt-and-braces: extractRequestId enforces these guards at
-  // capture time, and assembleRecord re-enforces them here so a future
-  // refactor that bypasses the extractor can't emit a row that would fail
-  // claude-meter's strict-object validation.
-  // Env read happens per-call so operators can flip it at runtime without
-  // proxy restart, matching the image-strip debug-gate pattern.
-  // Cross-repo contract: claude-code-meter v0.7.0+ accepts this optional
-  // field; older meter installs reject rows that carry it, so the gate
-  // stays default-off in v4.1.0. Default flips on in cache-fix v4.2.0.
+  // Emit request_id by default when the captured value is a non-empty
+  // string within the schema's max(64) constraint. Belt-and-braces:
+  // extractRequestId enforces these guards at capture time, and
+  // assembleRecord re-enforces them here so a future refactor that bypasses
+  // the extractor can't emit a row that would fail claude-meter's
+  // strict-object validation.
+  //
+  // v4.2.0 flipped the default from off to on (the v4.1.0 default-off was
+  // the precondition for shipping the field at all; meter v0.7.0+ now
+  // accepts it, and v0.7.0 + v0.7.1 + v0.8.0 are all published). The
+  // env-var becomes a kill-switch: CACHE_FIX_USAGE_LOG_REQID=off omits
+  // the field, for operators stuck on a pre-v0.7.0 meter install (uncommon
+  // — the v4.1.0 changelog already established meter v0.7.0+ as the
+  // upgrade-coupling requirement). Env read happens per-call so operators
+  // can flip it at runtime without proxy restart.
   if (
-    process.env.CACHE_FIX_USAGE_LOG_REQID === "on" &&
+    process.env.CACHE_FIX_USAGE_LOG_REQID !== "off" &&
     typeof requestId === "string" &&
     requestId.length > 0 &&
     requestId.length <= 64
