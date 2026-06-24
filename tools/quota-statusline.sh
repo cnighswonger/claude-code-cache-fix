@@ -235,6 +235,22 @@ if recent or sticky:
     else:
         label += ' | \033[31m' + pair + '\033[0m'
 
+# Tier-advisor cache (cache-fix #93). Read the advisor's persisted
+# `last_recommendation` and append a single token. Omitted when the
+# recommendation is `tier:ok` (the no-recommendation case) so the
+# statusline stays uncluttered. Graceful no-op when the state file
+# is missing (advisor hasn't been run yet) or malformed.
+try:
+    state_path = os.path.join(home, '.claude', 'tier-advisor-state.json')
+    if os.path.exists(state_path):
+        with open(state_path) as f:
+            ta_state = json.load(f)
+        rec = (ta_state or {}).get('last_recommendation') or ''
+        if rec in ('tier:upgrade', 'tier:downgrade', 'tier:unknown'):
+            label += ' | ' + rec
+except Exception:
+    pass
+
 print(label)
 PYEOF
 )
