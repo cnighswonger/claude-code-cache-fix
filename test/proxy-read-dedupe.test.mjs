@@ -460,6 +460,31 @@ test("27. bytes_saved is positive on duplicates of substantial content; zero on 
   assert.equal(noDupCtx.meta.readDedupeStats.bytes_saved, 0);
 });
 
+test("27b. stderr reads_seen counts ALL Read tool_results (eligible + skipped), per Codex r1 precision note", async () => {
+  // Setup: two eligible (string-content) Reads of the same file → 1 replacement,
+  // plus one mixed-array Read (the Codex blocker shape) → skipped_mixed_array.
+  // Stderr's reads_seen= integer must equal the sum across both buckets so the
+  // operator sees "3 Reads scanned" not "2 Reads scanned".
+  const messages = [
+    mkAsstMsg([mkReadUse("toolu_E1", "/x.txt")]),
+    mkUserMsg([mkToolResult("toolu_E1", "hello")]),
+    mkAsstMsg([mkReadUse("toolu_E2", "/x.txt")]),
+    mkUserMsg([mkToolResult("toolu_E2", "hello")]),
+    mkAsstMsg([mkReadUse("toolu_M1", "/y.png")]),
+    mkUserMsg([mkToolResult("toolu_M1", [{ type: "text", text: "img" }, { type: "image", source: { type: "base64", media_type: "image/png", data: "Z" } }])]),
+  ];
+  const orig = process.stderr.write;
+  let captured = "";
+  process.stderr.write = (chunk) => { captured += String(chunk); return true; };
+  try {
+    await runExt(messages);
+  } finally {
+    process.stderr.write = orig;
+  }
+  // 2 eligible + 1 skipped-mixed = 3 reads_seen
+  assert.match(captured, /reads_seen=3\b/, `expected reads_seen=3, got: ${captured.trim()}`);
+});
+
 test("27a. bytes_saved is bytes_original - bytes_after (can be negative on tiny content)", async () => {
   // Documents the contract: pointer text is ~55 bytes; deduping a 2-byte content
   // produces a "saving" of 2 - 55 = -53. Operators should look at bytes_saved

@@ -337,6 +337,12 @@ export default {
     const { messages, stats } = runReadDedupe(ctx.body);
     ctx.body.messages = messages;
     ctx.meta.readDedupeStats = stats;
-    emitSummary(stats, stats.read_tool_results_classified);
+    // reads_seen = all Read-originated tool_results we saw (eligible + skipped),
+    // not just the eligible-for-dedupe count. Codex r1 precision note: operators
+    // scanning the stderr summary expect "Reads scanned" to mean every Read
+    // result the extension considered, including mixed-array skips. The stats
+    // schema itself stays exactly as the directive specified; this only fixes
+    // the meaning of the single integer in the stderr line.
+    emitSummary(stats, stats.read_tool_results_classified + stats.read_tool_results_skipped);
   },
 };

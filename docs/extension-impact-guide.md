@@ -298,6 +298,8 @@ Stderr summary on every enabled invocation:
 [read-dedupe] no-op reads_seen=R (no duplicates)
 ```
 
+`reads_seen` counts every Read-originated `tool_result` the extension considered (eligible + skipped). Mixed-array Reads land in `read_tool_results_skipped_mixed_array` and still increment `reads_seen` so the operator sees the true scanned-Read total during rollout.
+
 **Byte-stability guarantee:** because the keeper is always the FIRST occurrence (not the last), pointer bytes never churn as new duplicates accumulate. The cache-miss profile is one miss per newly-added duplicate, not cascading. This was the load-bearing fix in directive Codex review #1.
 
 ## Preload-Only Features (v2.x, CC ≤v2.1.112)
