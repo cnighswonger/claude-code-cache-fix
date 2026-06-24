@@ -72,6 +72,16 @@ The statusline integration is opt-in via the user's existing statusline configur
 
 The tool itself runs whenever the user invokes it. If they want it on a cron, that's a user-side decision — we document the pattern but don't ship a cron.
 
+## Load-bearing classification (added 2026-06-24)
+
+**This change is load-bearing per `CLAUDE.md:86`.** Three reasons:
+
+1. **Shared input abstraction**: `~/.claude/quota-status/account.json` is consumed today by `quota-statusline.sh:29`, `proxy/extensions/rate-limit-log.mjs:146`, and the `overage-warning` extension. The advisor becomes a fourth consumer of that abstraction. Changes to the file's schema impact all four.
+2. **Persisted state shared across tooling**: `~/.claude/tier-advisor-state.json` is read by the statusline integration (per §Statusline integration below). Multiple processes will read/write it; the schema is a stable contract.
+3. **Visible behavior in the shipped statusline**: users with `quota-statusline.sh` wired into their shell prompt see the advisor's `tier:` token. The advisor changes what they see.
+
+**Process consequence**: implementation PR requires `approved-by-lead` (AITL) + `approved-by-codex-agent` (Codex) + **Chris human review** before merge. Same procedure as the OAuth refresher (cache-fix #237) and unlike the read-dedupe extension which is a request-body transform only with no shared persisted state.
+
 ## Recommendation logic
 
 ### Inputs
@@ -101,6 +111,25 @@ Compute current week's burn rate via a single deterministic rule (Codex blocker 
 The primary-or-fallback decision is binary: use whichever is available, prefer primary. **Never blend, never take a min/max** — those would produce different recommendations on the same data and make the tool's output non-deterministic. The prior draft's "lower of (a) and (b)" wording was wrong; this is the corrected rule.
 
 Output records which source produced the burn rate (`burn_rate_source: "header" | "log"`) so downstream tooling can audit the decision.
+
+### Note on unified header enrichment (added 2026-06-24)
+
+Anthropic emits a fuller set of `anthropic-ratelimit-unified-*` headers than rev-3 names, captured into `~/.claude/quota-status/account.json` by the `cache-telemetry` extension. Two subsets matter:
+
+**Always-present** (every successful response carries them, regardless of quota state):
+- `anthropic-ratelimit-unified-7d-utilization` and `anthropic-ratelimit-unified-7d-reset` — the Q7d burn rate and the calendar-week reset boundary. **These are the rev-3 primary source.** The advisor's projection uses them verbatim; no change from rev-3's binary primary-or-fallback rule.
+- `anthropic-ratelimit-unified-status`, `anthropic-ratelimit-unified-representative-claim`, `anthropic-ratelimit-unified-fallback-percentage` — context fields the advisor can record in `--json` output as provenance, but does not gate decisions on.
+
+**Conditional** (present only when the account is in an elevated quota state):
+- `anthropic-ratelimit-unified-7d-surpassed-threshold` (a float, e.g. `0.75` when the account has crossed 75% of Q7d)
+- `anthropic-ratelimit-unified-5h-surpassed-threshold` (analogous, 5h horizon — out of scope for a weekly tier decision)
+- `anthropic-ratelimit-unified-upgrade-paths` (a comma-separated string, e.g. `upgrade_plan,overage`)
+
+The conditional headers are **observed-when-present, not required**. The `overage-warning` extension already persists these to `~/.claude/overage-warnings.jsonl` when they fire. The advisor reads that file when it exists, to enrich the recommendation rationale text — e.g., "Q7d projection is on track AND in the last 7 days we crossed the 0.75 surpassed-threshold twice." If the file is empty or missing, the advisor falls back to projection-only with no degradation; the conditional headers are an upgrade in precision, not a hard dependency.
+
+This makes the unified-header consumption strictly additive on rev-3 rather than a replacement. Rev-3's defensive `tier:unknown` + exit-3 path stays as the fallback for genuinely-undetectable cases. The 2026-06-05 PR-comment refresh proposed replacing rev-3's projection foundation with the unified headers as primary inputs; that turned out to be wrong because the conditional headers are not present at quiescent state (empirically verified 2026-06-24 against `account.json` on this host). This section codifies the corrected enrichment posture.
+
+For the 5h-surpassed-threshold header specifically: the tier-advisor consumes only the 7d horizon. 5h is short-horizon load, not a weekly tier signal. A future additive change can include 5h if empirical observation in an actual overage window proves the signal is useful for tier decisions.
 
 ### Projection
 
@@ -362,6 +391,8 @@ export {
 - [ ] CI green on Node 18 / 20 / 22.
 - [ ] README + monitoring.md + docs/tier-advisor.md all reflect the actual env vars and CLI flags.
 - [ ] Empirical 4.4× multiplier from the 5x/20x analysis is cited, not hand-waved.
+- [ ] **Load-bearing PR procedure followed** (per §Load-bearing classification): `approved-by-lead` + `approved-by-codex-agent` + Chris human review before merge. Implementer MUST NOT self-merge.
+- [ ] **Unified header enrichment is additive** (per §Note on unified header enrichment): always-present headers feed the projection; conditional headers consumed only via `overage-warnings.jsonl` when present; advisor degrades gracefully to projection-only when the enrichment file is absent. Codex r2/r3-approved rev-3 projection foundation is intact.
 
 ## Out of scope (explicit, deferred)
 
