@@ -1,0 +1,74 @@
+{
+  "_provenance": "Hand-curated against the real CC 2.1.148 Anthropic /v1/messages body schema. Models the partial-read case: same file read three times with three different (offset, limit) windows. All three Reads return different content slices, so by construction they produce three distinct dedupe keys and zero replacements. This is the regression fixture for directive test #4 — different offsets must NOT collide even though the path is identical. Content is fabricated/sanitized — no real source-code is checked into this fixture.",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        { "type": "text", "text": "Read the top of proxy/pipeline.mjs, then the middle, then the tail." }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "toolu_01OffsetVarA",
+          "name": "Read",
+          "input": { "file_path": "/repo/proxy/pipeline.mjs", "offset": 0, "limit": 50 }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_01OffsetVarA",
+          "content": "import { readdir, readFile } from \"node:fs/promises\";\nimport { join } from \"node:path\";\n// ... top of file (lines 0-50) ...\n"
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "toolu_01OffsetVarB",
+          "name": "Read",
+          "input": { "file_path": "/repo/proxy/pipeline.mjs", "offset": 50, "limit": 100 }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_01OffsetVarB",
+          "content": "// ... middle of file (lines 50-150) ...\nexport async function loadExtensions(dir, configPath) {\n  // ...\n}\n"
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "toolu_01OffsetVarC",
+          "name": "Read",
+          "input": { "file_path": "/repo/proxy/pipeline.mjs", "offset": 150, "limit": 200 }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_01OffsetVarC",
+          "content": "// ... tail of file (lines 150-350) ...\nexport function snapshotRegistry() { return [...registry]; }\n"
+        }
+      ]
+    }
+  ]
+}

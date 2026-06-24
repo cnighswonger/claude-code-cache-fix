@@ -1,0 +1,59 @@
+{
+  "_provenance": "Hand-curated against the real CC 2.1.148 Anthropic /v1/messages body schema. Models the Codex-blocker regression case from directive review #1: two Read tool_results whose content is a multi-element array containing both text and image blocks. The text portions are byte-identical between the two tool_results; the image portions DIFFER. The eligibility classifier MUST skip both at detection (recorded in read_tool_results_skipped_mixed_array) — keying on text-only and deduping would silently collapse the two non-byte-identical bodies. This fixture is the proof the FIRST-keeper + mixed-array-skip design holds. Image base64 is fabricated (single-byte payloads).",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        { "type": "text", "text": "Read the screenshot file twice and compare." }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "toolu_01MixedShapeA",
+          "name": "Read",
+          "input": { "file_path": "/repo/docs/screenshot.png" }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_01MixedShapeA",
+          "content": [
+            { "type": "text", "text": "Screenshot read; see attached image:" },
+            { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "QQ==" } }
+          ]
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "toolu_01MixedShapeB",
+          "name": "Read",
+          "input": { "file_path": "/repo/docs/screenshot.png" }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_01MixedShapeB",
+          "content": [
+            { "type": "text", "text": "Screenshot read; see attached image:" },
+            { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "Qg==" } }
+          ]
+        }
+      ]
+    }
+  ]
+}

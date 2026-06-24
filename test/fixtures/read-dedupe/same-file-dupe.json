@@ -1,0 +1,76 @@
+{
+  "_provenance": "Hand-curated against the real CC 2.1.148 Anthropic /v1/messages body schema. Models the headline read-dedupe case: same file read three times across three turns, each tool_result carrying byte-identical content (typical of build-loop or test-triage agent flows). Tool_use shape and tool_result shape mirror CC's actual output (see test/fixtures/cc-transcript-shape-snapshot.json for the schema reference). Content is fabricated/sanitized — no real source-code is checked into this fixture.",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        { "type": "text", "text": "Read proxy/extensions/cache-control-normalize.mjs and tell me what it does." }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "toolu_01ReadDupeA1",
+          "name": "Read",
+          "input": { "file_path": "/repo/proxy/extensions/cache-control-normalize.mjs" }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_01ReadDupeA1",
+          "content": "// Cache-control normalize: places exactly one cache_control marker on the last\n// system block and the last tool block. Removes any duplicate markers earlier\n// in the body so the API sees a deterministic prefix-cache shape across turns.\n// Order 400. See docs/extension-impact-guide.md section 5.\n"
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        { "type": "text", "text": "Got it. Let me re-read to double-check the cache_control logic on the system block." },
+        {
+          "type": "tool_use",
+          "id": "toolu_01ReadDupeA2",
+          "name": "Read",
+          "input": { "file_path": "/repo/proxy/extensions/cache-control-normalize.mjs" }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_01ReadDupeA2",
+          "content": "// Cache-control normalize: places exactly one cache_control marker on the last\n// system block and the last tool block. Removes any duplicate markers earlier\n// in the body so the API sees a deterministic prefix-cache shape across turns.\n// Order 400. See docs/extension-impact-guide.md section 5.\n"
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        { "type": "text", "text": "And once more to confirm the marker placement logic." },
+        {
+          "type": "tool_use",
+          "id": "toolu_01ReadDupeA3",
+          "name": "Read",
+          "input": { "file_path": "/repo/proxy/extensions/cache-control-normalize.mjs" }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_01ReadDupeA3",
+          "content": "// Cache-control normalize: places exactly one cache_control marker on the last\n// system block and the last tool block. Removes any duplicate markers earlier\n// in the body so the API sees a deterministic prefix-cache shape across turns.\n// Order 400. See docs/extension-impact-guide.md section 5.\n"
+        }
+      ]
+    }
+  ]
+}
