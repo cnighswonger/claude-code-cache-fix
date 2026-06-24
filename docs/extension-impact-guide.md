@@ -261,6 +261,45 @@ A single stderr line is emitted on enabled invocations that did something observ
 
 See `docs/directives/proxy-microcompact-cache-stability.md` for the full spec.
 
+### 12. `read-dedupe` (order 380) — opt-in via `CACHE_FIX_READ_DEDUPE=1`
+
+**What it fixes:** In long Read-heavy sessions (build loops, doc-iterating agents, test triage), the same file is re-read across many turns and each `Read` tool_result carries the full file body. Once the cache prefix breaks for any reason, the proxy pays full input-token cost for every redundant copy. Empirically this also correlates with the SNR-collapse pattern that drives unrecoverable 500 errors (Lead reconfirm on CC 2.1.128: SNR 0.27 / 184 duplicate Reads in a single session, worse than the original 2026-04 incident referenced in issue #85).
+
+This extension walks every `Read`-originated `tool_result`, keeps the **first** occurrence intact, and replaces later byte-identical occurrences with a stable pointer line referencing the keeper's `tool_use_id` and turn number.
+
+**ON (`CACHE_FIX_READ_DEDUPE=1`):** Builds a `tool_use_id → tool_use` map over assistant messages, then walks user `tool_result` blocks. Buckets occurrences by `sha256(file_path, content, offset, limit)`. First-by-(msgIdx, blockIdx) is the keeper; later occurrences become `(unchanged — see tool_use_id=<id> in turn <N>)`. Eligible content shapes are `string` and single-element `[{type:"text", text}]`; mixed/multi-element arrays are recorded in `read_tool_results_skipped_mixed_array` and skipped at detection (the Codex blocker fix from directive review #1 — preserves the byte-identity guarantee).
+
+**OFF (default):** The extension is loaded but exits on the first line of `onRequest`. Telemetry object is still attached with `enabled: false` so dashboards can detect the extension is present-but-inert.
+
+**Measured impact:** Pending live measurement; default-off until validated against real workloads, then revisit. Expected upside scales with Read-heavy workflows: a 30-turn session that re-reads three 50 KB files five times each pays ~750 KB/turn of redundant `tool_result` content after the first cache miss; this extension collapses that to roughly 12 × ~60-byte pointer lines per turn after the first occurrence — orders of magnitude in pathological cases, zero in workflows that don't re-read.
+
+**When to disable:** Always default. Disable for any workflow that legitimately depends on byte-identical replay of historical `Read` tool_results (rare, and would also break the cache anyway). Tracked under issue #85; directive at `docs/directives/proxy-read-dedupe.md`.
+
+**Telemetry surface (`ctx.meta.readDedupeStats`):**
+```js
+{
+  enabled,
+  total_tool_results_scanned,
+  read_tool_results_classified,
+  read_tool_results_skipped,
+  read_tool_results_skipped_mixed_array,
+  unique_keys,
+  duplicate_keys,
+  replacements_written,
+  bytes_original,
+  bytes_after,
+  bytes_saved,    // bytes_original - bytes_after; can be negative on tiny content (pointer text is ~55 bytes)
+}
+```
+
+Stderr summary on every enabled invocation:
+```
+[read-dedupe] replaced=N keys=K bytes=A->B (saved=X%) reads_seen=R
+[read-dedupe] no-op reads_seen=R (no duplicates)
+```
+
+**Byte-stability guarantee:** because the keeper is always the FIRST occurrence (not the last), pointer bytes never churn as new duplicates accumulate. The cache-miss profile is one miss per newly-added duplicate, not cascading. This was the load-bearing fix in directive Codex review #1.
+
 ## Preload-Only Features (v2.x, CC ≤v2.1.112)
 
 These features only work with the preload interceptor (`NODE_OPTIONS="--import ..."`). They do NOT work on CC v2.1.113+ (Bun binary). Use the proxy extensions above for current CC versions.
