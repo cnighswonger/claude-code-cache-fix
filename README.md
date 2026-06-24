@@ -150,6 +150,10 @@ All proxy settings are controlled via environment variables. Set them before sta
 | `CACHE_FIX_DEBUG` | `0` | Enable debug logging |
 | `CACHE_FIX_HOT_RELOAD` | unset | Set to `on` to enable in-process extension hot-reload. Off by default as of v4.0.0 — see [Upgrading from v3.x](#upgrading-from-v3x) for details and the supervisor restart flow. |
 | `CACHE_FIX_READ_DEDUPE` | unset | Set to `1` to dedupe repeat `Read` tool results that re-appear unchanged across turns. Keeps the first occurrence intact; replaces later byte-identical ones (keyed on `file_path` + content + `offset` + `limit`) with a stable pointer line. Default-off; opt in per session to validate before broader rollout. See [extension impact guide](docs/extension-impact-guide.md). |
+| `CACHE_FIX_ADVISOR_PLAN` | unset | Plan override for `tools/tier-advisor.mjs` — one of `max-5x`, `max-20x`, `pro`. Bypasses heuristic plan detection. See [Tier advisor](docs/tier-advisor.md). |
+| `CACHE_FIX_ADVISOR_UPGRADE_THRESHOLD` | `80` | Projected-Q7d percent that triggers an `UPGRADE` recommendation from tier-advisor. |
+| `CACHE_FIX_ADVISOR_DOWNGRADE_THRESHOLD` | `20` | Projected-Q7d percent that triggers a `DOWNGRADE` recommendation from tier-advisor (paired with the `DOWNGRADE_WEEKS` consecutive-weeks gate). |
+| `CACHE_FIX_ADVISOR_DOWNGRADE_WEEKS` | `2` | Consecutive completed weeks under the downgrade threshold required before tier-advisor recommends downgrade. Single-week dips never trigger; single-week spikes DO trigger upgrade (cost-of-being-throttled asymmetry). |
 
 ### Corporate environments (proxies, custom CAs)
 

@@ -20,6 +20,12 @@ On the first API call, the interceptor reads `~/.claude.json` and logs the curre
 
 Response headers are parsed for `anthropic-ratelimit-unified-5h-utilization` and `7d-utilization`, saved for consumption by status line hooks or other tools. Proxy mode (v3.5.0+, via `cache-telemetry` extension) splits state into `~/.claude/quota-status/account.json` (account-global facts) plus `~/.claude/quota-status/sessions/<filename>.json` (per-session cache facts), so multi-agent users no longer see cross-session contamination. Preload mode keeps the legacy single-file `~/.claude/quota-status.json` (single-session by construction).
 
+## Tier upgrade/downgrade advisor
+
+`tools/tier-advisor.mjs` is a CLI tool that consumes the proxy-written `account.json` snapshot and the per-call `usage.jsonl` log, projects this week's Q7d burn forward to the weekly reset, and emits a tier-change recommendation (`tier:upgrade` / `tier:downgrade` / `tier:ok` / `tier:unknown`). Designed to be run on a cron / shell alias; the cache-fix statusline picks up the persisted recommendation and appends a single token to the user's prompt.
+
+See [`docs/tier-advisor.md`](tier-advisor.md) for the full reference: exit codes, CLI flags, env vars (`CACHE_FIX_ADVISOR_*`), cron setup, state-file shape, and the FIRST-keeper byte-stability guarantee for the calendar-week-scoped history. Directive: [`docs/directives/proxy-tier-advisor.md`](directives/proxy-tier-advisor.md) (PR #93, issue #63).
+
 ## Peak hour detection
 
 Anthropic applies elevated quota drain rates during weekday peak hours (13:00–19:00 UTC, Mon–Fri). The interceptor detects peak windows and writes `peak_hour: true/false` to the quota-status payload (`account.json` in proxy mode, `quota-status.json` in preload mode). See `docs/peak-hours-reference.md` for sources and details.
