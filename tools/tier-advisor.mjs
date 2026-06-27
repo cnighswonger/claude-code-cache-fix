@@ -462,7 +462,7 @@ export async function runAdvisor({ argv = process.argv, env = process.env, now =
     if (planRes.plan === "unknown" || planRes.plan === "pro") {
       // pro tier is not a recommendation target; pro users shouldn't get
       // 5x/20x tier-advisor recommendations at all.
-      return emitUnknown(opts, writeOutput, planRes, opts.json);
+      return emitUnknown(opts, writeOutput, planRes, statePath);
     }
     const planTokens = PLAN_TOKENS[planRes.plan] || PLAN_TOKENS["max-5x"];
     const entries = readUsageLogEntriesSince(usageLogPath, weekStartMs);
@@ -482,7 +482,7 @@ export async function runAdvisor({ argv = process.argv, env = process.env, now =
   });
 
   if (planRes.plan === "unknown" || planRes.plan === "pro") {
-    return emitUnknown(opts, writeOutput, planRes, opts.json);
+    return emitUnknown(opts, writeOutput, planRes, statePath);
   }
 
   // Projection. Uses currentPctFromSource which is single-source: header q7dPct
@@ -634,9 +634,9 @@ function emitHardError(opts, writeOutput, msg) {
   return EXIT.hardError;
 }
 
-function emitUnknown(opts, writeOutput, planRes, _isJson) {
+function emitUnknown(opts, writeOutput, planRes, statePath) {
+  const ts = new Date().toISOString();
   if (writeOutput && !opts.quiet) {
-    const ts = new Date().toISOString();
     if (opts.json) {
       process.stdout.write(JSON.stringify({
         ts,
@@ -647,6 +647,30 @@ function emitUnknown(opts, writeOutput, planRes, _isJson) {
       }, null, 2) + "\n");
     } else {
       process.stdout.write(`Tier Advisor — ${ts}\n\nCurrent plan: unknown (set CACHE_FIX_ADVISOR_PLAN to override)\n\nRecommendation: UNKNOWN (plan undetectable)\n\nSet CACHE_FIX_ADVISOR_PLAN=max-5x or max-20x and re-run.\n`);
+    }
+  }
+  // Persist state so the statusline can display tier:unknown per the
+  // documented contract (docs/tier-advisor.md statusline section +
+  // tools/quota-statusline.sh allowlist). Codex r2 blocker: previously
+  // emitUnknown returned without touching state, so an exit-3 run never
+  // wrote last_recommendation:"tier:unknown" and the statusline stayed
+  // empty even though the wiring was ready to display it.
+  if (!opts.noState && statePath) {
+    try {
+      let state;
+      try {
+        state = loadAdvisorState(statePath);
+      } catch (err) {
+        if (err && err.hardError) return EXIT.unknown;
+        throw err;
+      }
+      state.last_run = ts;
+      state.last_recommendation = "tier:unknown";
+      persistAdvisorState(statePath, state);
+    } catch {
+      // Persist failures on the unknown path are non-fatal: we already
+      // have an exit-3 to report and a stdout message; not worth
+      // upgrading to exit 4 just because the state file is unwritable.
     }
   }
   return EXIT.unknown;

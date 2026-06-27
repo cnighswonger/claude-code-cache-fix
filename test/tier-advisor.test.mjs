@@ -583,6 +583,68 @@ test("34. Plan unknown (no override + heuristic fails) → exit 3, recommendatio
   } finally { rmSync(dir, { recursive: true }); }
 });
 
+// Codex r2 blocker regression tests. The exit-3 (tier:unknown) paths
+// must persist last_recommendation:"tier:unknown" so the statusline can
+// display it. Two paths reach this: (a) plan heuristic + override both
+// unresolved (handler at runAdvisor:484), (b) pro plan during log
+// fallback (handler at runAdvisor:462). Both must write state.
+
+test("34a. Exit-3 unknown path persists last_recommendation:'tier:unknown' to state", () => {
+  const dir = makeTempDir();
+  try {
+    writeQuotaStatus(dir, { q7dPct: 50 });
+    const env = {
+      HOME: dir,
+      CACHE_FIX_ADVISOR_QUOTA_STATUS: join(dir, "account.json"),
+      CACHE_FIX_ADVISOR_USAGE_LOG: join(dir, "noexist.jsonl"),
+      CACHE_FIX_ADVISOR_STATE: join(dir, "state.json"),
+      // No CACHE_FIX_ADVISOR_PLAN → heuristic fails → unknown
+    };
+    const r = runCli([], env);
+    assert.equal(r.exit, 3);
+    const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
+    assert.equal(state.last_recommendation, "tier:unknown");
+    assert.ok(state.last_run, "last_run should be populated");
+  } finally { rmSync(dir, { recursive: true }); }
+});
+
+test("34b. Pro plan via log-fallback path → exit 3 AND state persisted as tier:unknown", () => {
+  const dir = makeTempDir();
+  try {
+    // No account.json + high usage.jsonl + pro plan → log-fallback enters
+    // emitUnknown via the planRes.plan === "pro" branch in runAdvisor.
+    const entry = { ts: new Date().toISOString(), usage: { input_tokens: 1_000_000, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } };
+    writeUsageLog(dir, [entry]);
+    const env = {
+      HOME: dir,
+      CACHE_FIX_ADVISOR_QUOTA_STATUS: join(dir, "noexist.json"),
+      CACHE_FIX_ADVISOR_USAGE_LOG: join(dir, "usage.jsonl"),
+      CACHE_FIX_ADVISOR_STATE: join(dir, "state.json"),
+      CACHE_FIX_ADVISOR_PLAN: "pro",
+    };
+    const r = runCli([], env);
+    assert.equal(r.exit, 3, `expected unknown exit 3; got ${r.exit}; stdout=${r.stdout}`);
+    const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
+    assert.equal(state.last_recommendation, "tier:unknown");
+  } finally { rmSync(dir, { recursive: true }); }
+});
+
+test("34c. --no-state with unknown path → exit 3 AND no state file written", () => {
+  const dir = makeTempDir();
+  try {
+    writeQuotaStatus(dir, { q7dPct: 50 });
+    const env = {
+      HOME: dir,
+      CACHE_FIX_ADVISOR_QUOTA_STATUS: join(dir, "account.json"),
+      CACHE_FIX_ADVISOR_USAGE_LOG: join(dir, "noexist.jsonl"),
+      CACHE_FIX_ADVISOR_STATE: join(dir, "state.json"),
+    };
+    const r = runCli(["--no-state"], env);
+    assert.equal(r.exit, 3);
+    assert.ok(!existsSync(join(dir, "state.json")), "--no-state should not write a state file even on unknown path");
+  } finally { rmSync(dir, { recursive: true }); }
+});
+
 // =============================================================================
 // CALENDAR-WEEK SEMANTICS (35-38) — Codex r1 blocker fix #2
 // =============================================================================
