@@ -59,7 +59,6 @@ export function parseArgs(argv) {
     json: false,
     quiet: false,
     noState: false,
-    week: 0,           // current week
     planOverride: null,
     help: false,
   };
@@ -69,8 +68,6 @@ export function parseArgs(argv) {
     else if (a === "--quiet") opts.quiet = true;
     else if (a === "--no-state") opts.noState = true;
     else if (a === "--help" || a === "-h") opts.help = true;
-    else if (a === "--week") opts.week = parseInt(argv[++i], 10) || 0;
-    else if (a.startsWith("--week=")) opts.week = parseInt(a.slice(7), 10) || 0;
     else if (a === "--plan") opts.planOverride = argv[++i];
     else if (a.startsWith("--plan=")) opts.planOverride = a.slice(7);
   }
@@ -107,6 +104,30 @@ export function computeBurnRateFromUsageLog(entries, weekStartTs, hoursSinceRese
   }
   const pct = (total / planTokens) * 100;
   return pct / hoursSinceReset;
+}
+
+// Single-source companion to computeBurnRateFromUsageLog: returns the
+// week-to-date consumed percent from the SAME weighted token sum used
+// for burn rate. Codex r1 blocker: the fallback path previously left
+// currentPct null/stale while reporting log-derived burn, which would
+// silently suppress an upgrade recommendation when account.json was
+// absent or stale. Co-derived currentPct + burnRate keep the projection
+// honest under the binary "primary header / fallback log" rule.
+export function computeCurrentPctFromUsageLog(entries, weekStartTs, planTokens) {
+  if (!Array.isArray(entries)) return 0;
+  if (!Number.isFinite(planTokens) || planTokens <= 0) return 0;
+  let total = 0;
+  for (const e of entries) {
+    if (!e || typeof e !== "object") continue;
+    const ts = Date.parse(e.ts || e.timestamp || "");
+    if (!Number.isFinite(ts) || ts < weekStartTs) continue;
+    const u = e.usage || e;
+    const inp = Number(u.input_tokens) || 0;
+    const cc = Number(u.cache_creation_input_tokens) || 0;
+    const cr = Number(u.cache_read_input_tokens) || 0;
+    total += inp + cc + cr * 0.1;
+  }
+  return (total / planTokens) * 100;
 }
 
 export function projectQ7dAtReset(currentPct, burnRatePerHour, hoursUntilReset) {
@@ -286,9 +307,12 @@ function readUsageLogEntriesSince(path, weekStartTs) {
   return out;
 }
 
-// Median Q5h budget from recent usage log, used for plan heuristic.
-// Right now this is a stub returning null; the heuristic can be sharpened
-// later. The CLI override + env-var path covers practical use.
+// Plan-heuristic input. v1 is intentionally stubbed: returns null so the
+// detectPlan heuristic branch is skipped and detection falls back to CLI
+// override / CACHE_FIX_ADVISOR_PLAN / "unknown". The practical path is the
+// CLI/env override — documented in docs/tier-advisor.md and surfaced via
+// exit code 3 with a "set CACHE_FIX_ADVISOR_PLAN" hint when neither is set.
+// Sharpening the heuristic from real Q5h budget patterns is a follow-up.
 function recentQ5hBudgetTokens(_quotaStatus, _usageLog) {
   return null;
 }
@@ -411,10 +435,14 @@ export async function runAdvisor({ argv = process.argv, env = process.env, now =
 
   // Compute burn rate via the SINGLE binary rule.
   // Primary: snapshot Q7d / hours_since_reset, when snapshot mtime is fresh.
-  // Fallback: usage.jsonl token sum over the week.
+  // Fallback: usage.jsonl token sum over the week — derives BOTH currentPct
+  // AND burnRate from the same sum so projection is honest. Codex r1 blocker
+  // fix: previously this branch left currentPct as null/stale, so projection
+  // collapsed to 0 and silently returned tier:ok under high burn.
   let burnRate = null;
   let burnRateSource = null;
   let burnRateWindowHours = null;
+  let currentPctFromSource = typeof q7dPct === "number" ? q7dPct : null;
 
   const snapshotFresh = snapshotTs !== null
     && (now - snapshotTs) <= PRIMARY_FRESHNESS_HOURS * 3600 * 1000;
@@ -422,6 +450,7 @@ export async function runAdvisor({ argv = process.argv, env = process.env, now =
     burnRate = computeBurnRate(q7dPct, hoursSinceReset);
     burnRateSource = "header";
     burnRateWindowHours = Math.round(hoursSinceReset);
+    currentPctFromSource = q7dPct;
   } else if (hasUsageLog) {
     // Plan detection happens first so we know which planTokens to use.
     // If plan is unknown, the log-fallback path can't normalize → exit 3.
@@ -440,6 +469,9 @@ export async function runAdvisor({ argv = process.argv, env = process.env, now =
     burnRate = computeBurnRateFromUsageLog(entries, weekStartMs, hoursSinceReset, planTokens);
     burnRateSource = "log";
     burnRateWindowHours = Math.round(hoursSinceReset);
+    // Single-source rule: derive currentPct from the SAME log sum that
+    // produced burnRate. Never blend with stale q7dPct from account.json.
+    currentPctFromSource = computeCurrentPctFromUsageLog(entries, weekStartMs, planTokens);
   }
 
   // Plan detection (re-resolve if not already done — most paths skip the log-fallback).
@@ -453,10 +485,11 @@ export async function runAdvisor({ argv = process.argv, env = process.env, now =
     return emitUnknown(opts, writeOutput, planRes, opts.json);
   }
 
-  // Projection.
-  const projected = (burnRate !== null && typeof q7dPct === "number")
-    ? projectQ7dAtReset(q7dPct, burnRate, hoursUntilReset)
-    : (typeof q7dPct === "number" ? q7dPct : 0);
+  // Projection. Uses currentPctFromSource which is single-source: header q7dPct
+  // when the snapshot was fresh, log-derived percent when the fallback fired.
+  const projected = (burnRate !== null && typeof currentPctFromSource === "number")
+    ? projectQ7dAtReset(currentPctFromSource, burnRate, hoursUntilReset)
+    : (typeof currentPctFromSource === "number" ? currentPctFromSource : 0);
 
   // State load.
   let state = INITIAL_STATE;
@@ -483,11 +516,15 @@ export async function runAdvisor({ argv = process.argv, env = process.env, now =
     && weekBoundaryCrossed(lastRunTs, now, justCompletedWeekEnding)
     && !state.weeks.some((w) => w && Date.parse(w.week_ending) === justCompletedWeekEnding)
   ) {
+    // Persist from the single source (header or log) that drove this run's
+    // projection. Codex r1: never carry stale account.json q7dPct into the
+    // weeks[] record when the run was a log-fallback.
+    const observed = typeof currentPctFromSource === "number" ? currentPctFromSource : projected;
     state.weeks = [
       {
         week_ending: new Date(justCompletedWeekEnding).toISOString(),
-        q7d_actual_at_reset: typeof q7dPct === "number" ? q7dPct : projected,
-        under_downgrade: (typeof q7dPct === "number" ? q7dPct : projected) < downgradeThreshold,
+        q7d_actual_at_reset: observed,
+        under_downgrade: observed < downgradeThreshold,
         tier_assumed: planRes.plan,
       },
       ...state.weeks,
@@ -514,7 +551,7 @@ export async function runAdvisor({ argv = process.argv, env = process.env, now =
     ts: new Date(now).toISOString(),
     current_plan: planRes.plan,
     current_plan_source: planRes.source,
-    current_q7d_pct: typeof q7dPct === "number" ? q7dPct : null,
+    current_q7d_pct: typeof currentPctFromSource === "number" ? currentPctFromSource : null,
     hours_since_reset: Number.isFinite(hoursSinceReset) ? Math.round(hoursSinceReset) : null,
     hours_until_reset: Number.isFinite(hoursUntilReset) ? hoursUntilReset : null,
     burn_rate_per_hour: burnRate,
@@ -625,7 +662,6 @@ Options:
   --json                       machine-readable JSON output
   --quiet                      no stdout/stderr; exit code only
   --no-state                   don't read or write state file
-  --week N                     analyze week N weeks ago (testing)
   --plan max-5x|max-20x|pro    override plan detection
   --help                       this text
 

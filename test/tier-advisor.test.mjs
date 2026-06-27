@@ -401,11 +401,14 @@ test("27. Statusline omits tier: token when last_recommendation is tier:ok", () 
 // CLI ARGS (28-30)
 // =============================================================================
 
-test("28. --week 1 affects analysis (smoke; CLI accepts the flag)", () => {
-  // The implementation treats --week 0 as current; --week >0 as historical
-  // analysis. Smoke: pass --week 1 and confirm the CLI accepts it.
+test("28. unknown flags don't crash parseArgs (v1 only ships --json/--quiet/--no-state/--plan/--help)", () => {
+  // Historical-week analysis is not in v1; --week is intentionally unparsed.
+  // Unknown args are silently ignored rather than rejected so future additions
+  // can land without breaking older wrapper scripts.
   const opts = parseArgs(["node", "tier-advisor.mjs", "--week", "1"]);
-  assert.equal(opts.week, 1);
+  assert.equal(opts.json, false);
+  assert.equal(opts.quiet, false);
+  assert.equal(opts.planOverride, null);
 });
 
 test("29. --plan flag wins over CACHE_FIX_ADVISOR_PLAN env", () => {
@@ -470,6 +473,61 @@ test("31. account.json missing AND usage.jsonl missing → hard error exit 4", (
     };
     const r = runCli([], env);
     assert.equal(r.exit, 4);
+  } finally { rmSync(dir, { recursive: true }); }
+});
+
+// Codex r1 blocker regression tests. The previous fallback path left
+// current_q7d_pct null / stale and projection=0, silently producing tier:ok
+// on high-burn fallback. Both must now derive current_q7d_pct from the
+// same log sum that drives burn_rate, so a 200M-token week on max-5x exits 1.
+
+test("31a. stale account.json + high usage.jsonl → log fallback, projection from log, exit 1 (upgrade)", () => {
+  const dir = makeTempDir();
+  try {
+    // Snapshot is 48h old (PRIMARY_FRESHNESS_HOURS=24) so the header path is
+    // disqualified and the log fallback fires.
+    const staleTs = new Date(Date.now() - 48 * 3600 * 1000).toISOString();
+    writeQuotaStatus(dir, { q7dPct: 5, snapshotTs: staleTs });
+    const entry = { ts: new Date().toISOString(), usage: { input_tokens: 200_000_000, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } };
+    writeUsageLog(dir, [entry]);
+    const env = {
+      HOME: dir,
+      CACHE_FIX_ADVISOR_QUOTA_STATUS: join(dir, "account.json"),
+      CACHE_FIX_ADVISOR_USAGE_LOG: join(dir, "usage.jsonl"),
+      CACHE_FIX_ADVISOR_STATE: join(dir, "state.json"),
+      CACHE_FIX_ADVISOR_PLAN: "max-5x",
+    };
+    const r = runCli(["--json"], env);
+    assert.equal(r.exit, 1, `expected upgrade exit 1, got ${r.exit}; stdout=${r.stdout}`);
+    const obj = JSON.parse(r.stdout);
+    assert.equal(obj.burn_rate_source, "log");
+    // current_q7d_pct must come from the log sum, not the stale header's 5%.
+    assert.ok(typeof obj.current_q7d_pct === "number" && obj.current_q7d_pct >= 80,
+      `expected log-derived current_q7d_pct ≥80; got ${obj.current_q7d_pct}`);
+    assert.equal(obj.recommendation, "upgrade");
+  } finally { rmSync(dir, { recursive: true }); }
+});
+
+test("31b. missing account.json + high usage.jsonl → log fallback, projection from log, exit 1 (upgrade)", () => {
+  const dir = makeTempDir();
+  try {
+    // No account.json at all. Log alone should drive a valid upgrade decision.
+    const entry = { ts: new Date().toISOString(), usage: { input_tokens: 200_000_000, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } };
+    writeUsageLog(dir, [entry]);
+    const env = {
+      HOME: dir,
+      CACHE_FIX_ADVISOR_QUOTA_STATUS: join(dir, "noexist.json"),
+      CACHE_FIX_ADVISOR_USAGE_LOG: join(dir, "usage.jsonl"),
+      CACHE_FIX_ADVISOR_STATE: join(dir, "state.json"),
+      CACHE_FIX_ADVISOR_PLAN: "max-5x",
+    };
+    const r = runCli(["--json"], env);
+    assert.equal(r.exit, 1, `expected upgrade exit 1, got ${r.exit}; stdout=${r.stdout}`);
+    const obj = JSON.parse(r.stdout);
+    assert.equal(obj.burn_rate_source, "log");
+    assert.ok(typeof obj.current_q7d_pct === "number" && obj.current_q7d_pct >= 80,
+      `expected log-derived current_q7d_pct ≥80; got ${obj.current_q7d_pct}`);
+    assert.equal(obj.recommendation, "upgrade");
   } finally { rmSync(dir, { recursive: true }); }
 });
 
@@ -581,18 +639,16 @@ test("38. Multiple runs within same week do not accumulate weeks entries", () =>
 // =============================================================================
 
 test("parseArgs: handles all documented flags", () => {
-  const opts = parseArgs(["node", "tier-advisor.mjs", "--json", "--quiet", "--no-state", "--week", "2", "--plan", "max-20x"]);
+  const opts = parseArgs(["node", "tier-advisor.mjs", "--json", "--quiet", "--no-state", "--plan", "max-20x"]);
   assert.equal(opts.json, true);
   assert.equal(opts.quiet, true);
   assert.equal(opts.noState, true);
-  assert.equal(opts.week, 2);
   assert.equal(opts.planOverride, "max-20x");
 });
 
-test("parseArgs: --plan=foo and --week=N forms work", () => {
-  const opts = parseArgs(["node", "tier-advisor.mjs", "--plan=max-5x", "--week=3"]);
+test("parseArgs: --plan=foo equals form works", () => {
+  const opts = parseArgs(["node", "tier-advisor.mjs", "--plan=max-5x"]);
   assert.equal(opts.planOverride, "max-5x");
-  assert.equal(opts.week, 3);
 });
 
 test("parseArgs: --help short-circuits", () => {

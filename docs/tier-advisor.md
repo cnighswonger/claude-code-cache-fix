@@ -15,6 +15,7 @@ The advisor reads three inputs:
 It computes:
 
 - **Burn rate** — `current_q7d_pct / hours_since_weekly_reset` when the `account.json` snapshot is fresh (within 24h). Otherwise, sums the weighted token count from `usage.jsonl` since the start of the week, divides by the plan's 100% budget (204M for 5x, 892M for 20x — empirical 4.4× multiplier), and normalizes per hour. **Never blends sources** — the rule is binary primary-or-fallback, recorded in the output as `burn_rate_source: "header"|"log"`.
+- **Single-source `current_q7d_pct`** — when the log fallback fires, the same weighted token sum drives `current_q7d_pct` as well as `burn_rate_per_hour`. The advisor never combines a stale/missing `account.json` percent with log-derived burn (Codex r1 blocker fix).
 - **Projection** — `current_q7d_pct + burn_rate × hours_until_reset`, capped at 200%.
 - **Recommendation** — `upgrade` if projected ≥ upgrade threshold (default 80%). `downgrade` if projected < downgrade threshold (default 20%) AND the most recent N completed weeks (default 2) were also under threshold. Otherwise `ok`.
 
@@ -52,9 +53,10 @@ Codes 1, 2, 3 are NOT errors in the shell sense — they signal the recommendati
 | `--json` | machine-readable output (JSON) |
 | `--quiet` | no stdout/stderr; exit code only |
 | `--no-state` | don't read or write the state file (one-shot analysis) |
-| `--week N` | analyze week N weeks ago instead of current (testing/debugging) |
 | `--plan max-5x\|max-20x\|pro` | override plan detection (highest priority) |
 | `--help` | usage |
+
+Historical-week analysis (`--week N`) is not in v1; the advisor only inspects the in-progress week. See the follow-up issue tracked from PR #244 for the design.
 
 ## Env vars
 
@@ -141,7 +143,7 @@ In order of priority:
 
 1. **`--plan` CLI flag** (highest priority).
 2. **`CACHE_FIX_ADVISOR_PLAN` env var**.
-3. **Heuristic** from recent Q5h budget patterns in `account.json` — currently a stub returning unknown when no override exists; the CLI override + env-var path covers the practical case.
+3. **Heuristic from recent Q5h budgets** — **not implemented in v1**. The hook in the code (`recentQ5hBudgetTokens()`) returns `null`, so detection skips straight to the fallback. The CLI override + env-var path is the supported way to pin a plan; sharpening the heuristic is a follow-up.
 4. **Fallback `tier:unknown`** with exit code `3` — the recommendation tells you to set `CACHE_FIX_ADVISOR_PLAN`.
 
 ## Optional enrichment
