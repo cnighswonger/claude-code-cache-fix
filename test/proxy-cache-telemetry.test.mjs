@@ -690,3 +690,74 @@ test("11. sweep failure isolation: response completes even if a deletion would f
     env.cleanup();
   }
 });
+
+// --- Issue #247: ttl_tier from the MEASURED ephemeral split, not a guess ---
+
+// driveResponse() sends only a scalar cache_creation_input_tokens; these cases
+// need the per-tier object usage.cache_creation.{ephemeral_1h,ephemeral_5m},
+// so drive the hooks inline and read the written session file.
+async function driveWithSplit({ sid, cacheRead, ephemeral1h, ephemeral5m }) {
+  const meta = {};
+  const telemetry = {};
+  await ext.onRequest({ headers: { "x-claude-code-session-id": sid }, meta });
+  await ext.onResponseStart({ headers: QUOTA_HEADERS, meta });
+  await ext.onStreamEvent({
+    event: { type: "message_start", message: { usage: {
+      cache_read_input_tokens: cacheRead,
+      cache_creation_input_tokens: ephemeral1h + ephemeral5m,
+      cache_creation: {
+        ephemeral_1h_input_tokens: ephemeral1h,
+        ephemeral_5m_input_tokens: ephemeral5m,
+      },
+      input_tokens: 5,
+    } } },
+    telemetry, meta,
+  });
+  await ext.onStreamEvent({ event: { type: "message_delta", usage: { output_tokens: 10 } }, telemetry, meta });
+}
+
+function readSession(home, sid) {
+  return JSON.parse(readFileSync(join(home, ".claude", "quota-status", "sessions", `${sid}.json`), "utf8"));
+}
+
+test("#247: 1h-dominant split with cache_read=0 labels ttl_tier 1h (was mislabeled 5m)", async () => {
+  const env = setupTmpHome();
+  try {
+    // Fresh-prefix request (a workflow subagent's first turn): cache_read=0 but
+    // the API cached it at 1h. The old heuristic (cr>0 ? 1h : 5m) said 5m.
+    await driveWithSplit({ sid: "ttl-1h", cacheRead: 0, ephemeral1h: 2000, ephemeral5m: 0 });
+    const sess = readSession(env.home, "ttl-1h");
+    assert.equal(sess.cache.ttl_tier, "1h");
+    assert.equal(sess.cache.ephemeral_1h, 2000);
+    assert.equal(sess.cache.ephemeral_5m, 0);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("#247: 5m-dominant split with cache_read>0 labels ttl_tier 5m (was mislabeled 1h)", async () => {
+  const env = setupTmpHome();
+  try {
+    // Genuine 5m downgrade: cache_read>0 but the split is 5m. The old heuristic
+    // said 1h, hiding the red TTL:5m downgrade the statusline should surface.
+    await driveWithSplit({ sid: "ttl-5m", cacheRead: 500, ephemeral1h: 0, ephemeral5m: 1500 });
+    const sess = readSession(env.home, "ttl-5m");
+    assert.equal(sess.cache.ttl_tier, "5m");
+    assert.equal(sess.cache.ephemeral_5m, 1500);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("#247: no split present falls back to the cache_read heuristic", async () => {
+  const env = setupTmpHome();
+  try {
+    // driveResponse sends a scalar cache_creation only (no ephemeral object), so
+    // the fix must fall back to the old heuristic: cc>0, cr=0 -> 5m.
+    await driveResponse({ headers: { "x-claude-code-session-id": "ttl-fallback" } });
+    const sess = readSession(env.home, "ttl-fallback");
+    assert.equal(sess.cache.ttl_tier, "5m");
+  } finally {
+    env.cleanup();
+  }
+});

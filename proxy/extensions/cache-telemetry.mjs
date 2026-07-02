@@ -324,10 +324,17 @@ export default {
       }
       if (event.message?.usage) {
         const usage = event.message.usage;
+        // cache_creation may be a scalar (total) AND/OR an object carrying the
+        // per-tier split { ephemeral_1h_input_tokens, ephemeral_5m_input_tokens }.
+        // Capture the split when present so ttl_tier reflects the ACTUAL cache
+        // TTL the API used, not a heuristic guessed from cache_read presence.
+        const cco = usage.cache_creation;
         ctx.meta.cacheStats = {
           cacheRead: usage.cache_read_input_tokens || 0,
           cacheCreation: usage.cache_creation_input_tokens || 0,
           inputTokens: usage.input_tokens || 0,
+          ephemeral1h: (cco && cco.ephemeral_1h_input_tokens) || 0,
+          ephemeral5m: (cco && cco.ephemeral_5m_input_tokens) || 0,
         };
       }
     }
@@ -345,10 +352,20 @@ export default {
       const total = cr + cc;
       const hitRate = total > 0 ? ((cr / total) * 100).toFixed(1) : "N/A";
 
-      const ephemeral1h = cc;
-      const ephemeral5m = 0;
-
-      const ttl = cr > 0 ? "1h" : (cc > 0 ? "5m" : "unknown");
+      // Prefer the MEASURED per-tier split from usage.cache_creation
+      // (ephemeral_1h/5m_input_tokens). Only when the API omits the split (older
+      // shapes) do we fall back to the coarse heuristic. Previously ephemeral1h
+      // was hardcoded to cc and ttl was guessed from cache_read presence, which
+      // made ttl_tier flicker 1h<->5m across a workflow's fan-out even when the
+      // cache was uniformly 1h.
+      const ephemeral1h = stats.ephemeral1h || 0;
+      const ephemeral5m = stats.ephemeral5m || 0;
+      let ttl;
+      if (ephemeral1h > 0 || ephemeral5m > 0) {
+        ttl = ephemeral1h >= ephemeral5m ? "1h" : "5m";
+      } else {
+        ttl = cr > 0 ? "1h" : (cc > 0 ? "5m" : "unknown");
+      }
 
       const timestamp = new Date().toISOString();
       const rawSid = ctx.meta._sessionId;
