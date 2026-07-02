@@ -27,6 +27,29 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:9801 claude
 
 That's it. The proxy applies its default extension pipeline automatically. No wrapper scripts, no `NODE_OPTIONS`, no preload.
 
+### Forward-proxy mode (keeps Remote Control working)
+
+The quick-start above is **reverse-proxy mode**: you point `ANTHROPIC_BASE_URL` at the proxy. That is simple, but on Claude Code **>= 2.1.196** a non-Anthropic `ANTHROPIC_BASE_URL` **disables Remote Control** (`/remote-control`), `/schedule`, and claude.ai MCP connectors (CC treats any custom base URL like a Bedrock/Vertex gateway). If you rely on those features, use forward-proxy mode instead.
+
+In **forward-proxy mode** the proxy sits in front of the *real* `api.anthropic.com` as an `HTTPS_PROXY`. Claude Code's base URL stays `api.anthropic.com`, so Remote Control keeps working, while the proxy still sees and transforms `/v1/messages`.
+
+```bash
+# Start the proxy in forward-proxy mode
+CACHE_FIX_FORWARD_PROXY=on node "$(npm root -g)/claude-code-cache-fix/proxy/server.mjs" &
+# It prints the two env vars to wire the client, e.g.:
+#   export HTTPS_PROXY=http://127.0.0.1:9801
+#   export NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem
+
+# Launch Claude Code through it (leave ANTHROPIC_BASE_URL UNSET)
+HTTPS_PROXY=http://127.0.0.1:9801 \
+NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem \
+  claude
+```
+
+How it works: the proxy also handles HTTP `CONNECT`. It MITMs **only** the upstream host (`api.anthropic.com`), terminating TLS with a locally-generated CA so it can run the same extension pipeline, and **blind-tunnels every other CONNECT** (mcp-proxy, telemetry, npm, ...) untouched. On first start it generates a CA under `~/.claude/cache-fix-ca/` (override with `CACHE_FIX_CA_DIR`); the client must trust it via `NODE_EXTRA_CA_CERTS`. A WebSocket/Upgrade to the upstream host (e.g. `/voice`) is relayed to upstream as-is. Because base URL stays `api.anthropic.com`, all of `/api/oauth/*`, `/v1/agents`, Remote Control credential fetches, etc. pass through untouched and RC stays enabled.
+
+Corporate proxy chaining works the same as reverse mode: set `HTTPS_PROXY`/`HTTP_PROXY` for the proxy's **own** upstream egress (the proxy dials `api.anthropic.com` through it). The client's `HTTPS_PROXY` points at the cache-fix proxy; the cache-fix proxy's `HTTPS_PROXY` (in its own env) points at the corporate proxy.
+
 ### What the proxy does
 
 On every `/v1/messages` request, the pipeline runs an ordered chain of extensions covering cache stability, observability, thinking-desync mitigation, image, microcompact, breakpoint, bootstrap-channel, and other surfaces. Several are gated behind env vars documented in their own sections below; bootstrap-channel handling defaults to `audit` mode. The headliners:
@@ -128,6 +151,22 @@ docker run -d --name cache-fix-proxy --restart=always -p 9801:9801 \
   ghcr.io/cnighswonger/claude-code-cache-fix:latest
 ```
 
+**Forward-proxy mode in Docker** (keeps Remote Control; see [Forward-proxy mode](#forward-proxy-mode-keeps-remote-control-working)). Add `-e CACHE_FIX_FORWARD_PROXY=on` and point `CACHE_FIX_CA_DIR` at a writable path. The image runs as the unprivileged `node` user (uid 1000), and a fresh Docker named volume mounts **root-owned**, so use a bind mount you `chown` to uid 1000 (this also persists the CA across restarts and lets the host read it):
+
+```bash
+mkdir -p ./cache-fix-ca && sudo chown 1000:1000 ./cache-fix-ca
+docker run -d --name cache-fix-proxy --restart=always -p 9801:9801 \
+  -e CACHE_FIX_FORWARD_PROXY=on \
+  -e CACHE_FIX_CA_DIR=/ca -v "$PWD/cache-fix-ca:/ca" \
+  ghcr.io/cnighswonger/claude-code-cache-fix:latest
+
+# The CA is now at ./cache-fix-ca/ca.pem on the host. Point the client at the
+# proxy (leave ANTHROPIC_BASE_URL unset so Remote Control stays enabled):
+HTTPS_PROXY=http://127.0.0.1:9801 NODE_EXTRA_CA_CERTS=$PWD/cache-fix-ca/ca.pem claude
+```
+
+If you don't need the CA to persist on the host, drop the volume and let it live in the container's writable layer: `-e CACHE_FIX_CA_DIR=/tmp/cache-fix-ca` (then `docker cp cache-fix-proxy:/tmp/cache-fix-ca/ca.pem ./ca.pem` to fetch it). Check it worked: `curl -s localhost:9801/health` must report `"forward_proxy":true`; a `false` there means the proxy fell back to reverse-proxy (e.g. an unwritable CA dir).
+
 ### Health check
 
 ```bash
@@ -144,6 +183,8 @@ All proxy settings are controlled via environment variables. Set them before sta
 | `CACHE_FIX_PROXY_PORT` | `9801` | Listen port |
 | `CACHE_FIX_PROXY_BIND` | `127.0.0.1` | Bind address |
 | `CACHE_FIX_PROXY_UPSTREAM` | `https://api.anthropic.com` | Upstream URL. Change to chain another proxy (e.g. `http://localhost:8080`) |
+| `CACHE_FIX_FORWARD_PROXY` | unset | Set to `on` for forward-proxy mode (HTTP CONNECT + selective MITM of the upstream host) so the client points `HTTPS_PROXY` at the proxy instead of `ANTHROPIC_BASE_URL`, keeping Remote Control enabled. See [Forward-proxy mode](#forward-proxy-mode-keeps-remote-control-working). |
+| `CACHE_FIX_CA_DIR` | `~/.claude/cache-fix-ca` | Directory for the forward-proxy CA/leaf cert (generated once on first start). The client trusts `ca.pem` via `NODE_EXTRA_CA_CERTS`. |
 | `CACHE_FIX_PROXY_TIMEOUT` | `600000` | Request timeout in milliseconds |
 | `CACHE_FIX_EXTENSIONS_DIR` | `proxy/extensions/` | Directory for extension `.mjs` files |
 | `CACHE_FIX_EXTENSIONS_CONFIG` | `proxy/extensions.json` | Extension configuration file |

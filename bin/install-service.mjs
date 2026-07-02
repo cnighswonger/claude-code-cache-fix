@@ -31,6 +31,12 @@ function getDefaults() {
     // generated unit/plist via `CACHE_FIX_HOT_RELOAD=on cache-fix-proxy
     // install-service`. Strict "on" match — anything else renders nothing.
     hotReload: process.env.CACHE_FIX_HOT_RELOAD === "on" ? "on" : "",
+    // Forward-proxy mode (CONNECT + selective MITM) so the SERVICE runs the
+    // proxy in the RC-preserving mode. Baked in at install time via
+    // `CACHE_FIX_FORWARD_PROXY=on cache-fix-proxy install-service`. Strict "on"
+    // match, same as hotReload. Note: clients still wire HTTPS_PROXY +
+    // NODE_EXTRA_CA_CERTS themselves (the service only controls the proxy end).
+    forwardProxy: process.env.CACHE_FIX_FORWARD_PROXY === "on" ? "on" : "",
     workingDir: resolve(__dirname, ".."),
   };
 }
@@ -110,6 +116,9 @@ function renderSystemdTemplate(template, vars) {
   const hotReloadLine = vars.hotReload
     ? `Environment=CACHE_FIX_HOT_RELOAD=${vars.hotReload}`
     : "";
+  const forwardProxyLine = vars.forwardProxy
+    ? `Environment=CACHE_FIX_FORWARD_PROXY=${vars.forwardProxy}`
+    : "";
   // Allow callers to wire a Requires= line (e.g. another service the proxy
   // chains to). Empty string by default so the unit has no extra deps.
   const requiresLine = vars.requires
@@ -124,6 +133,7 @@ function renderSystemdTemplate(template, vars) {
     .replaceAll("{{REJECT_UNAUTHORIZED_LINE}}", rejectUnauthorizedLine)
     .replaceAll("{{DEBUG_LINE}}", debugLine)
     .replaceAll("{{HOT_RELOAD_LINE}}", hotReloadLine)
+    .replaceAll("{{FORWARD_PROXY_LINE}}", forwardProxyLine)
     .replaceAll("{{REQUIRES_LINE}}", requiresLine)
     .replaceAll("{{WORKING_DIR}}", vars.workingDir)
     // Collapse triple newlines from empty optional lines down to single blank
@@ -146,6 +156,9 @@ function renderLaunchdTemplate(template, vars) {
   const hotReloadPlist = vars.hotReload
     ? `        <key>CACHE_FIX_HOT_RELOAD</key>\n        <string>${vars.hotReload}</string>`
     : "";
+  const forwardProxyPlist = vars.forwardProxy
+    ? `        <key>CACHE_FIX_FORWARD_PROXY</key>\n        <string>${vars.forwardProxy}</string>`
+    : "";
   return template
     .replaceAll("{{NODE}}", vars.node)
     .replaceAll("{{SERVER_PATH}}", vars.serverPath)
@@ -155,6 +168,7 @@ function renderLaunchdTemplate(template, vars) {
     .replaceAll("{{REJECT_UNAUTHORIZED_PLIST}}", rejectUnauthorizedPlist)
     .replaceAll("{{DEBUG_PLIST}}", debugPlist)
     .replaceAll("{{HOT_RELOAD_PLIST}}", hotReloadPlist)
+    .replaceAll("{{FORWARD_PROXY_PLIST}}", forwardProxyPlist)
     .replaceAll("{{WORKING_DIR}}", vars.workingDir)
     .replaceAll("{{LOG_DIR}}", vars.logDir)
     .replace(/\n\n+/g, "\n");

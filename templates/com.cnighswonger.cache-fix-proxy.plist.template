@@ -18,6 +18,7 @@
 {{REJECT_UNAUTHORIZED_PLIST}}
 {{DEBUG_PLIST}}
 {{HOT_RELOAD_PLIST}}
+{{FORWARD_PROXY_PLIST}}
     </dict>
     <key>WorkingDirectory</key>
     <string>{{WORKING_DIR}}</string>

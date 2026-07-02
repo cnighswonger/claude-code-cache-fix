@@ -1,5 +1,6 @@
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { readFileSync } from "node:fs";
 
 function envInt(name, fallback) {
   const raw = process.env[name];
@@ -10,12 +11,18 @@ function envInt(name, fallback) {
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+// Package version, read once at init. Surfaced on /health so clients (e.g. a
+// status line) can show which cache-fix build is actually serving them.
+let _version = "unknown";
+try { _version = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf8")).version || "unknown"; } catch {}
+
 // Most fields are read once at module init (preserving prior behavior).
 // Corp-proxy/CA fields and `upstream` are getters so they reflect live env —
 // important for test isolation (see test/proxy-upstream-corp-proxy.test.mjs
 // and test/proxy-server-bootstrap.test.mjs) and for callers that legitimately
 // want to flip env at runtime.
 const config = {
+  version: _version,
   port: envInt("CACHE_FIX_PROXY_PORT", 9801),
   bind: process.env.CACHE_FIX_PROXY_BIND || "127.0.0.1",
   get upstream() { return process.env.CACHE_FIX_PROXY_UPSTREAM || "https://api.anthropic.com"; },
@@ -39,6 +46,11 @@ const config = {
   // inert until CACHE_FIX_OAUTH_REFRESH=on is set and the proxy is restarted.
   // Contract: docs/directives/proxy-owned-oauth-refresh.md.
   get oauthRefreshEnabled() { return process.env.CACHE_FIX_OAUTH_REFRESH === "on"; },
+  // Forward-proxy (HTTP CONNECT + selective MITM) transport. Default OFF.
+  // When "on", the proxy also handles CONNECT and MITMs only the upstream host,
+  // so clients point HTTPS_PROXY (not ANTHROPIC_BASE_URL) at it and keep Remote
+  // Control. See proxy/forward-proxy.mjs.
+  get forwardProxy() { return process.env.CACHE_FIX_FORWARD_PROXY === "on"; },
   get oauthRefreshMarginMs() { return envInt("CACHE_FIX_OAUTH_REFRESH_MARGIN_MS", 2 * 60 * 60 * 1000); }, // 2h
   get oauthTickMs() { return envInt("CACHE_FIX_OAUTH_TICK_MS", 5 * 60 * 1000); }, // 5min
   // §2a hard deadline — strictly below the client's 10s stale-break.

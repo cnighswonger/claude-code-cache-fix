@@ -21,7 +21,20 @@ async function dispatch() {
         stdio: "inherit",
         env: process.env,
       });
-      serverProc.on("close", (code) => resolveP(code ?? 0));
+      // Forward termination to the child so a supervisor killing THIS launcher
+      // doesn't leak the actual server process. Without this, `kill <launcher>`
+      // leaves the listening child orphaned (it reparents to init and keeps the
+      // port bound). Each handler is idempotent; the child's exit resolves us.
+      const forward = (sig) => { try { serverProc.kill(sig); } catch {} };
+      const onSIGTERM = () => forward("SIGTERM");
+      const onSIGINT = () => forward("SIGINT");
+      process.on("SIGTERM", onSIGTERM);
+      process.on("SIGINT", onSIGINT);
+      serverProc.on("close", (code) => {
+        process.off("SIGTERM", onSIGTERM);
+        process.off("SIGINT", onSIGINT);
+        resolveP(code ?? 0);
+      });
       serverProc.on("error", (err) => {
         process.stderr.write(`Failed to start proxy server: ${err.message}\n`);
         resolveP(1);
