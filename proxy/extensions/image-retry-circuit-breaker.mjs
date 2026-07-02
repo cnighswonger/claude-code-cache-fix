@@ -1,9 +1,9 @@
 import { appendFileSync, statSync, renameSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { homedir } from "node:os";
 import { createHash } from "node:crypto";
 import { imageHashesFromBody } from "../image-hash.mjs";
 import { resolveSessionId } from "./cache-telemetry.mjs";
+import { claudeHome } from "../claude-home.mjs";
 
 // Directive: docs/directives/proxy-image-retry-circuit-breaker.md (merged at d12cc05)
 // Upstream: anthropics/claude-code#66815
@@ -39,7 +39,7 @@ function maxEntries() {
 
 function logPath() {
   return process.env.CACHE_FIX_IMAGE_RETRY_LOG_PATH ||
-    join(homedir(), ".claude", "image-retry-events.jsonl");
+    join(claudeHome(), "image-retry-events.jsonl");
 }
 
 // Single-tier rotation matching bootstrap-defense's rotateIfNeeded — any

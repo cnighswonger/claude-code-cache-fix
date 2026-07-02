@@ -34,16 +34,15 @@
 import { mkdir, appendFile } from "node:fs/promises";
 import { readdirSync, statSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { homedir } from "node:os";
+import { claudeHome } from "../claude-home.mjs";
 
-// Paths resolved per call so tests can swap $HOME between cases. The
-// homedir() call is essentially free.
+// Paths resolved per call so tests can swap CLAUDE_CONFIG_DIR / $HOME between
+// cases; claudeHome() reads the env live.
 function paths() {
-  const home = homedir();
   return {
-    logPath: join(home, ".claude", "usage-log", "rate-limit-events.jsonl"),
-    accountPath: join(home, ".claude", "quota-status", "account.json"),
-    sessionsDir: join(home, ".claude", "quota-status", "sessions"),
+    logPath: join(claudeHome(), "usage-log", "rate-limit-events.jsonl"),
+    accountPath: join(claudeHome(), "quota-status", "account.json"),
+    sessionsDir: join(claudeHome(), "quota-status", "sessions"),
   };
 }
 

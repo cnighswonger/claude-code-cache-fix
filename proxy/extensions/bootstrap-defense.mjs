@@ -1,7 +1,7 @@
 import { appendFileSync, statSync, renameSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { homedir } from "node:os";
 import { createHash } from "node:crypto";
+import { claudeHome } from "../claude-home.mjs";
 
 const LOG_ROTATE_BYTES = 5 * 1024 * 1024;
 const SCHEMA_VERSION = 2;
@@ -10,7 +10,7 @@ const EXTENSION_VERSION = "v3.7.1";
 const LEGACY_PROMPT_KEY = "tengu_heron_brook";
 
 function logPath() {
-  return process.env.CACHE_FIX_BOOTSTRAP_LOG_PATH || join(homedir(), ".claude", "cache-fix-bootstrap-log.jsonl");
+  return process.env.CACHE_FIX_BOOTSTRAP_LOG_PATH || join(claudeHome(), "cache-fix-bootstrap-log.jsonl");
 }
 
 // Single-tier rotation by design: any previous .1 gets overwritten. The audit

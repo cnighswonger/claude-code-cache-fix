@@ -12,13 +12,13 @@ import { startOAuthRefresher, stopOAuthRefresher } from "./oauth/refresher.mjs";
 // Env is read on every call so tests (and operators flipping the flag at
 // runtime) see live behavior — same pattern as image-strip's #98 gate.
 import { appendFileSync, mkdirSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import util from "node:util";
+import { claudeHome } from "./claude-home.mjs";
 
 function debugLogPath() {
   return process.env.CACHE_FIX_DEBUG_LOG ||
-    join(homedir(), ".claude", "cache-fix-debug.log");
+    join(claudeHome(), "cache-fix-debug.log");
 }
 
 // Never spread raw headers to the log: Authorization / x-api-key / cookies

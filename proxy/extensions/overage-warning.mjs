@@ -14,9 +14,9 @@
 
 import { appendFile, mkdir } from "node:fs/promises";
 import { join, dirname } from "node:path";
-import { homedir } from "node:os";
 
 import { WEIGHTED_TOKEN_COST_USD_COARSE } from "../rates.mjs";
+import { claudeHome } from "../claude-home.mjs";
 
 // Env-gated runtime flags read on each call. Reading at module load would
 // freeze the values and make per-test isolation impossible. The check is
@@ -244,7 +244,7 @@ function checkAndMarkDedup(threshold, q5h_resets_at) {
 // --- I/O ---
 
 async function appendJsonl(record, dir) {
-  const outDir = dir || (process.env.CACHE_FIX_OVERAGE_WARNING_DIR || join(homedir(), ".claude"));
+  const outDir = dir || (process.env.CACHE_FIX_OVERAGE_WARNING_DIR || claudeHome());
   const outPath = join(outDir, "overage-warnings.jsonl");
   await mkdir(outDir, { recursive: true });
   await appendFile(outPath, JSON.stringify(record) + "\n");

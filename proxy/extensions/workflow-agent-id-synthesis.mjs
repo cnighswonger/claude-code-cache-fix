@@ -33,10 +33,10 @@
 
 import { appendFileSync, statSync, renameSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { homedir } from "node:os";
 
 import { resolveSessionId, sessionFilename } from "./cache-telemetry.mjs";
 import { matchWorkflowMarker } from "../workflow-markers.mjs";
+import { claudeHome } from "../claude-home.mjs";
 import {
   deriveAgentId,
   deriveParentAgentId,
@@ -56,7 +56,7 @@ const _lastCanaryEmitMs = new Map();
 
 function logPath() {
   return process.env.CACHE_FIX_WORKFLOW_DERIVATION_LOG_PATH
-    || join(homedir(), ".claude", "workflow-derivation-events.jsonl");
+    || join(claudeHome(), "workflow-derivation-events.jsonl");
 }
 
 // Single-tier rotation precedent — see `bootstrap-defense.mjs:20-25`.

@@ -655,6 +655,12 @@ The shipped [`tools/quota-statusline.sh`](tools/quota-statusline.sh) is the refe
 
 On multi-agent hosts (multiple Claude Code sessions sharing one proxy), the pre-v3.5.0 single global file caused every session to overwrite the others' cache stats with each response. A statusline reading from session A would show session B's TTL tier whenever B sent a request more recently. Per-session files plus an account-global quota file resolve this without losing the easy account-wide view. See [#104](https://github.com/cnighswonger/claude-code-cache-fix/issues/104) for the original report.
 
+### `CLAUDE_CONFIG_DIR`
+
+Claude Code reads `CLAUDE_CONFIG_DIR` to relocate its config root away from the default `~/.claude` (used to keep multiple independent config roots in separate directories). The proxy now honors the same variable for **all** of its on-disk state: `quota-status/`, `usage.jsonl`, `cache-fix-state/`, session mirrors, snapshots, and OAuth events all land under `$CLAUDE_CONFIG_DIR` instead of a hardcoded `~/.claude`. When it's unset the proxy uses `~/.claude` exactly as before (no change for the common single-config case).
+
+This matters when you run **one proxy per config dir**: without it, every proxy writes to `~/.claude/quota-status/account.json` and they clobber each other's quota state. Give each proxy the same `CLAUDE_CONFIG_DIR` its Claude Code client uses, and their state stays cleanly separated.
+
 ## Image stripping (preload mode)
 
 Images read via the Read tool persist as base64 in conversation history, riding along on every subsequent API call. A single 500KB image costs ~62,500 tokens per turn on Opus 4.6, and **~85,000+ on Opus 4.7** due to the new tokenizer. Image stripping is strongly recommended on 4.7.

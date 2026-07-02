@@ -9,8 +9,8 @@
 // primary discipline is at the call site.
 
 import { appendFileSync, mkdirSync, statSync, renameSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { claudeHome } from "../claude-home.mjs";
 
 const FORBIDDEN_KEYS = new Set([
   "accessToken", "refreshToken", "access_token", "refresh_token",
@@ -22,7 +22,7 @@ const MAX_BYTES = 1_000_000;
 
 function eventsPath() {
   return process.env.CACHE_FIX_OAUTH_EVENTS_LOG ||
-    join(homedir(), ".claude", "cache-fix-oauth-events.jsonl");
+    join(claudeHome(), "cache-fix-oauth-events.jsonl");
 }
 
 function rotateIfLarge(path) {

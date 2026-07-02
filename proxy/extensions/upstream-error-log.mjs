@@ -37,13 +37,13 @@
 
 import { appendFile, mkdir } from "node:fs/promises";
 import { join, dirname } from "node:path";
-import { homedir } from "node:os";
+import { claudeHome } from "../claude-home.mjs";
 
 const ENV_VAR = "CACHE_FIX_UPSTREAM_ERROR_LOG";
 
 function logPath() {
   return process.env.CACHE_FIX_UPSTREAM_ERROR_LOG_PATH ||
-    join(homedir(), ".claude", "usage-log", "upstream-errors.jsonl");
+    join(claudeHome(), "usage-log", "upstream-errors.jsonl");
 }
 
 // Detection predicate — every non-200 upstream response is in scope.

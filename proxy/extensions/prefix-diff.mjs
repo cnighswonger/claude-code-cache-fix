@@ -24,8 +24,8 @@ import {
   rename as _rename,
 } from "node:fs/promises";
 import { join } from "node:path";
-import { homedir } from "node:os";
 import { createHash } from "node:crypto";
+import { claudeHome } from "../claude-home.mjs";
 
 const ENABLED = process.env.CACHE_FIX_PREFIXDIFF === "1";
 const DEBUG = process.env.CACHE_FIX_DEBUG === "1";
@@ -38,7 +38,7 @@ const DEFAULT_FS = {
 };
 
 function getSnapshotDir() {
-  return join(homedir(), ".claude", "cache-fix-snapshots");
+  return join(claudeHome(), "cache-fix-snapshots");
 }
 
 function debug(msg) {

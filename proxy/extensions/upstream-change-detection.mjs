@@ -28,8 +28,8 @@ import {
   appendFile as _appendFile,
 } from "node:fs/promises";
 import { join } from "node:path";
-import { homedir } from "node:os";
 import { createHash, randomBytes } from "node:crypto";
+import { claudeHome } from "../claude-home.mjs";
 
 // --- Allowlists ---
 //
@@ -110,7 +110,7 @@ export function _resetForTest() {
 }
 
 function getOutputDir() {
-  return process.env.CACHE_FIX_UPSTREAM_DIR || join(homedir(), ".claude");
+  return process.env.CACHE_FIX_UPSTREAM_DIR || claudeHome();
 }
 
 function getBaselinePath(dir) {

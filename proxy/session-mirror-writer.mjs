@@ -1,7 +1,7 @@
 import { appendFileSync, statSync, mkdirSync, readdirSync, unlinkSync, rmdirSync, renameSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { homedir } from "node:os";
 import { sessionFilename } from "./extensions/cache-telemetry.mjs";
+import { claudeHome } from "./claude-home.mjs";
 
 // Directive: docs/directives/proxy-jsonl-session-mirror.md
 // Storage root: ~/.claude/session-mirrors/<sessionFilename(sessionId)>/<timestamp>.jsonl
@@ -15,7 +15,7 @@ const SWEEP_THROTTLE_MS = 60_000;
 
 function mirrorRoot() {
   return process.env.CACHE_FIX_SESSION_MIRROR_DIR ||
-    join(homedir(), ".claude", "session-mirrors");
+    join(claudeHome(), "session-mirrors");
 }
 
 function eventLogPath() {

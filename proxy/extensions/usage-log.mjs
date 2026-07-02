@@ -53,10 +53,10 @@
 
 import { appendFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { homedir } from "node:os";
 import { createHash } from "node:crypto";
+import { claudeHome } from "../claude-home.mjs";
 
-const LOG_PATH = process.env.CACHE_FIX_USAGE_LOG || join(homedir(), ".claude", "usage.jsonl");
+const LOG_PATH = process.env.CACHE_FIX_USAGE_LOG || join(claudeHome(), "usage.jsonl");
 
 // --- Module-scope state ---
 
@@ -271,7 +271,7 @@ export function assembleRecord({ start, delta, quota, requestedModel, sid, prevQ
 // --- I/O ---
 
 async function appendJsonl(record, path = LOG_PATH) {
-  await mkdir(join(homedir(), ".claude"), { recursive: true });
+  await mkdir(claudeHome(), { recursive: true });
   await appendFile(path, JSON.stringify(record) + "\n");
 }
 
