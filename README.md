@@ -50,6 +50,41 @@ How it works: the proxy also handles HTTP `CONNECT`. It MITMs **only** the upstr
 
 Corporate proxy chaining works the same as reverse mode: set `HTTPS_PROXY`/`HTTP_PROXY` for the proxy's **own** upstream egress (the proxy dials `api.anthropic.com` through it). The client's `HTTPS_PROXY` points at the cache-fix proxy; the cache-fix proxy's `HTTPS_PROXY` (in its own env) points at the corporate proxy.
 
+**Running it persistently.** The `... node .../proxy/server.mjs &` above is fine for a quick try, but a backgrounded process is not supervised: it does not restart if it crashes or if the machine reboots. To run forward-proxy mode as a managed service (auto-restart, start-on-login), use the same `install-service` path described under [Running as a service](#running-as-a-service) — just set the flag at install time so it is baked into the unit:
+
+```bash
+CACHE_FIX_FORWARD_PROXY=on cache-fix-proxy install-service
+```
+
+The generated systemd unit / launchd agent carries `CACHE_FIX_FORWARD_PROXY=on`, so the service starts the proxy in forward-proxy mode and keeps it up (systemd `Restart=on-failure` plus the healthcheck timer; launchd `KeepAlive`).
+
+**The service only manages the proxy end.** It does **not** — and cannot — set anything on your `claude` client, which is a separate process. You still wire the client yourself in whatever shell launches `claude`, using the two values from the forward-proxy quick-start above:
+
+- `HTTPS_PROXY` — where the proxy listens: `http://127.0.0.1:<port>` (default port `9801`, or your `CACHE_FIX_PROXY_PORT`).
+- `NODE_EXTRA_CA_CERTS` — the CA the proxy generated on first start: `~/.claude/cache-fix-ca/ca.pem` (or `$CACHE_FIX_CA_DIR/ca.pem`).
+
+Three ways to wire it, depending on how broadly you want the vars to apply:
+
+```bash
+# a) per-invocation — scoped to just this claude run
+HTTPS_PROXY=http://127.0.0.1:9801 \
+NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem \
+  claude
+
+# b) whole shell — add to ~/.zshrc / ~/.bashrc (every HTTPS in that shell goes
+#    through the proxy; harmless since non-anthropic hosts are blind-tunneled,
+#    but that shell's HTTPS breaks if the proxy is ever down)
+export HTTPS_PROXY=http://127.0.0.1:9801
+export NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem
+
+# c) scoped to claude only — a shell function (recommended; avoids b's blast radius)
+claude() {
+  HTTPS_PROXY=http://127.0.0.1:9801 \
+  NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem \
+    command claude "$@"
+}
+```
+
 ### What the proxy does
 
 On every `/v1/messages` request, the pipeline runs an ordered chain of extensions covering cache stability, observability, thinking-desync mitigation, image, microcompact, breakpoint, bootstrap-channel, and other surfaces. Several are gated behind env vars documented in their own sections below; bootstrap-channel handling defaults to `audit` mode. The headliners:
