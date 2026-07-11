@@ -317,7 +317,19 @@ function handleHealth(_req, res) {
     return;
   }
   res.writeHead(200, { "content-type": "application/json" });
-  res.end(JSON.stringify({ status: "ok", version: config.version, forward_proxy: _forwardProxyActive }));
+  // Surface the outbound proxy the forward-proxy blind-tunnels CONNECTs through
+  // (config.httpsProxy, from HTTPS_PROXY/https_proxy). A supervisor/health probe
+  // can then tell a proxy that came up WITH the expected corp proxy from one that
+  // came up WITHOUT it — a stale instance started without HTTPS_PROXY still
+  // answers forward_proxy:true but silently dials non-MITM hosts directly, which
+  // fails behind a corp firewall. Only meaningful in forward-proxy mode; null
+  // when no outbound proxy is configured.
+  res.end(JSON.stringify({
+    status: "ok",
+    version: config.version,
+    forward_proxy: _forwardProxyActive,
+    https_proxy: (_forwardProxyActive && config.httpsProxy) || null,
+  }));
 }
 
 function handleNotFound(_req, res) {

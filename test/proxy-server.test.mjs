@@ -47,6 +47,10 @@ describe("proxy server", () => {
     assert.equal(res.status, 200);
     const parsed = JSON.parse(res.body);
     assert.equal(parsed.status, "ok");
+    // https_proxy is always present; null outside forward-proxy mode (this
+    // server runs in reverse-proxy mode, so forward_proxy is false here).
+    assert.equal(parsed.forward_proxy, false);
+    assert.equal(parsed.https_proxy, null);
   });
 
   it("GET /unknown returns 404", async () => {
