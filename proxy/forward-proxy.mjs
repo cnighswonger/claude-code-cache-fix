@@ -24,6 +24,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, rmSync 
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { HttpsProxyAgent } from "hpagent";
 import config from "./config.mjs";
 import { discoverBucket } from "./downloads-bucket.mjs";
@@ -133,7 +134,14 @@ export function ensureCA() {
     const ext = tmp("leaf.ext");
     const sanLine = hosts.map((h) => `DNS:${h}`).join(",");
     writeFileSync(ext, `subjectAltName=${sanLine}\nextendedKeyUsage=serverAuth\n`);
-    run(["x509", "-req", "-in", csr, "-CA", caPemSrc, "-CAkey", caKeySrc, "-CAcreateserial",
+    // -set_serial (random positive 128-bit) instead of -CAcreateserial: the
+    // latter derives the serial filename from the -CA path, and macOS LibreSSL
+    // truncates an absolute path at the first '.' (…/j.lee8/…/ca.pem → /Users/j
+    // .srl) then EACCES on write, so leaf signing throws and forward-proxy silently
+    // falls back to reverse mode. A random serial needs no file and is unique per
+    // mint. High bit cleared to keep the ASN.1 INTEGER positive.
+    const serial = "0x00" + randomBytes(16).toString("hex");
+    run(["x509", "-req", "-in", csr, "-CA", caPemSrc, "-CAkey", caKeySrc, "-set_serial", serial,
          "-out", tmp("leaf.pem"), "-days", "3650", "-extfile", ext]);
     // Atomic publish. The existence guard keys on ca.pem+leaf.pem+leaf.key, so
     // publish those last. When reusing the CA, ca.pem/ca.key already exist and
