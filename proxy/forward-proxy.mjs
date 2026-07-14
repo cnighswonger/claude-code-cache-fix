@@ -17,13 +17,16 @@
 // Client wiring (ANTHROPIC_BASE_URL stays UNSET):
 //   HTTPS_PROXY=http://127.0.0.1:<port>  NODE_EXTRA_CA_CERTS=<caPath>  claude
 import http from "node:http";
+import https from "node:https";
 import net from "node:net";
 import tls from "node:tls";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
+import { HttpsProxyAgent } from "hpagent";
 import config from "./config.mjs";
+import { discoverBucket } from "./downloads-bucket.mjs";
 
 // The CA is global (one cert CC trusts), not per-config-dir, so it lives outside
 // CLAUDE_CONFIG_DIR. Overridable for tests / non-default homes.
@@ -31,6 +34,26 @@ const CA_DIR = process.env.CACHE_FIX_CA_DIR || join(homedir(), ".claude", "cache
 
 function upstreamHost() {
   try { return new URL(config.upstream).hostname; } catch { return "api.anthropic.com"; }
+}
+
+// The extra host we MITM (besides the upstream) to accelerate large downloads.
+const DOWNLOADS_HOST = "downloads.claude.ai";
+
+// Whether download-rewrite is BOTH enabled (opt-in) AND has a usable bucket
+// discovered from the client binary. Only then do we MITM downloads.claude.ai;
+// with no bucket we leave it blind-tunneled, so a discovery miss degrades to
+// the pre-existing (slower but working) path instead of a broken rewrite.
+function downloadRewriteActive() {
+  return config.downloadRewrite && discoverBucket() !== "";
+}
+
+// All DNS names the leaf cert must cover so the client accepts our TLS
+// termination. Always the upstream host; plus downloads.claude.ai when the
+// download-rewrite acceleration is active.
+function mitmHosts() {
+  const hosts = [upstreamHost()];
+  if (downloadRewriteActive()) hosts.push(DOWNLOADS_HOST);
+  return hosts;
 }
 
 /**
@@ -44,7 +67,20 @@ export function ensureCA() {
   const leafPem = join(CA_DIR, "leaf.pem");
   const leafKey = join(CA_DIR, "leaf.key");
   const host = upstreamHost();
-  const ready = () => existsSync(caPem) && existsSync(leafPem) && existsSync(leafKey);
+  const hosts = mitmHosts();
+  // The leaf must cover every host in `hosts`. A leaf minted by an older build
+  // (or with download-rewrite previously off) may carry only a subset of SANs;
+  // treat that as not-ready so it gets regenerated instead of serving a cert
+  // the client rejects for downloads.claude.ai (UNKNOWN/ALTNAME mismatch).
+  const leafCoversAllHosts = () => {
+    try {
+      const pem = readFileSync(leafPem, "utf8");
+      const san = execFileSync("openssl", ["x509", "-noout", "-ext", "subjectAltName"],
+        { input: pem, stdio: ["pipe", "pipe", "ignore"] }).toString();
+      return hosts.every((h) => san.includes(`DNS:${h}`));
+    } catch { return false; }
+  };
+  const ready = () => existsSync(caPem) && existsSync(leafPem) && existsSync(leafKey) && leafCoversAllHosts();
   if (ready()) {
     return { caPath: caPem, key: readFileSync(leafKey), cert: readFileSync(leafPem) };
   }
@@ -74,19 +110,39 @@ export function ensureCA() {
     if (ready()) return { caPath: caPem, key: readFileSync(leafKey), cert: readFileSync(leafPem) };
     const run = (args) => execFileSync("openssl", args, { stdio: ["ignore", "ignore", "pipe"] });
     const tmp = (n) => join(CA_DIR, `.tmp.${n}`);
-    run(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", tmp("ca.key"), "-out", tmp("ca.pem"),
-         "-days", "3650", "-subj", "/CN=cache-fix forward-proxy CA"]);
+
+    // Reuse an existing root CA; only mint a new one on first run. Regenerating
+    // the root here is a bug: the client trusts the CA via a NODE_EXTRA_CA_CERTS
+    // bundle captured at its OWN startup, so rotating ca.pem/ca.key (e.g. when a
+    // new SAN forces a leaf re-issue) orphans every running session's trust and
+    // breaks TLS with "certificate verify failed". The leaf is always re-minted
+    // (SANs may have changed); the root is reused so the trust bundle stays
+    // valid across restarts. `CACHE_FIX_CA_FORCE_ROTATE=1` opts into a full
+    // rotation (e.g. suspected key compromise) at the cost of that break.
+    const haveCA = existsSync(caPem) && existsSync(caKey) &&
+                   process.env.CACHE_FIX_CA_FORCE_ROTATE !== "1";
+    const caPemSrc = haveCA ? caPem : tmp("ca.pem");
+    const caKeySrc = haveCA ? caKey : tmp("ca.key");
+    if (!haveCA) {
+      run(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", tmp("ca.key"), "-out", tmp("ca.pem"),
+           "-days", "3650", "-subj", "/CN=cache-fix forward-proxy CA"]);
+    }
     run(["genrsa", "-out", tmp("leaf.key"), "2048"]);
     const csr = tmp("leaf.csr");
     run(["req", "-new", "-key", tmp("leaf.key"), "-out", csr, "-subj", `/CN=${host}`]);
     const ext = tmp("leaf.ext");
-    writeFileSync(ext, `subjectAltName=DNS:${host}\nextendedKeyUsage=serverAuth\n`);
-    run(["x509", "-req", "-in", csr, "-CA", tmp("ca.pem"), "-CAkey", tmp("ca.key"), "-CAcreateserial",
+    const sanLine = hosts.map((h) => `DNS:${h}`).join(",");
+    writeFileSync(ext, `subjectAltName=${sanLine}\nextendedKeyUsage=serverAuth\n`);
+    run(["x509", "-req", "-in", csr, "-CA", caPemSrc, "-CAkey", caKeySrc, "-CAcreateserial",
          "-out", tmp("leaf.pem"), "-days", "3650", "-extfile", ext]);
-    // Atomic publish: rename the CA key first, then ca.pem, then leaf files.
-    // The existence guard keys on ca.pem+leaf.pem+leaf.key, so publish those last.
-    renameSync(tmp("ca.key"), caKey);
-    renameSync(tmp("ca.pem"), caPem);
+    // Atomic publish. The existence guard keys on ca.pem+leaf.pem+leaf.key, so
+    // publish those last. When reusing the CA, ca.pem/ca.key already exist and
+    // MUST NOT be touched (that is the whole point of the reuse) — only the leaf
+    // is renamed into place.
+    if (!haveCA) {
+      renameSync(tmp("ca.key"), caKey);
+      renameSync(tmp("ca.pem"), caPem);
+    }
     renameSync(tmp("leaf.key"), leafKey);
     renameSync(tmp("leaf.pem"), leafPem);
   } finally {
@@ -191,6 +247,93 @@ function relayUpstreamUpgrade(req, clientSocket, head) {
   }, () => bail(null));
 }
 
+// Egress agent for the storage re-issue: reuse the corp CONNECT proxy
+// (config.httpsProxy, e.g. privoxy at :8118) exactly like upstream.mjs, so the
+// storage.googleapis.com request follows the same routing that measured fast.
+// Cached (keepAlive) so range-request resumes reuse the connection.
+let _storageAgent;
+function storageAgent() {
+  if (_storageAgent !== undefined) return _storageAgent;
+  const proxyUrl = config.httpsProxy || config.httpProxy || "";
+  _storageAgent = proxyUrl
+    ? new HttpsProxyAgent({ keepAlive: true, proxy: proxyUrl })
+    : new https.Agent({ keepAlive: true });
+  return _storageAgent;
+}
+
+// Handle one decrypted request that arrived on the MITM'd downloads.claude.ai
+// connection: re-issue it to storage.googleapis.com/<bucket><path> and stream
+// the response back verbatim. Preserves method and Range (updater resumes with
+// byte ranges), rewrites Host, drops hop-by-hop + auth headers (public bucket).
+function handleDownloadsRequest(clientReq, clientRes) {
+  const bucket = discoverBucket();
+  if (!bucket) {
+    // No bucket (discovery regressed after the MITM was set up). Fail soft with
+    // a 502 rather than serving a wrong path; the updater retries and the SAN
+    // will drop on the next restart. Should not happen: the CONNECT branch only
+    // MITMs downloads when downloadRewriteActive() already saw a bucket.
+    try { clientRes.writeHead(502, { "content-type": "text/plain" }); clientRes.end("cache-fix: no download bucket"); } catch {}
+    return;
+  }
+  const path = "/" + bucket + (clientReq.url.startsWith("/") ? clientReq.url : "/" + clientReq.url);
+
+  const headers = {};
+  for (const [k, v] of Object.entries(clientReq.headers)) {
+    const lk = k.toLowerCase();
+    if (lk === "host" || lk === "connection" || lk === "keep-alive" ||
+        lk === "proxy-connection" || lk === "authorization" || lk === "cookie" ||
+        lk === "transfer-encoding" || lk === "te" || lk === "upgrade") continue;
+    headers[k] = v;
+  }
+  headers["host"] = "storage.googleapis.com";
+  headers["accept-encoding"] = "identity";
+
+  const opts = {
+    hostname: "storage.googleapis.com",
+    port: 443,
+    path,
+    method: clientReq.method,
+    headers,
+    agent: storageAgent(),
+    timeout: config.timeout,
+  };
+
+  const upReq = https.request(opts, (upRes) => {
+    const outHeaders = {};
+    for (const [k, v] of Object.entries(upRes.headers)) {
+      const lk = k.toLowerCase();
+      if (lk === "connection" || lk === "keep-alive" || lk === "transfer-encoding") continue;
+      outHeaders[k] = v;
+    }
+    clientRes.writeHead(upRes.statusCode || 502, outHeaders);
+    upRes.pipe(clientRes);
+    upRes.on("error", () => { try { clientRes.destroy(); } catch {} });
+  });
+  upReq.on("error", (err) => {
+    try {
+      if (!clientRes.headersSent) clientRes.writeHead(502, { "content-type": "text/plain" });
+      clientRes.end("cache-fix downloads-rewrite upstream error: " + err.message);
+    } catch {}
+  });
+  upReq.on("timeout", () => upReq.destroy(new Error("storage timeout")));
+  clientReq.on("error", () => upReq.destroy());
+  // Downloads are GET/HEAD (no body); end immediately.
+  clientReq.resume();
+  upReq.end();
+}
+
+// A dedicated http.Server whose sole job is to serve the decrypted
+// downloads.claude.ai stream via the storage rewrite. Built lazily so the
+// upstream MITM path is untouched when download-rewrite is off.
+let _downloadsServer;
+function downloadsServer() {
+  if (!_downloadsServer) {
+    _downloadsServer = http.createServer(handleDownloadsRequest);
+    _downloadsServer.on("clientError", (_e, sock) => { try { sock.destroy(); } catch {} });
+  }
+  return _downloadsServer;
+}
+
 /**
  * Attach the forward-proxy CONNECT handler to an existing http.Server (the one
  * returned by createProxyServer()). MITMs the upstream host and feeds the
@@ -228,6 +371,18 @@ export function attachForwardProxy(server) {
     try {
       const target = req.url; // "host:port"
       const reqHost = target.split(":")[0];
+
+      // downloads.claude.ai: MITM and serve via the storage-rewrite server so
+      // the big update/plugin binaries take the un-throttled GCS hostname. The
+      // decrypted stream goes to downloadsServer(), NOT the messages pipeline.
+      if (reqHost === DOWNLOADS_HOST && downloadRewriteActive()) {
+        clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+        const tlsSocket = new tls.TLSSocket(clientSocket, { isServer: true, secureContext });
+        tlsSocket.on("error", () => tlsSocket.destroy());
+        downloadsServer().emit("connection", tlsSocket);
+        return;
+      }
+
       if (reqHost !== host) return blindTunnel(target, clientSocket, head);
 
       // MITM the upstream host: terminate TLS with our leaf, then hand the

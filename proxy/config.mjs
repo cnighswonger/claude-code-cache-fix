@@ -51,6 +51,27 @@ const config = {
   // so clients point HTTPS_PROXY (not ANTHROPIC_BASE_URL) at it and keep Remote
   // Control. See proxy/forward-proxy.mjs.
   get forwardProxy() { return process.env.CACHE_FIX_FORWARD_PROXY === "on"; },
+  // Forward-proxy download acceleration (opt-in, default OFF). When "on" AND
+  // forward-proxy is active, MITM downloads.claude.ai (the Claude Code update /
+  // plugin CDN) and re-issue each request to storage.googleapis.com/<bucket> —
+  // the SAME GCS object served by a hostname a corp SSL-inspection proxy (e.g.
+  // Netskope) does not bandwidth-throttle. Measured through such a proxy:
+  // downloads.claude.ai ~0.2-1.7MB/s vs storage.googleapis.com ~16MB/s, so the
+  // ~240MB updater binary otherwise times out ("Auto-update failed").
+  //
+  // OFF by default because on an un-inspected network both hostnames hit the
+  // same GCS backend at the same speed, so the rewrite buys nothing. It is a
+  // corp-proxy workaround, not a general speedup — enable it only where a proxy
+  // throttles the CDN hostname. The bucket is NEVER hard-coded: it is discovered
+  // at runtime from the client's own claude binary (see downloads-bucket.mjs),
+  // so a bucket rotation is followed automatically with no code or config edit.
+  get downloadRewrite() { return process.env.CACHE_FIX_DOWNLOAD_REWRITE === "on"; },
+  // Optional explicit override for the discovered bucket (escape hatch only —
+  // normal operation needs no bucket config at all). Empty = auto-discover.
+  get downloadBucketOverride() { return process.env.CACHE_FIX_DOWNLOAD_BUCKET || ""; },
+  // Optional path to the claude binary to scan for the bucket. Empty = resolve
+  // the standard native-install launcher (~/.local/bin/claude) at runtime.
+  get downloadBinaryPath() { return process.env.CACHE_FIX_DOWNLOAD_BINARY || ""; },
   get oauthRefreshMarginMs() { return envInt("CACHE_FIX_OAUTH_REFRESH_MARGIN_MS", 2 * 60 * 60 * 1000); }, // 2h
   get oauthTickMs() { return envInt("CACHE_FIX_OAUTH_TICK_MS", 5 * 60 * 1000); }, // 5min
   // §2a hard deadline — strictly below the client's 10s stale-break.
