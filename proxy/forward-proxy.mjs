@@ -24,9 +24,9 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, rmSync 
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
-import { randomBytes } from "node:crypto";
-import { HttpsProxyAgent } from "hpagent";
+import { randomBytes, X509Certificate } from "node:crypto";
 import config from "./config.mjs";
+import { getAgent } from "./upstream.mjs";
 import { discoverBucket } from "./downloads-bucket.mjs";
 
 // The CA is global (one cert CC trusts), not per-config-dir, so it lives outside
@@ -73,12 +73,19 @@ export function ensureCA() {
   // (or with download-rewrite previously off) may carry only a subset of SANs;
   // treat that as not-ready so it gets regenerated instead of serving a cert
   // the client rejects for downloads.claude.ai (UNKNOWN/ALTNAME mismatch).
+  // Parsed in-process with node:crypto, NOT `openssl x509 -ext`: `-ext` is an
+  // OpenSSL 1.1.1+ flag that LibreSSL (which is what /usr/bin/openssl is on
+  // macOS) rejects with "unknown option". Shelling out would make this return
+  // false forever on any host whose PATH resolves to LibreSSL, so `ready()`
+  // could never be true: every call would re-mint the leaf, and a concurrent
+  // caller would spin the .gen.lock wait to its full deadline and then generate
+  // anyway — the exact race the lock exists to prevent. A throw here means the
+  // leaf is genuinely unparseable, for which re-minting IS the right answer.
   const leafCoversAllHosts = () => {
     try {
-      const pem = readFileSync(leafPem, "utf8");
-      const san = execFileSync("openssl", ["x509", "-noout", "-ext", "subjectAltName"],
-        { input: pem, stdio: ["pipe", "pipe", "ignore"] }).toString();
-      return hosts.every((h) => san.includes(`DNS:${h}`));
+      const san = new X509Certificate(readFileSync(leafPem)).subjectAltName || "";
+      const names = san.split(",").map((s) => s.trim());
+      return hosts.every((h) => names.includes(`DNS:${h}`));
     } catch { return false; }
   };
   const ready = () => existsSync(caPem) && existsSync(leafPem) && existsSync(leafKey) && leafCoversAllHosts();
@@ -259,20 +266,62 @@ function relayUpstreamUpgrade(req, clientSocket, head) {
 // (config.httpsProxy, e.g. privoxy at :8118) exactly like upstream.mjs, so the
 // storage.googleapis.com request follows the same routing that measured fast.
 // Cached (keepAlive) so range-request resumes reuse the connection.
-let _storageAgent;
+// Reuse upstream.mjs's agent builder rather than rolling our own: it is the one
+// place that honors NO_PROXY (shouldBypassProxy), CACHE_FIX_PROXY_CA_FILE, and
+// rejectUnauthorized together. A local reimplementation silently ignored all
+// three — forcing a NO_PROXY'd host through the corp proxy, and failing TLS for
+// anyone who needs a custom CA, which is precisely the SSL-inspecting setup this
+// feature targets. Agents are cached inside getAgent(), so this stays keep-alive.
 function storageAgent() {
-  if (_storageAgent !== undefined) return _storageAgent;
-  const proxyUrl = config.httpsProxy || config.httpProxy || "";
-  _storageAgent = proxyUrl
-    ? new HttpsProxyAgent({ keepAlive: true, proxy: proxyUrl })
-    : new https.Agent({ keepAlive: true });
-  return _storageAgent;
+  return getAgent(true, "storage.googleapis.com");
 }
 
 // Handle one decrypted request that arrived on the MITM'd downloads.claude.ai
 // connection: re-issue it to storage.googleapis.com/<bucket><path> and stream
 // the response back verbatim. Preserves method and Range (updater resumes with
 // byte ranges), rewrites Host, drops hop-by-hop + auth headers (public bucket).
+// Serve the request from the ORIGIN (downloads.claude.ai) instead of the storage
+// rewrite. Used when the rewrite can't deliver: the origin is reachable, merely
+// throttled, so this is slow-but-correct rather than a hard failure. Headers pass
+// through as the client sent them (same-origin request — no third-party leak
+// concern that the storage path's allowlist guards against); only hop-by-hop and
+// the proxy's own framing are dropped.
+function fallbackToOrigin(clientReq, clientRes, why) {
+  if (clientRes.headersSent || clientRes.writableEnded) return;
+  const headers = {};
+  for (const [k, v] of Object.entries(clientReq.headers)) {
+    const lk = k.toLowerCase();
+    if (lk === "connection" || lk === "keep-alive" || lk === "proxy-connection" ||
+        lk === "transfer-encoding" || lk === "te" || lk === "upgrade") continue;
+    headers[k] = v;
+  }
+  headers["host"] = DOWNLOADS_HOST;
+  const req = https.request({
+    hostname: DOWNLOADS_HOST, port: 443,
+    path: clientReq.url, method: clientReq.method, headers,
+    agent: getAgent(true, DOWNLOADS_HOST), timeout: config.timeout,
+  }, (res) => {
+    const out = {};
+    for (const [k, v] of Object.entries(res.headers)) {
+      const lk = k.toLowerCase();
+      if (lk === "connection" || lk === "keep-alive" || lk === "transfer-encoding") continue;
+      out[k] = v;
+    }
+    try { clientRes.writeHead(res.statusCode || 502, out); } catch { return; }
+    res.pipe(clientRes);
+    res.on("error", () => { try { clientRes.destroy(); } catch {} });
+  });
+  req.on("error", (err) => {
+    try {
+      if (!clientRes.headersSent) clientRes.writeHead(502, { "content-type": "text/plain" });
+      clientRes.end(`cache-fix downloads fallback failed (${why}): ${err.message}`);
+    } catch {}
+  });
+  req.on("timeout", () => req.destroy(new Error("origin timeout")));
+  clientRes.on("close", () => { if (!clientRes.writableFinished) req.destroy(); });
+  req.end();
+}
+
 function handleDownloadsRequest(clientReq, clientRes) {
   const bucket = discoverBucket();
   if (!bucket) {
@@ -285,15 +334,22 @@ function handleDownloadsRequest(clientReq, clientRes) {
   }
   const path = "/" + bucket + (clientReq.url.startsWith("/") ? clientReq.url : "/" + clientReq.url);
 
+  // ALLOWLIST, not a denylist: this re-issues the request to a THIRD PARTY
+  // (storage.googleapis.com), so anything not explicitly needed must not travel.
+  // A denylist leaks whatever it forgets — `proxy-authorization` (corp-proxy
+  // credentials!), `x-api-key`, `anthropic-*` are all headers the client may set
+  // for its own hosts. A public-bucket GET needs almost nothing, so enumerate it:
+  // range/if-range carry the updater's resume, the rest are content negotiation.
+  const ALLOWED = new Set(["range", "if-range", "if-none-match", "if-modified-since",
+                           "accept", "user-agent"]);
   const headers = {};
   for (const [k, v] of Object.entries(clientReq.headers)) {
-    const lk = k.toLowerCase();
-    if (lk === "host" || lk === "connection" || lk === "keep-alive" ||
-        lk === "proxy-connection" || lk === "authorization" || lk === "cookie" ||
-        lk === "transfer-encoding" || lk === "te" || lk === "upgrade") continue;
-    headers[k] = v;
+    if (ALLOWED.has(k.toLowerCase())) headers[k] = v;
   }
   headers["host"] = "storage.googleapis.com";
+  // identity: nothing here parses the body, but the bucket serves the binary
+  // pre-compressed; asking for identity keeps Content-Length/Range semantics
+  // exact for the updater's resume math.
   headers["accept-encoding"] = "identity";
 
   const opts = {
@@ -307,24 +363,38 @@ function handleDownloadsRequest(clientReq, clientRes) {
   };
 
   const upReq = https.request(opts, (upRes) => {
+    // The rewrite is an OPTIMIZATION; the origin is the source of truth. If the
+    // bucket answers with an error — rotated/renamed bucket (404), blocked by the
+    // corp proxy (403), outage (5xx) — serving that through would turn a working
+    // (if slow) download into a broken one. Fall back to the origin instead: this
+    // is the "degrade to the pre-existing path" this feature keeps promising.
+    // 2xx/3xx pass through; a Range request's 206 is a success, not an error.
+    const code = upRes.statusCode || 0;
+    if (code >= 400) {
+      upRes.resume();                       // drain, don't leak the socket
+      fallbackToOrigin(clientReq, clientRes, `storage ${code}`);
+      return;
+    }
     const outHeaders = {};
     for (const [k, v] of Object.entries(upRes.headers)) {
       const lk = k.toLowerCase();
       if (lk === "connection" || lk === "keep-alive" || lk === "transfer-encoding") continue;
       outHeaders[k] = v;
     }
-    clientRes.writeHead(upRes.statusCode || 502, outHeaders);
+    clientRes.writeHead(code || 502, outHeaders);
     upRes.pipe(clientRes);
     upRes.on("error", () => { try { clientRes.destroy(); } catch {} });
   });
   upReq.on("error", (err) => {
-    try {
-      if (!clientRes.headersSent) clientRes.writeHead(502, { "content-type": "text/plain" });
-      clientRes.end("cache-fix downloads-rewrite upstream error: " + err.message);
-    } catch {}
+    // Network-level failure reaching storage: same reasoning as an HTTP error.
+    fallbackToOrigin(clientReq, clientRes, "storage error: " + err.message);
   });
   upReq.on("timeout", () => upReq.destroy(new Error("storage timeout")));
   clientReq.on("error", () => upReq.destroy());
+  // A client that hangs up mid-body surfaces on the RESPONSE, not the request.
+  // Without this the upstream body keeps streaming to a dead socket: an aborted
+  // updater that retries would stack concurrent ~240MB fetches from storage.
+  clientRes.on("close", () => { if (!clientRes.writableFinished) upReq.destroy(); });
   // Downloads are GET/HEAD (no body); end immediately.
   clientReq.resume();
   upReq.end();
@@ -352,6 +422,11 @@ export function attachForwardProxy(server) {
   const { caPath, key, cert } = ensureCA();
   const secureContext = tls.createSecureContext({ key, cert });
   const host = upstreamHost();
+  // Freeze the download-rewrite decision here, next to the leaf we just minted:
+  // ensureCA() baked mitmHosts() into the SAN set, so this is the same answer
+  // the cert was built from. The CONNECT handler reads only this, never
+  // downloadRewriteActive() again — see the comment at the downloads branch.
+  const downloadsMitm = downloadRewriteActive();
 
   // WebSocket / HTTP Upgrade on the MITM'd host. Our http.Server has no default
   // upgrade handling, so without this Node would DESTROY the socket, breaking
@@ -383,7 +458,15 @@ export function attachForwardProxy(server) {
       // downloads.claude.ai: MITM and serve via the storage-rewrite server so
       // the big update/plugin binaries take the un-throttled GCS hostname. The
       // decrypted stream goes to downloadsServer(), NOT the messages pipeline.
-      if (reqHost === DOWNLOADS_HOST && downloadRewriteActive()) {
+      //
+      // Keyed on `downloadsMitm`, frozen at attach time alongside the leaf's SAN
+      // set — NOT re-evaluated per request. The two must agree: if discovery
+      // missed at startup the leaf carries no downloads SAN, and MITMing anyway
+      // (because discovery later succeeded, e.g. an auto-update repointed the
+      // launcher symlink) would serve a cert the client rejects with
+      // ERR_TLS_CERT_ALTNAME_INVALID — a hard failure instead of the intended
+      // degrade-to-blind-tunnel. Frozen together, cert and routing cannot drift.
+      if (reqHost === DOWNLOADS_HOST && downloadsMitm) {
         clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
         const tlsSocket = new tls.TLSSocket(clientSocket, { isServer: true, secureContext });
         tlsSocket.on("error", () => tlsSocket.destroy());

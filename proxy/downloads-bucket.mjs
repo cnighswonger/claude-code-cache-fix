@@ -15,7 +15,7 @@
 // leaves the download path untouched (blind-tunnel downloads.claude.ai as
 // before). Never throws.
 
-import { readFileSync, realpathSync, existsSync } from "node:fs";
+import { realpathSync, existsSync, openSync, readSync, closeSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import config from "./config.mjs";
@@ -47,16 +47,44 @@ export function discoverBucket() {
   // the launcher symlink to a new version that may carry a rotated bucket).
   if (_cached !== undefined && _cachedForPath === binPath) return _cached;
 
-  let bucket = "";
-  try {
-    const buf = readFileSync(binPath);
-    const m = buf.toString("latin1").match(BUCKET_RE);
-    if (m) bucket = m[1];
-  } catch { /* unreadable binary: leave bucket empty (caller falls back) */ }
+  const bucket = scanForBucket(binPath);
 
-  _cached = bucket;
-  _cachedForPath = binPath;
+  // Cache HITS only. A miss is commonly transient — this runs during an update,
+  // exactly when the binary is being replaced (EINTR, partial file, dangling
+  // symlink). Caching "" would key the failure to a path that is ALSO the cache
+  // key, wedging discovery off on the very version just installed. Retrying a
+  // miss costs one streamed scan on the next request; the hit path stays cached.
+  if (bucket) {
+    _cached = bucket;
+    _cachedForPath = binPath;
+  }
   return bucket;
+}
+
+// Stream the binary in chunks and regex over a sliding window instead of
+// readFileSync + toString("latin1"): that pair costs ~2x the file in RSS (a
+// ~230MB binary measured at ~484MB delta) and blocks the loop for ~100ms, and
+// readFileSync hard-fails past buffer MAX_STRING_LENGTH. Chunks overlap by
+// OVERLAP bytes so a match straddling a boundary is still found.
+function scanForBucket(binPath) {
+  const CHUNK = 4 * 1024 * 1024;
+  const OVERLAP = 256;            // >> longest possible match
+  let fd;
+  try {
+    fd = openSync(binPath, "r");
+    const buf = Buffer.allocUnsafe(CHUNK);
+    let carry = "";
+    for (;;) {
+      const n = readSync(fd, buf, 0, CHUNK, null);
+      if (n <= 0) break;
+      const text = carry + buf.toString("latin1", 0, n);
+      const m = text.match(BUCKET_RE);
+      if (m) return m[1];
+      carry = text.slice(-OVERLAP);
+    }
+  } catch { /* unreadable binary: caller falls back to the un-rewritten host */ }
+  finally { if (fd !== undefined) try { closeSync(fd); } catch {} }
+  return "";
 }
 
 // Test seam: drop the memoized result so a test can re-run discovery.

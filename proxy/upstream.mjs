@@ -156,7 +156,10 @@ function buildAgent(isHTTPS, proxyUrl) {
   return null;
 }
 
-function getAgent(isHTTPS, hostname) {
+// Exported so other egress paths (e.g. the forward-proxy's download rewrite to
+// storage.googleapis.com) reuse the SAME proxy/NO_PROXY/CA/TLS policy instead of
+// reimplementing a subset of it.
+export function getAgent(isHTTPS, hostname) {
   if (!_warnedTlsDisabled && !config.rejectUnauthorized) {
     _warnedTlsDisabled = true;
     process.stderr.write(
