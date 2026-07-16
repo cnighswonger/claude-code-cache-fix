@@ -2,7 +2,9 @@
 
 import { fork, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { dirname, resolve } from "node:path";
+import { dirname, resolve, join } from "node:path";
+import { homedir } from "node:os";
+import { existsSync } from "node:fs";
 import http from "node:http";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -64,6 +66,13 @@ async function dispatch() {
         "Wrapper-mode flags:\n" +
         "  --proxy-port <N>       Port for the spawned proxy (default 9801)\n" +
         "  --proxy-upstream <URL> Upstream URL the proxy forwards to (default api.anthropic.com)\n" +
+        "  --remote-control       Run in forward-proxy mode: spawn the proxy with\n" +
+        "                         CACHE_FIX_FORWARD_PROXY=on and wire claude via\n" +
+        "                         HTTPS_PROXY + the proxy's MITM CA instead of\n" +
+        "                         ANTHROPIC_BASE_URL, so Claude Code stays first-party\n" +
+        "                         and Remote Control / mobile session visibility keeps\n" +
+        "                         working (CC >= 2.1.196 disables it when\n" +
+        "                         ANTHROPIC_BASE_URL is set).\n" +
         "\nEnvironment:\n" +
         "  CACHE_FIX_PROXY_PORT     Port for the proxy server\n" +
         "  CACHE_FIX_PROXY_UPSTREAM Upstream URL\n" +
@@ -82,6 +91,7 @@ if (subcommandExit !== null) process.exit(subcommandExit);
 // No subcommand matched → wrapper mode (back-compat with v3.0.x behavior).
 let proxyPort = 9801;
 let proxyUpstream = undefined;
+let remoteControl = false;
 const claudeArgs = [];
 
 for (let i = 0; i < args.length; i++) {
@@ -89,6 +99,8 @@ for (let i = 0; i < args.length; i++) {
     proxyPort = parseInt(args[++i], 10);
   } else if (args[i] === "--proxy-upstream" && args[i + 1]) {
     proxyUpstream = args[++i];
+  } else if (args[i] === "--remote-control") {
+    remoteControl = true;
   } else {
     claudeArgs.push(args[i]);
   }
@@ -96,6 +108,10 @@ for (let i = 0; i < args.length; i++) {
 
 const proxyEnv = { ...process.env, CACHE_FIX_PROXY_PORT: String(proxyPort) };
 if (proxyUpstream) proxyEnv.CACHE_FIX_PROXY_UPSTREAM = proxyUpstream;
+// Forward-proxy mode: the spawned proxy must attach the CONNECT/MITM handler,
+// or the HTTPS_PROXY wiring below would tunnel to a proxy that only speaks
+// reverse-proxy and never terminates TLS for the upstream host.
+if (remoteControl) proxyEnv.CACHE_FIX_FORWARD_PROXY = "on";
 
 const proxyProc = fork(SERVER_PATH, [], {
   stdio: ["ignore", "pipe", "pipe", "ipc"],
@@ -148,10 +164,35 @@ try {
   process.exit(1);
 }
 
-const claudeEnv = {
-  ...process.env,
-  ANTHROPIC_BASE_URL: `http://127.0.0.1:${actualPort}`,
-};
+let claudeEnv;
+if (remoteControl) {
+  // Forward-proxy wiring. Leave ANTHROPIC_BASE_URL UNSET (that is exactly what
+  // keeps Remote Control enabled) and route claude through the proxy as an
+  // HTTPS proxy, trusting the MITM CA it generated on startup. CA path mirrors
+  // the proxy's config.caDir: ${CLAUDE_CONFIG_DIR||~/.claude}/cache-fix-ca.
+  const caRoot = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
+  const caPem = join(caRoot, "cache-fix-ca", "ca.pem");
+  if (!existsSync(caPem)) {
+    process.stderr.write(
+      `--remote-control: proxy MITM CA not found at ${caPem}. The proxy should ` +
+        `generate it on startup in forward-proxy mode; check for an openssl ` +
+        `failure in the proxy output above.\n`,
+    );
+    cleanup();
+    process.exit(1);
+  }
+  const proxyUrl = `http://127.0.0.1:${actualPort}`;
+  claudeEnv = { ...process.env };
+  delete claudeEnv.ANTHROPIC_BASE_URL;
+  claudeEnv.HTTPS_PROXY = proxyUrl;
+  claudeEnv.https_proxy = proxyUrl;
+  claudeEnv.NODE_EXTRA_CA_CERTS = caPem;
+} else {
+  claudeEnv = {
+    ...process.env,
+    ANTHROPIC_BASE_URL: `http://127.0.0.1:${actualPort}`,
+  };
+}
 
 const spawnOpts = { stdio: ["inherit", "pipe", "pipe"], env: claudeEnv };
 if (process.env.CACHE_FIX_CLAUDE_CMD) {

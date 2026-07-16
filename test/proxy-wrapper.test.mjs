@@ -122,4 +122,35 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
 
     assert.equal(code, 42, `Expected exit 42, got ${code}. stderr: ${stderr}`);
   });
+
+  it("--remote-control wires forward-proxy env (BASE unset, HTTPS_PROXY + CA set)", async () => {
+    // The child prints the three routing-relevant vars. Forward mode must leave
+    // ANTHROPIC_BASE_URL unset (that keeps Remote Control enabled) and instead
+    // route via HTTPS_PROXY + the proxy's MITM CA. The wrapper splits
+    // CACHE_FIX_CLAUDE_CMD on spaces, so the script must contain none — hence
+    // the "|" delimiter rather than spaces in the output string.
+    const script =
+      'process.stdout.write("BASE="+(process.env.ANTHROPIC_BASE_URL||"UNSET")+' +
+      '"|HP="+(process.env.HTTPS_PROXY||"UNSET")+' +
+      '"|CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")+"\\n")';
+    const wrapperProc = fork(WRAPPER_PATH, ["--remote-control", "--proxy-port", "0"], {
+      stdio: ["ignore", "pipe", "pipe", "ipc"],
+      env: cleanEnv({ CACHE_FIX_CLAUDE_CMD: `${NODE} -e ${script}` }),
+    });
+
+    let stdout = "";
+    let stderr = "";
+    wrapperProc.stdout.on("data", (c) => { stdout += c.toString(); });
+    wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
+
+    const code = await new Promise((resolve) => {
+      wrapperProc.on("exit", (c) => resolve(c));
+      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
+    });
+
+    assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
+    assert.ok(stdout.includes("BASE=UNSET"), `ANTHROPIC_BASE_URL should be unset in forward mode, got: ${stdout}`);
+    assert.match(stdout, /HP=http:\/\/127\.0\.0\.1:\d+/, `HTTPS_PROXY should point at the proxy, got: ${stdout}`);
+    assert.match(stdout, /CA=\S*cache-fix-ca\/ca\.pem/, `NODE_EXTRA_CA_CERTS should point at the MITM CA, got: ${stdout}`);
+  });
 });
