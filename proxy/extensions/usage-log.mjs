@@ -56,7 +56,12 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { claudeHome } from "../claude-home.mjs";
 
-const LOG_PATH = process.env.CACHE_FIX_USAGE_LOG || join(claudeHome(), "usage.jsonl");
+// Resolve live per call so CACHE_FIX_USAGE_LOG and CLAUDE_CONFIG_DIR (via
+// claudeHome()) are honored at write time, not frozen at import. Matches the
+// paths() / logPath() shape in the sibling log extensions.
+function logPath() {
+  return process.env.CACHE_FIX_USAGE_LOG || join(claudeHome(), "usage.jsonl");
+}
 
 // --- Module-scope state ---
 
@@ -270,7 +275,7 @@ export function assembleRecord({ start, delta, quota, requestedModel, sid, prevQ
 
 // --- I/O ---
 
-async function appendJsonl(record, path = LOG_PATH) {
+async function appendJsonl(record, path = logPath()) {
   await mkdir(claudeHome(), { recursive: true });
   await appendFile(path, JSON.stringify(record) + "\n");
 }
@@ -288,7 +293,7 @@ export function _resetDeltaStateForTest() {
   _lastQ7d = null;
 }
 
-export { LOG_PATH };
+export { logPath };
 
 // --- Extension contract ---
 
@@ -342,7 +347,7 @@ export default {
       _lastQ5h = quota.q5h;
       _lastQ7d = quota.q7d;
 
-      await appendJsonl(record, process.env.CACHE_FIX_USAGE_LOG || LOG_PATH);
+      await appendJsonl(record, logPath());
     } catch {
       // Fail-open: never throw to the pipeline.
     }
