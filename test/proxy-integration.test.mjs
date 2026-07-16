@@ -108,7 +108,13 @@ describe("proxy integration with extensions", () => {
       }).on("error", reject);
     });
     assert.equal(res.status, 200);
-    assert.deepEqual(JSON.parse(res.body), { status: "ok" });
+    const health = JSON.parse(res.body);
+    assert.equal(health.status, "ok");
+    // /health also reports version + mode fields. This suite runs the proxy in
+    // reverse-proxy mode, so assert those explicitly rather than a whole-object
+    // deep-equal, which would break on every new /health field and version bump.
+    assert.equal(health.forward_proxy, false);
+    assert.equal(health.https_proxy, null);
   });
 
   it("forwards request through extensions and streams response", async () => {
