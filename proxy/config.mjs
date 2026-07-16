@@ -1,6 +1,7 @@
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { readFileSync } from "node:fs";
+import { claudeHome } from "./claude-home.mjs";
 
 function envInt(name, fallback) {
   const raw = process.env[name];
@@ -51,6 +52,11 @@ const config = {
   // so clients point HTTPS_PROXY (not ANTHROPIC_BASE_URL) at it and keep Remote
   // Control. See proxy/forward-proxy.mjs.
   get forwardProxy() { return process.env.CACHE_FIX_FORWARD_PROXY === "on"; },
+  // Directory holding the forward-proxy's generated CA + leaf certs. Defaults
+  // under the Claude config root (claudeHome() honors CLAUDE_CONFIG_DIR), like
+  // the rest of the proxy's on-disk state, so relocating the config dir moves
+  // the CA with it. Override with CACHE_FIX_CA_DIR to pin a fixed location.
+  get caDir() { return process.env.CACHE_FIX_CA_DIR || join(claudeHome(), "cache-fix-ca"); },
   // Forward-proxy download acceleration (opt-in, default OFF). When "on" AND
   // forward-proxy is active, MITM downloads.claude.ai (the Claude Code update /
   // plugin CDN) and re-issue each request to storage.googleapis.com/<bucket> —

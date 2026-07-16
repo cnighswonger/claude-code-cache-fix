@@ -22,16 +22,11 @@ import net from "node:net";
 import tls from "node:tls";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { randomBytes, X509Certificate } from "node:crypto";
 import config from "./config.mjs";
 import { getAgent } from "./upstream.mjs";
 import { discoverBucket } from "./downloads-bucket.mjs";
-
-// The CA is global (one cert CC trusts), not per-config-dir, so it lives outside
-// CLAUDE_CONFIG_DIR. Overridable for tests / non-default homes.
-const CA_DIR = process.env.CACHE_FIX_CA_DIR || join(homedir(), ".claude", "cache-fix-ca");
 
 function upstreamHost() {
   try { return new URL(config.upstream).hostname; } catch { return "api.anthropic.com"; }
@@ -63,10 +58,13 @@ function mitmHosts() {
  * the CA path the client must trust via NODE_EXTRA_CA_CERTS.
  */
 export function ensureCA() {
-  const caPem = join(CA_DIR, "ca.pem");
-  const caKey = join(CA_DIR, "ca.key");
-  const leafPem = join(CA_DIR, "leaf.pem");
-  const leafKey = join(CA_DIR, "leaf.key");
+  // Read once per call from config (live, not frozen at import). The CA dir is
+  // global (outside CLAUDE_CONFIG_DIR); see config.caDir.
+  const caDir = config.caDir;
+  const caPem = join(caDir, "ca.pem");
+  const caKey = join(caDir, "ca.key");
+  const leafPem = join(caDir, "leaf.pem");
+  const leafKey = join(caDir, "leaf.key");
   const host = upstreamHost();
   const hosts = mitmHosts();
   // The leaf must cover every host in `hosts`. A leaf minted by an older build
@@ -92,7 +90,7 @@ export function ensureCA() {
   if (ready()) {
     return { caPath: caPem, key: readFileSync(leafKey), cert: readFileSync(leafPem) };
   }
-  mkdirSync(CA_DIR, { recursive: true, mode: 0o700 });
+  mkdirSync(caDir, { recursive: true, mode: 0o700 });
 
   // Serialize generation across concurrent proxies (two proxies started against
   // separate config dirs share this global CA dir). An atomic mkdir lock elects one generator;
@@ -101,7 +99,7 @@ export function ensureCA() {
   // the on-disk CA -> client UNKNOWN_ISSUER). All artifacts are written to
   // temp paths and atomically renamed into place so a reader never sees a
   // half-written file.
-  const lock = join(CA_DIR, ".gen.lock");
+  const lock = join(caDir, ".gen.lock");
   let haveLock = false;
   try { mkdirSync(lock); haveLock = true; } catch {}
   if (!haveLock) {
@@ -117,7 +115,7 @@ export function ensureCA() {
   try {
     if (ready()) return { caPath: caPem, key: readFileSync(leafKey), cert: readFileSync(leafPem) };
     const run = (args) => execFileSync("openssl", args, { stdio: ["ignore", "ignore", "pipe"] });
-    const tmp = (n) => join(CA_DIR, `.tmp.${n}`);
+    const tmp = (n) => join(caDir, `.tmp.${n}`);
 
     // Reuse an existing root CA; only mint a new one on first run. Regenerating
     // the root here is a bug: the client trusts the CA via a NODE_EXTRA_CA_CERTS
