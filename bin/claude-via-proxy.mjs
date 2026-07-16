@@ -78,7 +78,17 @@ async function dispatch() {
         "  CACHE_FIX_PROXY_UPSTREAM Upstream URL\n" +
         "  CACHE_FIX_DEBUG=1        Verbose proxy logging\n" +
         "  CACHE_FIX_HOT_RELOAD=on  Enable in-process extension hot-reload (off by default; see #196)\n" +
-        "  CACHE_FIX_CLAUDE_CMD     Override the `claude` command for the wrapper\n",
+        "  CACHE_FIX_CLAUDE_CMD     Override the `claude` command for the wrapper\n" +
+        "\nNotes on --remote-control:\n" +
+        "  Remote Control performs a trusted-device enrollment handshake on first\n" +
+        "  connect. That step is Claude Code's own, runs upstream, and can need a\n" +
+        "  few retries — especially on a freshly launched or auto-resumed session,\n" +
+        "  or when the Anthropic API is degraded. A failure prints \"device\n" +
+        "  enrollment didn't complete... run /remote-control again\"; re-running RC\n" +
+        "  is the intended fix and normally succeeds within a few attempts. This is\n" +
+        "  enrollment flakiness, NOT a forward-proxy failure — the proxy relays the\n" +
+        "  enrollment traffic unchanged (check the proxy journal for passthrough\n" +
+        "  errors to rule the proxy in or out).\n",
     );
     return 0;
   }
