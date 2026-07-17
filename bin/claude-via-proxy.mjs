@@ -88,7 +88,15 @@ async function dispatch() {
         "  is the intended fix and normally succeeds within a few attempts. This is\n" +
         "  enrollment flakiness, NOT a forward-proxy failure — the proxy relays the\n" +
         "  enrollment traffic unchanged (check the proxy journal for passthrough\n" +
-        "  errors to rule the proxy in or out).\n",
+        "  errors to rule the proxy in or out).\n" +
+        "\n" +
+        "  Enabling RC on an already-warm session costs ONE prompt-cache rebuild:\n" +
+        "  enrollment adds an RC anthropic-beta (and X-Trusted-Device-Token) to\n" +
+        "  outbound requests, and Anthropic keys the prompt cache partly on the beta\n" +
+        "  set, so the first post-/rc request rebuilds the prefix under the new\n" +
+        "  namespace. It re-warms on the very next turn (measured: 13.9% -> 98.2%\n" +
+        "  hit rate one turn later). To avoid paying it mid-session, launch with\n" +
+        "  --remote-control from the start so the beta is present from request one.\n",
     );
     return 0;
   }
