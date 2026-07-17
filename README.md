@@ -46,6 +46,16 @@ NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem \
   claude
 ```
 
+Or let the launcher do both steps for you with `--remote-control`:
+
+```bash
+# Spawns the proxy with CACHE_FIX_FORWARD_PROXY=on and wires the client
+# (HTTPS_PROXY + the MITM CA, ANTHROPIC_BASE_URL left unset) automatically.
+cache-fix-proxy --remote-control
+```
+
+The `--remote-control` flag is the one-command equivalent of the manual wiring above: it starts the proxy in forward-proxy mode, waits for the CA, and launches `claude` pointed at `HTTPS_PROXY` with `NODE_EXTRA_CA_CERTS` set. Without the flag the launcher stays in reverse-proxy mode (sets `ANTHROPIC_BASE_URL`), unchanged. Two things worth knowing: Remote Control does a trusted-device enrollment on first connect that can need a few `/remote-control` retries (a Claude Code step that runs upstream, not a proxy failure); and enabling RC on an already-warm session costs a **single** prompt-cache rebuild (RC adds an `anthropic-beta` the cache keys on), so if you want RC, launching with `--remote-control` from the start avoids that one-time flip. `cache-fix-proxy --help` documents both.
+
 How it works: the proxy also handles HTTP `CONNECT`. It MITMs **only** the upstream host (`api.anthropic.com`), terminating TLS with a locally-generated CA so it can run the same extension pipeline, and **blind-tunnels every other CONNECT** (mcp-proxy, telemetry, npm, ...) untouched. On first start it generates a CA under `$CLAUDE_CONFIG_DIR/cache-fix-ca/` (default `~/.claude/cache-fix-ca/`; override with `CACHE_FIX_CA_DIR`); the client must trust it via `NODE_EXTRA_CA_CERTS`. A WebSocket/Upgrade to the upstream host (e.g. `/voice`) is relayed to upstream as-is. Because base URL stays `api.anthropic.com`, all of `/api/oauth/*`, `/v1/agents`, Remote Control credential fetches, etc. pass through untouched and RC stays enabled.
 
 Corporate proxy chaining works the same as reverse mode: set `HTTPS_PROXY`/`HTTP_PROXY` for the proxy's **own** upstream egress (the proxy dials `api.anthropic.com` through it). The client's `HTTPS_PROXY` points at the cache-fix proxy; the cache-fix proxy's `HTTPS_PROXY` (in its own env) points at the corporate proxy.
@@ -1177,6 +1187,7 @@ Backout: gate off + proxy restart → clients self-manage exactly as today (they
 - **[@ojura](https://github.com/ojura)** — Opus 4.7 thinking-summaries root-cause analysis: filed [anthropics/claude-code#59844](https://github.com/anthropics/claude-code/issues/59844) with the CLI-binary decode (`!getIsNonInteractiveSession()` gate at offset 230510599 in v2.1.142) and the two-stacked-special-cases framing, which made the `thinking-display` extension (v3.6.1) a clean proxy-side complement to the proposed upstream fix
 - **[@yurukusa](https://github.com/yurukusa)** — [Cluster taxonomy](https://yurukusa.github.io/cc-safe-setup/cluster-tracker.html#cluster-extended-thinking-wedge) for [anthropics/claude-code#63147](https://github.com/anthropics/claude-code/issues/63147) thinking-desync wedge; the 13E (ToolSearch) sub-pattern synthesis that made the `thinking-block-sanitize` v2 directive predicate tractable (cache-fix #171, shipped behind `=v2` opt-in in v4.0.0)
 - **[@schuay](https://github.com/schuay)** — `quota-statusline.sh` enhancements: 10-cell quota bar with elapsed-time tick and exhaust-vs-reset projection replacing the prior `%/min` burn-rate display (PR #140, v3.6.2), and d/h vs h/m time-format autoselect plus named time-unit and burn-warmup constants (PR #143, v3.7.0)
+- **[@codeslake](https://github.com/codeslake)** — Opt-in forward-proxy mode (HTTP `CONNECT` + selective MITM of the upstream host) that keeps Remote Control / mobile session visibility working through the proxy, resolving the `ANTHROPIC_BASE_URL`-disables-RC breakage on CC >= 2.1.196 (PR #251, implements #248); and honoring `CLAUDE_CONFIG_DIR` for all on-disk proxy state so multiple config roots don't clobber each other's credentials/state (PR #246)
 
 If you contributed to the community effort on these issues and aren't listed here, please open an issue or PR — we want to credit everyone properly.
 
