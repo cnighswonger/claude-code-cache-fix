@@ -491,6 +491,20 @@ function downloadsServer() {
  * rest. Returns the CA path (for NODE_EXTRA_CA_CERTS).
  */
 export function attachForwardProxy(server) {
+  // Warm bucket discovery BEFORE minting the leaf. downloadRewriteActive() is
+  // consulted twice below and both answers are frozen for this proxy's life: once
+  // by ensureCA() -> mitmHosts() for the leaf SAN, once for `downloadsMitm`. A
+  // miss right now is commonly transient — the proxy (re)starts in the sub-second
+  // window of an auto-update's symlink swap and reads a dangling/partial binary —
+  // and would otherwise wedge the download-rewrite OFF for the whole instance
+  // (downloads.claude.ai blind-tunneled, updates hit the throttled origin).
+  // discoverBucket() re-scans on a miss (it caches hits only), so a short bounded
+  // retry rides out the swap so the SAN covers downloads.claude.ai and the rewrite
+  // arms consistently. Bounded (~1.5s worst case) and only when rewrite is on.
+  if (config.downloadRewrite && discoverBucket() === "") {
+    const sleep100 = () => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100); } catch {} };
+    for (let i = 0; i < 8 && discoverBucket() === ""; i++) sleep100();
+  }
   const { caPath, key, cert } = ensureCA();
   const secureContext = tls.createSecureContext({ key, cert });
   const host = upstreamHost();
