@@ -57,6 +57,11 @@ const config = {
   // the rest of the proxy's on-disk state, so relocating the config dir moves
   // the CA with it. Override with CACHE_FIX_CA_DIR to pin a fixed location.
   get caDir() { return process.env.CACHE_FIX_CA_DIR || join(claudeHome(), "cache-fix-ca"); },
+  // How long a starter waits on a peer's CA-generation lock (.gen.lock) before
+  // deciding it is wedged/stale. Generation itself takes well under a second;
+  // the generous default absorbs a slow first run on a loaded machine. Mostly
+  // a test seam (tests shrink it so lock-contention paths run fast).
+  get caLockWaitMs() { return Number(process.env.CACHE_FIX_CA_LOCK_WAIT_MS) || 30000; },
   // Forward-proxy download acceleration (opt-in, default OFF). When "on" AND
   // forward-proxy is active, MITM downloads.claude.ai (the Claude Code update /
   // plugin CDN) and re-issue each request to storage.googleapis.com/<bucket> —

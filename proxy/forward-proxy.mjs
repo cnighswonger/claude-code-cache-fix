@@ -115,22 +115,62 @@ export function ensureCA() {
   // temp paths and atomically renamed into place so a reader never sees a
   // half-written file.
   const lock = join(caDir, ".gen.lock");
-  let haveLock = false;
-  try { mkdirSync(lock); haveLock = true; } catch {}
+  // Acquiring = atomically creating the lock dir, then stamping our pid inside
+  // so peers can tell a live generator from a stale lock left by a dead one.
+  // Generation happens ONLY while holding the lock; the old code fell through
+  // on wait-timeout and generated anyway — without ownership, with the same
+  // fixed temp filenames as the (possibly still-running) real generator, and
+  // its `finally` then deleted the owner's lock. Two concurrent starts could
+  // clobber each other and publish a leaf that doesn't chain to the CA the
+  // client was told to trust (UNKNOWN_ISSUER).
+  const acquire = () => {
+    try { mkdirSync(lock); } catch { return false; }
+    try { writeFileSync(join(lock, "pid"), String(process.pid)); } catch {}
+    return true;
+  };
+  const lockOwnerAlive = () => {
+    try {
+      const pid = Number(readFileSync(join(lock, "pid"), "utf8").trim());
+      if (!pid) return false;
+      process.kill(pid, 0);
+      return true;
+    } catch (err) {
+      // EPERM = exists but not ours -> alive. ESRCH / unreadable pid -> dead.
+      // A lock with no pid file after the full wait is stale too: a live owner
+      // stamps its pid within milliseconds of the mkdir.
+      return !!err && err.code === "EPERM";
+    }
+  };
+  let haveLock = acquire();
   if (!haveLock) {
     // Someone else is generating. Wait (bounded) for the artifacts to appear.
     // Synchronous sleep via Atomics.wait (no busy-spin, no external `sleep`).
     const sleep100 = () => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100); } catch {} };
-    const deadline = Date.now() + 30000;
+    const deadline = Date.now() + config.caLockWaitMs;
     while (!ready() && Date.now() < deadline) sleep100();
     if (ready()) return { caPath: caPem, key: readFileSync(leafKey), cert: readFileSync(leafPem) };
-    // Timed out (stale lock / dead generator): fall through and generate anyway.
-    try { mkdirSync(lock); } catch {}
+    // Timed out. Reclaim ONLY a stale lock (owner dead); a live owner means a
+    // generator is still working (or wedged) — throwing is the safe answer, and
+    // the caller (attachForwardProxy) already degrades to reverse-proxy mode.
+    if (!lockOwnerAlive()) {
+      try { rmSync(lock, { recursive: true, force: true }); } catch {}
+      haveLock = acquire(); // may lose to another reclaimer; that's fine
+    }
+    if (!haveLock) {
+      throw new Error(
+        `cache-fix forward-proxy: CA generation lock ${lock} still held after ` +
+        `${config.caLockWaitMs}ms; refusing to generate without owning the lock`,
+      );
+    }
   }
+  // Temp names carry our pid: even if lock discipline were ever violated, two
+  // generators cannot clobber each other's in-flight files. All of ours are
+  // removed in the finally (rename already moved the durable ones into place;
+  // the csr/ext scratch files would otherwise accumulate as litter).
+  const tmp = (n) => join(caDir, `.tmp.${process.pid}.${n}`);
   try {
     if (ready()) return { caPath: caPem, key: readFileSync(leafKey), cert: readFileSync(leafPem) };
     const run = (args) => execFileSync("openssl", args, { stdio: ["ignore", "ignore", "pipe"] });
-    const tmp = (n) => join(caDir, `.tmp.${n}`);
 
     // Reuse an existing root CA; only mint a new one on first run. Regenerating
     // the root here is a bug: the client trusts the CA via a NODE_EXTRA_CA_CERTS
@@ -174,7 +214,15 @@ export function ensureCA() {
     renameSync(tmp("leaf.key"), leafKey);
     renameSync(tmp("leaf.pem"), leafPem);
   } finally {
-    try { rmSync(lock, { recursive: true, force: true }); } catch {}
+    for (const n of ["ca.key", "ca.pem", "leaf.key", "leaf.pem", "leaf.csr", "leaf.ext"]) {
+      try { rmSync(tmp(n), { force: true }); } catch {}
+    }
+    // Only remove a lock this process created. Deleting a peer's lock lets a
+    // third starter acquire it mid-generation and republish artifacts out from
+    // under the real owner.
+    if (haveLock) {
+      try { rmSync(lock, { recursive: true, force: true }); } catch {}
+    }
   }
   return { caPath: caPem, key: readFileSync(leafKey), cert: readFileSync(leafPem) };
 }
