@@ -242,4 +242,53 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
     assert.ok(stdout.includes("example.com"), `existing NO_PROXY entry should be preserved, got: ${stdout}`);
     assert.ok(stdout.includes("127.0.0.1"), `localhost should be merged in, got: ${stdout}`);
   });
+
+  it("--remote-control reads a lowercase-only no_proxy and preserves it", async () => {
+    // The existing value may be set under the lowercase name only; the merge
+    // must read either variant, not just NO_PROXY.
+    const script = 'process.stdout.write("NP="+(process.env.NO_PROXY||"UNSET")+"\\n")';
+    const wrapperProc = fork(WRAPPER_PATH, ["--remote-control", "--proxy-port", "0"], {
+      stdio: ["ignore", "pipe", "pipe", "ipc"],
+      env: cleanEnv({ CACHE_FIX_CLAUDE_CMD: `${NODE} -e ${script}`, no_proxy: "corp.internal" }),
+    });
+
+    let stdout = "";
+    let stderr = "";
+    wrapperProc.stdout.on("data", (c) => { stdout += c.toString(); });
+    wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
+
+    const code = await new Promise((resolve) => {
+      wrapperProc.on("exit", (c) => resolve(c));
+      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
+    });
+
+    assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
+    assert.ok(stdout.includes("corp.internal"), `lowercase no_proxy entry should be preserved, got: ${stdout}`);
+    assert.ok(stdout.includes("127.0.0.1"), `localhost should be merged in, got: ${stdout}`);
+  });
+
+  it("--remote-control does not duplicate a localhost host already present in NO_PROXY", async () => {
+    const script = 'process.stdout.write("NP="+(process.env.NO_PROXY||"UNSET")+"\\n")';
+    const wrapperProc = fork(WRAPPER_PATH, ["--remote-control", "--proxy-port", "0"], {
+      stdio: ["ignore", "pipe", "pipe", "ipc"],
+      env: cleanEnv({ CACHE_FIX_CLAUDE_CMD: `${NODE} -e ${script}`, NO_PROXY: "127.0.0.1" }),
+    });
+
+    let stdout = "";
+    let stderr = "";
+    wrapperProc.stdout.on("data", (c) => { stdout += c.toString(); });
+    wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
+
+    const code = await new Promise((resolve) => {
+      wrapperProc.on("exit", (c) => resolve(c));
+      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
+    });
+
+    assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
+    // 127.0.0.1 must appear exactly once, not duplicated, and localhost still added.
+    const np = (stdout.match(/NP=(\S*)/) || [])[1] || "";
+    const occurrences = np.split(",").filter((h) => h === "127.0.0.1").length;
+    assert.equal(occurrences, 1, `127.0.0.1 should appear exactly once, got NP=${np}`);
+    assert.ok(np.split(",").includes("localhost"), `localhost should be added, got NP=${np}`);
+  });
 });
