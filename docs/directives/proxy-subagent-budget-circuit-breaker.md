@@ -16,9 +16,12 @@ Give the proxy an opt-in **hard per-session spend ceiling**: once a session's
 cumulative token consumption (or our estimated cost, or its consumption *rate*)
 crosses an operator-configured limit, further `/v1/messages` for that session are
 short-circuited locally with a clean synthesized stop, so they never reach
-Anthropic and therefore cannot consume credits or trigger auto-purchase. This is
-a **circuit breaker, not a precise meter** — it stops the bleeding, it does not
-price each request to the cent.
+Anthropic and therefore cannot consume credits, trigger auto-purchase, or (for
+direct API-key users) keep billing the card. It serves **both billing models** —
+subscription/OAuth and pay-as-you-go API key — since the tally is body-sourced and
+auth-independent; for API-key users the cost lever is a literal dollar ceiling (see
+Billing models covered). This is a **circuit breaker, not a precise meter** — it
+stops the bleeding, it does not price each request to the cent.
 
 ## Why (refs CC#68285)
 
@@ -64,6 +67,49 @@ Codex's round-1 directive review (`docs/code-reviews/directive-subagent-budget-c
 3. **Explicit `Load-bearing?` declaration** was missing from the NFR section. Added
    below.
 
+## Billing models covered (both — and the API-key case is the more severe one)
+
+The breaker serves **both** billing models, because the mechanism is
+billing-agnostic: the proxy forwards whatever auth the client sends (`x-api-key`
+or OAuth bearer — both already in the redaction set at `server.mjs:30-36`), and
+the token counts it tallies come from the response **body** (`msg.usage`,
+`usage-log.mjs:89-90`), which every Messages API response carries regardless of
+how the request authenticated. So the per-session token tally and the cost lever
+work identically for a subscription client and a raw API-key client.
+
+- **Subscription (OAuth, e.g. Max) — the #68285 case.** Tokens are quota-until-
+  overage; the danger is the auto-purchase wall the account `q5h` gates. The
+  token/rate levers cap the runaway *session* before it drives the account into
+  auto-purchase. This is the referenced incident.
+- **Direct API key (pay-as-you-go) — the more severe case, and arguably the
+  primary audience for the cost lever.** There is **no quota buffer at all**: every
+  token is billed immediately at API list price. The same 700-subagent fan-out on
+  an API key has *no* spend circuit whatsoever — it charges the card until the
+  key's own tier limit or the bank intervenes (worse than #68285, which at least
+  had a Max-plan spend rail that fired, badly, 3×). For these users
+  `CACHE_FIX_SESSION_BUDGET_COST_USD` is a **literal dollar ceiling** —
+  `tools/rates.json` is Anthropic's API list pricing
+  (source: platform.claude.com/docs/pricing), so `tokens × rates.json` is real
+  money out of pocket, per token. Cost is their **primary** lever; tokens/rate are
+  the plan-agnostic backstops.
+- **Graceful degradation of the observational signal.** The per-session account-
+  `q5h` contribution signal is subscription-specific (it derives from the
+  `anthropic-ratelimit-unified-*` headers). API-key traffic is unlikely to carry
+  those, so the signal reads absent (`?? 0`) and simply doesn't render — which is
+  fine, since it was already demoted to non-blocking and fail-opens on absence. No
+  behavior change for API-key users; they rely on the cost/token/rate levers, all
+  of which are body-sourced and auth-independent.
+
+**Implication for the cost lever (sharpens the staleness caveat below):** because
+`_COST_USD` is a *real dollar ceiling* for API-key users, `rates.json` staleness
+matters more than for a notional subscription estimate. If `rates.json` lags a new
+model's price, the cost lever silently under-counts (an unknown model contributes
+0 to the cost tally — fail-open by design). The **token** and **rate** levers stay
+exact regardless, so the guidance for API-key users who want a hard dollar cap is:
+set a `_TOKENS` ceiling too, so a stale/unknown rate can't let cost run past the
+intended dollar figure unbounded. The implementation and README must state this
+plainly.
+
 ## The signals (all derived from data we already write)
 
 Every `~/.claude/usage.jsonl` row already carries, per request: `sid` (boot-sticky
@@ -98,10 +144,15 @@ At least one must be set for the breaker to ever fire. All per-session:
 
 - `CACHE_FIX_SESSION_BUDGET_TOKENS` — hard-stop when cumulative `input +
   cache_creation` tokens for the session cross this integer. Plan-agnostic;
-  the primary lever.
+  the primary lever for subscription users and the exact-signal backstop for
+  API-key users.
 - `CACHE_FIX_SESSION_BUDGET_COST_USD` — hard-stop when estimated cost (tokens ×
   rates.json) crosses this float. Requires a known model in rates.json; falls back
-  to token-only if the rate is unknown.
+  to token-only if the rate is unknown. **The primary lever for direct API-key
+  users** (a literal dollar ceiling). Because an unknown/stale rate makes this
+  under-count (fail-open), an API-key user who wants a guaranteed dollar cap should
+  ALSO set `_TOKENS` as a belt-and-suspenders bound — a stale rate then cannot let
+  spend run past the token bound unbounded.
 - `CACHE_FIX_SESSION_BUDGET_RATE_TPM` — hard-stop when the session's
   tokens/min over the sliding window crosses this integer (early fan-out catch).
 - `CACHE_FIX_SESSION_BUDGET_RATE_WINDOW_MS` — sliding window for the rate levers
