@@ -186,10 +186,15 @@ let claudeEnv;
 if (remoteControl) {
   // Forward-proxy wiring. Leave ANTHROPIC_BASE_URL UNSET (that is exactly what
   // keeps Remote Control enabled) and route claude through the proxy as an
-  // HTTPS proxy, trusting the MITM CA it generated on startup. CA path mirrors
-  // the proxy's config.caDir: ${CLAUDE_CONFIG_DIR||~/.claude}/cache-fix-ca.
-  const caRoot = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
-  const caPem = join(caRoot, "cache-fix-ca", "ca.pem");
+  // HTTPS proxy, trusting the MITM CA it generated on startup. Resolve the CA
+  // dir from the SAME inputs as the proxy's config.caDir, in the same order:
+  // CACHE_FIX_CA_DIR wins, else ${CLAUDE_CONFIG_DIR||~/.claude}/cache-fix-ca.
+  // (Reading only CLAUDE_CONFIG_DIR here would ignore a CACHE_FIX_CA_DIR
+  // override and point claude at the wrong — or absent — CA than the one the
+  // spawned proxy actually generated.)
+  const caDir = process.env.CACHE_FIX_CA_DIR ||
+    join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"), "cache-fix-ca");
+  const caPem = join(caDir, "ca.pem");
   if (!existsSync(caPem)) {
     process.stderr.write(
       `--remote-control: proxy MITM CA not found at ${caPem}. The proxy should ` +
