@@ -1,111 +1,300 @@
-# Directive: Subagent budget circuit breaker
+# Directive: Session budget circuit breaker
 
-Status: DRAFT (directive stage — pending AITL scope approval + Codex review)
+Status: DRAFT (directive stage — AITL scope approved; Codex round-1 REQUEST_CHANGES addressed in this revision)
 Author: Proxy Builder
 Refs: [anthropics/claude-code#68285](https://github.com/anthropics/claude-code/issues/68285)
 
+> **Rename note (r2):** originally "subagent budget circuit breaker." Renamed to
+> **session** budget circuit breaker because the reliable, wire-supported unit is
+> the session, not the individual subagent (see Scope). This is honest framing:
+> the ceiling is per-session, and once crossed it blocks the next `/v1/messages`
+> in that session — including a top-level turn, not only fan-out children.
+
 ## Goal
 
-Give the proxy an opt-in **hard spend ceiling** for a session (and, where the wire allows, a workflow fan-out): once cumulative cost/quota-utilization crosses an operator-configured limit, further `/v1/messages` requests are short-circuited locally with a clean synthesized stop, so they never reach Anthropic and therefore cannot consume credits or trigger auto-purchase. This is a **circuit breaker, not a precise meter** — it stops the bleeding, it does not price each request to the cent.
+Give the proxy an opt-in **hard per-session spend ceiling**: once a session's
+cumulative token consumption (or our estimated cost, or its consumption *rate*)
+crosses an operator-configured limit, further `/v1/messages` for that session are
+short-circuited locally with a clean synthesized stop, so they never reach
+Anthropic and therefore cannot consume credits or trigger auto-purchase. This is
+a **circuit breaker, not a precise meter** — it stops the bleeding, it does not
+price each request to the cent.
 
-## Why
+## Why (refs CC#68285)
 
-CC#68285: a Workflow fan-out of 700+ subagents inherited a premium-tier default (`claude-fable-5[1m]`) with **no per-agent model ceiling and no spend gate**. The tier × fan-out multiplication consumed ~$350 of pre-purchased credits and triggered ~$800 of auto-purchased overage across three card transactions before the user could intervene; the spend limit was hit 3× mid-run, corrupting workflow results with partial verdicts. The critical ask from the issue, verbatim:
+A Workflow fan-out of 700+ subagents inherited a premium-tier default
+(`claude-fable-5[1m]`) with **no per-agent model ceiling and no spend gate**. The
+tier × fan-out multiplication consumed ~$350 of pre-purchased credits and
+triggered ~$800 of auto-purchased overage across three card transactions before
+the user could intervene; the spend limit was hit 3× mid-run, corrupting workflow
+results with partial verdicts. The critical ask, verbatim:
 
-> "The spend-limit mechanism should not auto-purchase credits without explicit user consent when the overage is caused by a system-side defect."
+> "The spend-limit mechanism should not auto-purchase credits without explicit
+> user consent when the overage is caused by a system-side defect."
 
-We cannot change Anthropic's auto-purchase behavior. But auto-purchase is fed by requests, and **every request in a proxy deployment passes through us first.** If we refuse requests once a ceiling is crossed, we starve the overage at its source. The proxy is uniquely positioned here because the two hard primitives already ship:
+**Why per-session is the correct and sufficient lever for this exact issue:** the
+runaway was one workflow fan-out inside **one session** — all 700 subagents are
+children of a single session id. A per-session cumulative ceiling caps that
+session before it can drive the account quota up into auto-purchase territory. We
+cannot change Anthropic's auto-purchase; but every request in a proxy deployment
+passes through us first, and refusing a session's requests once *its own* tally
+crosses the ceiling stops the offending session at the source. **This directive
+does not ship unless it demonstrably caps the #68285 fan-out pattern** (see Sim
+validation).
 
-- **Per-subagent attribution** — `workflow-agent-id-synthesis` already derives a stable per-leg agent id from the wire (`sha256(sessionId + markerId + sha256(first-user-message text))`) for exactly the `parallel()` / `pipeline()` fan-out this issue is about (`proxy/extensions/workflow-agent-id-synthesis.mjs`).
-- **Cost/quota signal per request** — `usage-log` already captures full token counts plus `q5h` / `q7d` quota utilization from the `anthropic-ratelimit-unified-*` response headers on every row (`proxy/extensions/usage-log.mjs:145-147`). For a Max-plan overage — which is what bit the #68285 user — quota utilization is a **more direct** signal than dollar estimation, and we already have it.
-- **Block mechanism** — the pipeline's `onRequest` → `{ skip: true, ... }` short-circuit (used by `bootstrap-defense`, `image-retry-circuit-breaker`) already refuses a request and synthesizes a response before any upstream call (`proxy/pipeline.mjs:85-99` → `proxy/server.mjs` skip handler).
+## What changed since Codex round 1 (design corrections)
 
-The gap is precisely **warn → block.** We already ship `overage-warning`, which fires at q5h thresholds but only writes stderr + a JSONL record; it does not stop traffic. This directive adds the hard stop, reusing the SSE-synthesis wire format the image-retry breaker already validated in sim.
+Codex's round-1 directive review (`docs/code-reviews/directive-subagent-budget-circuit-breaker-codex.md`) found three design-level gaps, all verified against code. This revision fixes them:
+
+1. **Do NOT use Anthropic's account-global `q5h` header as a per-session lever.**
+   `usage-log.mjs:145` reads `anthropic-ratelimit-unified-5h-utilization` straight
+   from the response header — that is the **account's** rolling 5h window, which
+   already includes every other session/client/machine on the account. Blocking a
+   session on it would trip an innocent session because another one burned quota.
+   **Fix:** the blocking lever is a **per-session tally we compute ourselves** from
+   the per-session-tagged usage rows we already write (each carries `sid` + `ts` +
+   full token counts). Anthropic's account `q5h` is used only for an *observational*
+   attribution signal (below), never as a blocking gate.
+2. **`scope=workflow` is not implementable from the cited primitive.**
+   `deriveParentAgentId(sessionId)` = `sha16(sessionId + "workflow-root")` — one
+   constant per session, so all derived Workflow legs (across all runs in a
+   session) collapse into one bucket. There is no wire-visible per-workflow-run
+   discriminator. **Fix:** v1 is **session-scoped only.** `scope=workflow` is
+   removed; a v2 note records what a real per-run key would require.
+3. **Explicit `Load-bearing?` declaration** was missing from the NFR section. Added
+   below.
+
+## The signals (all derived from data we already write)
+
+Every `~/.claude/usage.jsonl` row already carries, per request: `sid` (boot-sticky
+8-char session id), `ts`, `input_tokens`, `output_tokens`,
+`cache_creation_input_tokens`, `cache_read_input_tokens`, and the account
+`q5h`/`q7d` plus `q5h_delta`/`q7d_delta` (`usage-log.mjs:145-146,201-202`). From
+the rows for a given `sid` the breaker computes, in-memory:
+
+- **Cumulative tokens** — running sum of `input + cache_creation` (the cost-bearing
+  inputs; cache_read is cheap and output is post-hoc) for the session.
+- **Estimated cost (USD)** — cumulative tokens × the per-model rates in
+  `tools/rates.json` (already maintained in-repo). Best-effort: rates.json may lag
+  a new model; unknown model → cost signal unavailable for that request (fail-open,
+  below), token signal still works.
+- **Consumption rate** — tokens/min (or $/min) over a sliding window using the
+  per-row `ts`. **This is the early-fan-out signal:** 700 subagents firing
+  near-simultaneously produce a rate spike detectable in the first 1-2s, so a rate
+  trip can fire on the *slope* and cut the runaway earlier than a pure cumulative
+  ceiling (which only trips after the tokens land — the concurrency-overshoot
+  limitation). Rate trips are the main mitigation for overshoot.
+- **Per-session account-q5h contribution (OBSERVATIONAL ONLY, never a block gate)**
+  — attribute the account's `q5h_delta` to the session that caused it by the
+  session's token share of the window, giving "this session is responsible for ~X%
+  of the account's 5h quota burn" and its rate. Useful for operators to see *which*
+  session is driving the account quota, and surfaced in the event log / statusline
+  follow-up. It is **not** a blocking lever (it's derived from an account-global
+  number); it informs humans, it does not gate traffic.
+
+## Blocking levers (opt-in; no ceiling set by default)
+
+At least one must be set for the breaker to ever fire. All per-session:
+
+- `CACHE_FIX_SESSION_BUDGET_TOKENS` — hard-stop when cumulative `input +
+  cache_creation` tokens for the session cross this integer. Plan-agnostic;
+  the primary lever.
+- `CACHE_FIX_SESSION_BUDGET_COST_USD` — hard-stop when estimated cost (tokens ×
+  rates.json) crosses this float. Requires a known model in rates.json; falls back
+  to token-only if the rate is unknown.
+- `CACHE_FIX_SESSION_BUDGET_RATE_TPM` — hard-stop when the session's
+  tokens/min over the sliding window crosses this integer (early fan-out catch).
+- `CACHE_FIX_SESSION_BUDGET_RATE_WINDOW_MS` — sliding window for the rate levers
+  (default 60000).
+
+Gate: `CACHE_FIX_SESSION_BUDGET` — `off` (default) / `on` / `dry-run`. With `on`
+but no ceiling set, inert + a one-shot stderr note (armed-but-toothless).
+`CACHE_FIX_SESSION_BUDGET_MAX_ENTRIES` — LRU cap on the per-session tally map
+(default 4096).
 
 ## Non-Functional Requirements
 
-- **Size/complexity budget:** extension code ~180 LOC; cumulative-accounting + limit-predicate helpers ~80 LOC; the synthesized-stop wire format is **reused verbatim** from `image-retry-circuit-breaker` (shared helper, not re-implemented); tests ~300 LOC. **Total budget ~600 LOC.** Flag at review if it grows past that. If the SSE synthesis is not already a shared helper by implementation time, extracting it from `image-retry-circuit-breaker` is in scope (and reduces net LOC).
-- **Threat model:** the breaker reads request bodies (to identify the model and the workflow/subagent id via the existing derivation helper) and response usage/quota headers. The proxy already does both. Breaker state (cumulative tallies) is **in-memory and per-session**; nothing new persists to disk beyond the optional structured event log of breaker fires. **Never** log request/response bodies, model-input content, or auth headers — the event log carries session id, agent id, cumulative tally, the crossed limit, timestamp, request_id only (matches `bootstrap-defense` / `image-retry` PII discipline). 5 MB single-tier rotation.
-- **Activation model:** `enabled: true` in `extensions.json` (always loaded) with an internal env-var gate `CACHE_FIX_SUBAGENT_BUDGET` (tri-state `on` / `off` / `dry-run`, following the `image-retry-circuit-breaker` precedent). **Default OFF** — a spend cap that blocks live traffic must never turn on without an operator deliberately setting a limit. `dry-run` logs what it *would* block without blocking, for tuning the ceiling before arming it.
-- **Failure mode — fail-OPEN, always.** This is the load-bearing safety inversion vs. the image breaker. If the accounting is uncertain, the state is missing, a header is unparseable, or anything throws: **forward the request.** A budget breaker that fails closed would wedge a user's entire session on a proxy bug — far worse than the overage it prevents. The only path that blocks is: gate is `on` AND a numerically-confident cumulative tally AND the tally is at/over an explicitly-configured ceiling. Everything else forwards. A single env-var flip (`=off`) fully disables it.
-- **Tunables (all opt-in; no ceiling is set by default):**
-  - `CACHE_FIX_SUBAGENT_BUDGET` — `off` (default) / `on` / `dry-run`.
-  - `CACHE_FIX_SUBAGENT_BUDGET_Q5H_LIMIT` — hard-stop when session `q5h` utilization crosses this float (e.g. `0.90`). Quota-based; the recommended primary lever for Max-plan users (directly matches #68285).
-  - `CACHE_FIX_SUBAGENT_BUDGET_TOKENS` — hard-stop when cumulative `input + cache_creation` tokens for the session cross this integer. Plan-agnostic secondary lever.
-  - `CACHE_FIX_SUBAGENT_BUDGET_SCOPE` — `session` (default) / `workflow`. `workflow` tallies per derived workflow-root id (see Scope); `session` tallies per `sid`.
-  - `CACHE_FIX_SUBAGENT_BUDGET_MAX_ENTRIES` — LRU cap on the tally map (default 4096).
-  - At least one of `_Q5H_LIMIT` / `_TOKENS` must be set for the breaker to ever fire; with the gate `on` but no limit set, it is inert (and logs a one-shot stderr note so the operator knows it's armed-but-toothless).
+- **Size/complexity budget:** extension ~180 LOC; tally/rate/cost helpers ~120 LOC;
+  the synthesized-stop wire format is **reused** from `image-retry-circuit-breaker`
+  (shared helper, extract if not already shared); tests ~320 LOC. **Total ~620
+  LOC.** Flag at review if it grows past that.
+- **Threat model:** reads response `usage` blocks + quota headers (same source
+  `usage-log` parses) and request bodies only to the extent the existing derivation
+  already does (for the `sid`). Tally state is **in-memory, per-session**; nothing
+  new persists beyond the optional event log. **Never** log request/response
+  bodies, model-input content, or auth headers — the event log carries `sid`,
+  cumulative tally, estimated cost, the crossed limit, `request_id` (nullable — see
+  below), `ts` only. 5 MB single-tier rotation (matches `bootstrap-defense` /
+  `image-retry`).
+- **Load-bearing? YES.** This blocks live, credential-bearing `/v1/messages`
+  traffic on a spend condition. It requires **human (Chris) review before any
+  implementation merge**, not just Lead + Codex, and sim-validation against a real
+  fan-out (below).
+- **Failure mode — fail-OPEN, always.** If accounting is uncertain, state is
+  missing, a header/usage field is unparseable, the model is unknown to rates.json
+  (for the cost lever only), or anything throws: **forward the request.** A budget
+  breaker that failed closed would wedge a whole session on a proxy bug — worse than
+  the overage. The fail-open contract is specified as a table (below), not left to
+  the implementer. One env-var flip (`=off`) fully disables it.
+- **Performance:** the tally update is O(1) per response (increment + sliding-window
+  prune); the map is LRU-bounded. No disk I/O on the request path beyond the
+  optional append-only event log on a fire.
+
+## Fail-open contract (explicit — closes Codex attention item)
+
+Per metric, per request. The breaker BLOCKS only when the gate is `on` AND at
+least one lever is **confidently** at/over its ceiling. Everything else forwards.
+
+| Condition | Token lever | Cost lever | Rate lever | Overall |
+|---|---|---|---|---|
+| Gate `off` | — | — | — | **forward** |
+| Gate `on`, no ceiling set | inert | inert | inert | **forward** (one-shot note) |
+| `usage` block present, tokens parse | tally updates; block if ≥ ceiling | as tokens, × known rate | window updates; block if ≥ ceiling | block if ANY lever confidently over |
+| `usage` missing / token field unparseable | **this metric not updated; not a block** | not updated | not updated | **forward** (no confident tally) |
+| Model unknown to rates.json | token lever unaffected | **cost lever unavailable this request; not a block** | unaffected | token/rate can still block; cost cannot |
+| Tally/map entry missing (first request, post-restart) | starts at 0 | 0 | empty window | **forward** |
+| Any throw in the extension | — | — | — | **forward** (pipeline catches) |
+
+Key rule: an unparseable/missing metric invalidates **only that metric**, never the
+whole decision, and never flips a forward into a block. A block requires a
+positive, numerically-confident over-ceiling on at least one lever.
 
 ## Pipeline-hook surface (verified against `proxy/pipeline.mjs`)
 
-Four hooks exist: `onRequest`, `onResponseStart`, `onStreamEvent`, `onResponse`. The breaker uses:
-
-- **`onResponse` / `onStreamEvent`** — reads the response `usage` block and the `anthropic-ratelimit-unified-*` quota headers (same source `usage-log` already parses) and **updates the cumulative tally** for this request's session (and workflow-root, if scope=workflow). This is where cost is learned. Output tokens are only known here (post-hoc), which is why the tally gates the *next* request, not the current one.
-- **`onRequest`** — before forwarding, checks the current cumulative tally against the configured ceiling for this request's scope key. If at/over: return `{ skip: true, status, headers, body }` with the synthesized stop (below). If under, or if the tally is missing/uncertain: return nothing and forward (fail-open).
-
-**Ordering:** the breaker's `onRequest` must run **after** `workflow-agent-id-synthesis` (so `ctx.meta._workflowAgentId` is populated for scope=workflow). Place its order value after the derivation extension's; verify against `extensions.json` at implementation time.
+- **`onResponse` / `onStreamEvent`** — read the response `usage` + quota headers
+  (same source `usage-log` parses at `usage-log.mjs:306-350`) and **update the
+  per-session tally** keyed by `sid`. Cost is learned here (output post-hoc), which
+  is why the tally gates the *next* request.
+- **`onRequest`** — before forwarding, check the session's current tally/rate
+  against the ceilings. If confidently over → `{ skip: true, ... }` synthesized
+  stop. Else forward (fail-open). The `sid` for keying is available from the same
+  header the usage-log/derivation path already reads; **no dependency on
+  `workflow-agent-id-synthesis`** now that scope is session-only (removes the
+  ordering constraint from round 1).
 
 ## Synthesized stop — wire format (reuse image-retry breaker)
 
-**Do not re-implement.** The image-retry circuit breaker already solved clean local short-circuit for both streaming and non-streaming `/v1/messages`, validated in sim (`docs/directives/proxy-image-retry-circuit-breaker.md`, "Synthesized response — wire format"). Reuse the same `{ skip: true, ... }` result shape and SSE event sequence, changing only the short-circuit message text:
+Reuse the image-retry breaker's validated `{ skip: true, ... }` shape and SSE
+sequence (`image-retry-circuit-breaker.mjs:216-269`), changing only the message:
 
 ```
-[cache-fix-proxy] Session budget ceiling reached (<limit-kind>=<limit>, observed=<tally>). This request was stopped locally to prevent further spend — it never reached Anthropic, so no credits were consumed and no auto-purchase can be triggered by it. Raise or clear the ceiling (CACHE_FIX_SUBAGENT_BUDGET_*) to resume. (See CC#68285.)
+[cache-fix-proxy] Session token/cost ceiling reached (<lever>=<limit>, observed=<tally>). This request was stopped locally to prevent further spend — it never reached Anthropic, so no credits were consumed and no auto-purchase can be triggered by it. Raise or clear the ceiling (CACHE_FIX_SESSION_BUDGET_*) to resume. (See CC#68285.)
 ```
 
-`status: 200` with the standard synthesized envelope so the harness consumes it as a completed turn rather than a hard error that triggers its own retry storm — the exact failure mode the image breaker had to avoid. **The wire-format sim-validation gate below is mandatory; do not merge on the assumption that the image breaker's format transfers unchanged — re-validate against a real fan-out.**
+`status: 200` with the standard synthesized envelope so the harness consumes it as
+a completed turn, not a hard error that triggers its own retry storm. **The
+wire-format sim-validation gate is mandatory** — re-validate against a real fan-out,
+do not assume the image-breaker format transfers unchanged.
 
-## Observability (matches image-retry breaker's meter-bypass reality)
+## Observability
 
-A skipped request returns before any upstream call, so **no `usage.jsonl` row is written** for the blocked request (correct — no cost was incurred, but note it does not appear in the meter). The **only** observability surface for breaker fires is this extension's JSONL event log at `~/.claude/subagent-budget-events.jsonl` (session id, scope key, agent id, cumulative tally, crossed limit, request_id, ts; 5 MB single-tier rotation). Document this in the extension's README entry so operators don't expect meter rows for blocked requests. `dry-run` mode writes the same events with a `would_block: true` flag and forwards the request.
+A skipped request returns before any upstream call → **no `usage.jsonl` row** for
+the blocked request (correct — no cost incurred, but note it's not in the meter).
+The only observability surface for fires is this extension's JSONL event log at
+`~/.claude/session-budget-events.jsonl` (`sid`, cumulative tally, estimated cost,
+crossed lever+limit, per-session account-q5h contribution, `request_id`, `ts`; 5 MB
+single-tier rotation). `dry-run` writes the same events with `would_block: true`
+and forwards.
+
+**`request_id` is nullable (closes Codex attention item):** the usual source is the
+upstream `request-id` response header, which a locally-blocked request does not
+have. Populate it from the client-supplied request header if present, else null.
+Never fabricate one.
 
 ## Scope
 
-- **v1 (this directive): scope=session is the reliable path.** Per-`sid` cumulative tally + hard ceiling is fully supported by primitives we already have (usage/quota per response, keyed by the boot-sticky `sid`). This alone solves the #68285 shape: the runaway fan-out shares one session, so a session ceiling caps the whole fan-out.
-- **v1: scope=workflow is best-effort.** `workflow-agent-id-synthesis` derives `parentId` per leg; tallying to a workflow-root key is feasible where the derivation fires, but carries the same known limitation the derivation directive documents (identical-prompt `parallel()` legs collide on the discriminator). Ship scope=workflow behind the tunable with that caveat explicit; scope=session is the default and the recommended lever.
-- **Explicitly OUT of scope:** (1) per-*model-tier* ceilings / model downgrade-on-budget — silently rewriting a subagent's model to a cheaper tier changes results invisibly; block-on-budget is cleaner than rewrite-on-budget, and rewrite is a separate directive if ever wanted. (2) Dollar-precise accounting — we gate on tokens/quota, not a live price table. (3) Anything touching Anthropic's auto-purchase directly — we can only refuse requests, not change billing behavior.
+- **v1: session-scoped only.** Per-`sid` cumulative tokens + cost + rate, with
+  hard ceilings. Fully supported by primitives verified in-tree. Solves #68285 (the
+  runaway fan-out shares one `sid`).
+- **Removed from v1: `scope=workflow`.** The derivation helper only provides a
+  session-wide synthetic root (`sha16(sessionId + "workflow-root")`), not a
+  per-run bucket — verified at `workflow-agent-derivation.mjs:30-32`. Session
+  scope already caps the #68285 case, so nothing is lost for the required fix.
+- **v2 note (not this directive):** a real per-workflow-run ceiling would need a
+  wire-visible run discriminator. CC keeps the workflow-run id in in-process state,
+  not the request body (per the workflow-agent-id-synthesis directive's binary
+  finding), so this is blocked on an upstream change or a new derivation input;
+  out of scope until one exists.
+- **Explicitly OUT of scope:** model downgrade-on-budget (silent result changes —
+  block, don't rewrite); dollar-precise accounting (we estimate from rates.json);
+  anything touching Anthropic's auto-purchase directly (we refuse requests, not
+  billing); persisting the tally across restarts.
 
 ## Known limitations (state honestly in README + PR)
 
-- **Concurrency overshoot.** A large fan-out fires near-simultaneously; by the time the first responses update the tally, many requests are already in flight. The breaker stops the bleeding but **overshoots by roughly the in-flight batch** — realistic outcome is stopping ~tens of dollars over the ceiling, not at it. This is a circuit breaker, not a precise cap. Say so plainly; a user expecting cent-precision will be surprised, and #68285's ask is "don't silently 10×," which this delivers.
-- **Output cost is post-hoc.** Accurate cumulative tracking gates the next request; it cannot price the current one in advance.
-- **Restart resets the tally.** In-memory state; a proxy restart mid-session zeroes the cumulative count. Acceptable for a safety backstop (a restart is a deliberate operator action); documented, not worked around.
+- **Concurrency overshoot.** A large fan-out fires near-simultaneously; a pure
+  cumulative ceiling trips only after the in-flight batch's tokens land, so it
+  overshoots by ~that batch. **The rate lever (`_RATE_TPM`) mitigates this** by
+  firing on the slope before the batch completes; measure and report the actual
+  overshoot for both levers in sim.
+- **Output cost is post-hoc** — the tally gates the next request, not the current.
+- **Cost is an estimate** — tokens × rates.json, which may lag a new model; the
+  token and rate levers are exact, the cost lever is best-effort.
+- **Restart resets the tally** — in-memory; a mid-session restart zeroes it.
+  Acceptable for a safety backstop; documented.
+- **Per-session, not per-account** — caps the offending *session*; it cannot lower
+  Anthropic's account-global quota or stop auto-purchase directly. For a
+  single-session runaway (#68285), capping that session is the right and
+  sufficient action.
 
-## Sim validation requirement (mandatory before default-on consideration)
+## Sim validation requirement (mandatory; gates default-on AND merge per #68285 bar)
 
-Carries `needs-sim-validation` as a merge gate. Validate against a **real workflow fan-out** (not a synthetic single request):
+Carries `needs-sim-validation`. Validate against a **real workflow fan-out**:
 
-1. The synthesized stop is consumed by the CC harness as a completed turn with **no retry storm** on the blocked subagents (the image-breaker risk, re-verified for the fan-out case).
-2. The tally correctly accumulates across concurrent legs and the ceiling fires within the overshoot bound claimed above (measure the actual overshoot; put the number in the PR).
-3. `dry-run` forwards every request and logs `would_block` at the right point.
-4. Fail-open holds: with the gate `on` but state deliberately corrupted/missing, every request forwards.
+1. **The #68285 case is demonstrably capped:** a fan-out that would exceed the
+   ceiling is stopped, with the measured overshoot for both the cumulative and rate
+   levers reported in the PR. This is the ship gate — no merge if it doesn't cap the
+   referenced pattern.
+2. The synthesized stop is consumed as a completed turn with **no retry storm** on
+   blocked subagents.
+3. The tally accumulates correctly across concurrent legs; the rate lever fires on
+   the slope earlier than the cumulative lever.
+4. `dry-run` forwards every request and logs `would_block` at the right point.
+5. Fail-open holds: gate `on` + deliberately corrupted/missing state → every
+   request forwards.
 
 ## Test plan
 
-- Unit: cumulative-tally accounting across a sequence of responses (tokens + q5h); limit predicate at/under/over for both `_Q5H_LIMIT` and `_TOKENS`; scope=session vs scope=workflow keying; LRU eviction at `_MAX_ENTRIES`.
-- Block path: `onRequest` returns the correct `{ skip: true, ... }` for `stream:true` and `stream:false`; the synthesized envelope matches the image-breaker shape.
-- **Fail-open:** every throw / missing-state / unparseable-header path forwards (this is the highest-value test class — assert it exhaustively).
-- Tri-state gate: `off` inert; `on` + no limit set inert (one-shot stderr note); `dry-run` forwards + logs `would_block`.
-- Event log: fields present, no bodies/creds, rotation at 5 MB.
+- Unit: cumulative token/cost/rate accounting across a response sequence; each
+  lever's predicate at/under/over; sliding-window rate math with injected
+  timestamps (note: `Date.now()` is available in the extension at runtime, but tests
+  inject `ts`); LRU eviction; unknown-model cost fallback.
+- Block path: `onRequest` returns the correct `{ skip: true, ... }` for
+  `stream:true`/`false`; envelope matches the image-breaker shape.
+- **Fail-open:** every row of the fail-open table above is a test case — this is the
+  highest-value class; assert exhaustively.
+- Tri-state gate; nullable `request_id`; event-log fields + no bodies/creds +
+  rotation.
 
 ## Files modified / created
 
-- `proxy/extensions/subagent-budget-breaker.mjs` (new) — the extension.
-- `proxy/extensions.json` — register `enabled:true`, order after `workflow-agent-id-synthesis`.
-- Shared SSE-synthesis helper — extract from `image-retry-circuit-breaker.mjs` if not already shared, and reuse (net LOC reduction).
-- `test/proxy-subagent-budget-breaker.test.mjs` (new).
-- `README.md` — new section documenting the tunables, the circuit-breaker-not-meter framing, the overshoot limitation, and the meter-bypass observability note.
+- `proxy/extensions/session-budget-breaker.mjs` (new).
+- `proxy/extensions.json` — register `enabled:true` (order is unconstrained now
+  that there's no derivation dependency; place near other observability extensions).
+- Shared SSE-synthesis helper — extract from `image-retry-circuit-breaker.mjs` if
+  not already shared.
+- `test/proxy-session-budget-breaker.test.mjs` (new).
+- `tools/rates.json` — consumed read-only (no change; note the staleness caveat).
+- `README.md` — new section: tunables, circuit-breaker-not-meter framing, the
+  per-session-not-per-account boundary, overshoot + rate-lever, meter-bypass
+  observability.
 - This directive.
 
 ## Reviewer checklist (cache-fix side)
 
-- Fail-open is provably the default for every non-happy path (grep every `catch` and every early return; none block).
-- The breaker never reads or logs message content, bodies, or auth headers.
-- Order runs after `workflow-agent-id-synthesis`; scope=workflow degrades to session-equivalent when derivation doesn't fire, rather than mis-keying.
-- Default-off; no ceiling set by default; `dry-run` genuinely forwards.
-- The synthesized stop reuses (not forks) the image-breaker wire format, and the sim-validation gate is satisfied before any default-on discussion.
-- **Load-bearing** (blocks live credential-bearing traffic on a spend condition): requires human (Chris) review before merge, not just Lead + Codex.
+- The blocking levers are **all per-session tallies we compute**; Anthropic's
+  account `q5h` header is used ONLY for the observational contribution signal, never
+  as a block gate.
+- Fail-open is provably the default for every row of the fail-open table.
+- Never reads/logs message content, bodies, or auth headers.
+- scope=session only; no dependency on `workflow-agent-id-synthesis`.
+- Default-off; no ceiling by default; `dry-run` genuinely forwards.
+- Synthesized stop reuses (not forks) the image-breaker wire format.
+- **Load-bearing → human (Chris) review before merge**, and sim proves the #68285
+  fan-out is capped before merge.
 
 ## Out of scope (explicit)
 
-Model downgrade-on-budget; dollar-precise pricing; changing Anthropic auto-purchase; persisting the tally across restarts; per-model-tier ceilings. Each is a separate directive if ever wanted.
+Model downgrade-on-budget; dollar-precise pricing; account-global quota blocking or
+changing auto-purchase; per-workflow-run ceilings; persisting the tally across
+restarts. Each is a separate directive if ever wanted.
