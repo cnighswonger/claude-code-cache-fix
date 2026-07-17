@@ -298,7 +298,12 @@ async function handleBootstrap(clientReq, clientRes) {
 // missing so CA generation threw) and we fell back to reverse-proxy. /health
 // reports the effective value so clients/monitoring aren't told forward-proxy
 // is on when it silently isn't.
-let _forwardProxyActive = false;
+// Count of live, successfully-attached forward-proxy instances in this process
+// (embedded/test processes can run several). Routing and /health key on this —
+// NOT on config.forwardProxy — so a requested-but-failed attach serves
+// reverse-mode semantics, and a closed forward instance retires its vote
+// instead of haunting later reverse-only instances in the same process.
+let _forwardActive = 0;
 
 function handleHealth(_req, res) {
   // Surface extension-load failures so callers (operators, monitoring) see
@@ -327,8 +332,8 @@ function handleHealth(_req, res) {
   res.end(JSON.stringify({
     status: "ok",
     version: config.version,
-    forward_proxy: _forwardProxyActive,
-    https_proxy: (_forwardProxyActive && config.httpsProxy) || null,
+    forward_proxy: _forwardActive > 0,
+    https_proxy: (_forwardActive > 0 && config.httpsProxy) || null,
   }));
 }
 
@@ -411,7 +416,11 @@ export function createProxyServer() {
         if (req.url?.startsWith("/api/claude_cli/bootstrap")) return await handleBootstrap(req, res);
         // Forward-proxy mode MITMs the whole host, so any other path (RC creds,
         // OAuth, ...) must be relayed to upstream untouched rather than 404'd.
-        if (config.forwardProxy) return await handlePassthrough(req, res);
+        // Keyed on _forwardProxyActive (attach actually succeeded), NOT
+        // config.forwardProxy (the env request): if attachForwardProxy() threw,
+        // the proxy is serving reverse-mode only and must keep that mode's 404
+        // contract instead of silently relaying non-core paths upstream.
+        if (_forwardActive > 0) return await handlePassthrough(req, res);
         debugLog("ERROR: handler not found for req.url=", req.url, "method=", req.method);
         handleNotFound(req, res);
       } catch (error) {
@@ -425,6 +434,34 @@ export function createProxyServer() {
       }
     })();
   });
+}
+
+// The forward-mode self-heal swallowers are process-wide, so they are
+// installed once (ref-counted across instances) and — the part the old
+// env-var guard got wrong — removed again when the last attached forward
+// instance closes. An embedded/shared process that ran forward mode earlier
+// must regain Node's default crash-on-uncaught semantics afterwards, not
+// keep masking fatal bugs for every later run.
+let _selfHealRefs = 0;
+let _selfHealHandlers = null;
+function installSelfHeal() {
+  _selfHealRefs++;
+  if (_selfHealHandlers) return;
+  const onException = (err) => {
+    process.stderr.write(`[cache-fix] self-heal: uncaughtException swallowed (proxy stays up): ${err && err.stack || err}\n`);
+  };
+  const onRejection = (reason) => {
+    process.stderr.write(`[cache-fix] self-heal: unhandledRejection swallowed (proxy stays up): ${reason && reason.stack || reason}\n`);
+  };
+  process.on("uncaughtException", onException);
+  process.on("unhandledRejection", onRejection);
+  _selfHealHandlers = { onException, onRejection };
+}
+function removeSelfHeal() {
+  if (!_selfHealHandlers || --_selfHealRefs > 0) return;
+  process.off("uncaughtException", _selfHealHandlers.onException);
+  process.off("unhandledRejection", _selfHealHandlers.onRejection);
+  _selfHealHandlers = null;
 }
 
 /**
@@ -488,27 +525,20 @@ export async function startProxy(options = {}) {
   // handler is present for the first CONNECT. Failure falls back to
   // reverse-proxy only rather than preventing the proxy from serving.
   let forwardProxyCA = null;
+  let forwardAttached = false;
   if (config.forwardProxy) {
-    try { forwardProxyCA = attachForwardProxy(server); _forwardProxyActive = true; }
+    try { forwardProxyCA = attachForwardProxy(server); _forwardActive++; forwardAttached = true; }
     catch (err) { process.stderr.write(`[cache-fix] forward-proxy FAILED (reverse-proxy only): ${err && err.message}\n`); }
 
     // Self-heal: in forward-proxy mode the proxy MITMs the whole upstream host,
     // so a stray socket/TLS error or a bug in one request must never take the
     // process down: an in-flight CC session is wired to THIS port and cannot
-    // fail over. Log and keep serving instead of crashing. Scoped to
-    // forward-proxy mode so reverse-proxy deployments keep Node's default
-    // crash-on-uncaught semantics (their supervisor restarts them). Registered
-    // once; guarded so repeated startProxy() calls in a test process don't
-    // stack listeners.
-    if (!process.env.__CACHE_FIX_SELF_HEAL_ON) {
-      process.env.__CACHE_FIX_SELF_HEAL_ON = "1";
-      process.on("uncaughtException", (err) => {
-        process.stderr.write(`[cache-fix] self-heal: uncaughtException swallowed (proxy stays up): ${err && err.stack || err}\n`);
-      });
-      process.on("unhandledRejection", (reason) => {
-        process.stderr.write(`[cache-fix] self-heal: unhandledRejection swallowed (proxy stays up): ${reason && reason.stack || reason}\n`);
-      });
-    }
+    // fail over. Log and keep serving instead of crashing. Scoped to a
+    // SUCCESSFULLY ATTACHED forward proxy — a failed attach serves reverse-mode
+    // only and must keep Node's default crash-on-uncaught semantics (its
+    // supervisor restarts it), not have them silently swallowed. Removed again
+    // when the last attached instance closes (see installSelfHeal).
+    if (forwardAttached) installSelfHeal();
   }
 
   await new Promise((resolve, reject) => {
@@ -539,12 +569,20 @@ export async function startProxy(options = {}) {
       `  export NODE_EXTRA_CA_CERTS=${forwardProxyCA}\n`,
     );
   }
+  let closed = false;
   return {
     server,
     port: addr.port,
     address: addr.address,
     close: () =>
       new Promise((resolve, reject) => {
+        // Retire this instance's forward-mode vote exactly once (guarded
+        // against double-close): routing/health stop passthrough behavior and
+        // the process-wide self-heal is removed with the last live instance.
+        if (!closed) {
+          closed = true;
+          if (forwardAttached) { _forwardActive--; removeSelfHeal(); }
+        }
         try { stopOAuthRefresher(); } catch {}
         try {
           if (watcher) watcher.close();
