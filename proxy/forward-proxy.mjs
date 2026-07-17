@@ -20,7 +20,7 @@ import http from "node:http";
 import https from "node:https";
 import net from "node:net";
 import tls from "node:tls";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, rmSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { randomBytes, X509Certificate, createPublicKey } from "node:crypto";
@@ -58,8 +58,11 @@ function mitmHosts() {
  * the CA path the client must trust via NODE_EXTRA_CA_CERTS.
  */
 export function ensureCA() {
-  // Read once per call from config (live, not frozen at import). The CA dir is
-  // global (outside CLAUDE_CONFIG_DIR); see config.caDir.
+  // Read once per call from config (live, not frozen at import). The CA dir
+  // defaults under the Claude config root and follows CLAUDE_CONFIG_DIR, with
+  // CACHE_FIX_CA_DIR as an explicit override; see config.caDir. Note that two
+  // proxies started against separate config dirs CAN still share one CA dir
+  // (via the override), which is why generation below is lock-serialized.
   const caDir = config.caDir;
   const caPem = join(caDir, "ca.pem");
   const caKey = join(caDir, "ca.key");
@@ -102,8 +105,16 @@ export function ensureCA() {
   const ready = () =>
     existsSync(caPem) && existsSync(leafPem) && existsSync(leafKey) &&
     leafCoversAllHosts() && leafKeyMatchesCert();
-  if (ready()) {
+  // Every successful return goes through here: normalize private-key modes to
+  // 0600 even on reuse — openssl defaults are not guaranteed, and a preexisting
+  // operator-supplied ca.key must not stay world-readable just because this
+  // process didn't mint it.
+  const publish = () => {
+    for (const f of [caKey, leafKey]) { try { chmodSync(f, 0o600); } catch {} }
     return { caPath: caPem, key: readFileSync(leafKey), cert: readFileSync(leafPem) };
+  };
+  if (ready()) {
+    return publish();
   }
   mkdirSync(caDir, { recursive: true, mode: 0o700 });
 
@@ -148,7 +159,7 @@ export function ensureCA() {
     const sleep100 = () => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100); } catch {} };
     const deadline = Date.now() + config.caLockWaitMs;
     while (!ready() && Date.now() < deadline) sleep100();
-    if (ready()) return { caPath: caPem, key: readFileSync(leafKey), cert: readFileSync(leafPem) };
+    if (ready()) return publish();
     // Timed out. Reclaim ONLY a stale lock (owner dead); a live owner means a
     // generator is still working (or wedged) — throwing is the safe answer, and
     // the caller (attachForwardProxy) already degrades to reverse-proxy mode.
@@ -169,7 +180,7 @@ export function ensureCA() {
   // the csr/ext scratch files would otherwise accumulate as litter).
   const tmp = (n) => join(caDir, `.tmp.${process.pid}.${n}`);
   try {
-    if (ready()) return { caPath: caPem, key: readFileSync(leafKey), cert: readFileSync(leafPem) };
+    if (ready()) return publish();
     const run = (args) => execFileSync("openssl", args, { stdio: ["ignore", "ignore", "pipe"] });
 
     // Reuse an existing root CA; only mint a new one on first run. Regenerating
@@ -224,7 +235,7 @@ export function ensureCA() {
       try { rmSync(lock, { recursive: true, force: true }); } catch {}
     }
   }
-  return { caPath: caPem, key: readFileSync(leafKey), cert: readFileSync(leafPem) };
+  return publish();
 }
 
 // Parse an http(s)://host:port proxy URL into { host, port }.

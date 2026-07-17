@@ -9,7 +9,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, existsSync, readFileSync, writeFileSync, readdirSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, existsSync, readFileSync, writeFileSync, readdirSync, rmSync, chmodSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { X509Certificate, createPublicKey, generateKeyPairSync } from "node:crypto";
@@ -170,6 +170,23 @@ process.stdout.write(JSON.stringify({ chains: leaf.verify(ca.publicKey), keyMatc
     assert.equal(existsSync(join(dir, ".gen.lock")), false, "lock left behind");
     const litter = readdirSync(dir).filter((f) => f.startsWith(".tmp."));
     assert.deepEqual(litter, [], `leftover temp files: ${litter.join(", ")}`);
+  });
+});
+
+// Review follow-up: private-key file modes are normalized to 0600 on every
+// successful return — including reuse of preexisting on-disk keys with loose
+// permissions (openssl defaults are not guaranteed, and an operator-supplied
+// ca.key must not stay world-readable just because it already existed).
+test("ensureCA: normalizes ca.key/leaf.key to 0600, including on reuse", () => {
+  withCA({}, (dir) => {
+    ensureCA();
+    chmodSync(join(dir, "ca.key"), 0o644);
+    chmodSync(join(dir, "leaf.key"), 0o644);
+    ensureCA(); // reuse path: artifacts exist and are valid
+    for (const f of ["ca.key", "leaf.key"]) {
+      const mode = statSync(join(dir, f)).mode & 0o777;
+      assert.equal(mode, 0o600, `${f} mode ${mode.toString(8)} != 600`);
+    }
   });
 });
 
