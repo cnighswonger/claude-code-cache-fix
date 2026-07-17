@@ -23,7 +23,7 @@ import tls from "node:tls";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
-import { randomBytes, X509Certificate } from "node:crypto";
+import { randomBytes, X509Certificate, createPublicKey } from "node:crypto";
 import config from "./config.mjs";
 import { getAgent } from "./upstream.mjs";
 import { discoverBucket } from "./downloads-bucket.mjs";
@@ -86,7 +86,22 @@ export function ensureCA() {
       return hosts.every((h) => names.includes(`DNS:${h}`));
     } catch { return false; }
   };
-  const ready = () => existsSync(caPem) && existsSync(leafPem) && existsSync(leafKey) && leafCoversAllHosts();
+  // Existence + SAN is not enough: leaf.key and leaf.pem are published as two
+  // separate renames, so a reader can catch a window where a new key sits next
+  // to an old (still SAN-valid) cert, or vice versa — a mismatched pair that
+  // fails tls.createSecureContext() at handshake time. Prove the on-disk key
+  // matches the on-disk cert (public keys equal) before treating them as ready,
+  // so a mixed-generation pair is regenerated instead of served.
+  const leafKeyMatchesCert = () => {
+    try {
+      const certPub = new X509Certificate(readFileSync(leafPem)).publicKey.export({ type: "spki", format: "der" });
+      const keyPub = createPublicKey(readFileSync(leafKey)).export({ type: "spki", format: "der" });
+      return Buffer.compare(keyPub, certPub) === 0;
+    } catch { return false; }
+  };
+  const ready = () =>
+    existsSync(caPem) && existsSync(leafPem) && existsSync(leafKey) &&
+    leafCoversAllHosts() && leafKeyMatchesCert();
   if (ready()) {
     return { caPath: caPem, key: readFileSync(leafKey), cert: readFileSync(leafPem) };
   }
