@@ -72,7 +72,9 @@ async function dispatch() {
         "                         ANTHROPIC_BASE_URL, so Claude Code stays first-party\n" +
         "                         and Remote Control / mobile session visibility keeps\n" +
         "                         working (CC >= 2.1.196 disables it when\n" +
-        "                         ANTHROPIC_BASE_URL is set).\n" +
+        "                         ANTHROPIC_BASE_URL is set). Also adds localhost to\n" +
+        "                         NO_PROXY so local HTTP MCP servers / services bypass\n" +
+        "                         the proxy (any existing NO_PROXY is preserved).\n" +
         "\nEnvironment:\n" +
         "  CACHE_FIX_PROXY_PORT     Port for the proxy server\n" +
         "  CACHE_FIX_PROXY_UPSTREAM Upstream URL\n" +
@@ -210,6 +212,23 @@ if (remoteControl) {
   claudeEnv.HTTPS_PROXY = proxyUrl;
   claudeEnv.https_proxy = proxyUrl;
   claudeEnv.NODE_EXTRA_CA_CERTS = caPem;
+  // Exclude localhost from the proxy. Without this, HTTPS_PROXY routes EVERY
+  // connection claude makes — including to local services like HTTP/SSE-transport
+  // MCP servers (e.g. an MCP on 127.0.0.1) — at the cache-fix proxy, which only
+  // knows how to serve api.anthropic.com and 404s the rest. stdio-transport MCPs
+  // are unaffected (they're pipes, no network), which is why only network-transport
+  // local services break. Merge into any existing NO_PROXY rather than clobber it
+  // (a corporate env may already set one). Set both cases to cover libs that read
+  // either variable.
+  const NO_PROXY_LOCAL = "127.0.0.1,localhost,::1";
+  const mergeNoProxy = (existing) => {
+    const parts = (existing || "").split(",").map((s) => s.trim()).filter(Boolean);
+    for (const h of NO_PROXY_LOCAL.split(",")) if (!parts.includes(h)) parts.push(h);
+    return parts.join(",");
+  };
+  const merged = mergeNoProxy(claudeEnv.NO_PROXY || claudeEnv.no_proxy);
+  claudeEnv.NO_PROXY = merged;
+  claudeEnv.no_proxy = merged;
 } else {
   claudeEnv = {
     ...process.env,
