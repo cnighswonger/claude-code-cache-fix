@@ -21,6 +21,7 @@
   "cache-telemetry": { "enabled": true, "order": 600 },
   "overage-warning": { "enabled": true, "order": 610 },
   "upstream-error-log": { "enabled": true, "order": 670 },
+  "session-budget-breaker": { "enabled": true, "order": 690 },
   "request-log": { "enabled": false, "order": 700 },
   "jsonl-session-mirror": { "enabled": true, "order": 720 }
 }
