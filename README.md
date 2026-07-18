@@ -115,6 +115,7 @@ On every `/v1/messages` request, the pipeline runs an ordered chain of extension
 | `session-health` | Observes per-session thinking-desync risk (context size + thinking-block count) and warns before a session reaches the danger zone. Read-only |
 | `thinking-block-sanitize` | Drops omitted (empty-text) thinking blocks to head off the CC thinking-desync `400` (#63147). **On by default as of v4.0.0** (v1 mode). Set `CACHE_FIX_THINKING_SANITIZE=off` to disable, `=v2` for additional tools-hash-mismatch drop (opt-in). |
 | `workflow-agent-id-synthesis` | Derives a stable per-leg agent id for Workflow-tool subagents whose canonical `x-claude-code-agent-id` header CC does not set ([CC#66761](https://github.com/anthropics/claude-code/issues/66761)). On by default; stash lives on `ctx.meta._workflowAgentId` and never leaves the proxy. `usage-log` emits the `agent_id` + `agent_id_source` fields when `CACHE_FIX_USAGE_LOG_AGENT_ID=on` AND meter v0.8.0+ is installed. Master switch: `CACHE_FIX_WORKFLOW_AGENT_DERIVATION=off`. |
+| `session-budget-breaker` | Opt-in hard **per-session spend ceiling** — short-circuits a session's requests locally once its cumulative tokens / estimated cost / consumption rate cross a limit you set, so a runaway fan-out can't drive credits or auto-purchase ([CC#68285](https://github.com/anthropics/claude-code/issues/68285)). Default-off; fail-open. Gate `CACHE_FIX_SESSION_BUDGET=on` + a ceiling. See [Session budget circuit breaker](#session-budget-circuit-breaker-proxy-mode-opt-in). |
 
 Extensions live as `.mjs` files in `proxy/extensions/` with configuration in `proxy/extensions.json`. As of v4.0.0 the proxy loads them once at startup; adding, removing, or modifying an extension requires a supervisor-level proxy restart (see [Upgrading from v3.x](#upgrading-from-v3x)). Hot-reload is available as opt-in via `CACHE_FIX_HOT_RELOAD=on` for users who want the v3.x behavior back; that path is subject to the Node ESM stale-import race documented in [#196](https://github.com/cnighswonger/claude-code-cache-fix/issues/196).
 
@@ -871,6 +872,63 @@ export CACHE_FIX_IMAGE_RETRY_BREAKER=on
 4. Current request is on the same session (resolved via `x-claude-code-session-id` / `x-session-id` / `x-anthropic-session-id`).
 
 Sessionless requests bucket to `"unknown"` — they're not isolated from each other by request signature, an acknowledged limitation mitigated by the 30s sliding window.
+
+## Session budget circuit breaker (proxy mode, opt-in)
+
+An opt-in **hard per-session spend ceiling.** Once a CC session's cumulative token consumption (or its estimated cost, or its consumption *rate*) crosses a limit you set, further `/v1/messages` for that session are short-circuited locally — they never reach Anthropic, so they cannot consume credits, trigger auto-purchase, or (for direct API-key users) keep billing the card. Motivated by [anthropics/claude-code#68285](https://github.com/anthropics/claude-code/issues/68285): a Workflow fan-out of 700+ subagents inherited a premium-tier default with no per-agent model ceiling and no spend gate, burning ~$350 of credits and triggering ~$800 of auto-purchased overage before the user could intervene. All 700 subagents were children of a single session, so a per-session ceiling caps that runaway at the source.
+
+**This is a circuit breaker, not a meter.** It stops the bleeding; it does not price each request to the cent. The tally is body-sourced (`msg.usage` token counts, which every Messages response carries) and auth-independent, so it works identically for subscription/OAuth and direct API-key clients.
+
+Opt-in via the gate; **default-off**, and inert until you set at least one ceiling:
+
+```bash
+export CACHE_FIX_SESSION_BUDGET=on
+export CACHE_FIX_SESSION_BUDGET_COST_USD=25      # e.g. stop this session at ~$25
+```
+
+| Mode | Behavior |
+|------|----------|
+| `on` | Tally per session; short-circuit the next request once confidently over a ceiling |
+| `off` (default) | Pass-through, no tally, no logging |
+| `dry-run` | Tally + log `would_block` events at the block point, but **forward every request** (measure before you enforce) |
+
+### The three blocking levers (set at least one)
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `CACHE_FIX_SESSION_BUDGET` | `off` | Gate — `on` / `off` / `dry-run` |
+| `CACHE_FIX_SESSION_BUDGET_TOKENS` | unset | Hard-stop when cumulative `input + cache_creation` tokens for the session cross this integer. Plan-agnostic and **exact** — the backstop lever. |
+| `CACHE_FIX_SESSION_BUDGET_COST_USD` | unset | Hard-stop when estimated cost (tokens × `tools/rates.json`) crosses this float. |
+| `CACHE_FIX_SESSION_BUDGET_RATE_TPM` | unset | Hard-stop when the session's tokens/min over the sliding window cross this integer — the **early fan-out catch** (fires on the slope, before a big in-flight batch lands). |
+| `CACHE_FIX_SESSION_BUDGET_RATE_WINDOW_MS` | 60000 | Sliding window for the rate lever. |
+| `CACHE_FIX_SESSION_BUDGET_MAX_ENTRIES` | 4096 | LRU cap on the in-memory per-session tally map. |
+| `CACHE_FIX_SESSION_BUDGET_EVENT_LOG` | `~/.claude/session-budget-events.jsonl` | Structured fire-event log path (5 MB single-tier rotation). |
+
+### Which lever for which billing model
+
+The breaker serves **both** billing models, but the danger — and so the primary lever — differs:
+
+- **Subscription (OAuth, e.g. Max) — the #68285 case.** Tokens are quota-until-overage; the hazard is the account-global auto-purchase wall. Use `_TOKENS` (or `_RATE_TPM`) to cap the runaway *session* before it drives the account into auto-purchase. Cost is informational here.
+- **Direct API key (pay-as-you-go) — the more severe case.** There is **no quota buffer**: every token is billed immediately at API list price, and the same fan-out has *no* spend circuit at all — it charges the card until the key's tier limit or the bank intervenes. Here `_COST_USD` is a **literal dollar ceiling**: `tools/rates.json` is Anthropic's API list pricing, so `tokens × rates.json` is real money out of pocket.
+
+**Cost is an estimate — pair it with a token cap for a guaranteed dollar bound.** `rates.json` may lag a newly-released model. An unknown model contributes **0** to the cost tally (fail-open by design), so a stale rate silently *under*-counts and can let cost run past your intended dollar figure. The token and rate levers are always exact. If you want a hard dollar cap on an API key, **also set `_TOKENS`** so a stale/unknown rate can't let spend run unbounded — the token bound then backstops the estimate. (`tools/rates.json` is refreshed weekly from Anthropic's pricing page via a fetch-and-open-PR cron; a human reviews every pricing diff.)
+
+### Fail-open, always
+
+If accounting is uncertain — gate off, no ceiling set, `usage` missing or unparseable, no session key, the model unknown to `rates.json` (cost lever only), first request after a restart, or anything throws — the request **forwards.** A block requires the gate `on` **and** at least one lever numerically, confidently at/over its ceiling. A budget breaker that failed *closed* would wedge a whole session on a proxy bug, which is worse than the overage. One env flip (`CACHE_FIX_SESSION_BUDGET=off`) fully disables it.
+
+### Observability surface (meter bypass)
+
+A short-circuited request returns before any upstream call, so it produces **no `usage.jsonl` row** — correct (no cost was incurred), but note it is **not** in the meter. The only fire signal is the JSONL event log: each block writes `{ event: "session_budget_block", would_block, sid, lever, limit, observed, cumulative_tokens, cumulative_cost_usd, request_id, ts }`. `dry-run` writes the same records with `would_block: true` and forwards. The log carries the tally and the crossed limit only — **no request/response bodies, no model-input content, no auth headers.** `request_id` is nullable (a locally-blocked request has no upstream request-id; it's populated from the client request header if present, else `null` — never fabricated).
+
+Each fire event also carries an **observational** `account_q5h_contribution` — an estimate of how much of the account's rolling-5h quota burn this session drove, attributed by the session's token share of the window (`{ window_ms, account_q5h_delta, session_token_share, attributed_q5h_delta }`). This is derived from Anthropic's **account-global** `anthropic-ratelimit-unified-5h-utilization` header, so it is **never** a blocking lever — it would trip an innocent session for another session's burn. It exists only to show operators *which* session is driving the account quota. API-key traffic lacks the header, so the field is simply omitted.
+
+### Known limitations
+
+- **Concurrency overshoot.** A large fan-out fires near-simultaneously, so a pure cumulative (`_TOKENS`/`_COST_USD`) ceiling trips only after the in-flight batch's tokens land — it overshoots by ~that batch. **`_RATE_TPM` mitigates this** by firing on the slope before the batch completes.
+- **Output cost is post-hoc** — the tally gates the *next* request, not the current one.
+- **Restart resets the tally** — it's in-memory; a mid-session proxy restart zeroes it. Acceptable for a safety backstop.
+- **Per-session, not per-account** — it caps the offending *session*; it cannot lower Anthropic's account-global quota or stop auto-purchase directly. For a single-session runaway (#68285), capping that session is the right and sufficient action.
 
 ## `cc_version` normalize (proxy mode, opt-in)
 

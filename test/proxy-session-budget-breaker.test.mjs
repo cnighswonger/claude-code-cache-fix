@@ -1,5 +1,8 @@
 import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { readFileSync, rmSync } from "node:fs";
 import ext from "../proxy/extensions/session-budget-breaker.mjs";
 
 // Directive: docs/directives/proxy-subagent-budget-circuit-breaker.md
@@ -10,10 +13,13 @@ const SID = "sess-abc";
 const H = (sid = SID) => ({ "x-claude-code-session-id": sid });
 // A message_start stream event carrying input+cache_creation tokens. `model` is
 // optional (cost lever prices per-model; token/rate levers ignore it).
-const start = (inp, cc = 0, model = undefined, sid = SID) => ({
+const start = (inp, cc = 0, model = undefined, sid = SID, responseHeaders = undefined) => ({
   headers: H(sid),
+  responseHeaders,
   event: { type: "message_start", message: { model, usage: { input_tokens: inp, cache_creation_input_tokens: cc, output_tokens: 0, cache_read_input_tokens: 0 } } },
 });
+// A response-headers block carrying the account-global 5h utilization.
+const q5hHdr = (util) => ({ "anthropic-ratelimit-unified-5h-utilization": String(util) });
 const req = (sid = SID, stream = true) => ({ headers: H(sid), body: { model: "claude-fable-5", stream } });
 
 function clearEnv() {
@@ -195,6 +201,78 @@ test("cost lever alone with an unknown model → forward (cost cannot block)", a
   await ext.onStreamEvent(start(1000000, 0, "claude-fable-5"));
   const r = await ext.onRequest(req());
   assert.equal(r, undefined, "cost-only + unknown model = fail-open forward");
+});
+
+// --- observational q5h contribution (never gates; event-log only) ---
+
+test("q5h contribution: absent when no account header seen (API-key traffic)", async () => {
+  process.env.CACHE_FIX_SESSION_BUDGET = "on";
+  process.env.CACHE_FIX_SESSION_BUDGET_TOKENS = "100";
+  // No responseHeaders → no q5h signal ever recorded.
+  await ext.onStreamEvent(start(500));
+  assert.equal(ext.__testOnly.q5hContribution(SID), null, "no header → signal absent");
+});
+
+test("q5h contribution: single session gets ~100% of the account delta", async () => {
+  process.env.CACHE_FIX_SESSION_BUDGET = "on";
+  process.env.CACHE_FIX_SESSION_BUDGET_TOKENS = "100";
+  // First observation delta is 0 (baseline); second adds +0.10.
+  await ext.onStreamEvent(start(1000, 0, undefined, SID, q5hHdr(0.20)));
+  await ext.onStreamEvent(start(1000, 0, undefined, SID, q5hHdr(0.30)));
+  const c = ext.__testOnly.q5hContribution(SID);
+  assert.ok(c, "signal should be present");
+  assert.ok(Math.abs(c.account_q5h_delta - 0.10) < 1e-9, `account delta ${c.account_q5h_delta}`);
+  assert.ok(Math.abs(c.session_token_share - 1.0) < 1e-9, `share ${c.session_token_share}`);
+  assert.ok(Math.abs(c.attributed_q5h_delta - 0.10) < 1e-9, `attributed ${c.attributed_q5h_delta}`);
+});
+
+test("q5h contribution: split by token share across two sessions", async () => {
+  process.env.CACHE_FIX_SESSION_BUDGET = "on";
+  process.env.CACHE_FIX_SESSION_BUDGET_TOKENS = "1000000"; // don't block; just observe
+  // Baseline (delta 0), then session A burns 3000 tok and B burns 1000 tok over
+  // the same window with the account q5h climbing +0.20 total.
+  await ext.onStreamEvent(start(1, 0, undefined, "A", q5hHdr(0.10))); // baseline
+  await ext.onStreamEvent(start(3000, 0, undefined, "A", q5hHdr(0.20))); // +0.10
+  await ext.onStreamEvent(start(1000, 0, undefined, "B", q5hHdr(0.30))); // +0.10
+  const cA = ext.__testOnly.q5hContribution("A");
+  const cB = ext.__testOnly.q5hContribution("B");
+  // Account delta over window = 0.20; account tokens = 1+3000+1000 = 4001.
+  assert.ok(Math.abs(cA.account_q5h_delta - 0.20) < 1e-9, `A acct delta ${cA.account_q5h_delta}`);
+  // A share ≈ 3001/4001 ≈ 0.7501; B share ≈ 1000/4001 ≈ 0.2499.
+  assert.ok(cA.session_token_share > cB.session_token_share, "A drove more of the burn than B");
+  assert.ok(Math.abs((cA.attributed_q5h_delta + cB.attributed_q5h_delta) - 0.20) < 1e-3,
+    "attributed deltas sum to ~the account delta");
+});
+
+test("q5h contribution: surfaced in the fire event log, never a block gate", async () => {
+  process.env.CACHE_FIX_SESSION_BUDGET = "on";
+  process.env.CACHE_FIX_SESSION_BUDGET_TOKENS = "100";
+  const logPath = join(tmpdir(), `sbb-q5h-${process.pid}-${SID}.jsonl`);
+  rmSync(logPath, { force: true });
+  process.env.CACHE_FIX_SESSION_BUDGET_EVENT_LOG = logPath;
+  await ext.onStreamEvent(start(60, 0, undefined, SID, q5hHdr(0.10))); // baseline
+  await ext.onStreamEvent(start(60, 0, undefined, SID, q5hHdr(0.25))); // +0.15, cumulative 120 ≥ 100
+  const r = await ext.onRequest(req());
+  assert.ok(r && r.skip === true, "token lever still gates — q5h is not the reason, just observed");
+  const rec = JSON.parse(readFileSync(logPath, "utf8").trim().split("\n").pop());
+  assert.equal(rec.lever, "TOKENS", "block is on tokens, not q5h");
+  assert.ok(rec.account_q5h_contribution, "event carries the observational q5h contribution");
+  assert.ok(Math.abs(rec.account_q5h_contribution.account_q5h_delta - 0.15) < 1e-9);
+  rmSync(logPath, { force: true });
+});
+
+test("q5h contribution: omitted from the event when no header was seen", async () => {
+  process.env.CACHE_FIX_SESSION_BUDGET = "on";
+  process.env.CACHE_FIX_SESSION_BUDGET_TOKENS = "100";
+  const logPath = join(tmpdir(), `sbb-noq5h-${process.pid}-${SID}.jsonl`);
+  rmSync(logPath, { force: true });
+  process.env.CACHE_FIX_SESSION_BUDGET_EVENT_LOG = logPath;
+  await ext.onStreamEvent(start(150)); // no responseHeaders
+  const r = await ext.onRequest(req());
+  assert.ok(r && r.skip === true);
+  const rec = JSON.parse(readFileSync(logPath, "utf8").trim().split("\n").pop());
+  assert.equal("account_q5h_contribution" in rec, false, "field omitted when signal absent");
+  rmSync(logPath, { force: true });
 });
 
 // --- throw safety ---

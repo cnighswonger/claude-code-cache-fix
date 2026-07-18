@@ -16,11 +16,19 @@
 // first request, any throw — FORWARDS. See the fail-open table in the directive.
 //
 // Levers (all per-session; at least one must be set to ever fire):
-//   CACHE_FIX_SESSION_BUDGET_TOKENS       int  cumulative input+cache_creation
-//   CACHE_FIX_SESSION_BUDGET_RATE_TPM     int  tokens/min over the sliding window
+//   CACHE_FIX_SESSION_BUDGET_TOKENS       int   cumulative input+cache_creation
+//   CACHE_FIX_SESSION_BUDGET_COST_USD     float tokens × rates.json ($ ceiling)
+//   CACHE_FIX_SESSION_BUDGET_RATE_TPM     int   tokens/min over the sliding window
 //   CACHE_FIX_SESSION_BUDGET_RATE_WINDOW_MS int window for the rate lever (60000)
-//   (CACHE_FIX_SESSION_BUDGET_COST_USD — cost lever — is stubbed; wired next.)
 // Gate: CACHE_FIX_SESSION_BUDGET = off (default) / on / dry-run.
+//
+// Observational-only (NEVER gates traffic): per-session account-q5h contribution.
+// Anthropic's `anthropic-ratelimit-unified-5h-utilization` header is account-GLOBAL
+// (every session/machine on the account); it must never block a session. We use it
+// only to attribute the account's windowed q5h burn to the session that drove it,
+// by the session's token share of the window — a human-facing "this session caused
+// ~X% of the account's 5h quota burn" figure in the fire event log. API-key traffic
+// lacks the header, so the signal reads absent and simply isn't emitted.
 
 import { appendFileSync, statSync, renameSync, mkdirSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -103,6 +111,23 @@ function anyLimitSet() {
 const _tallies = new Map();
 let _armedNoteEmitted = false;
 
+// --- Account-global state for the OBSERVATIONAL q5h-contribution signal only ---
+// Never gates. `_accountEvents` is the cross-session windowed token pool (the
+// denominator for a session's share); `_accountQ5hEvents` is the account's q5h
+// header delta per observation over the same window; `_lastAccountQ5h` tracks the
+// previous account q5h value (null until the first header is seen — API-key
+// traffic keeps it null and the whole signal stays absent).
+const _accountEvents = [];   // [{ t, tokens }] — all sessions
+const _accountQ5hEvents = []; // [{ t, d }]      — account q5h deltas
+let _lastAccountQ5h = null;
+
+function accountQ5h(headers) {
+  const v = headers && headers["anthropic-ratelimit-unified-5h-utilization"];
+  if (v === undefined || v === null || v === "") return null;
+  const n = parseFloat(v);
+  return Number.isFinite(n) ? n : null;
+}
+
 function touch(sid) {
   let e = _tallies.get(sid);
   if (e) {
@@ -137,6 +162,36 @@ function rateTpm(e, now) {
   const spanMs = Math.max(1000, now - e.events[0].t); // floor 1s to avoid div blow-up
   const sum = windowTokens(e, now);
   return (sum / spanMs) * 60000;
+}
+
+// --- Observational q5h-contribution (never gates) ---
+// Prune the account-global windows to the same span as the rate lever.
+function pruneAccountWindows(now) {
+  const cutoff = now - rateWindowMs();
+  while (_accountEvents.length && _accountEvents[0].t < cutoff) _accountEvents.shift();
+  while (_accountQ5hEvents.length && _accountQ5hEvents[0].t < cutoff) _accountQ5hEvents.shift();
+}
+// This session's estimated share of the account's q5h burn over the window:
+// (session tokens / all-session tokens) × (account q5h delta), plus the raw
+// inputs so the operator can sanity-check. Returns null when there's no q5h
+// signal at all (API-key traffic; header never seen) or no account tokens to
+// divide by — the caller then omits the field entirely.
+function q5hContribution(e, now) {
+  pruneAccountWindows(now);
+  if (!_accountQ5hEvents.length) return null; // no account q5h observed → absent
+  let acctTokens = 0;
+  for (const ev of _accountEvents) acctTokens += ev.tokens;
+  if (acctTokens <= 0) return null;
+  let acctQ5hDelta = 0;
+  for (const ev of _accountQ5hEvents) acctQ5hDelta += ev.d;
+  const sessTokens = windowTokens(e, now);
+  const share = sessTokens / acctTokens;
+  return {
+    window_ms: rateWindowMs(),
+    account_q5h_delta: Math.round(acctQ5hDelta * 1e6) / 1e6,
+    session_token_share: Math.round(share * 1e4) / 1e4,
+    attributed_q5h_delta: Math.round(share * acctQ5hDelta * 1e6) / 1e6,
+  };
 }
 
 // --- Event log (fires only; PII-safe: no bodies/creds) ---
@@ -226,6 +281,7 @@ export default {
 
     const dry = gate() === "dry-run";
     const requestId = (ctx.headers && (ctx.headers["request-id"] || ctx.headers["x-request-id"])) || null;
+    const q5hContrib = q5hContribution(e, now); // observational; null → omitted
     logEvent({
       ts: new Date(now).toISOString(),
       event: "session_budget_block",
@@ -236,6 +292,9 @@ export default {
       observed: hit.observed,
       cumulative_tokens: e.tokens,
       cumulative_cost_usd: Math.round(e.costUsd * 10000) / 10000,
+      // Observational per-session account-q5h contribution; omitted entirely when
+      // no account q5h header has been seen (e.g. API-key traffic). Never a gate.
+      ...(q5hContrib ? { account_q5h_contribution: q5hContrib } : {}),
       request_id: requestId, // nullable: local block has no upstream request-id
     });
     if (dry) return; // dry-run: log what we WOULD block, then forward
@@ -268,15 +327,36 @@ export default {
       e.events.push({ t: now, tokens: split.total });
       e.last = now;
       pruneWindow(e, now);
+
+      // Observational only: feed the account-global windows for the q5h-
+      // contribution signal. Token pool spans all sessions; the q5h delta comes
+      // from the account header if present (absent for API-key traffic → the
+      // whole signal stays absent, never blocks). First observation delta is 0.
+      _accountEvents.push({ t: now, tokens: split.total });
+      const q5h = accountQ5h(ctx.responseHeaders);
+      if (q5h !== null) {
+        const d = _lastAccountQ5h === null ? 0 : q5h - _lastAccountQ5h;
+        _lastAccountQ5h = q5h;
+        _accountQ5hEvents.push({ t: now, d });
+      }
+      pruneAccountWindows(now);
     } catch { /* fail-open: never let accounting throw affect the request */ }
   },
 
   // Test seam.
   __testOnly: {
-    reset() { _tallies.clear(); _armedNoteEmitted = false; _unknownModelNoted.clear(); },
+    reset() {
+      _tallies.clear();
+      _armedNoteEmitted = false;
+      _unknownModelNoted.clear();
+      _accountEvents.length = 0;
+      _accountQ5hEvents.length = 0;
+      _lastAccountQ5h = null;
+    },
     tally(sid) { return _tallies.get(sid); },
     rateTpm(sid) { const e = _tallies.get(sid); return e ? rateTpm(e, Date.now()) : 0; },
     costUsd(sid) { const e = _tallies.get(sid); return e ? e.costUsd : 0; },
+    q5hContribution(sid) { const e = _tallies.get(sid); return e ? q5hContribution(e, Date.now()) : null; },
     usageInputTokens,
     costOf,
   },
