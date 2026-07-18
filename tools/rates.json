@@ -1,5 +1,5 @@
 {
-  "last_updated": "2026-04-09",
+  "last_updated": "2026-07-18",
   "source": "https://platform.claude.com/docs/en/about-claude/pricing",
   "notes": "Auto-fetched from Anthropic docs.",
   "models": {
@@ -86,6 +86,48 @@
       "cache_read": 0.03,
       "cache_write_5m": 0.3,
       "cache_write_1h": 0.5
+    },
+    "claude-fable-5": {
+      "input": 10,
+      "output": 50,
+      "cache_read": 1,
+      "cache_write_5m": 12.5,
+      "cache_write_1h": 20
+    },
+    "claude-mythos-5": {
+      "input": 10,
+      "output": 50,
+      "cache_read": 1,
+      "cache_write_5m": 12.5,
+      "cache_write_1h": 20
+    },
+    "claude-opus-4-8": {
+      "input": 5,
+      "output": 25,
+      "cache_read": 0.5,
+      "cache_write_5m": 6.25,
+      "cache_write_1h": 10
+    },
+    "claude-opus-4-7": {
+      "input": 5,
+      "output": 25,
+      "cache_read": 0.5,
+      "cache_write_5m": 6.25,
+      "cache_write_1h": 10
+    },
+    "claude-sonnet-5": {
+      "input": 2,
+      "output": 10,
+      "cache_read": 0.2,
+      "cache_write_5m": 2.5,
+      "cache_write_1h": 4
+    },
+    "claude-haiku-4-5": {
+      "input": 1,
+      "output": 5,
+      "cache_read": 0.1,
+      "cache_write_5m": 1.25,
+      "cache_write_1h": 2
     }
   }
 }
