@@ -8,10 +8,11 @@ import ext from "../proxy/extensions/session-budget-breaker.mjs";
 
 const SID = "sess-abc";
 const H = (sid = SID) => ({ "x-claude-code-session-id": sid });
-// A message_start stream event carrying input+cache_creation tokens.
-const start = (inp, cc = 0) => ({
-  headers: H(),
-  event: { type: "message_start", message: { usage: { input_tokens: inp, cache_creation_input_tokens: cc, output_tokens: 0, cache_read_input_tokens: 0 } } },
+// A message_start stream event carrying input+cache_creation tokens. `model` is
+// optional (cost lever prices per-model; token/rate levers ignore it).
+const start = (inp, cc = 0, model = undefined, sid = SID) => ({
+  headers: H(sid),
+  event: { type: "message_start", message: { model, usage: { input_tokens: inp, cache_creation_input_tokens: cc, output_tokens: 0, cache_read_input_tokens: 0 } } },
 });
 const req = (sid = SID, stream = true) => ({ headers: H(sid), body: { model: "claude-fable-5", stream } });
 
@@ -142,6 +143,58 @@ test("rate lever blocks when tokens/min over the window exceeds the ceiling", as
   await ext.onStreamEvent(start(5000));
   const r = await ext.onRequest(req());
   assert.ok(r && r.skip === true, "rate spike should trip the rate lever");
+});
+
+// --- cost lever (rates.json: claude-opus-4-6 input=$5/M, cache_write_1h=$10/M) ---
+
+test("cost lever blocks when estimated USD crosses the ceiling (known model)", async () => {
+  process.env.CACHE_FIX_SESSION_BUDGET = "on";
+  process.env.CACHE_FIX_SESSION_BUDGET_COST_USD = "1"; // $1
+  // 200k input tokens of opus-4-6 = 200000 * 5 / 1e6 = $1.00 ≥ $1.
+  await ext.onStreamEvent(start(120000, 0, "claude-opus-4-6"));
+  await ext.onStreamEvent(start(80000, 0, "claude-opus-4-6")); // cumulative 200k = $1.00
+  const r = await ext.onRequest(req());
+  assert.ok(r && r.skip === true, "cost should cross $1 and block");
+});
+
+test("cost lever prices cache_creation at the higher cache_write_1h rate", async () => {
+  process.env.CACHE_FIX_SESSION_BUDGET = "on";
+  process.env.CACHE_FIX_SESSION_BUDGET_COST_USD = "1";
+  // 100k cache_creation of opus-4-6 = 100000 * 10 / 1e6 = $1.00 (would be only
+  // $0.50 if mispriced at the input rate). Proves the split pricing.
+  await ext.onStreamEvent(start(0, 100000, "claude-opus-4-6"));
+  const r = await ext.onRequest(req());
+  assert.ok(r && r.skip === true, "cache_creation must be priced at cache_write_1h, not input");
+  assert.ok(Math.abs(ext.__testOnly.costUsd(SID) - 1.0) < 1e-9, `expected ~$1.00, got ${ext.__testOnly.costUsd(SID)}`);
+});
+
+test("cost lever UNDER the ceiling → forward", async () => {
+  process.env.CACHE_FIX_SESSION_BUDGET = "on";
+  process.env.CACHE_FIX_SESSION_BUDGET_COST_USD = "1";
+  await ext.onStreamEvent(start(100000, 0, "claude-opus-4-6")); // $0.50 < $1
+  const r = await ext.onRequest(req());
+  assert.equal(r, undefined, "$0.50 < $1 → forward");
+});
+
+test("unknown model → cost not accrued (fail-open); token lever still works", async () => {
+  process.env.CACHE_FIX_SESSION_BUDGET = "on";
+  process.env.CACHE_FIX_SESSION_BUDGET_COST_USD = "0.01"; // tiny cost ceiling
+  process.env.CACHE_FIX_SESSION_BUDGET_TOKENS = "100"; // and a token ceiling
+  // Model absent from rates.json → costOf returns null → costUsd stays 0, so the
+  // cost lever cannot block; but the token tally still accrues and CAN block.
+  await ext.onStreamEvent(start(150, 0, "claude-fable-5")); // 150 tokens ≥ 100
+  assert.equal(ext.__testOnly.costUsd(SID), 0, "unknown model must not accrue cost");
+  const r = await ext.onRequest(req());
+  assert.ok(r && r.skip === true, "token lever must still fire even when cost is unavailable");
+});
+
+test("cost lever alone with an unknown model → forward (cost cannot block)", async () => {
+  process.env.CACHE_FIX_SESSION_BUDGET = "on";
+  process.env.CACHE_FIX_SESSION_BUDGET_COST_USD = "0.01";
+  // Unknown model, no token/rate ceiling set → nothing can block → forward.
+  await ext.onStreamEvent(start(1000000, 0, "claude-fable-5"));
+  const r = await ext.onRequest(req());
+  assert.equal(r, undefined, "cost-only + unknown model = fail-open forward");
 });
 
 // --- throw safety ---

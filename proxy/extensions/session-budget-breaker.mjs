@@ -22,11 +22,49 @@
 //   (CACHE_FIX_SESSION_BUDGET_COST_USD — cost lever — is stubbed; wired next.)
 // Gate: CACHE_FIX_SESSION_BUDGET = off (default) / on / dry-run.
 
-import { appendFileSync, statSync, renameSync, mkdirSync } from "node:fs";
+import { appendFileSync, statSync, renameSync, mkdirSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { claudeHome } from "../claude-home.mjs";
 import { resolveSessionId } from "./cache-telemetry.mjs";
 import { buildSkipResult } from "../synth-response.mjs";
+
+// --- Cost pricing (tools/rates.json; values are $ per MILLION tokens) ---
+// Loaded once, lazily. rates.json is Anthropic API list pricing. The cost lever
+// is a best-effort DOLLAR estimate: input tokens priced at the model's `input`
+// rate, cache_creation at `cache_write_1h` (the proxy can't see which cache tier
+// the API applied, so it uses the higher 1h write rate — a deliberate slight
+// OVER-estimate, safer for a spend cap than under-billing). Unknown model →
+// null (cost lever unavailable for that request; token/rate levers unaffected).
+const __dirname = dirname(fileURLToPath(import.meta.url));
+let _rates = null; // { model: {input, cache_write_1h, ...} } | {} on load failure
+function loadRates() {
+  if (_rates !== null) return _rates;
+  try {
+    const p = join(__dirname, "..", "..", "tools", "rates.json");
+    _rates = JSON.parse(readFileSync(p, "utf8")).models || {};
+  } catch { _rates = {}; }
+  return _rates;
+}
+const _unknownModelNoted = new Set();
+// Returns estimated USD for (inputTok, cacheCreationTok) at model's rates, or
+// null if the model is unknown (fail-open — caller must not block on cost then).
+function costOf(model, inputTok, cacheCreationTok) {
+  if (typeof model !== "string" || !model) return null;
+  const r = loadRates()[model];
+  if (!r) {
+    if (!_unknownModelNoted.has(model)) {
+      _unknownModelNoted.add(model);
+      process.stderr.write(`[session-budget-breaker] cost lever: model "${model}" not in ` +
+        `tools/rates.json — cost not counted for it (token/rate levers still apply; ` +
+        `set CACHE_FIX_SESSION_BUDGET_TOKENS for a hard cap). Update rates.json to enable cost.\n`);
+    }
+    return null;
+  }
+  const inRate = typeof r.input === "number" ? r.input : 0;
+  const ccRate = typeof r.cache_write_1h === "number" ? r.cache_write_1h : inRate;
+  return (inputTok * inRate + cacheCreationTok * ccRate) / 1_000_000;
+}
 
 // --- Gate + config (read live per call: tests and operators flip at runtime) ---
 
@@ -42,6 +80,10 @@ function rateLimitTpm() {
   const n = parseInt(process.env.CACHE_FIX_SESSION_BUDGET_RATE_TPM, 10);
   return Number.isFinite(n) && n > 0 ? n : null;
 }
+function costLimitUsd() {
+  const n = parseFloat(process.env.CACHE_FIX_SESSION_BUDGET_COST_USD);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
 function rateWindowMs() {
   const n = parseInt(process.env.CACHE_FIX_SESSION_BUDGET_RATE_WINDOW_MS, 10);
   return Number.isFinite(n) && n > 0 ? n : 60000;
@@ -51,7 +93,7 @@ function maxEntries() {
   return Number.isFinite(n) && n > 0 ? n : 4096;
 }
 function anyLimitSet() {
-  return tokenLimit() !== null || rateLimitTpm() !== null;
+  return tokenLimit() !== null || rateLimitTpm() !== null || costLimitUsd() !== null;
 }
 
 // --- Per-session tally state (in-memory, LRU-bounded) ---
@@ -66,7 +108,7 @@ function touch(sid) {
   if (e) {
     _tallies.delete(sid); // move to newest
   } else {
-    e = { tokens: 0, events: [], last: 0 };
+    e = { tokens: 0, costUsd: 0, events: [], last: 0 };
   }
   _tallies.set(sid, e);
   while (_tallies.size > maxEntries()) {
@@ -132,6 +174,10 @@ function shortCircuitText(lever, limit, observed) {
 function overCeiling(e, now) {
   const tl = tokenLimit();
   if (tl !== null && e.tokens >= tl) return { lever: "TOKENS", limit: tl, observed: e.tokens };
+  const cl = costLimitUsd();
+  if (cl !== null && e.costUsd >= cl) {
+    return { lever: "COST_USD", limit: cl, observed: Math.round(e.costUsd * 10000) / 10000 };
+  }
   const rl = rateLimitTpm();
   if (rl !== null) {
     const r = Math.round(rateTpm(e, now));
@@ -140,17 +186,19 @@ function overCeiling(e, now) {
   return null;
 }
 
-// Sum the cost-bearing input tokens from a usage block. cache_read is cheap and
-// output is not an input cost; the tally tracks input + cache_creation.
+// Extract the cost-bearing input token split from a usage block. cache_read is
+// cheap and output is not an input cost; the tally tracks input + cache_creation
+// (priced separately for the cost lever). Returns { input, cacheCreation, total }
+// or null if the field we key on is unparseable (fail-open — don't update).
 function usageInputTokens(usage) {
   if (!usage || typeof usage !== "object") return null;
   const inp = usage.input_tokens;
   const cc = usage.cache_creation_input_tokens;
-  // Fail-open: if the field we key on is unparseable, return null (don't update).
   const i = typeof inp === "number" ? inp : (typeof inp === "string" ? parseInt(inp, 10) : NaN);
   const c = typeof cc === "number" ? cc : (typeof cc === "string" ? parseInt(cc, 10) : 0);
   if (!Number.isFinite(i)) return null;
-  return i + (Number.isFinite(c) ? c : 0);
+  const cacheCreation = Number.isFinite(c) ? c : 0;
+  return { input: i, cacheCreation, total: i + cacheCreation };
 }
 
 export default {
@@ -187,6 +235,7 @@ export default {
       limit: hit.limit,
       observed: hit.observed,
       cumulative_tokens: e.tokens,
+      cumulative_cost_usd: Math.round(e.costUsd * 10000) / 10000,
       request_id: requestId, // nullable: local block has no upstream request-id
     });
     if (dry) return; // dry-run: log what we WOULD block, then forward
@@ -202,15 +251,21 @@ export default {
       // message_start carries the input/cache_creation counts for the turn.
       if (!ev || ev.type !== "message_start") return;
       const usage = ev.message && ev.message.usage;
-      const added = usageInputTokens(usage);
-      if (added === null) return; // unparseable/missing → don't update (fail-open)
+      const split = usageInputTokens(usage);
+      if (split === null) return; // unparseable/missing → don't update (fail-open)
       let sid;
       try { sid = resolveSessionId(ctx.headers); } catch { return; }
       if (!sid) return;
       const now = Date.now();
       const e = touch(sid);
-      e.tokens += added;
-      e.events.push({ t: now, tokens: added });
+      e.tokens += split.total;
+      // Cost: price input + cache_creation at this turn's model rates. Unknown
+      // model → costOf returns null → cost simply not accrued (fail-open); the
+      // token/rate tally is unaffected so those levers still work.
+      const model = ev.message && ev.message.model;
+      const cost = costOf(model, split.input, split.cacheCreation);
+      if (cost !== null) e.costUsd += cost;
+      e.events.push({ t: now, tokens: split.total });
       e.last = now;
       pruneWindow(e, now);
     } catch { /* fail-open: never let accounting throw affect the request */ }
@@ -218,9 +273,11 @@ export default {
 
   // Test seam.
   __testOnly: {
-    reset() { _tallies.clear(); _armedNoteEmitted = false; },
+    reset() { _tallies.clear(); _armedNoteEmitted = false; _unknownModelNoted.clear(); },
     tally(sid) { return _tallies.get(sid); },
     rateTpm(sid) { const e = _tallies.get(sid); return e ? rateTpm(e, Date.now()) : 0; },
+    costUsd(sid) { const e = _tallies.get(sid); return e ? e.costUsd : 0; },
     usageInputTokens,
+    costOf,
   },
 };
