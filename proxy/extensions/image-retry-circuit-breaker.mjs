@@ -205,46 +205,13 @@ function shortCircuitText(firstHash, remainingMs) {
     `Please drop or replace the image. (See CC#66815. Cooldown: ${remainingMs}ms.)`;
 }
 
-function synthMessageId() {
-  return "msg_synth_" + createHash("sha256").update(String(Date.now()) + ":" + Math.random())
-    .digest("hex").slice(0, 22);
-}
-
-// Minimal valid SSE event sequence consumed as a normal completed assistant
-// turn by the CC harness SDK. Per directive: omits `data: [DONE]` by default;
-// sim validation determines whether real upstream emits it on this surface.
-export function buildSseString(model, text) {
-  const msgId = synthMessageId();
-  const usage = { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
-  const startMsg = {
-    type: "message_start",
-    message: {
-      id: msgId, type: "message", role: "assistant", model, content: [],
-      stop_reason: null, stop_sequence: null, usage,
-    },
-  };
-  return (
-    `event: message_start\ndata: ${JSON.stringify(startMsg)}\n\n` +
-    `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n` +
-    `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text } })}\n\n` +
-    `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n` +
-    `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 0 } })}\n\n` +
-    `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`
-  );
-}
-
-export function buildJsonBody(model, text) {
-  return {
-    id: synthMessageId(),
-    type: "message",
-    role: "assistant",
-    model,
-    content: [{ type: "text", text }],
-    stop_reason: "end_turn",
-    stop_sequence: null,
-    usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
-  };
-}
+// SSE/JSON synthesis moved to the shared proxy/synth-response.mjs so the
+// session-budget-breaker (and future local short-circuits) reuse one wire
+// format. Imported for local use by buildSkipResult below, AND re-exported to
+// preserve this module's existing import surface (its tests import
+// buildSseString / buildJsonBody by name).
+import { buildSseString, buildJsonBody, synthMessageId } from "../synth-response.mjs";
+export { buildSseString, buildJsonBody, synthMessageId };
 
 function buildSkipResult(mode, request, entry) {
   const remainingMs = Math.max(0, cooloffMs() - (Date.now() - entry.lastFailureAt));
