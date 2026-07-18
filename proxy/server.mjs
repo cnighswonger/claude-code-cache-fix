@@ -1,12 +1,12 @@
 import http from "node:http";
 import { pathToFileURL, URL } from "node:url";
 import config from "./config.mjs";
-import { forwardRequest } from "./upstream.mjs";
+import { forwardRequest, parseAbsoluteForm } from "./upstream.mjs";
 import { streamResponse, createTelemetryRecord } from "./stream.mjs";
 import { loadExtensions, snapshotRegistry, runOnRequest, runOnResponseStart, runOnResponse, getFailedExtensions } from "./pipeline.mjs";
 import { startWatcher } from "./watcher.mjs";
 import { startOAuthRefresher, stopOAuthRefresher } from "./oauth/refresher.mjs";
-import { attachForwardProxy } from "./forward-proxy.mjs";
+import { attachForwardProxy, handleDownloadsAbsolute } from "./forward-proxy.mjs";
 
 // Debug logging — writes to ~/.claude/cache-fix-debug.log (override path with
 // CACHE_FIX_DEBUG_LOG). Self-gated on CACHE_FIX_DEBUG=1; a no-op otherwise.
@@ -417,6 +417,29 @@ export function createProxyServer() {
           debugLog("[PROXY -> CLAUDE] Close connection (res.end)");
           return originalEnd.apply(res, [chunk, ...args]);
         };
+
+        // RFC 7230 §5.3.2 absolute-form request-target. A proxy-configured
+        // client does not always tunnel: axios's plain-proxy mode (the CLI's
+        // auto-updater / telemetry paths) sends `GET https://host/path` on the
+        // proxy connection instead of CONNECT. Only meaningful in forward mode
+        // — reverse mode keeps its 404 contract for such targets (see below).
+        if (_forwardActive > 0) {
+          const abs = parseAbsoluteForm(req.url);
+          if (abs) {
+            // downloads.claude.ai with the rewrite active: same acceleration
+            // as the CONNECT-MITM arrival style.
+            if (handleDownloadsAbsolute(req, res, abs)) return;
+            // Targets on the upstream reduce to origin-form so the normal
+            // routing below (incl. the /v1/messages transform) applies.
+            // Compare origins, not hostnames: scheme and port are part of
+            // the authority (two servers on one host differ only by port).
+            // Foreign targets fall through to handlePassthrough, where
+            // buildUpstreamUrl honors the absolute-form authority.
+            let upOrigin = "";
+            try { upOrigin = new URL(config.upstream).origin; } catch {}
+            if (abs.origin === upOrigin) req.url = abs.pathname + abs.search;
+          }
+        }
 
         if (req.method === "GET" && req.url === "/health") return handleHealth(req, res);
         if (req.method === "POST" && req.url?.startsWith("/v1/messages")) return await handleMessages(req, res);

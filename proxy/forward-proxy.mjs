@@ -472,6 +472,20 @@ function handleDownloadsRequest(clientReq, clientRes) {
   upReq.end();
 }
 
+// Absolute-form entry into the download rewrite. The CONNECT-MITM path feeds
+// decrypted downloads.claude.ai requests into handleDownloadsRequest; a client
+// that skips CONNECT (axios's plain-proxy mode, RFC 7230 §5.3.2) delivers the
+// same request as an absolute-form GET on the proxy port. Route it through the
+// same rewrite so both arrival styles get the acceleration; when the rewrite
+// is inactive the caller falls through to the generic relay (origin — slower
+// but correct). Returns true when the request was taken over.
+export function handleDownloadsAbsolute(clientReq, clientRes, url) {
+  if (url.hostname !== DOWNLOADS_HOST || !downloadRewriteActive()) return false;
+  clientReq.url = url.pathname + url.search;
+  handleDownloadsRequest(clientReq, clientRes);
+  return true;
+}
+
 // A dedicated http.Server whose sole job is to serve the decrypted
 // downloads.claude.ai stream via the storage rewrite. Built lazily so the
 // upstream MITM path is untouched when download-rewrite is off.
