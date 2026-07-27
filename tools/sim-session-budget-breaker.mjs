@@ -18,6 +18,29 @@
 // ceiling is crossed has passed the gate and will still accrue — that in-flight
 // batch IS the overshoot. Run: node tools/sim-session-budget-breaker.mjs
 
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { rmSync } from "node:fs";
+
+// Point the fire-event log at a temp file BEFORE importing the extension. The
+// sim provokes thousands of blocks by design, and the extension's default log
+// path is the OPERATOR's ~/.claude/session-budget-events.jsonl — a single sim
+// run otherwise appends ~12k synthetic "wf-68285-runaway" events to a real
+// developer's log, enough to trigger its 5 MB rotation on pure noise and make a
+// genuine first fire look like it has history. Diagnostics belong in the
+// console output below, not in the operator's event log.
+const SIM_EVENT_LOG = join(tmpdir(), `sbb-sim-${process.pid}.jsonl`);
+process.env.CACHE_FIX_SESSION_BUDGET_EVENT_LOG = SIM_EVENT_LOG;
+process.on("exit", () => { try { rmSync(SIM_EVENT_LOG, { force: true }); } catch {} });
+
+// Clear every scenario knob between runs, then restore the log override — a bare
+// CACHE_FIX_SESSION_BUDGET* wipe would take _EVENT_LOG with it and silently drop
+// the next scenario's events back into the operator's default log.
+function resetBudgetEnv() {
+  for (const k of Object.keys(process.env)) if (k.startsWith("CACHE_FIX_SESSION_BUDGET")) delete process.env[k];
+  process.env.CACHE_FIX_SESSION_BUDGET_EVENT_LOG = SIM_EVENT_LOG;
+}
+
 import ext from "../proxy/extensions/session-budget-breaker.mjs";
 
 // --- Virtual clock: the extension reads Date.now() in both hooks; drive it. ---
@@ -68,7 +91,7 @@ const jsonResCtx = (meta) => ({
 // (SSE), false → onResponse (the stream:false path Codex r1 found unhooked).
 async function runFanout({ concurrency, gate = "on", env = {}, stream = true }) {
   ext.__testOnly.reset();
-  for (const k of Object.keys(process.env)) if (k.startsWith("CACHE_FIX_SESSION_BUDGET")) delete process.env[k];
+  resetBudgetEnv();
   process.env.CACHE_FIX_SESSION_BUDGET = gate;
   for (const [k, v] of Object.entries(env)) process.env[k] = String(v);
 
@@ -199,7 +222,7 @@ async function main() {
   // ---- 6) Fail-open: gate on, ceiling set, but usage corrupted → nothing blocks ----
   console.log(`\n[6] Fail-open: gate=on, TOKENS ceiling set, every response's usage unparseable`);
   ext.__testOnly.reset();
-  for (const k of Object.keys(process.env)) if (k.startsWith("CACHE_FIX_SESSION_BUDGET")) delete process.env[k];
+  resetBudgetEnv();
   process.env.CACHE_FIX_SESSION_BUDGET = "on";
   process.env.CACHE_FIX_SESSION_BUDGET_TOKENS = "10";
   VCLOCK = 0;

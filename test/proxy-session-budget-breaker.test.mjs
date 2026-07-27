@@ -1,4 +1,4 @@
-import { test, beforeEach } from "node:test";
+import { test, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -43,7 +43,20 @@ function clearEnv() {
   for (const k of Object.keys(process.env)) if (k.startsWith("CACHE_FIX_SESSION_BUDGET")) delete process.env[k];
 }
 
-beforeEach(() => { clearEnv(); ext.__testOnly.reset(); });
+// Every fire writes a JSONL event, and the extension's default path is the
+// OPERATOR's ~/.claude/session-budget-events.jsonl. clearEnv() wipes
+// _EVENT_LOG along with the rest, so without re-pointing it here each test
+// would append to that real log — which is exactly what happened: a run of
+// this suite plus the sim left ~12k synthetic events in a developer's file.
+// Re-point it after every clear so no test can reach the default path.
+const TEST_EVENT_LOG = join(tmpdir(), `sbb-suite-${process.pid}.jsonl`);
+function isolateEventLog() {
+  process.env.CACHE_FIX_SESSION_BUDGET_EVENT_LOG = TEST_EVENT_LOG;
+}
+
+beforeEach(() => { clearEnv(); isolateEventLog(); ext.__testOnly.reset(); });
+
+after(() => { rmSync(TEST_EVENT_LOG, { force: true }); });
 
 // --- Fail-open table ---
 
