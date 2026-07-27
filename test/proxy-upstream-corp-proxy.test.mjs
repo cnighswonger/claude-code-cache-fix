@@ -30,18 +30,23 @@ test("selectProxyUrl: protocol-based selection matches curl/Python/Go", async ()
     ["",          "",         false, "",          "http upstream returns empty when neither set"],
   ];
 
-  const saved = { HTTPS_PROXY: process.env.HTTPS_PROXY, HTTP_PROXY: process.env.HTTP_PROXY };
+  // Save and clear BOTH cases. selectProxyUrl honors lowercase too, so an
+  // ambient lowercase https_proxy in the developer's shell would otherwise leak
+  // into the cases that set only the uppercase var and expect no proxy.
+  const VARS = ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"];
+  const saved = Object.fromEntries(VARS.map((k) => [k, process.env[k]]));
   try {
+    for (const k of VARS) delete process.env[k];
     for (const [hps, hp, isHTTPS, expected, label] of cases) {
       process.env.HTTPS_PROXY = hps;
       process.env.HTTP_PROXY = hp;
       assert.equal(selectProxyUrl(isHTTPS), expected, label);
     }
   } finally {
-    if (saved.HTTPS_PROXY === undefined) delete process.env.HTTPS_PROXY;
-    else process.env.HTTPS_PROXY = saved.HTTPS_PROXY;
-    if (saved.HTTP_PROXY === undefined) delete process.env.HTTP_PROXY;
-    else process.env.HTTP_PROXY = saved.HTTP_PROXY;
+    for (const k of VARS) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
   }
 });
 

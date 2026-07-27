@@ -307,7 +307,7 @@ export default {
     // Anthropic doesn't echo them, and onResponse's ctx.headers are RESPONSE
     // headers, so the non-streaming accrual path can't re-resolve the sid
     // itself. server.mjs threads the same meta object through both hooks.
-    ctx.meta._sbbSessionId = sid;
+    if (ctx.meta) ctx.meta._sbbSessionId = sid;
     const e = _tallies.get(sid);
     if (!e) return; // no tally yet (first request) → forward
     const now = Date.now();
