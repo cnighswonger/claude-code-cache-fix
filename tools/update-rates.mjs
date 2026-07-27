@@ -15,16 +15,26 @@
 // flag from the usage block (see the fast-mode-cost tracking issue). This
 // records STANDARD, non-batch, global list pricing only.
 //
+// FAIL CLOSED. The failure mode that matters for a money-path config is a
+// plausible-looking WRONG number, not a crash. Every uncertainty below aborts
+// without touching rates.json: a missing required model, a price outside a sane
+// range, cache multipliers that don't match the documented formula, or a model
+// whose row can't be unambiguously resolved to today's effective pricing.
+//
 // Exit codes: 0 = wrote a change, 10 = no change (rates already current),
-// 1 = fetch/parse failure (rates.json left untouched).
+// 1 = fetch/parse/validation failure (rates.json left untouched).
 
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync, renameSync, unlinkSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const PRICING_URL = "https://platform.claude.com/docs/en/about-claude/pricing";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const RATES_PATH = join(__dirname, "rates.json");
+
+// The page is ~1 MB of HTML. 8 MB is generous headroom while still bounding an
+// unexpected body (a redirected CDN error page, a mis-served binary).
+const MAX_BODY_BYTES = 8 * 1024 * 1024;
 
 // Display-name (as shown in the pricing table) → wire model identifier(s) the
 // proxy sees on the request. One display row can map to several wire ids (a
@@ -34,6 +44,7 @@ const RATES_PATH = join(__dirname, "rates.json");
 const NAME_TO_WIRE = {
   "Claude Fable 5": ["claude-fable-5"],
   "Claude Mythos 5": ["claude-mythos-5"],
+  "Claude Opus 5": ["claude-opus-5"],
   "Claude Opus 4.8": ["claude-opus-4-8"],
   "Claude Opus 4.7": ["claude-opus-4-7"],
   "Claude Opus 4.6": ["claude-opus-4-6"],
@@ -50,69 +61,219 @@ const NAME_TO_WIRE = {
   "Claude 3 Haiku": ["claude-3-haiku-20240307"],
 };
 
-function money(s) {
-  const m = /\$([0-9]+(?:\.[0-9]+)?)/.exec(s);
-  return m ? parseFloat(m[1]) : null;
+// Models the proxy actually sees in live traffic. If any of these is missing
+// from a parse, the run aborts rather than writing a file that would silently
+// price real traffic at zero. Deliberately NOT the full NAME_TO_WIRE set —
+// retired models legitimately drop off the page over time, and requiring them
+// would make the fetcher fail permanently on a normal upstream change.
+const REQUIRED_WIRE_IDS = [
+  "claude-fable-5",
+  "claude-opus-5",
+  "claude-opus-4-8",
+  "claude-opus-4-7",
+  "claude-opus-4-6",
+  "claude-sonnet-5",
+  "claude-haiku-4-5",
+];
+
+// Sanity band for a per-MTok list price, in dollars. Nothing Anthropic has ever
+// published sits outside this; a value that does means we parsed the wrong cell
+// (a token count, a percentage, a footnote number) and must not be written.
+const MIN_PRICE = 0.01;
+const MAX_PRICE = 2000;
+
+// Documented cache multipliers (see the pricing page's prompt-caching section).
+// Checked per row: a parse that satisfies these is very unlikely to have picked
+// up cells from the wrong row or in the wrong column order.
+const MULTIPLIERS = { cache_write_5m: 1.25, cache_write_1h: 2, cache_read: 0.1 };
+// Published prices are rounded to the cent, so an exact multiplier check would
+// reject legitimate rows. Allow a cent of slack either way.
+const MULTIPLIER_EPSILON = 0.011;
+
+const MONTHS = {
+  january: 0, february: 1, march: 2, april: 3, may: 4, june: 5,
+  july: 6, august: 7, september: 8, october: 9, november: 10, december: 11,
+};
+
+// Parse "August 31, 2026" → UTC ms. Returns null if not a date we recognize.
+function parseDate(monthName, day, year) {
+  const m = MONTHS[monthName.toLowerCase()];
+  if (m === undefined) return null;
+  return Date.UTC(Number(year), m, Number(day));
 }
 
-// Parse the HTML model-pricing table. Rows look like:
-//   ...>Claude Fable 5</td><td ...>$10 / MTok</td><td ...>$12.50 / MTok</td>
-//      <td ...>$20 / MTok</td><td ...>$1 / MTok</td><td ...>$50 / MTok</td>
-// Columns in order: Base Input | 5m Cache Write | 1h Cache Write | Cache Hits | Output.
-function parsePricing(html) {
-  const out = {};
-  for (const [display, wireIds] of Object.entries(NAME_TO_WIRE)) {
-    // Find the model name in a <td>, then grab the next five $-bearing cells.
-    // Tolerate a trailing footnote link Anthropic appends to some names, but
-    // the char right after the name must NOT be a version continuation
-    // ([.0-9]) — otherwise "Claude Opus 4" would prefix-match the "Claude Opus
-    // 4.8" row and steal its prices (real bug caught in review). So require the
-    // name to be followed by whitespace, "<" (tag/footnote), or "/" (retired),
-    // never a digit or dot.
-    // Anchor on the name (NOT followed by [.0-9], so "Claude Opus 4" can't grab
-    // the "Claude Opus 4.8" row), then allow the rest of the name cell —
-    // including any footnote <a>…</a> link and the closing </td> — up to the
-    // first price cell. Capture from the first "$…/ MTok" cell through the next
-    // five cells (input | 5m | 1h | read | output). Non-greedy on the gap so we
-    // stop at THIS row's first price, not a later row's.
-    const escaped = display.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const re = new RegExp(
-      escaped + "(?![.0-9]).*?<td[^>]*>\\s*(\\$[^<]*<\\/td>(?:\\s*<td[^>]*>[^<]*<\\/td>){4})",
-    );
-    const m = re.exec(html);
-    if (!m) continue; // unmatched model → skip (leaves existing entry untouched)
-    // Extract the five $-values from the captured span, in column order:
-    // input | 5m-write | 1h-write | cache-read | output.
-    const vals = [...m[1].matchAll(/\$([0-9][0-9.]*)/g)].map((s) => parseFloat(s[1]));
-    const [input, w5m, w1h, read, output] = vals;
-    if (vals.length !== 5 || [input, w5m, w1h, read, output].some((v) => v === undefined)) continue;
-    for (const id of wireIds) {
-      out[id] = { input, output, cache_read: read, cache_write_5m: w5m, cache_write_1h: w1h };
+// A model can appear on more than one row when pricing changes on a known date
+// (as Claude Sonnet 5 does: introductory pricing through 2026-08-31, standard
+// pricing from 2026-09-01). Extract that qualifier from the name cell so the
+// right row can be picked for the fetch date. `null` window bound = open-ended.
+function effectiveWindow(nameCell) {
+  const through = /through\s+([A-Za-z]+)\s+(\d{1,2}),\s*(\d{4})/i.exec(nameCell);
+  const starting = /starting\s+([A-Za-z]+)\s+(\d{1,2}),\s*(\d{4})/i.exec(nameCell);
+  const win = { from: null, until: null, qualified: false };
+  if (through) {
+    // "through August 31, 2026" is inclusive of that day.
+    const d = parseDate(through[1], through[2], through[3]);
+    if (d === null) return null; // unrecognized date → caller treats as ambiguous
+    win.until = d + 24 * 60 * 60 * 1000 - 1;
+    win.qualified = true;
+  }
+  if (starting) {
+    const d = parseDate(starting[1], starting[2], starting[3]);
+    if (d === null) return null;
+    win.from = d;
+    win.qualified = true;
+  }
+  return win;
+}
+
+function windowCovers(win, atMs) {
+  if (win.from !== null && atMs < win.from) return false;
+  if (win.until !== null && atMs > win.until) return false;
+  return true;
+}
+
+// Split the page into table rows and reduce each to plain-text cells. Tag
+// stripping happens per cell, so a footnote link inside a name cell collapses
+// into the surrounding text rather than truncating the cell.
+function tableRows(html) {
+  const rows = [];
+  for (const rowMatch of html.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/g)) {
+    const cells = [...rowMatch[1].matchAll(/<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/g)]
+      .map((c) => c[1].replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim());
+    if (cells.length) rows.push(cells);
+  }
+  return rows;
+}
+
+const PRICE_CELL = /^\$([0-9][0-9,]*(?:\.[0-9]+)?)\s*\/\s*MTok$/;
+
+// A model-pricing row is exactly: name cell + the five price columns
+// (input | 5m write | 1h write | cache read | output). This shape requirement is
+// what keeps the batch-pricing table (two price cells) and the tool-use table
+// (token counts, not prices) from being mistaken for pricing rows — the old
+// first-match-anywhere scan had no such guard.
+function priceRow(cells) {
+  if (cells.length !== 6) return null;
+  const vals = [];
+  for (let i = 1; i < 6; i++) {
+    const m = PRICE_CELL.exec(cells[i]);
+    if (!m) return null;
+    vals.push(parseFloat(m[1].replace(/,/g, "")));
+  }
+  const [input, w5m, w1h, read, output] = vals;
+  return { name: cells[0], input, output, cache_read: read, cache_write_5m: w5m, cache_write_1h: w1h };
+}
+
+// Does this row's name cell name this model — as opposed to a longer model whose
+// name it prefixes? "Claude Opus 4" must not claim the "Claude Opus 4.8" row, so
+// the character after the name may not continue a version number.
+function namesModel(nameCell, display) {
+  if (!nameCell.startsWith(display)) return false;
+  const next = nameCell.charAt(display.length);
+  return next === "" || !/[.0-9]/.test(next);
+}
+
+// Validate one row's numbers before it can reach rates.json. Returns an error
+// string (fail closed) or null when the row is trustworthy.
+function validateRates(wireId, r) {
+  for (const [field, v] of Object.entries(r)) {
+    if (typeof v !== "number" || !Number.isFinite(v)) return `${wireId}.${field} is not a finite number`;
+    if (v < MIN_PRICE || v > MAX_PRICE) return `${wireId}.${field}=${v} outside sane range $${MIN_PRICE}–$${MAX_PRICE}`;
+  }
+  for (const [field, mult] of Object.entries(MULTIPLIERS)) {
+    const expected = r.input * mult;
+    if (Math.abs(r[field] - expected) > MULTIPLIER_EPSILON) {
+      return `${wireId}.${field}=${r[field]} contradicts the documented ${mult}x input multiplier ` +
+        `(input=${r.input} → expected ${expected.toFixed(4)})`;
     }
   }
-  return out;
+  if (r.output < r.input) return `${wireId} output=${r.output} < input=${r.input} (columns likely swapped)`;
+  return null;
+}
+
+// Parse the model-pricing table. `atMs` is the effective date used to pick
+// between dated variants of the same model. Returns { rates, errors }.
+export function parsePricing(html, atMs = Date.now()) {
+  const rows = tableRows(html).map(priceRow).filter(Boolean);
+  const rates = {};
+  const errors = [];
+
+  for (const [display, wireIds] of Object.entries(NAME_TO_WIRE)) {
+    const candidates = rows.filter((r) => namesModel(r.name, display));
+    if (!candidates.length) continue; // absent from the page → REQUIRED check decides
+
+    let chosen;
+    if (candidates.length === 1) {
+      chosen = candidates[0];
+    } else {
+      // Several rows name this model. Only a dated qualifier can legitimately
+      // distinguish them; anything else is unexplained duplication and we
+      // refuse to guess which price is real.
+      const windows = candidates.map((r) => ({ row: r, win: effectiveWindow(r.name) }));
+      if (windows.some((w) => w.win === null || !w.win.qualified)) {
+        errors.push(`${display}: ${candidates.length} pricing rows and at least one carries no ` +
+          `parseable effective-date qualifier — refusing to guess (rows: ${candidates.map((c) => JSON.stringify(c.name)).join(", ")})`);
+        continue;
+      }
+      const active = windows.filter((w) => windowCovers(w.win, atMs));
+      if (active.length !== 1) {
+        errors.push(`${display}: ${active.length} of ${candidates.length} dated rows are in effect on ` +
+          `${new Date(atMs).toISOString().slice(0, 10)} — expected exactly 1 ` +
+          `(rows: ${candidates.map((c) => JSON.stringify(c.name)).join(", ")})`);
+        continue;
+      }
+      chosen = active[0].row;
+    }
+
+    const { name, ...r } = chosen;
+    for (const id of wireIds) {
+      const err = validateRates(id, r);
+      if (err) { errors.push(err); continue; }
+      rates[id] = { ...r };
+    }
+  }
+
+  for (const id of REQUIRED_WIRE_IDS) {
+    if (!rates[id]) errors.push(`required model "${id}" missing from the parse`);
+  }
+  return { rates, errors };
+}
+
+async function fetchPricing() {
+  const res = await fetch(PRICING_URL, {
+    headers: { "user-agent": "cache-fix-proxy rates-updater (+https://github.com/cnighswonger/claude-code-cache-fix)" },
+    signal: AbortSignal.timeout(20000),
+    redirect: "error", // a redirect off this host would change what we're trusting
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const ctype = res.headers.get("content-type") || "";
+  if (!/text\/html|text\/plain|text\/markdown/i.test(ctype)) {
+    throw new Error(`unexpected content-type ${JSON.stringify(ctype)}`);
+  }
+  const len = Number(res.headers.get("content-length"));
+  if (Number.isFinite(len) && len > MAX_BODY_BYTES) {
+    throw new Error(`body too large (content-length ${len} > ${MAX_BODY_BYTES})`);
+  }
+  const buf = Buffer.from(await res.arrayBuffer());
+  if (buf.byteLength > MAX_BODY_BYTES) {
+    throw new Error(`body too large (${buf.byteLength} > ${MAX_BODY_BYTES})`);
+  }
+  return buf.toString("utf8");
 }
 
 async function main() {
   let html;
   try {
-    const res = await fetch(PRICING_URL, {
-      headers: { "user-agent": "cache-fix-proxy rates-updater (+https://github.com/cnighswonger/claude-code-cache-fix)" },
-      signal: AbortSignal.timeout(20000),
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    html = await res.text();
+    html = await fetchPricing();
   } catch (err) {
     process.stderr.write(`[update-rates] fetch failed: ${err.message} — rates.json untouched\n`);
     process.exit(1);
   }
 
-  const parsed = parsePricing(html);
-  const n = Object.keys(parsed).length;
-  if (n < 5) {
-    // Sanity floor: the page always lists well over 5 models. A tiny count means
-    // the markup changed and our parser is broken — do NOT overwrite good data.
-    process.stderr.write(`[update-rates] only parsed ${n} models (markup likely changed) — rates.json untouched\n`);
+  const { rates, errors } = parsePricing(html);
+  if (errors.length) {
+    process.stderr.write(`[update-rates] parse validation failed — rates.json untouched:\n`);
+    for (const e of errors) process.stderr.write(`  - ${e}\n`);
     process.exit(1);
   }
 
@@ -121,9 +282,17 @@ async function main() {
   // find (e.g. a model dropped from the page but still referenced), and keep
   // per-entry "note" fields.
   const merged = { ...current.models };
-  for (const [id, rates] of Object.entries(parsed)) {
+  for (const [id, r] of Object.entries(rates)) {
     const prevNote = merged[id] && merged[id].note;
-    merged[id] = prevNote ? { ...rates, note: prevNote } : rates;
+    merged[id] = prevNote ? { ...r, note: prevNote } : r;
+  }
+
+  const n = Object.keys(rates).length;
+  const before = JSON.stringify(current.models);
+  const after = JSON.stringify(merged);
+  if (before === after) {
+    process.stderr.write(`[update-rates] no change (${n} models parsed, rates already current)\n`);
+    process.exit(10);
   }
 
   const next = {
@@ -133,16 +302,22 @@ async function main() {
     models: merged,
   };
 
-  const before = JSON.stringify(current.models);
-  const after = JSON.stringify(merged);
-  if (before === after) {
-    process.stderr.write(`[update-rates] no change (${n} models parsed, rates already current)\n`);
-    process.exit(10);
+  // Write-then-rename: an interrupted run must not leave a truncated pricing
+  // file behind, since a half-written rates.json is a money-path corruption.
+  const tmp = RATES_PATH + ".tmp";
+  try {
+    writeFileSync(tmp, JSON.stringify(next, null, 2) + "\n");
+    renameSync(tmp, RATES_PATH);
+  } catch (err) {
+    try { unlinkSync(tmp); } catch {}
+    process.stderr.write(`[update-rates] write failed: ${err.message} — rates.json untouched\n`);
+    process.exit(1);
   }
-
-  writeFileSync(RATES_PATH, JSON.stringify(next, null, 2) + "\n");
   process.stderr.write(`[update-rates] wrote rates.json (${n} models parsed; content changed)\n`);
   process.exit(0);
 }
 
-main();
+// Importable for tests; only fetches when run as a script.
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+  main();
+}
