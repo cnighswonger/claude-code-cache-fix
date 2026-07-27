@@ -55,12 +55,16 @@ test("the introductory window is inclusive of its final day and flips the next",
   assert.equal(parsePricing(FIXTURE, firstDay).rates["claude-sonnet-5"].input, 3);
 });
 
-test("a date outside every dated window fails closed rather than guessing", () => {
-  // Both Sonnet 5 rows are bounded relative to a 2025 date: "through Aug 2026"
-  // covers it, "starting Sep 2026" does not — so exactly one is active and the
-  // parse still succeeds. The real risk is the opposite case, covered below.
-  const { errors } = parsePricing(FIXTURE, Date.parse("2025-01-01T00:00:00Z"));
+test("a date before the dated rows still resolves to exactly one active row", () => {
+  // Read at a 2025 date, the two Sonnet 5 rows split cleanly: "through
+  // August 31, 2026" covers it, "starting September 1, 2026" does not. Exactly
+  // one active row means this must SUCCEED — it guards against over-rejecting a
+  // legitimately unambiguous page, which would make refreshes impossible and let
+  // rates.json rot. The fail-closed direction is covered by the refusal tests
+  // further down.
+  const { rates, errors } = parsePricing(FIXTURE, Date.parse("2025-01-01T00:00:00Z"));
   assert.deepEqual(errors, []);
+  assert.equal(rates["claude-sonnet-5"].input, 2, "the through-Aug-2026 row is the active one");
 });
 
 test("duplicate rows with no date qualifier are refused, not guessed", () => {
