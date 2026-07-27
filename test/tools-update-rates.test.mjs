@@ -72,7 +72,7 @@ test("duplicate rows with no date qualifier are refused, not guessed", () => {
     </table>`;
   const { rates, errors } = parsePricing(html, AUG);
   assert.equal(rates["claude-fable-5"], undefined, "must not pick either row");
-  assert.ok(errors.some((e) => /Claude Fable 5.*no parseable effective-date qualifier/.test(e)),
+  assert.ok(errors.some((e) => /Claude Fable 5.*none carries a parseable effective-date qualifier/.test(e)),
     `expected an ambiguity error, got: ${JSON.stringify(errors)}`);
 });
 
@@ -184,4 +184,53 @@ test("checked-in rates.json agrees with the fixture parse for required models", 
     const { note, ...s } = shipped[id];
     assert.deepEqual(s, rates[id], `rates.json ${id} disagrees with the published table`);
   }
+});
+
+// --- dated qualifiers bind regardless of candidate count (Codex r2 blocker) ---
+// Round 2 found that effectiveWindow() was only consulted when a model had
+// MULTIPLE rows, so a lone row was accepted whatever its qualifier said. A sole
+// "starting September 1, 2026" row read in August is not today's price.
+
+const soleRow = (name, input) =>
+  `<table><tr><td>${name}</td><td>$${input} / MTok</td><td>$${input * 1.25} / MTok</td>` +
+  `<td>$${input * 2} / MTok</td><td>$${(input * 0.1).toFixed(2)} / MTok</td><td>$${input * 5} / MTok</td></tr></table>`;
+
+test("a sole not-yet-effective row is refused, not adopted", () => {
+  const { rates, errors } = parsePricing(soleRow("Claude Fable 5 starting September 1, 2026", 99), AUG);
+  assert.equal(rates["claude-fable-5"], undefined, "a future row is not today's price");
+  assert.ok(errors.some((e) => /0 of 1 dated rows are in effect/.test(e)), JSON.stringify(errors));
+});
+
+test("a sole already-expired row is refused", () => {
+  const { rates, errors } = parsePricing(soleRow("Claude Fable 5 through June 30, 2026", 99), AUG);
+  assert.equal(rates["claude-fable-5"], undefined, "an expired row is not today's price");
+  assert.ok(errors.some((e) => /0 of 1 dated rows are in effect/.test(e)), JSON.stringify(errors));
+});
+
+test("a sole dated row that IS in effect is accepted", () => {
+  const { rates, errors } = parsePricing(soleRow("Claude Fable 5 through December 31, 2026", 10), AUG);
+  assert.equal(rates["claude-fable-5"].input, 10);
+  assert.ok(!errors.some((e) => /in effect/.test(e)), JSON.stringify(errors));
+});
+
+test("a sole undated row is still accepted (the normal case)", () => {
+  const { rates } = parsePricing(soleRow("Claude Fable 5", 10), AUG);
+  assert.equal(rates["claude-fable-5"].input, 10);
+});
+
+test("a qualifier in an unrecognized date format is refused, not ignored", () => {
+  // The unparseable qualifier may be the very thing saying "not yet in effect",
+  // so it must disqualify rather than fall through to acceptance.
+  const { rates, errors } = parsePricing(soleRow("Claude Fable 5 starting Fructidor 1, 2026", 99), AUG);
+  assert.equal(rates["claude-fable-5"], undefined);
+  assert.ok(errors.some((e) => /format this parser does not recognize/.test(e)), JSON.stringify(errors));
+});
+
+test("a model mixing a dated and an undated row is refused", () => {
+  const two =
+    `<table><tr><td>Claude Fable 5 starting September 1, 2026</td><td>$20 / MTok</td><td>$25 / MTok</td><td>$40 / MTok</td><td>$2 / MTok</td><td>$100 / MTok</td></tr>` +
+    `<tr><td>Claude Fable 5</td><td>$10 / MTok</td><td>$12.50 / MTok</td><td>$20 / MTok</td><td>$1 / MTok</td><td>$50 / MTok</td></tr></table>`;
+  const { rates, errors } = parsePricing(two, AUG);
+  assert.equal(rates["claude-fable-5"], undefined, "cannot tell which row is authoritative");
+  assert.ok(errors.some((e) => /mixes 1 dated and 1 undated/.test(e)), JSON.stringify(errors));
 });

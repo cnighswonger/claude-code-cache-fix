@@ -61,11 +61,19 @@ const NAME_TO_WIRE = {
   "Claude 3 Haiku": ["claude-3-haiku-20240307"],
 };
 
-// Models the proxy actually sees in live traffic. If any of these is missing
-// from a parse, the run aborts rather than writing a file that would silently
-// price real traffic at zero. Deliberately NOT the full NAME_TO_WIRE set —
-// retired models legitimately drop off the page over time, and requiring them
-// would make the fetcher fail permanently on a normal upstream change.
+// Models whose absence would price CURRENT sessions at zero. That is the
+// membership rule — not "every model we know about" and not "every model on the
+// page". If one of these is missing from a parse, the run aborts rather than
+// writing a file that silently under-counts live traffic.
+//
+// OWNERSHIP: whoever adds a model to the proxy's live traffic owns adding it
+// here, and whoever retires one owns removing it. A rename or retirement
+// upstream will hard-fail every refresh until this list is updated in-tree —
+// that is the intended trade-off (a loud stop beats a quiet wrong price), but it
+// means the list is a maintenance obligation, not a set-and-forget constant.
+// Deliberately NOT the full NAME_TO_WIRE set: retired models legitimately drop
+// off the page, and requiring them would make the fetcher fail permanently on a
+// normal upstream change.
 const REQUIRED_WIRE_IDS = [
   "claude-fable-5",
   "claude-opus-5",
@@ -82,9 +90,12 @@ const REQUIRED_WIRE_IDS = [
 const MIN_PRICE = 0.01;
 const MAX_PRICE = 2000;
 
-// Documented cache multipliers (see the pricing page's prompt-caching section).
-// Checked per row: a parse that satisfies these is very unlikely to have picked
-// up cells from the wrong row or in the wrong column order.
+// Documented cache multipliers (see the pricing page's prompt-caching section),
+// checked per row. This catches a column-order change or cells lifted from the
+// wrong row. It is NOT semantic validation: a wrong-but-plausible row that
+// happens to satisfy these ratios and the range band below will still pass.
+// Treat these as guards against structural misparses, not proof of correctness —
+// the human PR review is what confirms the numbers are actually right.
 const MULTIPLIERS = { cache_write_5m: 1.25, cache_write_1h: 2, cache_read: 0.1 };
 // Published prices are rounded to the cent, so an exact multiplier check would
 // reject legitimate rows. Allow a cent of slack either way.
@@ -96,6 +107,13 @@ const MONTHS = {
 };
 
 // Parse "August 31, 2026" → UTC ms. Returns null if not a date we recognize.
+//
+// The page states these dates without a timezone, so UTC midnight is an
+// assumption, not a documented fact. Practical effect at the 2026-08-31 →
+// 09-01 Sonnet 5 cutover: a run in the hours after 09-01T00:00Z adopts the
+// higher rate slightly before a US-business-timezone reading would. That errs
+// toward over-estimating spend, which is the safe direction for a ceiling, and
+// any such refresh still lands as a reviewable PR diff rather than silently.
 function parseDate(monthName, day, year) {
   const m = MONTHS[monthName.toLowerCase()];
   if (m === undefined) return null;
@@ -202,22 +220,44 @@ export function parsePricing(html, atMs = Date.now()) {
     const candidates = rows.filter((r) => namesModel(r.name, display));
     if (!candidates.length) continue; // absent from the page → REQUIRED check decides
 
+    // A row's effective-date qualifier is binding regardless of how many rows
+    // the model has. A lone "starting September 1, 2026" row read in August is
+    // NOT today's price, and accepting it because it had no sibling would be the
+    // same silent-wrong-number failure the duplicate branch exists to prevent.
+    const windows = candidates.map((r) => ({ row: r, win: effectiveWindow(r.name) }));
+    const dated = windows.filter((w) => w.win === null || w.win.qualified);
+    const undated = windows.filter((w) => w.win !== null && !w.win.qualified);
+
     let chosen;
-    if (candidates.length === 1) {
-      chosen = candidates[0];
-    } else {
-      // Several rows name this model. Only a dated qualifier can legitimately
-      // distinguish them; anything else is unexplained duplication and we
-      // refuse to guess which price is real.
-      const windows = candidates.map((r) => ({ row: r, win: effectiveWindow(r.name) }));
-      if (windows.some((w) => w.win === null || !w.win.qualified)) {
-        errors.push(`${display}: ${candidates.length} pricing rows and at least one carries no ` +
-          `parseable effective-date qualifier — refusing to guess (rows: ${candidates.map((c) => JSON.stringify(c.name)).join(", ")})`);
+    if (!dated.length) {
+      // No row carries a date qualifier. Exactly one is the normal case; more
+      // than one is unexplained duplication we refuse to resolve.
+      if (undated.length > 1) {
+        errors.push(`${display}: ${undated.length} pricing rows and none carries a parseable ` +
+          `effective-date qualifier — refusing to guess (rows: ${candidates.map((c) => JSON.stringify(c.name)).join(", ")})`);
         continue;
       }
-      const active = windows.filter((w) => windowCovers(w.win, atMs));
+      chosen = undated[0].row;
+    } else if (undated.length) {
+      // Mixing a dated row with an undated one for the same model is ambiguous:
+      // we cannot tell whether the undated row is the fallback or a stale entry.
+      errors.push(`${display}: mixes ${dated.length} dated and ${undated.length} undated pricing ` +
+        `row(s) — refusing to guess (rows: ${candidates.map((c) => JSON.stringify(c.name)).join(", ")})`);
+      continue;
+    } else {
+      // Every candidate is dated (or carries a qualifier we could not parse).
+      // A qualifier we failed to parse is itself disqualifying — it may well be
+      // the one that says this row isn't in effect.
+      const unparseable = dated.filter((w) => w.win === null);
+      if (unparseable.length) {
+        errors.push(`${display}: ${unparseable.length} row(s) carry an effective-date qualifier in a ` +
+          `format this parser does not recognize — refusing to guess ` +
+          `(rows: ${candidates.map((c) => JSON.stringify(c.name)).join(", ")})`);
+        continue;
+      }
+      const active = dated.filter((w) => windowCovers(w.win, atMs));
       if (active.length !== 1) {
-        errors.push(`${display}: ${active.length} of ${candidates.length} dated rows are in effect on ` +
+        errors.push(`${display}: ${active.length} of ${dated.length} dated rows are in effect on ` +
           `${new Date(atMs).toISOString().slice(0, 10)} — expected exactly 1 ` +
           `(rows: ${candidates.map((c) => JSON.stringify(c.name)).join(", ")})`);
         continue;
