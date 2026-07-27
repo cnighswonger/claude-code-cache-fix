@@ -3,11 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import ext, {
-  _resetState,
-  buildSseString,
-  buildJsonBody,
-} from "../proxy/extensions/image-retry-circuit-breaker.mjs";
+import ext, { _resetState } from "../proxy/extensions/image-retry-circuit-breaker.mjs";
 
 const IMG_A_B64 = Buffer.from("image-a-bytes").toString("base64");
 const IMG_B_B64 = Buffer.from("image-b-bytes-completely-different").toString("base64");
@@ -427,61 +423,6 @@ test("CC#66815 replay: 1 upstream call + 18 short-circuits = 1 failure_recorded 
   const fireCount = events.filter((e) => e.event === "breaker_fire").length;
   assert.equal(failureCount, 1);
   assert.equal(fireCount, 18);
-});
-
-// -----------------------------------------------------------------------------
-// SSE / JSON synthesis structural correctness
-// -----------------------------------------------------------------------------
-
-test("buildSseString emits the full event sequence (no [DONE] by default)", () => {
-  const out = buildSseString("claude-opus-4-7", "hi");
-  assert.match(out, /^event: message_start/);
-  assert.ok(out.indexOf("event: content_block_start") > 0);
-  assert.ok(out.indexOf("event: content_block_delta") > 0);
-  assert.ok(out.indexOf("event: content_block_stop") > 0);
-  assert.ok(out.indexOf("event: message_delta") > 0);
-  assert.ok(out.indexOf("event: message_stop") > 0);
-  assert.ok(!out.includes("[DONE]"), "[DONE] sentinel is deferred to sim validation per directive N1");
-});
-
-test("buildSseString event payloads are valid JSON and carry the required structural fields", () => {
-  const out = buildSseString("claude-opus-4-7", "delta-text");
-  const events = out
-    .split("\n\n")
-    .filter(Boolean)
-    .map((block) => {
-      const lines = block.split("\n");
-      const dataLine = lines.find((l) => l.startsWith("data:"));
-      return dataLine ? JSON.parse(dataLine.slice("data: ".length)) : null;
-    })
-    .filter(Boolean);
-
-  assert.equal(events.length, 6);
-  const start = events[0];
-  assert.equal(start.type, "message_start");
-  assert.equal(start.message.role, "assistant");
-  assert.equal(start.message.model, "claude-opus-4-7");
-  assert.equal(typeof start.message.usage.input_tokens, "number");
-
-  assert.equal(events[1].type, "content_block_start");
-  assert.equal(events[1].index, 0);
-  assert.equal(events[2].type, "content_block_delta");
-  assert.equal(events[2].delta.text, "delta-text");
-  assert.equal(events[3].type, "content_block_stop");
-  assert.equal(events[4].type, "message_delta");
-  assert.equal(events[4].delta.stop_reason, "end_turn");
-  assert.equal(events[5].type, "message_stop");
-});
-
-test("buildJsonBody produces the upstream non-streaming envelope shape", () => {
-  const out = buildJsonBody("claude-opus-4-7", "the text");
-  assert.equal(out.type, "message");
-  assert.equal(out.role, "assistant");
-  assert.equal(out.model, "claude-opus-4-7");
-  assert.equal(out.content[0].type, "text");
-  assert.equal(out.content[0].text, "the text");
-  assert.equal(out.stop_reason, "end_turn");
-  assert.equal(typeof out.usage.input_tokens, "number");
 });
 
 // -----------------------------------------------------------------------------

@@ -207,11 +207,8 @@ function shortCircuitText(firstHash, remainingMs) {
 
 // SSE/JSON synthesis moved to the shared proxy/synth-response.mjs so the
 // session-budget-breaker (and future local short-circuits) reuse one wire
-// format. Imported for local use by buildSkipResult below, AND re-exported to
-// preserve this module's existing import surface (its tests import
-// buildSseString / buildJsonBody by name).
-import { buildSseString, buildJsonBody, synthMessageId } from "../synth-response.mjs";
-export { buildSseString, buildJsonBody, synthMessageId };
+// format.
+import { buildSseString, buildJsonBody } from "../synth-response.mjs";
 
 function buildSkipResult(mode, request, entry) {
   const remainingMs = Math.max(0, cooloffMs() - (Date.now() - entry.lastFailureAt));
