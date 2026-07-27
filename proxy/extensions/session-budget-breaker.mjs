@@ -256,6 +256,36 @@ function usageInputTokens(usage) {
   return { input: i, cacheCreation, total: i + cacheCreation };
 }
 
+// Fold one turn's usage into the per-session tally. Shared by the streaming
+// (message_start) and non-streaming (JSON body) accrual paths so both request
+// modes feed the same ceilings. Callers pass the already-parsed split.
+function accrue(sid, split, model, responseHeaders) {
+  const now = Date.now();
+  const e = touch(sid);
+  e.tokens += split.total;
+  // Cost: price input + cache_creation at this turn's model rates. Unknown
+  // model → costOf returns null → cost simply not accrued (fail-open); the
+  // token/rate tally is unaffected so those levers still work.
+  const cost = costOf(model, split.input, split.cacheCreation);
+  if (cost !== null) e.costUsd += cost;
+  e.events.push({ t: now, tokens: split.total });
+  e.last = now;
+  pruneWindow(e, now);
+
+  // Observational only: feed the account-global windows for the q5h-
+  // contribution signal. Token pool spans all sessions; the q5h delta comes
+  // from the account header if present (absent for API-key traffic → the
+  // whole signal stays absent, never blocks). First observation delta is 0.
+  _accountEvents.push({ t: now, tokens: split.total });
+  const q5h = accountQ5h(responseHeaders);
+  if (q5h !== null) {
+    const d = _lastAccountQ5h === null ? 0 : q5h - _lastAccountQ5h;
+    _lastAccountQ5h = q5h;
+    _accountQ5hEvents.push({ t: now, d });
+  }
+  pruneAccountWindows(now);
+}
+
 export default {
   name: "session-budget-breaker",
 
@@ -273,6 +303,11 @@ export default {
     let sid;
     try { sid = resolveSessionId(ctx.headers); } catch { return; } // fail-open
     if (!sid) return; // no session key → forward
+    // Stash for onResponse: session-id headers ride on the REQUEST only —
+    // Anthropic doesn't echo them, and onResponse's ctx.headers are RESPONSE
+    // headers, so the non-streaming accrual path can't re-resolve the sid
+    // itself. server.mjs threads the same meta object through both hooks.
+    ctx.meta._sbbSessionId = sid;
     const e = _tallies.get(sid);
     if (!e) return; // no tally yet (first request) → forward
     const now = Date.now();
@@ -302,44 +337,38 @@ export default {
     return buildSkipResult(ctx.body, text);
   },
 
-  // Learn cost from the response usage; update the per-session tally.
+  // Learn cost from a streaming response's usage; update the per-session tally.
   async onStreamEvent(ctx) {
     try {
       if (gate() === "off" || !anyLimitSet()) return;
       const ev = ctx.event;
       // message_start carries the input/cache_creation counts for the turn.
       if (!ev || ev.type !== "message_start") return;
-      const usage = ev.message && ev.message.usage;
-      const split = usageInputTokens(usage);
+      const split = usageInputTokens(ev.message && ev.message.usage);
       if (split === null) return; // unparseable/missing → don't update (fail-open)
       let sid;
       try { sid = resolveSessionId(ctx.headers); } catch { return; }
       if (!sid) return;
-      const now = Date.now();
-      const e = touch(sid);
-      e.tokens += split.total;
-      // Cost: price input + cache_creation at this turn's model rates. Unknown
-      // model → costOf returns null → cost simply not accrued (fail-open); the
-      // token/rate tally is unaffected so those levers still work.
-      const model = ev.message && ev.message.model;
-      const cost = costOf(model, split.input, split.cacheCreation);
-      if (cost !== null) e.costUsd += cost;
-      e.events.push({ t: now, tokens: split.total });
-      e.last = now;
-      pruneWindow(e, now);
+      accrue(sid, split, ev.message && ev.message.model, ctx.responseHeaders);
+    } catch { /* fail-open: never let accounting throw affect the request */ }
+  },
 
-      // Observational only: feed the account-global windows for the q5h-
-      // contribution signal. Token pool spans all sessions; the q5h delta comes
-      // from the account header if present (absent for API-key traffic → the
-      // whole signal stays absent, never blocks). First observation delta is 0.
-      _accountEvents.push({ t: now, tokens: split.total });
-      const q5h = accountQ5h(ctx.responseHeaders);
-      if (q5h !== null) {
-        const d = _lastAccountQ5h === null ? 0 : q5h - _lastAccountQ5h;
-        _lastAccountQ5h = q5h;
-        _accountQ5hEvents.push({ t: now, d });
-      }
-      pruneAccountWindows(now);
+  // Same accrual for non-streaming (stream:false) responses, which never emit
+  // stream events — server.mjs routes their parsed JSON body through onResponse.
+  // Without this the whole non-streaming request mode would bypass the ceilings.
+  async onResponse(ctx) {
+    try {
+      if (gate() === "off" || !anyLimitSet()) return;
+      const body = ctx.body;
+      if (!body || body.type !== "message") return; // errors/other shapes → skip
+      const split = usageInputTokens(body.usage);
+      if (split === null) return; // unparseable/missing → don't update (fail-open)
+      // ctx.headers here are RESPONSE headers — the sid came from the request,
+      // so read the stash onRequest left on the shared meta. No stash means
+      // onRequest bailed (no sid on the request) → nothing to attribute.
+      const sid = ctx.meta && ctx.meta._sbbSessionId;
+      if (!sid) return;
+      accrue(sid, split, body.model, ctx.headers);
     } catch { /* fail-open: never let accounting throw affect the request */ }
   },
 

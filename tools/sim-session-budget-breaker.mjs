@@ -37,21 +37,36 @@ const LATENCY_MS = 2000;         // response round-trip per leg
 const fmt = (n) => Math.round(n).toLocaleString("en-US");
 const usd = (n) => "$" + n.toFixed(2);
 
-const reqCtx = () => ({ headers: { "x-claude-code-session-id": SID }, body: { model: MODEL, stream: true } });
+const legUsage = () => ({
+  input_tokens: LEG_INPUT, cache_creation_input_tokens: LEG_CACHE_CREATION,
+  output_tokens: 0, cache_read_input_tokens: 0,
+});
+const reqCtx = (stream = true) => ({
+  headers: { "x-claude-code-session-id": SID },
+  body: { model: MODEL, stream },
+  meta: { route: "messages" },
+});
 const startEvent = () => ({
   headers: { "x-claude-code-session-id": SID },
   responseHeaders: {},
-  event: { type: "message_start", message: { model: MODEL, usage: {
-    input_tokens: LEG_INPUT, cache_creation_input_tokens: LEG_CACHE_CREATION,
-    output_tokens: 0, cache_read_input_tokens: 0,
-  } } },
+  event: { type: "message_start", message: { model: MODEL, usage: legUsage() } },
+});
+// Non-streaming (stream:false) accrual: server.mjs hands the parsed JSON body to
+// onResponse with RESPONSE headers and the SAME meta the request carried.
+const jsonResCtx = (meta) => ({
+  status: 200,
+  headers: {},
+  body: { type: "message", model: MODEL, usage: legUsage() },
+  meta,
 });
 
 // Discrete-event sim over a virtual clock. Events: DISPATCH (client sends the
 // request → onRequest gate) and ACCRUE (response lands → onStreamEvent tally).
 // A slot is reserved at dispatch; released immediately on a block (no upstream),
 // or LATENCY_MS later at accrue (the request went upstream and returned).
-async function runFanout({ concurrency, gate = "on", env = {} }) {
+// `stream` selects which accrual path the sim exercises: true → onStreamEvent
+// (SSE), false → onResponse (the stream:false path Codex r1 found unhooked).
+async function runFanout({ concurrency, gate = "on", env = {}, stream = true }) {
   ext.__testOnly.reset();
   for (const k of Object.keys(process.env)) if (k.startsWith("CACHE_FIX_SESSION_BUDGET")) delete process.env[k];
   process.env.CACHE_FIX_SESSION_BUDGET = gate;
@@ -64,7 +79,7 @@ async function runFanout({ concurrency, gate = "on", env = {} }) {
   let maxTokens = 0, maxCost = 0;
 
   const q = [];
-  const push = (time, kind) => q.push({ time, seq: seq++, kind });
+  const push = (time, kind, meta) => q.push({ time, seq: seq++, kind, meta });
   const pop = () => {
     let bi = 0;
     for (let i = 1; i < q.length; i++)
@@ -80,7 +95,8 @@ async function runFanout({ concurrency, gate = "on", env = {} }) {
     const ev = pop();
     VCLOCK = ev.time;
     if (ev.kind === "DISPATCH") {
-      const r = await ext.onRequest(reqCtx());
+      const ctx = reqCtx(stream);
+      const r = await ext.onRequest(ctx);
       if (r && r.skip) {
         blocked++;
         inflight--; // immediate local return, no upstream call, slot freed
@@ -95,10 +111,13 @@ async function runFanout({ concurrency, gate = "on", env = {} }) {
         dispatchMore();
       } else {
         forwarded++;
-        push(VCLOCK + LATENCY_MS, "ACCRUE");
+        // Carry this request's meta to its own accrual — that's the channel the
+        // non-streaming path uses to recover the session id at onResponse time.
+        push(VCLOCK + LATENCY_MS, "ACCRUE", ctx.meta);
       }
     } else {
-      await ext.onStreamEvent(startEvent());
+      if (stream) await ext.onStreamEvent(startEvent());
+      else await ext.onResponse(jsonResCtx(ev.meta));
       inflight--;
       const e = ext.__testOnly.tally(SID);
       if (e) { maxTokens = Math.max(maxTokens, e.tokens); maxCost = Math.max(maxCost, e.costUsd); }
@@ -194,6 +213,27 @@ async function main() {
   }
   console.log(`     forwarded ${foForwarded}/${N_LEGS}, blocked ${foBlocked}`);
   check(foForwarded === N_LEGS && foBlocked === 0, "corrupted usage → tally never updates → every leg forwards (fail-open)");
+
+  // Codex review r1 blocker: the breaker originally learned spend only from
+  // onStreamEvent, so a stream:false fan-out accrued nothing and every leg
+  // forwarded. Same runaway, same ceiling, driven through onResponse instead.
+  console.log(`\n[7] Non-streaming fan-out (stream:false → onResponse accrual), TOKENS ceiling`);
+  console.log(`     concurrency │ forwarded │ blocked │ max tokens`);
+  const nsRows = [];
+  for (const c of [1, 16]) {
+    const r = await runFanout({ concurrency: c, stream: false,
+      env: { CACHE_FIX_SESSION_BUDGET_TOKENS: TOKENS_CEIL } });
+    nsRows.push(r);
+    console.log(`     ${String(c).padStart(11)} │ ${String(r.forwarded).padStart(9)} │ ${String(r.blocked).padStart(7)} │ ${fmt(r.maxTokens).padStart(10)}`);
+  }
+  check(nsRows.every((r) => r.blocked > 0), "stream:false runaway is capped too (onResponse accrual wired)");
+  check(nsRows.every((r) => r.forwarded < N_LEGS), "not all stream:false legs reached Anthropic");
+  // Same ceiling, same runaway, only the accrual hook differs — the two modes
+  // must cap at the same leg, or one of them is a bypass.
+  const sSerial = await runFanout({ concurrency: 1, stream: true,
+    env: { CACHE_FIX_SESSION_BUDGET_TOKENS: TOKENS_CEIL } });
+  check(nsRows[0].forwarded === sSerial.forwarded,
+    `stream:false caps at the same leg as streaming (${nsRows[0].forwarded} vs ${sSerial.forwarded}) — no mode-dependent bypass`);
 
   console.log("\n" + line);
   console.log(failures === 0 ? "SIM RESULT: PASS — #68285 fan-out is demonstrably capped." : `SIM RESULT: FAIL — ${failures} check(s) failed.`);

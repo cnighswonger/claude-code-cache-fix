@@ -913,6 +913,8 @@ The breaker serves **both** billing models, but the danger — and so the primar
 
 **Cost is an estimate — pair it with a token cap for a guaranteed dollar bound.** `rates.json` may lag a newly-released model. An unknown model contributes **0** to the cost tally (fail-open by design), so a stale rate silently *under*-counts and can let cost run past your intended dollar figure. The token and rate levers are always exact. If you want a hard dollar cap on an API key, **also set `_TOKENS`** so a stale/unknown rate can't let spend run unbounded — the token bound then backstops the estimate. (`tools/rates.json` is refreshed weekly from Anthropic's pricing page via a fetch-and-open-PR cron; a human reviews every pricing diff.)
 
+Both request modes are covered: streaming responses accrue from the `message_start` event, non-streaming (`stream:false`) responses from the returned JSON body. The tally, the ceilings, and the block behaviour are identical either way — there is no mode that bypasses the budget.
+
 ### Fail-open, always
 
 If accounting is uncertain — gate off, no ceiling set, `usage` missing or unparseable, no session key, the model unknown to `rates.json` (cost lever only), first request after a restart, or anything throws — the request **forwards.** A block requires the gate `on` **and** at least one lever numerically, confidently at/over its ceiling. A budget breaker that failed *closed* would wedge a whole session on a proxy bug, which is worse than the overage. One env flip (`CACHE_FIX_SESSION_BUDGET=off`) fully disables it.
@@ -922,6 +924,8 @@ If accounting is uncertain — gate off, no ceiling set, `usage` missing or unpa
 A short-circuited request returns before any upstream call, so it produces **no `usage.jsonl` row** — correct (no cost was incurred), but note it is **not** in the meter. The only fire signal is the JSONL event log: each block writes `{ event: "session_budget_block", would_block, sid, lever, limit, observed, cumulative_tokens, cumulative_cost_usd, request_id, ts }`. `dry-run` writes the same records with `would_block: true` and forwards. The log carries the tally and the crossed limit only — **no request/response bodies, no model-input content, no auth headers.** `request_id` is nullable (a locally-blocked request has no upstream request-id; it's populated from the client request header if present, else `null` — never fabricated).
 
 Each fire event also carries an **observational** `account_q5h_contribution` — an estimate of how much of the account's rolling-5h quota burn this session drove, attributed by the session's token share of the window (`{ window_ms, account_q5h_delta, session_token_share, attributed_q5h_delta }`). This is derived from Anthropic's **account-global** `anthropic-ratelimit-unified-5h-utilization` header, so it is **never** a blocking lever — it would trip an innocent session for another session's burn. It exists only to show operators *which* session is driving the account quota. API-key traffic lacks the header, so the field is simply omitted.
+
+The attribution denominator is the proxy's **process-global** token pool, so the estimate is only sound when a proxy instance serves **one** Anthropic account (the normal single-operator deployment). If one instance fronts several accounts, independent accounts share the same denominator and a session's contribution can be over- or under-stated. Being observational, this never affects gating.
 
 ### Known limitations
 

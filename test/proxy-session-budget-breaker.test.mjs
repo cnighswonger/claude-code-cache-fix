@@ -20,7 +20,18 @@ const start = (inp, cc = 0, model = undefined, sid = SID, responseHeaders = unde
 });
 // A response-headers block carrying the account-global 5h utilization.
 const q5hHdr = (util) => ({ "anthropic-ratelimit-unified-5h-utilization": String(util) });
-const req = (sid = SID, stream = true) => ({ headers: H(sid), body: { model: "claude-fable-5", stream } });
+// `meta` mirrors server.mjs preForward: one object threaded through onRequest →
+// onResponse, which is how the non-streaming accrual path learns the session id.
+const req = (sid = SID, stream = true, meta = { route: "messages" }) =>
+  ({ headers: H(sid), body: { model: "claude-fable-5", stream }, meta });
+// A non-streaming (stream:false) response body as server.mjs hands it to
+// onResponse: parsed JSON, plus RESPONSE headers (no session id on them).
+const jsonRes = (inp, cc = 0, model = undefined, meta = undefined, responseHeaders = {}) => ({
+  status: 200,
+  headers: responseHeaders,
+  body: { type: "message", model, usage: { input_tokens: inp, cache_creation_input_tokens: cc, output_tokens: 0, cache_read_input_tokens: 0 } },
+  meta,
+});
 
 function clearEnv() {
   for (const k of Object.keys(process.env)) if (k.startsWith("CACHE_FIX_SESSION_BUDGET")) delete process.env[k];
@@ -48,7 +59,7 @@ test("gate on but no ceiling set → inert, forward", async () => {
 test("gate on, ceiling set, no session key → forward", async () => {
   process.env.CACHE_FIX_SESSION_BUDGET = "on";
   process.env.CACHE_FIX_SESSION_BUDGET_TOKENS = "10";
-  const r = await ext.onRequest({ headers: {}, body: { model: "m", stream: true } });
+  const r = await ext.onRequest({ headers: {}, body: { model: "m", stream: true }, meta: { route: "messages" } });
   assert.equal(r, undefined, "no x-claude-code-session-id → forward");
 });
 
@@ -284,4 +295,75 @@ test("a throw in onStreamEvent never propagates (fail-open)", async () => {
   await assert.doesNotReject(() => ext.onStreamEvent({ headers: H(), event: undefined }));
   const r = await ext.onRequest(req());
   assert.equal(r, undefined);
+});
+
+// --- Non-streaming (stream:false) accrual: onResponse path ---
+// Codex review r1 blocker: server.mjs routes non-streaming /v1/messages
+// responses through onResponse only, so a breaker that learns spend from
+// onStreamEvent alone lets the entire stream:false request mode bypass the
+// ceilings. These tests drive the real hook with the real ctx shape.
+
+test("stream:false response accrues via onResponse and can cross the ceiling", async () => {
+  process.env.CACHE_FIX_SESSION_BUDGET = "on";
+  process.env.CACHE_FIX_SESSION_BUDGET_TOKENS = "100";
+  const meta = { route: "messages" };
+  // Turn 1: onRequest forwards (no tally), then the non-streaming body accrues.
+  assert.equal(await ext.onRequest(req(SID, false, meta)), undefined);
+  await ext.onResponse(jsonRes(150, 0, "claude-fable-5", meta));
+  assert.equal(ext.__testOnly.tally(SID).tokens, 150);
+  // Turn 2 must now be blocked — this is what the streaming-only breaker missed.
+  const r = await ext.onRequest(req(SID, false, { route: "messages" }));
+  assert.ok(r && r.skip === true, "second stream:false request must block");
+  assert.equal(r.headers["content-type"], "application/json");
+});
+
+test("onResponse without an onRequest stash does not accrue (no sid to attribute)", async () => {
+  process.env.CACHE_FIX_SESSION_BUDGET = "on";
+  process.env.CACHE_FIX_SESSION_BUDGET_TOKENS = "100";
+  // Response headers never carry the session id, so a bare onResponse can't
+  // attribute — must be a no-op rather than tallying against a wrong key.
+  await ext.onResponse(jsonRes(500, 0, "claude-fable-5", { route: "messages" }));
+  assert.equal(ext.__testOnly.tally(SID), undefined);
+  assert.equal(await ext.onRequest(req()), undefined, "still forwards");
+});
+
+test("onResponse ignores non-message bodies (error envelopes)", async () => {
+  process.env.CACHE_FIX_SESSION_BUDGET = "on";
+  process.env.CACHE_FIX_SESSION_BUDGET_TOKENS = "100";
+  const meta = { route: "messages" };
+  await ext.onRequest(req(SID, false, meta));
+  await ext.onResponse({ status: 429, headers: {}, meta, body: { type: "error", error: { type: "rate_limit_error" } } });
+  assert.equal(ext.__testOnly.tally(SID), undefined, "error envelope must not accrue");
+});
+
+test("onResponse prices cost for stream:false the same as streaming", async () => {
+  process.env.CACHE_FIX_SESSION_BUDGET = "on";
+  process.env.CACHE_FIX_SESSION_BUDGET_COST_USD = "1000";
+  const meta = { route: "messages" };
+  await ext.onRequest(req(SID, false, meta));
+  await ext.onResponse(jsonRes(1_000_000, 0, "claude-opus-4-6", meta));
+  const viaResponse = ext.__testOnly.costUsd(SID);
+  ext.__testOnly.reset();
+  await ext.onStreamEvent(start(1_000_000, 0, "claude-opus-4-6"));
+  assert.equal(viaResponse, ext.__testOnly.costUsd(SID), "both paths price identically");
+  assert.ok(viaResponse > 0, "known model must accrue cost");
+});
+
+test("onResponse gate off / no ceiling → no accrual", async () => {
+  process.env.CACHE_FIX_SESSION_BUDGET = "off";
+  process.env.CACHE_FIX_SESSION_BUDGET_TOKENS = "100";
+  await ext.onResponse(jsonRes(500, 0, "claude-fable-5", { route: "messages", _sbbSessionId: SID }));
+  assert.equal(ext.__testOnly.tally(SID), undefined, "gate off must not accrue");
+  process.env.CACHE_FIX_SESSION_BUDGET = "on";
+  delete process.env.CACHE_FIX_SESSION_BUDGET_TOKENS;
+  await ext.onResponse(jsonRes(500, 0, "claude-fable-5", { route: "messages", _sbbSessionId: SID }));
+  assert.equal(ext.__testOnly.tally(SID), undefined, "no ceiling set must not accrue");
+});
+
+test("a throw in onResponse never propagates (fail-open)", async () => {
+  process.env.CACHE_FIX_SESSION_BUDGET = "on";
+  process.env.CACHE_FIX_SESSION_BUDGET_TOKENS = "100";
+  await assert.doesNotReject(() => ext.onResponse({ status: 200, headers: {}, meta: undefined, body: undefined }));
+  await assert.doesNotReject(() => ext.onResponse({ status: 200, headers: {}, body: { type: "message", usage: null }, meta: { _sbbSessionId: SID } }));
+  assert.equal(ext.__testOnly.tally(SID), undefined);
 });
