@@ -20,6 +20,12 @@ const start = (inp, cc = 0, model = undefined, sid = SID, responseHeaders = unde
 });
 // A response-headers block carrying the account-global 5h utilization.
 const q5hHdr = (util) => ({ "anthropic-ratelimit-unified-5h-utilization": String(util) });
+// A model id deliberately absent from tools/rates.json, and never a real model.
+// The unknown-model fail-open tests below must NOT name a real one: they said
+// "claude-fable-5", which was genuinely unpriced when this suite was written and
+// became priced when rates.json was refreshed (PR #259), turning them red for a
+// reason unrelated to the breaker.
+const UNPRICED_MODEL = "claude-not-a-real-model-fixture";
 // `meta` mirrors server.mjs preForward: one object threaded through onRequest →
 // onResponse, which is how the non-streaming accrual path learns the session id.
 const req = (sid = SID, stream = true, meta = { route: "messages" }) =>
@@ -199,7 +205,7 @@ test("unknown model → cost not accrued (fail-open); token lever still works", 
   process.env.CACHE_FIX_SESSION_BUDGET_TOKENS = "100"; // and a token ceiling
   // Model absent from rates.json → costOf returns null → costUsd stays 0, so the
   // cost lever cannot block; but the token tally still accrues and CAN block.
-  await ext.onStreamEvent(start(150, 0, "claude-fable-5")); // 150 tokens ≥ 100
+  await ext.onStreamEvent(start(150, 0, UNPRICED_MODEL)); // 150 tokens ≥ 100
   assert.equal(ext.__testOnly.costUsd(SID), 0, "unknown model must not accrue cost");
   const r = await ext.onRequest(req());
   assert.ok(r && r.skip === true, "token lever must still fire even when cost is unavailable");
@@ -209,7 +215,7 @@ test("cost lever alone with an unknown model → forward (cost cannot block)", a
   process.env.CACHE_FIX_SESSION_BUDGET = "on";
   process.env.CACHE_FIX_SESSION_BUDGET_COST_USD = "0.01";
   // Unknown model, no token/rate ceiling set → nothing can block → forward.
-  await ext.onStreamEvent(start(1000000, 0, "claude-fable-5"));
+  await ext.onStreamEvent(start(1000000, 0, UNPRICED_MODEL));
   const r = await ext.onRequest(req());
   assert.equal(r, undefined, "cost-only + unknown model = fail-open forward");
 });
