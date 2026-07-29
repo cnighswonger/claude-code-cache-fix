@@ -45,11 +45,13 @@ budget — which is exactly the information an operator needs to act on (2).
 
 ## Non-Functional Requirements
 
-- **Size/complexity budget** — ~150–220 LOC across `session-budget-breaker.mjs`
+- **Size/complexity budget** — ~120–180 LOC across `session-budget-breaker.mjs`
   plus tests. Revised upward from an initial ~80–120 after review: warn-threshold
-  parsing, sticky fired-threshold state, heavy-hitter retention with eviction,
-  dual-share formatting, and the sim's mixed-model scenario each carry real
-  weight. No new extension, no new module. An implementation landing materially
+  parsing, sticky fired-threshold state, dual-share computation, nested agent
+  detail, and the sim's mixed-model scenario each carry real weight. Dropping
+  eviction in round 3 removed the most intricate part of the estimate, so this
+  is revised down from the round-2 figure of 150–220. No new extension, no new
+  module. An implementation landing materially
   larger (≈2×) should still be challenged.
 - **Threat model** — the fire/warn event log is operator-facing and already
   contains no bodies, no prompt content, and no auth material. Attribution adds
@@ -118,42 +120,81 @@ worker, since Fable is 2× per token class. Emit **both** `token_share` and
 `cost_share` on every entry so the log is self-describing, and record
 `ranked_by: "tokens" | "cost"` so a reader knows which drove ordering.
 
-### Retention must preserve heavy hitters, not arrival order
+### Retention: none needed — model keys are naturally bounded
 
-Cap the map at **64 keys**. On overflow, evict the **smallest current contributor**
-(by the fired-lever dimension, falling back to tokens while no lever has fired) and
-fold it into a single `__other__` bucket — never "first 64 win."
+**Round 2 correction.** The previous revision specified a 64-key cap with
+smallest-first eviction and an `__other__` fold. That was solving a problem this
+design does not have, and it introduced two of its own: eviction decisions happen
+before the fired lever is known (so a token-based eviction can discard the
+contributor a later `COST_USD` fire needed), and evicted-key re-entry semantics
+were unspecified.
 
-Arrival-order eviction would let a heavy Fable worker that appears late in a
-700-leg fan-out vanish into `__other__`, producing a precise-looking top 5 that
-omits the dominant contributor. That is worse than no attribution, because it
-looks authoritative.
+Both dissolve by keying the primary map on **model alone**:
 
-Emit `other_share` alongside `top` so an operator can always see how much of the
-burn is unattributed. If `other_share` exceeds 0.25, the attribution is not
-trustworthy for root-causing and the event should say so via
-`attribution_quality: "degraded"`.
+| bound | value |
+|---|---|
+| distinct models in `tools/rates.json` | 19 |
+| max distinct models observed in one real traffic bucket | **6** |
+
+A session cannot use more models than exist. There is no unbounded dimension, so
+there is **no eviction, no `__other__` bucket, and no re-entry problem**. The model
+map is complete and exact, always.
+
+The unbounded dimension was only ever `agent_id` — which, per the measurements
+above, is populated on 0.03% of requests. Agent detail is therefore a **nested,
+optional refinement** inside each model entry, with a hard cap of 16 agent keys
+per model. On exceeding the cap, stop adding new agent keys and set
+`agents_truncated: true` on that model entry. **Model totals remain exact
+regardless** — only the within-model agent split becomes partial, and the event
+says so.
+
+This is strictly simpler than the evicting design, and it is honest by
+construction rather than by a quality flag.
+
+### Share normalization (exact)
+
+Every share is computed over the **complete** model set, so:
+
+```
+sum(models[*].token_share) == 1.0    (±0.001 rounding)
+sum(models[*].cost_share)  == 1.0    (±0.001 rounding)
+```
+
+Both invariants hold on every event, for every value of `ranked_by`. There is no
+tail to exclude and no `other_share` field — those existed only to describe the
+eviction fold that no longer happens.
+
+`ranked_by` records which dimension drove ordering; the other share is emitted as
+**informational** so a reader can see when token share and cost share disagree,
+which is exactly the Opus-vs-Fable signal. Neither is "the" share — both are
+always present and both always sum to 1.0.
+
+Cost shares are computed from the same `costOf()` pricing the cost lever uses. A
+model unknown to `rates.json` prices at 0 (existing fail-open behaviour), so its
+`cost_share` is 0 while its `token_share` is accurate; set
+`cost_complete: false` at the top level when any contributing model was unpriced,
+so a reader knows cost shares understate.
 
 On fire, emit:
 
 ```json
 "burn_attribution": {
   "ranked_by": "cost",
-  "top": [
-    { "model": "claude-fable-5", "agent_id": null, "tokens": 8200000,
-      "cost_usd": 41.0, "token_share": 0.78, "cost_share": 0.88, "requests": 34 },
-    { "model": "claude-opus-5", "agent_id": null, "tokens": 2300000,
-      "cost_usd": 5.6, "token_share": 0.22, "cost_share": 0.12, "requests": 12 }
-  ],
-  "other_share": 0.0,
-  "attribution_quality": "ok",
-  "distinct_models": 2,
-  "distinct_agents": 0
+  "cost_complete": true,
+  "models": [
+    { "model": "claude-fable-5", "tokens": 8200000, "cost_usd": 41.0,
+      "token_share": 0.78, "cost_share": 0.88, "requests": 34,
+      "agents": [{ "agent_id": "wf-a1b2", "tokens": 5100000, "requests": 21 }],
+      "agents_truncated": false },
+    { "model": "claude-opus-5", "tokens": 2300000, "cost_usd": 5.6,
+      "token_share": 0.22, "cost_share": 0.12, "requests": 12,
+      "agents": [], "agents_truncated": false }
+  ]
 }
 ```
 
-Cap `top` at 5 entries so a wide fan-out cannot bloat a log line; `distinct_*`
-and `other_share` convey breadth without enumerating it.
+`models` is emitted in full — bounded at 19 by construction, and 6 in practice.
+No top-N truncation, so nothing can hide.
 
 ## Phase 1 — early warning events
 
@@ -203,16 +244,16 @@ first and alone.
 
 Extend `test/proxy-session-budget-breaker.test.mjs`:
 
-- attribution present on fire, shares sum to ~1.0, `top` capped at 5
+- attribution present on fire; `models` emitted in full with no truncation
+- **both** `sum(token_share)` and `sum(cost_share)` equal 1.0 (±0.001) on every
+  event, for every `ranked_by` value
 - `ranked_by` follows the fired lever; a COST_USD fire ranks by cost, and a
   low-token/high-cost contributor outranks a high-token/low-cost one
-- both `token_share` and `cost_share` are emitted on every entry
-- overflow evicts the SMALLEST contributor, not the newest: a heavy contributor
-  arriving after 64 keys exist must still appear in `top`
-- `other_share` reflects the folded tail; `attribution_quality` flips to
-  "degraded" above 0.25
+- a model unknown to `rates.json` yields `cost_share: 0`, an accurate
+  `token_share`, and `cost_complete: false` at the top level
+- agent detail caps at 16 per model, setting `agents_truncated: true`, while the
+  model's own `tokens`/`cost_usd`/shares stay exact
 - attribution keys on `(model, agent_id)`; absent agent id keys on model alone
-- map bounded at 64 keys; overflow folds into `__other__`
 - warn fires once per (session, fraction, lever), not per request
 - warn stickiness: utilisation crossing 0.75, falling back to 0.60, then
   re-crossing 0.75 emits exactly ONE warn for that fraction
