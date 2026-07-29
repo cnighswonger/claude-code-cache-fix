@@ -47,23 +47,25 @@ budget — which is exactly the information an operator needs to act on (2).
 
 - **Size/complexity budget** — ~100–150 LOC across `session-budget-breaker.mjs`
   plus tests. Revised upward from an initial ~80–120 after review: warn-threshold
-  parsing, sticky fired-threshold state, dual-share computation, nested agent
-  detail, and the sim's mixed-model scenario each carry real weight. Dropping
+  parsing, sticky fired-threshold state, dual-share computation, and the sim's
+  mixed-model scenario each carry real weight. Dropping
   eviction in round 3 removed the most intricate part of the estimate, so this
   is revised down from 150–220 (round 2) and again from 120–180 after round 3
   dropped nested agent detail. No new extension, no new
   module. An implementation landing materially
   larger (≈2×) should still be challenged.
 - **Threat model** — the fire/warn event log is operator-facing and already
-  contains no bodies, no prompt content, and no auth material. Attribution adds
-  **model ids and synthesized agent ids only** — both already present in
-  `usage.jsonl` via `usage-log`. No new class of data enters the log. Agent ids are
-  synthesized (`workflow-agent-id-synthesis`) and never leave the host.
+  contains no bodies, no prompt content, and no auth material. Phase 1 attribution
+  adds **model ids only** — upstream-supplied identifiers already written to
+  `usage.jsonl` on every row. No new class of data enters the log. Agent ids are
+  not emitted in Phase 1 at all (see § Agent-level detail), so the
+  prompt-digest-derivation question they raise does not arise here; it must be
+  revisited if a follow-up adds them.
 - **Maintainability** — extends existing structures (`_tallies` entries, `logEvent`)
   rather than adding abstractions. The per-model map lives on the existing tally
-  entry, so it is bounded by the same LRU that bounds the session tally. The model
-  map itself is uncapped — see § Retention for why that is safe and what the real
-  bound is.
+  entry, so it is discarded with that entry under the same LRU that bounds the
+  session tally. The map itself has no internal cap — see § Retention for why that
+  is safe and what the real bound is.
 - **Performance** — one extra map write per accrual; the tally is already computed
   on every request. Warn evaluation reuses the ceiling comparison already performed.
 - **Load-bearing?** **Yes.** The file gates live credential-bearing traffic. Chris
@@ -82,11 +84,15 @@ e.byModel = Map<modelId, { tokens, costUsd, requests }>
 one, and that wording is gone.
 
 `model` comes from the accrual path (already read for pricing) and is populated on
-**every** request. `agentId` comes from `ctx.meta._workflowAgentId`, stashed by
-`workflow-agent-id-synthesis` (order **365**) before this extension (order **690**)
-and already consumed by `usage-log`.
+**every** request. That is the only input Phase 1 needs.
 
-### Agent id is opportunistic enrichment, not the primary key
+### Why there is no agent dimension (provenance)
+
+An earlier revision keyed on `(model, agentId)`, sourcing the agent from
+`ctx.meta._workflowAgentId` — stashed by `workflow-agent-id-synthesis`
+(order **365**) ahead of this extension (order **690**) and already read by
+`usage-log`. That path exists and works. It is not used here, for the reasons
+measured below.
 
 **Model is the primary key. Agent id refines it when present, and it is usually
 absent.** Measured on the maintainer's host:
@@ -106,9 +112,11 @@ Two paths can populate it, and both are narrow today:
    which means the catalog has gone stale against current CC versions. Tracked
    separately — that staleness is a pre-existing bug this directive does not fix.
 
-**Design consequence:** `agent_id` MUST be optional in the emitted shape, and no
-consumer may assume it is set. Attribution keyed on model alone still answers the
-question that motivated this work — *"78% of this burn was `claude-fable-5`"* is
+**Design consequence:** Phase 1 does not emit `agent_id` **at all** (see
+§ Agent-level detail is out of scope for Phase 1). The measurements above are
+recorded here as *provenance* — why an agent layer was considered and rejected —
+not as a description of an emitted field. Attribution keyed on model alone still
+answers the question that motivated this work — *"78% of this burn was `claude-fable-5`"* is
 the Opus→Fable signal; the agent id would only say *which child*, not *which model*.
 The directive previously implied agent-level attribution was near-free because the
 data was "already there." It is not. Model-level attribution is near-free; agent
@@ -116,16 +124,29 @@ level is a bonus when CC happens to send the header.
 
 ### Ranking must follow the fired lever
 
-The emitted `top` list is ordered by **the dimension of the lever that fired**:
+The emitted `models` array is ordered by **the dimension of the lever that fired**:
 
-- `TOKENS` or `RATE_TPM` fire → rank by tokens, `share` is token share
-- `COST_USD` fire → rank by cost, `share` is cost share
+- `TOKENS` or `RATE_TPM` fire → sort by `tokens`, descending
+- `COST_USD` fire → sort by `cost_usd`, descending
 
 Ranking a cost fire by tokens would mis-explain exactly the mixed-model case this
 feature exists for: a lower-token Fable worker can outspend a higher-token Opus
 worker, since Fable is 2× per token class. Emit **both** `token_share` and
 `cost_share` on every entry so the log is self-describing, and record
 `ranked_by: "tokens" | "cost"` so a reader knows which drove ordering.
+
+**Determinism (so two implementations agree byte-for-byte):**
+
+- `models` is **sorted**, never insertion-ordered.
+- Ties on the ranking dimension break by **model id, ascending lexicographic**.
+  Ties are realistic — two models with identical token counts is unlikely, but two
+  models both at `cost_usd: 0` (both unpriced) is not.
+- Shares are rounded to **4 decimal places**; `cost_usd` to **4**; `tokens` and
+  `requests` are integers. Rounding is applied at emit time only — the running
+  tally keeps full precision, so rounding never feeds back into a gate decision.
+- Because shares are rounded independently, their sum may differ from 1.0 in the
+  last place. The stated invariant is therefore `|sum − 1.0| <= 0.001`, not exact
+  equality.
 
 ### Retention: none needed — model keys are bounded in practice
 
@@ -242,8 +263,10 @@ On fire, emit:
 }
 ```
 
-`models` is emitted in full — bounded at 19 by construction, and 6 in practice.
-No top-N truncation, so nothing can hide.
+`models` is emitted in full, with no top-N truncation, so nothing can hide. Its
+length is the number of distinct model strings Anthropic returned for the session
+— see § Retention for why that vocabulary is small and upstream-controlled rather
+than bounded by `rates.json`.
 
 ## Phase 1 — early warning events
 
@@ -319,7 +342,9 @@ Extend `test/proxy-session-budget-breaker.test.mjs`:
 
 Extend `tools/sim-session-budget-breaker.mjs` with a mixed-model fan-out
 (Opus parent + Fable children) asserting attribution correctly identifies the
-Fable children as the dominant contributor. This is the sim's first
+`claude-fable-5` as the dominant contributing **model** — Phase 1 emits no
+child/agent detail, so the assertion is at model granularity, which is the
+granularity the Opus→Fable case turns on. This is the sim's first
 multi-model scenario and is the closest reproduction we have of the
 Opus→Fable shape reported in CC#38335.
 
