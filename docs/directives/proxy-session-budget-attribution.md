@@ -45,12 +45,13 @@ budget — which is exactly the information an operator needs to act on (2).
 
 ## Non-Functional Requirements
 
-- **Size/complexity budget** — ~120–180 LOC across `session-budget-breaker.mjs`
+- **Size/complexity budget** — ~100–150 LOC across `session-budget-breaker.mjs`
   plus tests. Revised upward from an initial ~80–120 after review: warn-threshold
   parsing, sticky fired-threshold state, dual-share computation, nested agent
   detail, and the sim's mixed-model scenario each carry real weight. Dropping
   eviction in round 3 removed the most intricate part of the estimate, so this
-  is revised down from the round-2 figure of 150–220. No new extension, no new
+  is revised down from 150–220 (round 2) and again from 120–180 after round 3
+  dropped nested agent detail. No new extension, no new
   module. An implementation landing materially
   larger (≈2×) should still be challenged.
 - **Threat model** — the fire/warn event log is operator-facing and already
@@ -59,8 +60,10 @@ budget — which is exactly the information an operator needs to act on (2).
   `usage.jsonl` via `usage-log`. No new class of data enters the log. Agent ids are
   synthesized (`workflow-agent-id-synthesis`) and never leave the host.
 - **Maintainability** — extends existing structures (`_tallies` entries, `logEvent`)
-  rather than adding abstractions. The per-`(model, agent)` map is bounded by the
-  same LRU that bounds the session tally.
+  rather than adding abstractions. The per-model map lives on the existing tally
+  entry, so it is bounded by the same LRU that bounds the session tally. The model
+  map itself is uncapped — see § Retention for why that is safe and what the real
+  bound is.
 - **Performance** — one extra map write per accrual; the tally is already computed
   on every request. Warn evaluation reuses the ceiling comparison already performed.
 - **Load-bearing?** **Yes.** The file gates live credential-bearing traffic. Chris
@@ -71,8 +74,12 @@ budget — which is exactly the information an operator needs to act on (2).
 Extend each `_tallies` entry with a bounded breakdown:
 
 ```
-e.by = Map<"model|agentId", { tokens, costUsd, n }>
+e.byModel = Map<modelId, { tokens, costUsd, requests }>
 ```
+
+**One structure, not two.** Attribution is a model-primary map. There is no flat
+`(model, agent)` key space anywhere in this design — an earlier revision specified
+one, and that wording is gone.
 
 `model` comes from the accrual path (already read for pricing) and is populated on
 **every** request. `agentId` comes from `ctx.meta._workflowAgentId`, stashed by
@@ -160,18 +167,26 @@ that fires rarely. If it ever materialises, the fix is a cap *then*, informed by
 what the real distribution looks like. Adding one now would repeat the round-1
 mistake of designing against unmeasured cardinality.
 
-The unbounded dimension was only ever `agent_id`, which per the measurements above
-is populated on 0.03% of requests. Agent detail is therefore a **nested, optional
-refinement** inside each model entry, with a cap of 16 agent keys per model. On
-exceeding the cap, stop adding new agent keys and set `agents_truncated: true` on
-that model entry. **Model totals remain exact regardless** — only the within-model
-agent split becomes partial, and the event says so.
+### Agent-level detail is out of scope for Phase 1
 
-Note the asymmetry is deliberate: model keys are upstream-controlled and bounded,
-so they need no cap; agent keys scale with *fan-out width* (a 700-leg fan-out on
-one model could produce 700 agent ids once #271 is fixed), so they do. Truncating
-agent detail costs the "which child" answer but never the "which model" answer —
-and "which model" is what the Opus→Fable case turns on.
+**Round 3 correction.** The previous revision nested a 16-agent cap inside each
+model entry with an `agents_truncated` flag. Review correctly identified that as
+first-16-wins — the same "a later dominant contributor silently disappears"
+problem this directive already rejected at the model layer, just one level down.
+
+Defending it properly would need heavy-hitter retention and an omitted-tail
+quantity: exactly the machinery removed in round 3, reintroduced for a field that
+is populated on **0.03% of requests** and blocked on #271 regardless.
+
+So Phase 1 emits **no agent detail at all.** The `burn_attribution` shape carries
+model entries only.
+
+This is not a permanent decision. Once #271 restores agent-id population, a
+follow-up can add agent attribution — and it will have to meet the same
+truthfulness standard as the model layer, with real cardinality data available to
+design against instead of the guesswork that produced two bad caps here.
+
+Dropping it now also removes the last unbounded dimension from the design.
 
 ### Share normalization (exact)
 
@@ -186,8 +201,8 @@ Both invariants hold on every event, for every value of `ranked_by`. There is no
 tail to exclude and no `other_share` field — those existed only to describe the
 eviction fold that no longer happens.
 
-`ranked_by` records which dimension drove ordering; the other share is emitted as
-**informational** so a reader can see when token share and cost share disagree,
+`ranked_by` records which dimension drove ordering; the non-ranking share is
+emitted alongside it so a reader can see when token share and cost share disagree,
 which is exactly the Opus-vs-Fable signal. Neither is "the" share — both are
 always present and both always sum to 1.0.
 
@@ -220,12 +235,9 @@ On fire, emit:
   "unpriced_models": [],
   "models": [
     { "model": "claude-fable-5", "tokens": 8200000, "cost_usd": 41.0,
-      "token_share": 0.78, "cost_share": 0.88, "requests": 34,
-      "agents": [{ "agent_id": "wf-a1b2", "tokens": 5100000, "requests": 21 }],
-      "agents_truncated": false },
+      "token_share": 0.78, "cost_share": 0.88, "requests": 34 },
     { "model": "claude-opus-5", "tokens": 2300000, "cost_usd": 5.6,
-      "token_share": 0.22, "cost_share": 0.12, "requests": 12,
-      "agents": [], "agents_truncated": false }
+      "token_share": 0.22, "cost_share": 0.12, "requests": 12 }
   ]
 }
 ```
@@ -293,13 +305,13 @@ Extend `test/proxy-session-budget-breaker.test.mjs`:
   COST_USD fire
 - a model string absent from `rates.json` still creates its own map key (keys
   follow arriving model strings, not `rates.json` membership)
-- agent detail caps at 16 per model, setting `agents_truncated: true`, while the
-  model's own `tokens`/`cost_usd`/shares stay exact
-- attribution keys on `(model, agent_id)`; absent agent id keys on model alone
+- no agent fields are emitted in Phase 1, regardless of whether
+  `ctx.meta._workflowAgentId` is populated
+- attribution is keyed on model only; no `(model, agent)` composite key exists
 - warn fires once per (session, fraction, lever), not per request
 - warn stickiness: utilisation crossing 0.75, falling back to 0.60, then
   re-crossing 0.75 emits exactly ONE warn for that fraction
-- agent_id absent (the common case) still produces usable model-keyed attribution
+- `ctx.meta._workflowAgentId` present or absent produces identical output
 - warn fires in `dry-run` and in `on`; never returns a skip result
 - `WARN_AT=""` disables warns entirely
 - malformed `WARN_AT` (non-numeric, >1, <0) is ignored without throwing — fail-open
