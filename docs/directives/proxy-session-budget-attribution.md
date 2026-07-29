@@ -45,9 +45,12 @@ budget — which is exactly the information an operator needs to act on (2).
 
 ## Non-Functional Requirements
 
-- **Size/complexity budget** — ~80–120 LOC across `session-budget-breaker.mjs`
-  plus tests. No new extension, no new module. An implementation landing materially
-  larger (≈2×) should be challenged.
+- **Size/complexity budget** — ~150–220 LOC across `session-budget-breaker.mjs`
+  plus tests. Revised upward from an initial ~80–120 after review: warn-threshold
+  parsing, sticky fired-threshold state, heavy-hitter retention with eviction,
+  dual-share formatting, and the sim's mixed-model scenario each carry real
+  weight. No new extension, no new module. An implementation landing materially
+  larger (≈2×) should still be challenged.
 - **Threat model** — the fire/warn event log is operator-facing and already
   contains no bodies, no prompt content, and no auth material. Attribution adds
   **model ids and synthesized agent ids only** — both already present in
@@ -69,35 +72,88 @@ Extend each `_tallies` entry with a bounded breakdown:
 e.by = Map<"model|agentId", { tokens, costUsd, n }>
 ```
 
-`model` comes from the accrual path (already read for pricing). `agentId` comes
-from `ctx.meta._workflowAgentId` — stashed by `workflow-agent-id-synthesis`
-(order **365**), well before this extension (order **690**), and already consumed
-by `usage-log`. Absent agent id → key on model alone.
+`model` comes from the accrual path (already read for pricing) and is populated on
+**every** request. `agentId` comes from `ctx.meta._workflowAgentId`, stashed by
+`workflow-agent-id-synthesis` (order **365**) before this extension (order **690**)
+and already consumed by `usage-log`.
 
-On fire, emit the top contributors:
+### Agent id is opportunistic enrichment, not the primary key
+
+**Model is the primary key. Agent id refines it when present, and it is usually
+absent.** Measured on the maintainer's host:
+
+| signal | count |
+|---|---|
+| requests carrying canonical `x-claude-code-agent-id` | **38 / 121,685** (0.03%) |
+| `workflow-derivation` events yielding an id | **0** — all 3,747 are `drift_canary` |
+| `usage.jsonl` rows with `agent_id` populated | **0 / 176,344** |
+
+Two paths can populate it, and both are narrow today:
+
+1. **Canonical pass-through** — `x-claude-code-agent-id` sent by CC. Real, but
+   present on 0.03% of requests here.
+2. **Workflow-marker synthesis** — fires only when the marker catalog matches.
+   It currently matches nothing on this host; every attempt emits a drift canary,
+   which means the catalog has gone stale against current CC versions. Tracked
+   separately — that staleness is a pre-existing bug this directive does not fix.
+
+**Design consequence:** `agent_id` MUST be optional in the emitted shape, and no
+consumer may assume it is set. Attribution keyed on model alone still answers the
+question that motivated this work — *"78% of this burn was `claude-fable-5`"* is
+the Opus→Fable signal; the agent id would only say *which child*, not *which model*.
+The directive previously implied agent-level attribution was near-free because the
+data was "already there." It is not. Model-level attribution is near-free; agent
+level is a bonus when CC happens to send the header.
+
+### Ranking must follow the fired lever
+
+The emitted `top` list is ordered by **the dimension of the lever that fired**:
+
+- `TOKENS` or `RATE_TPM` fire → rank by tokens, `share` is token share
+- `COST_USD` fire → rank by cost, `share` is cost share
+
+Ranking a cost fire by tokens would mis-explain exactly the mixed-model case this
+feature exists for: a lower-token Fable worker can outspend a higher-token Opus
+worker, since Fable is 2× per token class. Emit **both** `token_share` and
+`cost_share` on every entry so the log is self-describing, and record
+`ranked_by: "tokens" | "cost"` so a reader knows which drove ordering.
+
+### Retention must preserve heavy hitters, not arrival order
+
+Cap the map at **64 keys**. On overflow, evict the **smallest current contributor**
+(by the fired-lever dimension, falling back to tokens while no lever has fired) and
+fold it into a single `__other__` bucket — never "first 64 win."
+
+Arrival-order eviction would let a heavy Fable worker that appears late in a
+700-leg fan-out vanish into `__other__`, producing a precise-looking top 5 that
+omits the dominant contributor. That is worse than no attribution, because it
+looks authoritative.
+
+Emit `other_share` alongside `top` so an operator can always see how much of the
+burn is unattributed. If `other_share` exceeds 0.25, the attribution is not
+trustworthy for root-causing and the event should say so via
+`attribution_quality: "degraded"`.
+
+On fire, emit:
 
 ```json
 "burn_attribution": {
+  "ranked_by": "cost",
   "top": [
-    { "model": "claude-fable-5", "agent_id": "wf-…", "tokens": 8200000,
-      "cost_usd": 41.0, "share": 0.78, "requests": 34 },
+    { "model": "claude-fable-5", "agent_id": null, "tokens": 8200000,
+      "cost_usd": 41.0, "token_share": 0.78, "cost_share": 0.88, "requests": 34 },
     { "model": "claude-opus-5", "agent_id": null, "tokens": 2300000,
-      "cost_usd": 11.5, "share": 0.22, "requests": 12 }
+      "cost_usd": 5.6, "token_share": 0.22, "cost_share": 0.12, "requests": 12 }
   ],
+  "other_share": 0.0,
+  "attribution_quality": "ok",
   "distinct_models": 2,
-  "distinct_agents": 5
+  "distinct_agents": 0
 }
 ```
 
-Cap `top` at 5 entries (highest `tokens` first) so a wide fan-out cannot bloat a
-log line. `distinct_*` counts convey breadth without enumerating it.
-
-**Bounding:** cap the map at 64 keys per session. On overflow, fold further keys
-into a single `{ model: "__other__", agent_id: null }` bucket rather than growing
-without limit — a 700-leg fan-out must not create 700 map entries.
-
-This turns *"session hit its ceiling"* into *"session hit its ceiling, and 78% of
-it was a Fable child on agent X"* — actionable, and directly aimed at finding (2).
+Cap `top` at 5 entries so a wide fan-out cannot bloat a log line; `distinct_*`
+and `other_share` convey breadth without enumerating it.
 
 ## Phase 1 — early warning events
 
@@ -114,8 +170,12 @@ When a session's highest lever utilisation first crosses each fraction, emit:
 
 Rules:
 
-- **Fires at most once per (session, fraction, lever).** Track fired fractions on
-  the tally entry; a session must not emit a warn per request once past a threshold.
+- **Fires at most once per (session, fraction, lever), and the crossing is STICKY.**
+  Track fired fractions on the tally entry. Once a fraction has fired it never
+  re-arms for that session, **even if utilisation later falls back below it**.
+  This matters specifically for `RATE_TPM`: it is a sliding window, so utilisation
+  oscillates as old events age out. A non-sticky rule would let one sustained
+  fan-out emit a warn every time the window breathes across 0.75.
   This is the failure mode that put ~34K synthetic events in an operator's log
   during sim development (#267) — do not repeat it.
 - **Never gates.** Warn is log-only in every gate mode, including `on`.
@@ -144,9 +204,19 @@ first and alone.
 Extend `test/proxy-session-budget-breaker.test.mjs`:
 
 - attribution present on fire, shares sum to ~1.0, `top` capped at 5
+- `ranked_by` follows the fired lever; a COST_USD fire ranks by cost, and a
+  low-token/high-cost contributor outranks a high-token/low-cost one
+- both `token_share` and `cost_share` are emitted on every entry
+- overflow evicts the SMALLEST contributor, not the newest: a heavy contributor
+  arriving after 64 keys exist must still appear in `top`
+- `other_share` reflects the folded tail; `attribution_quality` flips to
+  "degraded" above 0.25
 - attribution keys on `(model, agent_id)`; absent agent id keys on model alone
 - map bounded at 64 keys; overflow folds into `__other__`
 - warn fires once per (session, fraction, lever), not per request
+- warn stickiness: utilisation crossing 0.75, falling back to 0.60, then
+  re-crossing 0.75 emits exactly ONE warn for that fraction
+- agent_id absent (the common case) still produces usable model-keyed attribution
 - warn fires in `dry-run` and in `on`; never returns a skip result
 - `WARN_AT=""` disables warns entirely
 - malformed `WARN_AT` (non-numeric, >1, <0) is ignored without throwing — fail-open
