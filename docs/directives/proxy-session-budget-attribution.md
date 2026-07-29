@@ -120,7 +120,7 @@ worker, since Fable is 2× per token class. Emit **both** `token_share` and
 `cost_share` on every entry so the log is self-describing, and record
 `ranked_by: "tokens" | "cost"` so a reader knows which drove ordering.
 
-### Retention: none needed — model keys are naturally bounded
+### Retention: none needed — model keys are bounded in practice
 
 **Round 2 correction.** The previous revision specified a 64-key cap with
 smallest-first eviction and an `__other__` fold. That was solving a problem this
@@ -129,27 +129,49 @@ before the fired lever is known (so a token-based eviction can discard the
 contributor a later `COST_USD` fire needed), and evicted-key re-entry semantics
 were unspecified.
 
-Both dissolve by keying the primary map on **model alone**:
+Both dissolve by keying the primary map on **model alone**.
 
-| bound | value |
-|---|---|
-| distinct models in `tools/rates.json` | 19 |
-| max distinct models observed in one real traffic bucket | **6** |
+**Precise statement of the bound.** The map keys on the model string as it arrives,
+not on `rates.json` membership — a model absent from `rates.json` still creates a
+key (priced at 0, per existing fail-open behaviour). So `rates.json`'s 19 entries
+are *not* the bound. The real bound is **the number of distinct model strings
+Anthropic returns for one session**, which matters because:
 
-A session cannot use more models than exist. There is no unbounded dimension, so
-there is **no eviction, no `__other__` bucket, and no re-entry problem**. The model
-map is complete and exact, always.
+- The model is read from the **response** (`message_start.message.model` for
+  streaming, `body.model` for non-streaming), i.e. it is Anthropic's echo of what
+  actually served the request — not a client-supplied string. A caller cannot
+  inject arbitrary keys by varying the request.
+- Measured: **9** distinct model strings across the entire usage history on this
+  host, **6** in the largest single traffic bucket, and **0** strings seen that
+  were absent from `rates.json`.
+- The realistic growth path is Anthropic shipping new models or dated snapshots,
+  which adds keys at the rate models are released — single digits per year, not
+  per session.
 
-The unbounded dimension was only ever `agent_id` — which, per the measurements
-above, is populated on 0.03% of requests. Agent detail is therefore a **nested,
-optional refinement** inside each model entry, with a hard cap of 16 agent keys
-per model. On exceeding the cap, stop adding new agent keys and set
-`agents_truncated: true` on that model entry. **Model totals remain exact
-regardless** — only the within-model agent split becomes partial, and the event
-says so.
+So the map is bounded by a small, slow-growing, **upstream-controlled** vocabulary.
+No cap, no eviction, no `__other__`, no re-entry question. The model map is
+complete and exact.
 
-This is strictly simpler than the evicting design, and it is honest by
-construction rather than by a quality flag.
+**Residual risk, stated rather than engineered around:** if a future CC or API
+change caused per-request model variance (aliases, region-tagged ids, per-call
+snapshot pins), key count would grow. This is judged unlikely and low-impact — each
+entry is four numbers, so even a pathological 100 keys is a few KB on an event
+that fires rarely. If it ever materialises, the fix is a cap *then*, informed by
+what the real distribution looks like. Adding one now would repeat the round-1
+mistake of designing against unmeasured cardinality.
+
+The unbounded dimension was only ever `agent_id`, which per the measurements above
+is populated on 0.03% of requests. Agent detail is therefore a **nested, optional
+refinement** inside each model entry, with a cap of 16 agent keys per model. On
+exceeding the cap, stop adding new agent keys and set `agents_truncated: true` on
+that model entry. **Model totals remain exact regardless** — only the within-model
+agent split becomes partial, and the event says so.
+
+Note the asymmetry is deliberate: model keys are upstream-controlled and bounded,
+so they need no cap; agent keys scale with *fan-out width* (a 700-leg fan-out on
+one model could produce 700 agent ids once #271 is fixed), so they do. Truncating
+agent detail costs the "which child" answer but never the "which model" answer —
+and "which model" is what the Opus→Fable case turns on.
 
 ### Share normalization (exact)
 
@@ -171,16 +193,31 @@ always present and both always sum to 1.0.
 
 Cost shares are computed from the same `costOf()` pricing the cost lever uses. A
 model unknown to `rates.json` prices at 0 (existing fail-open behaviour), so its
-`cost_share` is 0 while its `token_share` is accurate; set
-`cost_complete: false` at the top level when any contributing model was unpriced,
-so a reader knows cost shares understate.
+`cost_share` is 0 while its `token_share` stays accurate.
+
+Two rules make this unambiguous:
+
+- **`unpriced_models`** — a list of the model ids that priced at 0, so a reader
+  knows *which* entries understate rather than only *that* some do. Empty list is
+  the normal case. (A top-level boolean alone would say the cost picture is
+  incomplete without saying where the hole is.)
+- **Degenerate case:** if total session cost is 0 — every contributing model
+  unpriced — `cost_share` is emitted as `null` on every entry rather than `0` or
+  `NaN`, and the `sum(cost_share) == 1.0` invariant does **not** apply. In that
+  state `ranked_by` MUST be `"tokens"` even for a `COST_USD` fire, since cost
+  ordering is meaningless; the event still records which lever fired, so the
+  mismatch is visible and explicable rather than silently wrong.
+
+A `COST_USD` fire with a *partially* unpriced set still ranks by cost — the priced
+portion is the part that drove the ceiling — with `unpriced_models` naming what is
+missing.
 
 On fire, emit:
 
 ```json
 "burn_attribution": {
   "ranked_by": "cost",
-  "cost_complete": true,
+  "unpriced_models": [],
   "models": [
     { "model": "claude-fable-5", "tokens": 8200000, "cost_usd": 41.0,
       "token_share": 0.78, "cost_share": 0.88, "requests": 34,
@@ -250,7 +287,12 @@ Extend `test/proxy-session-budget-breaker.test.mjs`:
 - `ranked_by` follows the fired lever; a COST_USD fire ranks by cost, and a
   low-token/high-cost contributor outranks a high-token/low-cost one
 - a model unknown to `rates.json` yields `cost_share: 0`, an accurate
-  `token_share`, and `cost_complete: false` at the top level
+  `token_share`, and its id listed in `unpriced_models`
+- all-unpriced session: `cost_share` is `null` on every entry, the cost-sum
+  invariant is waived, and `ranked_by` falls back to `"tokens"` even on a
+  COST_USD fire
+- a model string absent from `rates.json` still creates its own map key (keys
+  follow arriving model strings, not `rates.json` membership)
 - agent detail caps at 16 per model, setting `agents_truncated: true`, while the
   model's own `tokens`/`cost_usd`/shares stay exact
 - attribution keys on `(model, agent_id)`; absent agent id keys on model alone
