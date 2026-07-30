@@ -99,6 +99,43 @@ claude() {
 }
 ```
 
+#### `CACHE_FIX_DOWNLOAD_REWRITE` breaks `claude update` — leave it off
+
+`CACHE_FIX_DOWNLOAD_REWRITE=on` reads like a pure performance knob. It is not:
+turning it on **disables `claude update` entirely** on that host. Rewriting a
+download URL means reading it, which means MITM-ing `downloads.claude.ai` — and
+the release-channel client pins **public roots only** and rejects any private
+CA, so the version check dies before a byte is downloaded:
+
+```
+Failed to fetch version from .../claude-code-releases/latest after 3 attempt(s):
+  unable to verify the first certificate
+```
+
+Measured with `openssl s_client -proxy 127.0.0.1:9901 -connect downloads.claude.ai:443
+-servername downloads.claude.ai`:
+
+| `CACHE_FIX_DOWNLOAD_REWRITE` | leaf CN | verify |
+|---|---|---|
+| `on` | `api.anthropic.com` | code 21 |
+| `off` | `downloads.claude.ai` (WR3 / GTS Root R1) | code 0 |
+
+Two things make this worse than it first looks:
+
+- **It cannot be narrowed to the binary download.** MITM is decided per host at
+  `CONNECT` time, and the version check shares `downloads.claude.ai` with the
+  download itself. It is all-or-nothing per host.
+- **No client-side override reaches that client.** `HTTPS_PROXY` / `ALL_PROXY`,
+  `/etc/hosts`, `/etc/resolv.conf`, and `NODE_EXTRA_CA_CERTS` were each
+  disproved against a control on the identical path — a local resolver logged 0
+  queries and a TCP forwarder logged 0 connects across a full `claude update`,
+  while a plain `node https.get` through that same forwarder returned 200. So no
+  amount of CA injection can make the rewrite work. Only not intercepting works.
+
+Other hosts are unaffected: `github.com` through the same proxy returns its real
+certificate and verifies. The flag is off by default; keep it that way unless you
+are prepared to update Claude Code some other way.
+
 ### What the proxy does
 
 On every `/v1/messages` request, the pipeline runs an ordered chain of extensions covering cache stability, observability, thinking-desync mitigation, image, microcompact, breakpoint, bootstrap-channel, and other surfaces. Several are gated behind env vars documented in their own sections below; bootstrap-channel handling defaults to `audit` mode. The headliners:

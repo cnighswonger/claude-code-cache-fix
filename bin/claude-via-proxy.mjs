@@ -4,7 +4,7 @@ import { fork, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
 import { homedir } from "node:os";
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import http from "node:http";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -229,7 +229,26 @@ if (remoteControl) {
     const dst = join(caTrustDir, "ccf.pem");
     // Byte-compare skip so a bundle builder keying on mtime is not woken by a
     // launch that changed nothing.
-    if (!existsSync(dst) || !readFileSync(dst).equals(ours)) writeFileSync(dst, ours);
+    let same = false;
+    try { same = readFileSync(dst).equals(ours); } catch { /* absent => write */ }
+    if (!same) {
+      // Write a temp sibling and rename() over the target: rename is atomic on
+      // POSIX, so a builder reading the directory sees either the old complete
+      // file or the new one, never a half. A plain writeFileSync(dst) opens with
+      // O_TRUNC and leaves a torn pem visible for the duration of the write —
+      // and a torn pem does not merely lose OUR CA, it can void the ENTIRE merged
+      // bundle: Node's PEM reader aborts the whole extras load on an unterminated
+      // block. Measured on node v24 / openssl 3.5 with a leaf signed by this CA:
+      // torn entry AFTER a good one warns "bad end line" but still verifies;
+      // torn entry BEFORE it fails with UNABLE_TO_VERIFY_LEAF_SIGNATURE. The
+      // builder concatenates sort(*.pem) and "ccf.pem" sorts first, so a torn
+      // OURS lands in exactly the fatal position and takes every other component
+      // CA and corporate root down with it. Temp must be in the SAME directory —
+      // rename across filesystems is not atomic (and would EXDEV).
+      const tmp = `${dst}.${process.pid}`;
+      writeFileSync(tmp, ours);
+      renameSync(tmp, dst);
+    }
   } catch (e) {
     // Non-fatal: publishing is how OTHERS trust us. This session only needs its
     // own CA, so a failure to publish must not stop it.
@@ -253,10 +272,34 @@ if (remoteControl) {
   // sides at different files.
   const caTrustBundle = join(configDir, "ca-trust.pem");
   let caForClaude = caPem;
-  // statSync throws when absent, which is the same "use our own CA" answer as a
-  // zero-byte or unreadable bundle — one catch covers all three.
+  // Accept the bundle only if OUR CA is actually in it. A bundle that exists and
+  // is non-empty but predates our publish (the normal state right after a CCF
+  // upgrade, or on the very first launch on a host whose builder ran earlier) is
+  // WORSE than no bundle: handing it to claude makes the client distrust the very
+  // proxy it is being routed through, so every request fails TLS instead of
+  // merely losing some other component's CA. Size alone cannot tell the two
+  // apart. readFileSync throws when absent, which is the same "use our own CA"
+  // answer as an empty, stale, or unreadable bundle — one catch covers them all.
+  //
+  // ALSO require balanced BEGIN/END markers. Containment cannot see a tear: a
+  // bundle whose EARLIER entry lost its END line still literally contains our CA
+  // further down, and that is the fatal ordering — an unterminated block ahead of
+  // a good one fails the handshake outright, while one after it merely warns
+  // (measured above). So a torn-ahead bundle passes containment and would leave
+  // the session trusting nothing at all, our own proxy included. The two checks
+  // are complementary: containment catches STALE, the counts catch TORN, neither
+  // sees the other's case. Counting two substrings is cheaper than forking
+  // openssl and needs no new dependency.
+  //
+  // Both are pre-flight guards, not proof — only a handshake proves Node verifies
+  // with the bundle. They exist to keep a known-bad bundle away from the client.
   try {
-    if (statSync(caTrustBundle).size > 0) caForClaude = caTrustBundle;
+    const merged = readFileSync(caTrustBundle, "utf8");
+    const begins = (merged.match(/-----BEGIN CERTIFICATE-----/g) || []).length;
+    const ends = (merged.match(/-----END CERTIFICATE-----/g) || []).length;
+    if (begins === ends && merged.includes(readFileSync(caPem, "utf8").trim())) {
+      caForClaude = caTrustBundle;
+    }
   } catch { /* no usable bundle => our own CA, same as before */ }
   claudeEnv.NODE_EXTRA_CA_CERTS = caForClaude;
   // Exclude localhost from the proxy. Without this, HTTPS_PROXY routes EVERY
