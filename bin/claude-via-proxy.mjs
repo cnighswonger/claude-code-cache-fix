@@ -214,7 +214,8 @@ if (remoteControl) {
   claudeEnv.https_proxy = proxyUrl;
   // Publish our MITM CA where other components can find it. NODE_EXTRA_CA_CERTS
   // takes ONE file, so whoever assigns it last wins and every other CA is
-  // silently untrusted — measured 2026-07-30 against cswap's pin proxy, which
+  // silently untrusted — measured 2026-07-30 against an account-switching pin
+  // proxy, which
   // also MITMs api.anthropic.com and also set the var, breaking Remote Control
   // inbound on the work Mac. The fix is a directory each component publishes its
   // own file into, so a bundle can be built from all of them.

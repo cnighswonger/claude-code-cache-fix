@@ -228,7 +228,7 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
 
   // --- ca-trust.d: coexisting with another component that also MITMs ---------
   // NODE_EXTRA_CA_CERTS takes ONE file, so a plain assignment silently untrusts
-  // whatever else needed trusting. Measured 2026-07-30: cswap's pin proxy also
+  // whatever else needed trusting. Measured 2026-07-30: an account-switching pin proxy also
   // MITMs api.anthropic.com and also set this var; last writer won and broke
   // Remote Control inbound on the work Mac. The contract: each component
   // publishes ONLY its own ca-trust.d/<name>.pem, one external writer builds the
@@ -298,7 +298,7 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
     const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
     const trustDir = join(configDir, "ca-trust.d");
     mkdirSync(trustDir, { recursive: true });
-    const sibling = join(trustDir, "cswap-pin.pem");
+    const sibling = join(trustDir, "other-component.pem");
     const SIBLING_BYTES = "# another component's CA — must survive untouched\n";
     writeFileSync(sibling, SIBLING_BYTES);
     const script = 'process.stdout.write("OK\\n")';
@@ -354,9 +354,9 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
     // with a leaf signed by the CCF CA and a bundle = good.pem + torn.pem:
     //   torn AFTER  -> "Ignoring extra certs ... bad end line", verify still ok
     //   torn BEFORE -> "... ASN1 lib",  verify FAILS UNABLE_TO_VERIFY_LEAF_SIGNATURE
-    // The builder concatenates sort(ca-trust.d/*.pem), and "ccf.pem" sorts before
-    // "cswap-pin.pem", so a torn OURS lands in the fatal position and takes every
-    // other component CA and corporate root down with it. A plain
+    // The builder concatenates sort(ca-trust.d/*.pem), so a torn OURS lands ahead
+    // of any sibling that sorts later and takes every other component CA and
+    // corporate root down with it. A plain
     // writeFileSync(dst) is exactly what leaves that state visible to a
     // concurrent builder, so the write must be rename-into-place.
     //
@@ -474,7 +474,8 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
     // the very proxy it is about to be routed through: every request fails TLS
     // instead of merely losing another component's CA. A stale builder is the
     // normal state right after a CCF upgrade, so this is not a corner case.
-    // (cswap hit the same hazard from the other side and guards it identically.)
+    // (a sibling component hit the same hazard from the other side and guards
+    // it identically.)
     const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
     const bundle = join(configDir, "ca-trust.pem");
     // A plausible stale bundle: real PEM content, just not ours.
@@ -513,8 +514,8 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
     //
     // Counting BEGIN vs END markers catches exactly this and nothing else; the
     // containment check catches the stale bundle and cannot see a tear. Both are
-    // needed, neither subsumes the other (independently reproduced by cswap, whose
-    // pin proxy is both producer and consumer of the same directory).
+    // needed, neither subsumes the other (independently reproduced by a sibling
+    // component that is both producer and consumer of the same directory).
     //
     // Reader beware: this is a cheap pre-flight guard, not proof. Balanced markers
     // and containment together still do not prove Node verifies with the result —
