@@ -4,7 +4,7 @@ import { fork, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
 import { homedir } from "node:os";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import http from "node:http";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -211,7 +211,54 @@ if (remoteControl) {
   delete claudeEnv.ANTHROPIC_BASE_URL;
   claudeEnv.HTTPS_PROXY = proxyUrl;
   claudeEnv.https_proxy = proxyUrl;
-  claudeEnv.NODE_EXTRA_CA_CERTS = caPem;
+  // Publish our MITM CA where other components can find it. NODE_EXTRA_CA_CERTS
+  // takes ONE file, so whoever assigns it last wins and every other CA is
+  // silently untrusted — measured 2026-07-30 against cswap's pin proxy, which
+  // also MITMs api.anthropic.com and also set the var, breaking Remote Control
+  // inbound on the work Mac. The fix is a directory each component publishes its
+  // own file into, so a bundle can be built from all of them.
+  //
+  // We write EXACTLY ONE path, ca-trust.d/ccf.pem, and never a sibling's.
+  // Rewritten every launch, not once: the proxy regenerates its CA whenever
+  // caDir is wiped, and a stale pem would advertise a key nothing signs with.
+  const configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
+  const caTrustDir = process.env.CACHE_FIX_CA_TRUST_DIR || join(configDir, "ca-trust.d");
+  try {
+    mkdirSync(caTrustDir, { recursive: true });
+    const ours = readFileSync(caPem);
+    const dst = join(caTrustDir, "ccf.pem");
+    // Byte-compare skip so a bundle builder keying on mtime is not woken by a
+    // launch that changed nothing.
+    if (!existsSync(dst) || !readFileSync(dst).equals(ours)) writeFileSync(dst, ours);
+  } catch (e) {
+    // Non-fatal: publishing is how OTHERS trust us. This session only needs its
+    // own CA, so a failure to publish must not stop it.
+    process.stderr.write(`cache-fix: could not publish CA to ${caTrustDir}: ${e.message}\n`);
+  }
+  // Read the merged bundle if something built one, so a session trusts every
+  // component's CA and not only ours.
+  //
+  // We deliberately do NOT build it. Merging must include the ambient/corporate
+  // roots, and finding those is environment-specific (a Linux host may keep them
+  // in /usr/local/share/ca-certificates/*.crt and NOT in the system bundle a
+  // shell points at; a Mac keeps them in the keychain). That knowledge does not
+  // belong in this repo. It also keeps the writer count at one: two launchers
+  // both rebuilding the bundle would race the same output. We are write-own +
+  // read-merged.
+  //
+  // No bundle => our own CA alone, byte for byte what this did before, so a host
+  // with no other MITM and no bundle builder sees no change at all.
+  // Fixed name, no env override: the builder writes this exact path (it resolves
+  // the config dir the same way), so a knob here could only ever point the two
+  // sides at different files.
+  const caTrustBundle = join(configDir, "ca-trust.pem");
+  let caForClaude = caPem;
+  // statSync throws when absent, which is the same "use our own CA" answer as a
+  // zero-byte or unreadable bundle — one catch covers all three.
+  try {
+    if (statSync(caTrustBundle).size > 0) caForClaude = caTrustBundle;
+  } catch { /* no usable bundle => our own CA, same as before */ }
+  claudeEnv.NODE_EXTRA_CA_CERTS = caForClaude;
   // Exclude localhost from the proxy. Without this, HTTPS_PROXY routes EVERY
   // connection claude makes — including to local services like HTTP/SSE-transport
   // MCP servers (e.g. an MCP on 127.0.0.1) — at the cache-fix proxy, which only

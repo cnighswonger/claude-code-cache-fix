@@ -4,7 +4,7 @@ import { fork } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
 import { tmpdir } from "node:os";
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import http from "node:http";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -186,6 +186,131 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
     assert.ok(
       stdout.includes(`CA=${join(caDir, "ca.pem")}`),
       `NODE_EXTRA_CA_CERTS should be the CACHE_FIX_CA_DIR override (${join(caDir, "ca.pem")}), got: ${stdout}`,
+    );
+  });
+
+  // --- ca-trust.d: coexisting with another component that also MITMs ---------
+  // NODE_EXTRA_CA_CERTS takes ONE file, so a plain assignment silently untrusts
+  // whatever else needed trusting. Measured 2026-07-30: cswap's pin proxy also
+  // MITMs api.anthropic.com and also set this var; last writer won and broke
+  // Remote Control inbound on the work Mac. The contract: each component
+  // publishes ONLY its own ca-trust.d/<name>.pem, one external writer builds the
+  // merged ca-trust.pem (it needs ambient corp-root discovery, which is
+  // environment-specific and stays out of this repo), and we READ that bundle.
+  // These four tests pin the whole contract: publish, read, isolation, fallback.
+
+  it("--remote-control publishes its CA to ca-trust.d/ccf.pem before exec'ing claude", async () => {
+    // Publishing is how OTHER components learn to trust us, and it must happen
+    // before the client runs — a bundle builder that reads the dir on a cold
+    // start would otherwise miss us and produce a bundle without our CA.
+    const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
+    const script = 'process.stdout.write("OK\\n")';
+    const wrapperProc = fork(WRAPPER_PATH, ["--remote-control", "--proxy-port", "0"], {
+      stdio: ["ignore", "pipe", "pipe", "ipc"],
+      env: cleanEnv({ CACHE_FIX_CLAUDE_CMD: `${NODE} -e ${script}`, CLAUDE_CONFIG_DIR: configDir }),
+    });
+
+    let stdout = "";
+    let stderr = "";
+    wrapperProc.stdout.on("data", (c) => { stdout += c.toString(); });
+    wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
+
+    const code = await new Promise((resolve) => {
+      wrapperProc.on("exit", (c) => resolve(c));
+      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
+    });
+
+    assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
+    // The child already ran and exited, so anything on disk now was written
+    // before the exec — that ordering is the point of this assertion.
+    const published = join(configDir, "ca-trust.d", "ccf.pem");
+    assert.ok(existsSync(published), `expected published CA at ${published}. stdout: ${stdout} stderr: ${stderr}`);
+    const ours = readFileSync(join(configDir, "cache-fix-ca", "ca.pem"), "utf8");
+    assert.equal(readFileSync(published, "utf8"), ours, "published pem must be our CA verbatim");
+    assert.match(ours, /BEGIN CERTIFICATE/, "published pem should be a PEM certificate");
+  });
+
+  it("--remote-control points NODE_EXTRA_CA_CERTS at the merged bundle when one exists", async () => {
+    // The whole reason the contract exists: with a merged bundle present we must
+    // hand claude THAT, not our own CA alone, or the other component's CA is
+    // untrusted for this session.
+    const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
+    const bundle = join(configDir, "ca-trust.pem");
+    writeFileSync(bundle, "# merged by the launcher\n");
+    const script = 'process.stdout.write("CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")+"\\n")';
+    const wrapperProc = fork(WRAPPER_PATH, ["--remote-control", "--proxy-port", "0"], {
+      stdio: ["ignore", "pipe", "pipe", "ipc"],
+      env: cleanEnv({ CACHE_FIX_CLAUDE_CMD: `${NODE} -e ${script}`, CLAUDE_CONFIG_DIR: configDir }),
+    });
+
+    let stdout = "";
+    let stderr = "";
+    wrapperProc.stdout.on("data", (c) => { stdout += c.toString(); });
+    wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
+
+    const code = await new Promise((resolve) => {
+      wrapperProc.on("exit", (c) => resolve(c));
+      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
+    });
+
+    assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
+    assert.ok(stdout.includes(`CA=${bundle}`), `NODE_EXTRA_CA_CERTS should be the merged bundle (${bundle}), got: ${stdout}`);
+  });
+
+  it("--remote-control never writes the merged bundle and never touches a sibling component's pem", async () => {
+    // Single-writer invariant. Two launchers both "helpfully" rebuilding the
+    // merged file race one output, and a component that rewrites a sibling's pem
+    // can untrust it. So: we write exactly one path, ca-trust.d/ccf.pem.
+    const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
+    const trustDir = join(configDir, "ca-trust.d");
+    mkdirSync(trustDir, { recursive: true });
+    const sibling = join(trustDir, "cswap-pin.pem");
+    const SIBLING_BYTES = "# another component's CA — must survive untouched\n";
+    writeFileSync(sibling, SIBLING_BYTES);
+    const script = 'process.stdout.write("OK\\n")';
+    const wrapperProc = fork(WRAPPER_PATH, ["--remote-control", "--proxy-port", "0"], {
+      stdio: ["ignore", "pipe", "pipe", "ipc"],
+      env: cleanEnv({ CACHE_FIX_CLAUDE_CMD: `${NODE} -e ${script}`, CLAUDE_CONFIG_DIR: configDir }),
+    });
+
+    let stderr = "";
+    wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
+
+    const code = await new Promise((resolve) => {
+      wrapperProc.on("exit", (c) => resolve(c));
+      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
+    });
+
+    assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
+    assert.equal(readFileSync(sibling, "utf8"), SIBLING_BYTES, "sibling component's pem must be untouched");
+    assert.ok(!existsSync(join(configDir, "ca-trust.pem")), "we must NOT create the merged bundle — exactly one external writer owns it");
+    assert.ok(existsSync(join(trustDir, "ccf.pem")), "our own pem should still be published");
+  });
+
+  it("--remote-control falls back to its own CA when no merged bundle exists (unchanged standalone behaviour)", async () => {
+    // A plain CCF user with no other MITM and no bundle builder must see exactly
+    // what they saw before this contract existed.
+    const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
+    const script = 'process.stdout.write("CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")+"\\n")';
+    const wrapperProc = fork(WRAPPER_PATH, ["--remote-control", "--proxy-port", "0"], {
+      stdio: ["ignore", "pipe", "pipe", "ipc"],
+      env: cleanEnv({ CACHE_FIX_CLAUDE_CMD: `${NODE} -e ${script}`, CLAUDE_CONFIG_DIR: configDir }),
+    });
+
+    let stdout = "";
+    let stderr = "";
+    wrapperProc.stdout.on("data", (c) => { stdout += c.toString(); });
+    wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
+
+    const code = await new Promise((resolve) => {
+      wrapperProc.on("exit", (c) => resolve(c));
+      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
+    });
+
+    assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
+    assert.ok(
+      stdout.includes(`CA=${join(configDir, "cache-fix-ca", "ca.pem")}`),
+      `with no bundle NODE_EXTRA_CA_CERTS must be our own CA, got: ${stdout}`,
     );
   });
 
