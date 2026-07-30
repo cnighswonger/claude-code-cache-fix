@@ -75,6 +75,25 @@ function cleanEnv(overrides) {
 
 const NODE = process.execPath;
 
+// Fork the wrapper in forward mode, collect the child's output, resolve when it
+// exits. Two ca-trust tests below run the wrapper TWICE against one config dir
+// (first launch publishes our CA, second reads the bundle built from it), which
+// is what makes a named helper worth it over the inline fork the older tests use.
+async function runWrapper(script, overrides) {
+  const p = fork(WRAPPER_PATH, ["--remote-control", "--proxy-port", "0"], {
+    stdio: ["ignore", "pipe", "pipe", "ipc"],
+    env: cleanEnv({ CACHE_FIX_CLAUDE_CMD: `${NODE} -e ${script}`, ...overrides }),
+  });
+  let out = "", err = "";
+  p.stdout.on("data", (c) => { out += c.toString(); });
+  p.stderr.on("data", (c) => { err += c.toString(); });
+  const code = await new Promise((res) => {
+    p.on("exit", res);
+    setTimeout(() => { p.kill("SIGTERM"); res(null); }, 15000);
+  });
+  return { code, out, err };
+}
+
 describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
   it("exits with error when claude command is not found", async () => {
     const wrapperProc = fork(WRAPPER_PATH, ["--proxy-port", "0"], {
@@ -251,20 +270,7 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
     const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
     const bundle = join(configDir, "ca-trust.pem");
     const script = 'process.stdout.write("CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")+"\\n")';
-    const runOnce = async () => {
-      const p = fork(WRAPPER_PATH, ["--remote-control", "--proxy-port", "0"], {
-        stdio: ["ignore", "pipe", "pipe", "ipc"],
-        env: cleanEnv({ CACHE_FIX_CLAUDE_CMD: `${NODE} -e ${script}`, CLAUDE_CONFIG_DIR: configDir }),
-      });
-      let out = "", err = "";
-      p.stdout.on("data", (c) => { out += c.toString(); });
-      p.stderr.on("data", (c) => { err += c.toString(); });
-      const c = await new Promise((res) => {
-        p.on("exit", res);
-        setTimeout(() => { p.kill("SIGTERM"); res(null); }, 15000);
-      });
-      return { code: c, out, err };
-    };
+    const runOnce = () => runWrapper(script, { CLAUDE_CONFIG_DIR: configDir });
 
     const first = await runOnce();
     assert.equal(first.code, 0, `first run should exit 0, got ${first.code}. stderr: ${first.err}`);
@@ -452,20 +458,7 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
     const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
     const bundle = join(configDir, "ca-trust.pem");
     const script = 'process.stdout.write("CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")+"\\n")';
-    const runOnce = async () => {
-      const p = fork(WRAPPER_PATH, ["--remote-control", "--proxy-port", "0"], {
-        stdio: ["ignore", "pipe", "pipe", "ipc"],
-        env: cleanEnv({ CACHE_FIX_CLAUDE_CMD: `${NODE} -e ${script}`, CLAUDE_CONFIG_DIR: configDir }),
-      });
-      let out = "", err = "";
-      p.stdout.on("data", (c) => { out += c.toString(); });
-      p.stderr.on("data", (c) => { err += c.toString(); });
-      const c = await new Promise((res) => {
-        p.on("exit", res);
-        setTimeout(() => { p.kill("SIGTERM"); res(null); }, 15000);
-      });
-      return { code: c, out, err };
-    };
+    const runOnce = () => runWrapper(script, { CLAUDE_CONFIG_DIR: configDir });
 
     // First run publishes our CA, so the torn bundle we then build is realistic:
     // a builder that concatenated a truncated sibling ahead of our complete pem.

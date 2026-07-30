@@ -281,15 +281,13 @@ if (remoteControl) {
   // apart. readFileSync throws when absent, which is the same "use our own CA"
   // answer as an empty, stale, or unreadable bundle — one catch covers them all.
   //
-  // ALSO require balanced BEGIN/END markers. Containment cannot see a tear: a
+  // ALSO require balanced BEGIN/END markers. Containment cannot see a tear — a
   // bundle whose EARLIER entry lost its END line still literally contains our CA
-  // further down, and that is the fatal ordering — an unterminated block ahead of
-  // a good one fails the handshake outright, while one after it merely warns
-  // (measured above). So a torn-ahead bundle passes containment and would leave
-  // the session trusting nothing at all, our own proxy included. The two checks
-  // are complementary: containment catches STALE, the counts catch TORN, neither
-  // sees the other's case. Counting two substrings is cheaper than forking
-  // openssl and needs no new dependency.
+  // further down, and per the measurement at the publish path above that is the
+  // FATAL ordering, leaving the session trusting nothing at all, our own proxy
+  // included. So the two checks are complementary: containment catches STALE, the
+  // counts catch TORN, neither sees the other's case. Counting two substrings is
+  // cheaper than forking openssl and needs no new dependency.
   //
   // Both are pre-flight guards, not proof — only a handshake proves Node verifies
   // with the bundle. They exist to keep a known-bad bundle away from the client.
