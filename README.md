@@ -311,6 +311,7 @@ All proxy settings are controlled via environment variables. Set them before sta
 | `CACHE_FIX_PROXY_UPSTREAM` | `https://api.anthropic.com` | Upstream URL. Change to chain another proxy (e.g. `http://localhost:8080`) |
 | `CACHE_FIX_FORWARD_PROXY` | unset | Set to `on` for forward-proxy mode (HTTP CONNECT + selective MITM of the upstream host) so the client points `HTTPS_PROXY` at the proxy instead of `ANTHROPIC_BASE_URL`, keeping Remote Control enabled. See [Forward-proxy mode](#forward-proxy-mode-keeps-remote-control-working). |
 | `CACHE_FIX_CA_DIR` | `~/.claude/cache-fix-ca` | Directory for the forward-proxy CA/leaf cert (generated once on first start). The client trusts `ca.pem` via `NODE_EXTRA_CA_CERTS`. |
+| `CACHE_FIX_CA_TRUST_DIR` | `$CLAUDE_CONFIG_DIR/ca-trust.d` | Where `--remote-control` publishes our CA as `ccf.pem` so another MITM on the same host can merge it. See [Coexisting with another MITM](#coexisting-with-another-mitm-on-the-same-machine-ca-trustd). |
 | `CACHE_FIX_PROXY_TIMEOUT` | `600000` | Request timeout in milliseconds |
 | `CACHE_FIX_EXTENSIONS_DIR` | `proxy/extensions/` | Directory for extension `.mjs` files |
 | `CACHE_FIX_EXTENSIONS_CONFIG` | `proxy/extensions.json` | Extension configuration file |

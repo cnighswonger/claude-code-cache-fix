@@ -4,7 +4,8 @@ import { fork, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
 import { homedir } from "node:os";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { X509Certificate, randomUUID } from "node:crypto";
 import http from "node:http";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -245,9 +246,18 @@ if (remoteControl) {
       // OURS lands in exactly the fatal position and takes every other component
       // CA and corporate root down with it. Temp must be in the SAME directory —
       // rename across filesystems is not atomic (and would EXDEV).
-      const tmp = `${dst}.${process.pid}`;
+      // pid alone is not unique: two launches in separate PID namespaces sharing
+      // a bind-mounted config dir can hold the same pid and collide on the temp
+      // path, so one publishes the other's bytes. uuid removes that.
+      const tmp = `${dst}.${process.pid}.${randomUUID()}`;
       writeFileSync(tmp, ours);
       renameSync(tmp, dst);
+    }
+    // Reap temps orphaned by a kill between the write and the rename. They do
+    // not match a *.pem glob so a builder ignores them, but nothing else would
+    // ever remove them.
+    for (const f of readdirSync(caTrustDir)) {
+      if (f.startsWith("ccf.pem.")) try { rmSync(join(caTrustDir, f)); } catch { /* raced */ }
     }
   } catch (e) {
     // Non-fatal: publishing is how OTHERS trust us. This session only needs its
@@ -281,24 +291,56 @@ if (remoteControl) {
   // apart. readFileSync throws when absent, which is the same "use our own CA"
   // answer as an empty, stale, or unreadable bundle — one catch covers them all.
   //
-  // ALSO require balanced BEGIN/END markers. Containment cannot see a tear — a
-  // bundle whose EARLIER entry lost its END line still literally contains our CA
-  // further down, and per the measurement at the publish path above that is the
-  // FATAL ordering, leaving the session trusting nothing at all, our own proxy
-  // included. So the two checks are complementary: containment catches STALE, the
-  // counts catch TORN, neither sees the other's case. Counting two substrings is
-  // cheaper than forking openssl and needs no new dependency.
+  // Both conditions are checked by PARSING, not by matching substrings. Node's
+  // PEM reader aborts the whole extras load on one block it cannot decode, so a
+  // damaged entry does not merely lose itself — it can void every other component
+  // CA and corporate root in the file, our own included. Substring checks miss
+  // exactly that, measured here against real handshakes:
   //
-  // Both are pre-flight guards, not proof — only a handshake proves Node verifies
-  // with the bundle. They exist to keep a known-bad bundle away from the client.
+  //   bundle shape                            substring guard | real handshake
+  //   corrupt base64 ahead, markers intact  |  accept         | FAIL
+  //   torn BEGIN TRUSTED CERTIFICATE ahead  |  accept         | FAIL
+  //   whole bundle CRLF                     |  reject         | authorized
+  //
+  // The first two are the dangerous direction: a counted BEGIN/END pair says
+  // nothing about whether the body decodes, and hard-coding the CERTIFICATE label
+  // makes any other label a corporate bundle carries invisible to the count. So:
+  // every block must construct an X509Certificate, and one of them must BE ours
+  // (compared by DER, not by text, which also fixes the CRLF false reject).
+  //
+  // Torn blocks have no END line, so the regex never yields them — that is why
+  // the block count is compared against the BEGIN count rather than trusted
+  // directly. A count mismatch means something in there is unterminated.
+  //
+  // Still only a pre-flight guard, not proof: it establishes the file parses and
+  // carries us, never that Node will verify a given leaf with it. Only a
+  // handshake shows that, and the launcher does not perform one.
   try {
-    const merged = readFileSync(caTrustBundle, "utf8");
-    const begins = (merged.match(/-----BEGIN CERTIFICATE-----/g) || []).length;
-    const ends = (merged.match(/-----END CERTIFICATE-----/g) || []).length;
-    if (begins === ends && merged.includes(readFileSync(caPem, "utf8").trim())) {
-      caForClaude = caTrustBundle;
+    const merged = readFileSync(caTrustBundle, "utf8").replace(/\r\n/g, "\n");
+    const blocks = merged.match(/-----BEGIN [^-]*-----[\s\S]*?-----END [^-]*-----/g) || [];
+    if (blocks.length !== (merged.match(/-----BEGIN /g) || []).length) throw new Error("torn block");
+    // Throws on an empty or malformed ca.pem, which must fall through rather than
+    // match everything — a zero-byte CA made the old substring test vacuously true.
+    const oursDer = new X509Certificate(readFileSync(caPem)).raw;
+    let carriesUs = false;
+    for (const block of blocks) {
+      // One unparseable block is enough to void the load, so refuse the file.
+      if (new X509Certificate(block).raw.equals(oursDer)) carriesUs = true;
     }
-  } catch { /* no usable bundle => our own CA, same as before */ }
+    if (!carriesUs) throw new Error("bundle does not carry our CA");
+    caForClaude = caTrustBundle;
+  } catch (e) {
+    // Absent is the normal case on a host with no builder — silent, and the same
+    // answer as every other unusable state. But a bundle that EXISTS and was
+    // refused means the one component allowed to write it produced something
+    // broken, and in a multi-component contract that has to be visible: the
+    // session still works (we fall back to our own CA) while every other
+    // component's CA is silently gone, which is precisely the failure nobody
+    // would otherwise notice.
+    if (existsSync(caTrustBundle)) {
+      process.stderr.write(`cache-fix: ignoring ${caTrustBundle} (${e.message}); using our own CA only\n`);
+    }
+  }
   claudeEnv.NODE_EXTRA_CA_CERTS = caForClaude;
   // Exclude localhost from the proxy. Without this, HTTPS_PROXY routes EVERY
   // connection claude makes — including to local services like HTTP/SSE-transport

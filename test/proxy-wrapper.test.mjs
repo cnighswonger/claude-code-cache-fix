@@ -4,7 +4,7 @@ import { fork } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
 import { tmpdir } from "node:os";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import http from "node:http";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -70,6 +70,15 @@ function cleanEnv(overrides) {
   // machine that exports NO_PROXY.
   for (const k of ["CACHE_FIX_PROXY_PORT", "CACHE_FIX_PROXY_UPSTREAM", "NO_PROXY", "no_proxy"]) delete env[k];
   env.CACHE_FIX_PROXY_BIND = "127.0.0.1";
+  // A config dir per invocation, by DEFAULT — not opt-in per test. Forward mode
+  // publishes our CA into <config>/ca-trust.d/ccf.pem, so any test that forgot to
+  // set this published a throwaway temp CA over the developer's REAL
+  // ~/.claude/ca-trust.d/ccf.pem. Measured: one run of the CACHE_FIX_CA_DIR test
+  // took the host's pem from 5dc414fc to 3773c611, leaving the machine's merged
+  // bundle advertising a CA nothing signs with — precisely the failure this
+  // feature exists to prevent. It also silently poisons the suite itself: two
+  // cases were reading the host's real merged bundle instead of a fixture.
+  env.CLAUDE_CONFIG_DIR = mkdtempSync(join(tmpdir(), "cffcfg-"));
   return { ...env, ...overrides };
 }
 
@@ -339,7 +348,7 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
     );
   });
 
-  it("--remote-control publishes atomically (a reader never sees a torn ccf.pem)", async () => {
+  it("--remote-control never leaves a truncated ccf.pem visible while publishing", async () => {
     // A torn pem is not a cosmetic problem: Node's PEM reader aborts the whole
     // extras load on an unterminated block. Measured on node v24 / openssl 3.5,
     // with a leaf signed by the CCF CA and a bundle = good.pem + torn.pem:
@@ -351,25 +360,50 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
     // writeFileSync(dst) is exactly what leaves that state visible to a
     // concurrent builder, so the write must be rename-into-place.
     //
-    // Distinguishing atomic from non-atomic needs a property that only holds for
-    // rename-into-place: an EXISTING published file must never be observed
-    // truncated or partially rewritten. writeFileSync(dst) opens the target with
-    // O_TRUNC, so the moment it starts the reader can see a zero-length or
-    // half-written ccf.pem; rename() swaps a complete file in one step and the
-    // old complete file stays readable until it does. We pin that by making the
-    // target unwritable-in-place but the DIRECTORY writable: a truncating write
-    // then fails outright, while rename still succeeds. That asymmetry is the
-    // mechanism, not an incidental detail.
+    // Distinguishing atomic from non-atomic needs a property that holds ONLY for
+    // rename-into-place, and "replaces a read-only file" is not it: a read-only
+    // target is also defeated by unlink-then-write, which is maximally
+    // non-atomic (a reader can observe ENOENT, then zero length, then a partial
+    // file). An earlier version of this test asserted exactly that and passed
+    // green against `unlinkSync(dst); writeFileSync(dst, ours)` — it proved
+    // nothing.
+    //
+    // The property that separates them is INODE STABILITY for an existing
+    // reader. A builder that opened ccf.pem before the publish holds a
+    // descriptor on the old inode. rename() swaps a new inode into the
+    // directory entry and leaves the old one intact and fully readable until
+    // that descriptor closes, so the reader still sees complete old content.
+    // Any in-place rewrite — O_TRUNC or unlink-and-recreate — either truncates
+    // the very bytes that reader is consuming or leaves it on a deleted inode
+    // whose content is gone. So: hold a descriptor open across the launch, then
+    // read it to the end.
     const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
     const trustDir = join(configDir, "ca-trust.d");
     const dst = join(trustDir, "ccf.pem");
     mkdirSync(trustDir, { recursive: true });
-    // A stale published file, read-only, standing in for "an existing complete
-    // file a builder may be reading right now". Its content differs from our CA,
-    // so the publish path must replace it rather than take the byte-compare skip.
+    // A stale published file, standing in for "an existing complete file a
+    // builder may be reading right now". Its content differs from our CA, so the
+    // publish path must replace it rather than take the byte-compare skip.
     const STALE = "-----BEGIN CERTIFICATE-----\nc3RhbGUtcHVibGlzaGVk\n-----END CERTIFICATE-----\n";
     writeFileSync(dst, STALE);
-    chmodSync(dst, 0o444);
+    // The concurrent reader, opened BEFORE the publish and deliberately not read
+    // until after it.
+    const readerFd = openSync(dst, "r");
+    const inodeBefore = fstatSync(readerFd).ino;
+    // A builder does not hold a descriptor open across our publish — it opens
+    // ca-trust.d/*.pem by NAME whenever it rebuilds. So the property that
+    // actually protects it is that the NAME never resolves to anything but a
+    // complete file. Sample it as fast as the runtime allows for the whole
+    // launch: with rename the name is always the old or the new file; with
+    // O_TRUNC it is briefly zero-length, and with unlink-then-write it briefly
+    // does not exist at all. (Holding a descriptor is NOT sufficient to tell
+    // these apart — POSIX keeps an unlinked inode alive for an open fd, so the
+    // fd-based assertion below passes even for unlink+write.)
+    const observations = [];
+    const sampler = setInterval(() => {
+      try { observations.push(readFileSync(dst, "utf8")); }
+      catch (e) { observations.push(`ENOENT:${e.code}`); }
+    }, 1);
 
     const script = 'process.stdout.write("OK\\n")';
     const wrapperProc = fork(WRAPPER_PATH, ["--remote-control", "--proxy-port", "0"], {
@@ -385,11 +419,44 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
       setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
     });
 
+    clearInterval(sampler);
     assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
-    // rename() replaces a read-only target (the directory grants permission);
-    // a truncating in-place write cannot, and would leave the stale bytes.
+    // THE assertion. Every sample taken by name, across the whole launch, must
+    // be one of the two COMPLETE states — never absent, never partial.
+    //
+    // Mutation-tested, and the result bounds what this test is worth:
+    //   writeFileSync(dst)  [O_TRUNC]   -> FAILS   (caught)
+    //   unlinkSync + writeFileSync      -> passes  (NOT caught)
+    //   temp + renameSync               -> passes
+    // The unlink variant's window between unlink and create is shorter than the
+    // sampler's 1 ms floor, so a timing-based observer cannot see it. Hence the
+    // test name: no TRUNCATED file is ever visible. Not "atomic" in general —
+    // proving that would need an inotify watch for IN_DELETE-before-IN_CREATE,
+    // which is not worth a dependency for a shape nothing here writes.
+    const ourCa = readFileSync(join(configDir, "cache-fix-ca", "ca.pem"), "utf8");
+    const bad = observations.filter((o) => o !== STALE && o !== ourCa);
+    assert.deepEqual(
+      bad, [],
+      `every observation of ccf.pem must be a complete file (stale or ours); saw ${bad.length} bad ` +
+      `of ${observations.length}: ${JSON.stringify(bad.slice(0, 3))}`,
+    );
+    assert.ok(observations.length > 0, "sampler must have observed the file at least once");
+    // Secondary: the pre-existing reader still sees complete old content. True
+    // for rename AND for unlink (POSIX keeps an unlinked inode alive for an open
+    // fd), so this alone does not prove atomicity — it is here to document that
+    // an in-place O_TRUNC rewrite would corrupt a reader mid-read.
+    const viaOldFd = readFileSync(readerFd, "utf8");
+    closeSync(readerFd);
+    assert.equal(
+      viaOldFd, STALE,
+      "a reader holding the pre-publish descriptor must still see the COMPLETE old pem — " +
+      "an in-place rewrite would have truncated or orphaned it mid-read",
+    );
+    // ...and the directory entry now points at a DIFFERENT inode, which is what
+    // "swapped in" means. Same inode would mean it was rewritten under the reader.
+    assert.notEqual(statSync(dst).ino, inodeBefore, "publish must swap a new inode into place, not rewrite the old one");
     const pem = readFileSync(dst, "utf8");
-    assert.notEqual(pem, STALE, "publish must replace an existing read-only pem (rename), not fail to overwrite it in place");
+    assert.notEqual(pem, STALE, "publish must actually replace the stale pem");
     assert.equal(pem, readFileSync(join(configDir, "cache-fix-ca", "ca.pem"), "utf8"), "published pem must be our CA verbatim");
     // No leftover temp: a builder globbing *.pem must not find a partial sibling,
     // and nothing may be left behind for the next run to trip over.

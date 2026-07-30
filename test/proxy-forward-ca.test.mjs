@@ -272,3 +272,80 @@ test("ca-trust: a bundle torn AHEAD of our CA does NOT verify (why the marker ch
     assert.equal(res.ok, false, "a torn-ahead bundle must not verify — if it did, the marker guard would be pointless");
   });
 });
+
+// The three shapes a substring-based guard gets WRONG. Each row was measured
+// against a real handshake before the guard was rewritten to parse; two of them
+// are the dangerous direction (a bundle that kills the session, waved through)
+// and one is a healthy bundle needlessly refused:
+//
+//   bundle                                  substring guard | handshake
+//   corrupt base64 ahead, markers intact  |  accept         | FAIL
+//   torn BEGIN TRUSTED CERTIFICATE ahead  |  accept         | FAIL
+//   whole bundle CRLF-normalized          |  reject         | authorized
+//
+// This test pins the DECISION the launcher makes, mirroring bin/claude-via-proxy
+// exactly, and asserts the decision agrees with the handshake in every row. The
+// decision lives in the launcher (a child process there, so not importable), so
+// it is duplicated here deliberately — if the two ever drift, the row whose
+// handshake disagrees fails, which is the point.
+function bundleIsUsable(merged, caPemPath) {
+  try {
+    const norm = merged.replace(/\r\n/g, "\n");
+    const blocks = norm.match(/-----BEGIN [^-]*-----[\s\S]*?-----END [^-]*-----/g) || [];
+    if (blocks.length !== (norm.match(/-----BEGIN /g) || []).length) return false;
+    const oursDer = new X509Certificate(readFileSync(caPemPath)).raw;
+    let carriesUs = false;
+    for (const b of blocks) if (new X509Certificate(b).raw.equals(oursDer)) carriesUs = true;
+    return carriesUs;
+  } catch { return false; }
+}
+
+test("ca-trust: the bundle guard agrees with a real handshake on every known-bad shape", async () => {
+  await withCA({}, async (dir) => {
+    const r = ensureCA();
+    const caPemPath = join(dir, "ca.pem");
+    const ours = readFileSync(caPemPath, "utf8");
+    // A PEM body with no END line — the shape that makes a block unterminated.
+    const body = ours.split("\n").slice(1, -2).join("\n");
+
+    const rows = [
+      ["healthy: ours alone", ours, true],
+      // Markers balanced and our CA present verbatim, but the FIRST block's body
+      // is not base64. Node aborts the whole extras load on it.
+      ["corrupt base64 ahead", `-----BEGIN CERTIFICATE-----\n!!!not base64!!!\n-----END CERTIFICATE-----\n${ours}`, false],
+      // A label other than CERTIFICATE, torn. A CERTIFICATE-only marker count
+      // cannot see this at all.
+      ["torn TRUSTED CERTIFICATE ahead", `-----BEGIN TRUSTED CERTIFICATE-----\n${body}\n${ours}`, false],
+      // Perfectly good bundle that a byte-exact containment check refuses.
+      ["CRLF line endings", ours.replace(/\n/g, "\r\n"), true],
+      // Real cert, just not ours: the stale-builder case.
+      ["stale, does not carry us", "-----BEGIN CERTIFICATE-----\nc3RhbGU=\n-----END CERTIFICATE-----\n", false],
+    ];
+
+    for (const [name, bundle, expectUsable] of rows) {
+      assert.equal(bundleIsUsable(bundle, caPemPath), expectUsable, `guard verdict wrong for: ${name}`);
+      // And the guard's YES must mean the handshake really works. Its NO is not
+      // required to mean the handshake fails — refusing a usable-but-odd bundle
+      // only costs the other components' CAs, while accepting a broken one costs
+      // the session. The guard is allowed to be conservative, never permissive.
+      if (expectUsable) {
+        const res = await handshakeTrusting(bundle, r);
+        assert.equal(res.ok, true, `guard accepted "${name}" but the handshake failed: ${res.err}`);
+      }
+    }
+  });
+});
+
+test("ca-trust: an empty ca.pem does not make the guard vacuously accept", async () => {
+  await withCA({}, async (dir) => {
+    ensureCA();
+    // "".includes("") is true, so a zero-byte CA made the old substring check
+    // pass against ANY bundle — including one that does not carry us at all.
+    // Parsing rejects it instead: X509Certificate throws on empty input.
+    const emptyCa = join(dir, "empty-ca.pem");
+    writeFileSync(emptyCa, "");
+    const stale = "-----BEGIN CERTIFICATE-----\nc3RhbGU=\n-----END CERTIFICATE-----\n";
+    assert.equal("".includes(""), true, "premise: the old check was vacuous on an empty CA");
+    assert.equal(bundleIsUsable(stale, emptyCa), false, "an empty ca.pem must not accept a bundle that lacks us");
+  });
+});

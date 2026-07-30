@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **`--remote-control` no longer clobbers another component's `NODE_EXTRA_CA_CERTS`.** That variable takes exactly one file, so on a host where something else also MITMs `api.anthropic.com` (a corporate agent, an account-pinning proxy) the last writer won and every other CA was silently untrusted — measured breaking Remote Control inbound. The launcher now publishes its own CA to `${CLAUDE_CONFIG_DIR:-~/.claude}/ca-trust.d/ccf.pem` (own filename only, never a sibling's, rewritten every launch, atomically via temp + `rename`) and reads a merged `ca-trust.pem` if one exists. It never writes the merged bundle: merging needs ambient corporate-root discovery, which is environment-specific and belongs outside this repo. The bundle is used only when every PEM block in it parses **and** one of them is our own CA (compared by DER) — a bundle that is torn or predates our publish is worse than none, since it makes the client distrust the very proxy it is routed through. On a host with no other MITM and no bundle, behavior is byte-identical to before. New opt-in env var: `CACHE_FIX_CA_TRUST_DIR`. See [Coexisting with another MITM](README.md#coexisting-with-another-mitm-on-the-same-machine-ca-trustd).
+
+### Documentation
+
+- **`CACHE_FIX_DOWNLOAD_REWRITE=on` disables `claude update` entirely**, which the flag's name does not suggest. Rewriting a download URL requires MITM-ing `downloads.claude.ai`, whose release client pins public roots only, so the version check fails before anything downloads. It cannot be narrowed to the binary path (MITM is decided per host at `CONNECT`, and the version check shares the host) and no client-side override reaches that client. Documented with the measurement in the README.
+
 ## [4.3.0] - 2026-07-17
 
 Headline: **Remote Control works through the proxy.** Claude Code ≥ 2.1.196 disables Remote Control / mobile session visibility (and `/schedule`, claude.ai MCP connectors) whenever `ANTHROPIC_BASE_URL` is set — which is exactly how reverse-proxy mode routes the client. This release adds an opt-in **forward-proxy mode** that keeps the client first-party (`ANTHROPIC_BASE_URL` unset, `HTTPS_PROXY` set) so those features keep working while the proxy still sees and transforms `/v1/messages`. All changes are additive and backward-compatible; every new mode is opt-in and defaults are unchanged.
