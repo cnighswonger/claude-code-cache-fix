@@ -294,19 +294,12 @@ if (remoteControl) {
   // Both conditions are checked by PARSING, not by matching substrings. Node's
   // PEM reader aborts the whole extras load on one block it cannot decode, so a
   // damaged entry does not merely lose itself — it can void every other component
-  // CA and corporate root in the file, our own included. Substring checks miss
-  // exactly that, measured here against real handshakes:
-  //
-  //   bundle shape                            substring guard | real handshake
-  //   corrupt base64 ahead, markers intact  |  accept         | FAIL
-  //   torn BEGIN TRUSTED CERTIFICATE ahead  |  accept         | FAIL
-  //   whole bundle CRLF                     |  reject         | authorized
-  //
-  // The first two are the dangerous direction: a counted BEGIN/END pair says
-  // nothing about whether the body decodes, and hard-coding the CERTIFICATE label
-  // makes any other label a corporate bundle carries invisible to the count. So:
-  // every block must construct an X509Certificate, and one of them must BE ours
-  // (compared by DER, not by text, which also fixes the CRLF false reject).
+  // CA and corporate root in the file, our own included. Counting BEGIN/END says
+  // nothing about whether a body decodes, and hard-coding the CERTIFICATE label
+  // makes any other label a corporate bundle carries invisible to the count; both
+  // gaps were measured accepting bundles that fail a real handshake. The shapes
+  // and their handshake results are in test/proxy-forward-ca.test.mjs, which
+  // asserts this decision agrees with an actual TLS verify on every one.
   //
   // Torn blocks have no END line, so the regex never yields them — that is why
   // the block count is compared against the BEGIN count rather than trusted
@@ -315,6 +308,10 @@ if (remoteControl) {
   // Still only a pre-flight guard, not proof: it establishes the file parses and
   // carries us, never that Node will verify a given leaf with it. Only a
   // handshake shows that, and the launcher does not perform one.
+  //
+  // This block is a top-level script, so a test cannot import it — the same
+  // decision is mirrored in test/proxy-forward-ca.test.mjs `bundleIsUsable`.
+  // Change one, change both.
   try {
     const merged = readFileSync(caTrustBundle, "utf8").replace(/\r\n/g, "\n");
     const blocks = merged.match(/-----BEGIN [^-]*-----[\s\S]*?-----END [^-]*-----/g) || [];

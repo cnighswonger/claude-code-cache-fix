@@ -386,8 +386,14 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
     // publish path must replace it rather than take the byte-compare skip.
     const STALE = "-----BEGIN CERTIFICATE-----\nc3RhbGUtcHVibGlzaGVk\n-----END CERTIFICATE-----\n";
     writeFileSync(dst, STALE);
-    // The concurrent reader, opened BEFORE the publish and deliberately not read
-    // until after it.
+    // The load-bearing observer: a descriptor held across the publish. Measured,
+    // and counter-intuitive enough to be worth stating — the 1 ms sampler below
+    // CANNOT see the O_TRUNC window for a ~1.2 KB write (100 samples over a
+    // truncate+write saw only the complete file, never length 0). Only this
+    // descriptor catches it, because O_TRUNC destroys the bytes under an existing
+    // reader while rename leaves that inode intact. Deleting these two assertions
+    // as "duplicated by the sampler" was tried and silently dropped O_TRUNC
+    // detection entirely.
     const readerFd = openSync(dst, "r");
     const inodeBefore = fstatSync(readerFd).ino;
     // A builder does not hold a descriptor open across our publish — it opens
@@ -395,10 +401,9 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
     // actually protects it is that the NAME never resolves to anything but a
     // complete file. Sample it as fast as the runtime allows for the whole
     // launch: with rename the name is always the old or the new file; with
-    // O_TRUNC it is briefly zero-length, and with unlink-then-write it briefly
-    // does not exist at all. (Holding a descriptor is NOT sufficient to tell
-    // these apart — POSIX keeps an unlinked inode alive for an open fd, so the
-    // fd-based assertion below passes even for unlink+write.)
+    // O_TRUNC or unlink-then-write it is briefly zero-length or absent. In
+    // practice this catches a SLOW bad write, not a fast one (see the note
+    // above) — it is the cheap wide net, the descriptor is the precise one.
     const observations = [];
     const sampler = setInterval(() => {
       try { observations.push(readFileSync(dst, "utf8")); }
@@ -441,20 +446,13 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
       `of ${observations.length}: ${JSON.stringify(bad.slice(0, 3))}`,
     );
     assert.ok(observations.length > 0, "sampler must have observed the file at least once");
-    // Secondary: the pre-existing reader still sees complete old content. True
-    // for rename AND for unlink (POSIX keeps an unlinked inode alive for an open
-    // fd), so this alone does not prove atomicity — it is here to document that
-    // an in-place O_TRUNC rewrite would corrupt a reader mid-read.
+    // O_TRUNC destroys the bytes under this reader; rename does not. This is the
+    // assertion that actually catches a truncating in-place write.
     const viaOldFd = readFileSync(readerFd, "utf8");
     closeSync(readerFd);
-    assert.equal(
-      viaOldFd, STALE,
-      "a reader holding the pre-publish descriptor must still see the COMPLETE old pem — " +
-      "an in-place rewrite would have truncated or orphaned it mid-read",
-    );
-    // ...and the directory entry now points at a DIFFERENT inode, which is what
-    // "swapped in" means. Same inode would mean it was rewritten under the reader.
-    assert.notEqual(statSync(dst).ino, inodeBefore, "publish must swap a new inode into place, not rewrite the old one");
+    assert.equal(viaOldFd, STALE,
+      "a reader holding the pre-publish descriptor must still see the COMPLETE old pem");
+    assert.notEqual(statSync(dst).ino, inodeBefore, "publish must swap a new inode into place");
     const pem = readFileSync(dst, "utf8");
     assert.notEqual(pem, STALE, "publish must actually replace the stale pem");
     assert.equal(pem, readFileSync(join(configDir, "cache-fix-ca", "ca.pem"), "utf8"), "published pem must be our CA verbatim");
