@@ -99,6 +99,45 @@ claude() {
 }
 ```
 
+#### Coexisting with another MITM on the same machine (`ca-trust.d`)
+
+`NODE_EXTRA_CA_CERTS` takes exactly **one** file. If anything else on the host
+also MITMs `api.anthropic.com` and also sets that variable — a corporate agent,
+an account-switching pin proxy — the last writer wins and every other CA is
+silently untrusted. Measured 2026-07-30: two such components on one machine took
+turns breaking each other's TLS, with no error attributable to either.
+
+So `--remote-control` does not simply assign the variable. It:
+
+1. **Publishes** our CA to `<config>/ca-trust.d/ccf.pem` — our own filename only,
+   never a sibling's, rewritten every launch (the proxy regenerates its CA
+   whenever the CA dir is wiped, and a stale pem advertises a key nothing signs
+   with), skipped when the bytes already match, and written via temp + `rename`
+   so a reader never sees a half-written file.
+2. **Reads** `<config>/ca-trust.pem` — a merged bundle built by exactly one
+   external writer from the ambient/corporate roots plus every published
+   `ca-trust.d/*.pem` — and points `NODE_EXTRA_CA_CERTS` at it.
+
+`<config>` is `CLAUDE_CONFIG_DIR` or `~/.claude`. **We never write the merged
+bundle**: merging requires finding the ambient corporate roots, which is
+environment-specific (a Linux host may keep them outside the bundle a shell
+points at; a Mac keeps them in the keychain), and two components both rebuilding
+it would race one output.
+
+The bundle is used only if it is intact (balanced `BEGIN`/`END` markers) **and**
+carries our own CA. A bundle failing either check is worse than no bundle — it
+would make the client distrust the very proxy it is being routed through, so
+every request fails TLS rather than merely losing some other component's CA. In
+that case, and when no bundle exists at all, the launcher falls back to our own
+CA and behaves exactly as it did before any of this existed. **A host with no
+other MITM and no bundle builder sees no change.**
+
+Note the limit of what a consumer can check: intact, and carries my CA. Whether
+the bundle is *complete* — that no corporate root went missing — is the
+builder's guarantee, not something a reader can verify, because a reader has no
+previous state to compare against and a legitimately small bundle is
+indistinguishable from a narrowed one.
+
 #### `CACHE_FIX_DOWNLOAD_REWRITE` breaks `claude update` — leave it off
 
 `CACHE_FIX_DOWNLOAD_REWRITE=on` reads like a pure performance knob. It is not:
