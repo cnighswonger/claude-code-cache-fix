@@ -101,6 +101,55 @@ transform pipeline sitting in front of `api.anthropic.com`.
   unit / integration tests alone can't prove behavior under real
   traffic.
 
+## Evidence Class (every finding, every reviewer)
+
+The global baseline asks you to distinguish what is **confirmed correct**
+from what is **assumed or hypothesized**. That is a disposition, and a
+disposition is self-assessed: a reviewer who read a code path and found
+it plausible will file it honestly under "confirmed."
+
+So state *how* you know, not just that you know. Tag every finding —
+blocking or not — with one of three classes:
+
+- **Measured** — you ran something. Name the command and paste the
+  result. `node --test test/proxy-read-dedupe.test.mjs` →
+  `actual: 'insertion-normalization', expected: 'cache-control-normalize'`.
+- **Read** — you read the code. Cite `file:line`, and say plainly that
+  it is a code read. Reading proves a path *exists*, not what it does on
+  real traffic.
+- **Reported** — the author's claim, or another agent's. Name the source
+  and say you did not reproduce it. Never restate it as fact.
+
+**The hard rule:** a load-bearing claim from a PR body may not be
+repeated as fact in a review without independent measurement. If you
+cannot measure it, mark it *Reported* and say what would settle it.
+
+This binds every reviewer — Codex, the implementation agent's own
+maintainer comments, and any third model added later. A finding relayed
+without its class is not usable by the next reader.
+
+### Why this rule exists
+
+On PR #270 the reviewer **endorsed** a claim about agent-id availability
+that measurement later destroyed. Measured 2026-06 during that review:
+the canonical header was present on 38 of 121,685 requests (0.03%), and
+0 of 176,344 usage rows were populated. Re-measured 2026-07-31 against a
+now-larger log: still **0 of 184,976**. The claim was plausible, the code
+path existed, and a second model family agreed with it. Cross-family
+review did not catch it. One query did.
+
+Two consequences worth internalizing:
+
+- **A reviewer agreeing is not verification.** Correlated plausibility
+  is what agreement measures.
+- **Measurement is usually cheap.** The two queries that settled #270's
+  design were one command each; run on day one they would have prevented
+  most of five review rounds.
+
+When several reviewers are on one PR, the classes are what make their
+findings cheap to reconcile — *Measured* from one and *Read* from
+another on the same point is a signal, not a contradiction.
+
 ## Anti-Bloat Lens (no-directive PRs)
 
 The global baseline's bloat bar is *"larger than the directive's
