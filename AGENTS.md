@@ -19,11 +19,32 @@ cache-fix-specific context.
 This repo uses **`docs/code-reviews/`** (not `docs/reviews/` — older
 convention retained for continuity). Commit review documents there:
 
-- **PR review** → on the PR branch as
+- **PR review, PR branch owned by this org** → on the PR branch as
   `docs/code-reviews/pr-<N>-round-<R>-codex.md`
+- **PR review, PR from a contributor's fork** → **do not push anything to
+  the fork.** See below.
 - **Issue / directive review** → on a review branch (or the directive's
   branch if one exists) as
   `docs/code-reviews/issue-<N>-round-<R>-codex.md`
+
+### Never write to a contributor's fork
+
+When the PR head is a fork you do not own, the review artifact does **not**
+get committed anywhere. Post the review body in the formal `gh pr review`
+and stop there — that is the artifact.
+
+`maintainerCanModify: true` makes pushing mechanically possible on most
+community PRs. It is not permission. A contributor's branch is theirs; a
+push you make to it rewrites history they may have local work on, and it
+puts our internal review notes into their PR's file diff where they do not
+belong.
+
+There is also a mechanical cost: this repo dismisses stale reviews on push,
+so a review-doc commit **dismisses the very approval it documents**, and
+any `approved-by-*` label instantly goes stale against the new head.
+
+Check before writing: if `gh pr view <N> --json headRepositoryOwner` is not
+this org, no commit.
 
 ## What cache-fix Is
 
