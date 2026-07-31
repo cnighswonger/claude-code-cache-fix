@@ -101,6 +101,74 @@ transform pipeline sitting in front of `api.anthropic.com`.
   unit / integration tests alone can't prove behavior under real
   traffic.
 
+## Anti-Bloat Lens (no-directive PRs)
+
+The global baseline's bloat bar is *"larger than the directive's
+requirements justify."* **Community PRs have no directive**, so that bar
+has nothing to anchor to and the finding defaults to "None" — including
+on a PR adding thousands of lines. Measured 2026-07-31 across eight open
+community PRs: every review reported `Bloat: None`, one of them on 6,630
+lines of new production code.
+
+For a PR with no directive, anchor to **the defect it claims to fix**
+instead. Ask: *what is the smallest change that fixes the stated
+problem, and how much larger is this?*
+
+Report these numbers in the review, always, even when the verdict is
+"proportionate" — a stated number is checkable, "None" is not:
+
+- **production LOC** (excluding `test/`), and **test:production ratio**
+- **new files, new exports, new env vars, new on-disk paths**
+- **comment:code ratio** on the production diff
+
+Calibration from merged work in this repo. These are all *proportionate*
+— use them as the reference for what normal looks like:
+
+| PR | prod LOC | test:prod | shape |
+|---|---|---|---|
+| #274 header propagation | 7 code + 19 comment | 23x | a wire-path defect fix |
+| #277 supervised stop | 9 code + 10 comment | 9.0x | one branch + a watchdog |
+| #261 absolute-form | 23 code + 31 comment | 8.4x | one parser + 3 call sites |
+
+Two things that table shows, both deliberate:
+
+- **A high test:prod ratio is a good sign, not bloat.** Do not flag it.
+- **Comment lines exceeding code lines is normal here** and is not
+  bloat when the comment explains *why* — every one of the above
+  records a defect's mechanism or a non-obvious constraint. Flag
+  comments that restate the code, not comments that carry history.
+
+Raise a **blocking** finding when any of these hold:
+
+- Production LOC is **an order of magnitude** beyond what the stated
+  defect requires, and the excess is not itself explained in the PR.
+- New **abstraction** with fewer than ~3 call sites and no concrete
+  near-term reuse case — default is to inline.
+- **Dead code**: an export, branch, or option with no call site. Verify
+  by grepping `origin/main` *after* the merge base, not a local branch —
+  a stale checkout produces false "unused" findings.
+- **Defensive handling for cases that cannot occur** given the
+  surrounding code's invariants.
+- New **env var / on-disk path / config key** that is not required by
+  the fix. Each one is permanent surface area.
+
+Do **not** flag: test volume, fixtures, comment density explaining
+mechanism, or complexity you cannot show is safe to remove. Per the
+global rule, never assert a simplification is behavior-preserving when
+you have not verified it — say you could not verify instead.
+
+### Missing Non-Functional Requirements
+
+A community PR over roughly **300 production LOC** should carry a
+`## Non-Functional Requirements` section (same checklist as a
+directive), including the required **Load-bearing?** yes/no. If it is
+absent, say so as an attention item and ask for it — do not block on it
+alone, and do not treat its absence as licence to skip the size
+question. Independently assess load-bearing status yourself: an author's
+"no" on something touching a wire contract, shared abstraction, or
+security-relevant path is a blocking finding, because that
+classification decides whether a human reviews before merge.
+
 ## Repo-Specific Labels
 
 In addition to the global review-outcome labels (`reviewed-by-codex-agent`,
