@@ -76,9 +76,21 @@ export function bundleCarriesOurCA(text, ourCaPem) {
     // Bounded by the NEXT marker, not by a search to end-of-file. An unbounded
     // indexOf lets a torn block borrow the END line of a later one, so the
     // unterminated check never fires and the slice spans two entries.
+    // The END marker must also END ITS LINE, bar trailing whitespace. indexOf
+    // alone ignored whatever followed it, so `-----END CERTIFICATE-----garbage`
+    // and `-----END CERTIFICATE-------` both read as terminators here while
+    // openssl rejected the block and node loaded zero CAs — measured, both as
+    // false accepts on an otherwise healthy bundle. Whitespace is fine (13/13
+    // agreement with a real handshake on what may follow), anything else is not.
     const endMarker = `\n-----END ${label}-----`;
     const nextBegin = text.indexOf("\n-----BEGIN ", m.index + 1);
-    let end = text.indexOf(endMarker, m.index);
+    let end = -1;
+    for (let at = text.indexOf(endMarker, m.index); at !== -1;
+         at = text.indexOf(endMarker, at + 1)) {
+      const lineEnd = text.indexOf("\n", at + 1);
+      const tail = text.slice(at + endMarker.length, lineEnd === -1 ? undefined : lineEnd);
+      if (/^[ \t\r]*$/.test(tail)) { end = at; break; }
+    }
     if (end !== -1 && nextBegin !== -1 && end > nextBegin) end = -1;
     // Unterminated, or closed by a different label. Fatal whatever the label
     // is, and deliberately not analyzed further: openssl's base64 decoder

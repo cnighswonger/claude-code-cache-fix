@@ -403,6 +403,13 @@ test("ca-trust: the bundle guard never accepts a bundle NODE_EXTRA_CA_CERTS cann
       // to end-of-file let the torn block borrow it, so the unterminated check
       // never fired and the slice spanned two entries.
       ["torn block borrowing a later END", `-----BEGIN CERTIFICATE-----\n${body}\n${other}${ours}`, false],
+      // The END marker must end its own line. `indexOf` alone ignored whatever
+      // followed it, so a block openssl rejects read as terminated here — both
+      // of these were measured as false accepts on an otherwise healthy bundle.
+      ["END marker with trailing garbage", ours.replace("-----END CERTIFICATE-----", "-----END CERTIFICATE-----garbage"), false],
+      ["END marker with extra dashes", ours.replace("-----END CERTIFICATE-----", "-----END CERTIFICATE-------"), false],
+      // ...but trailing whitespace is fine, and must stay fine: node loads it.
+      ["END marker with a trailing space", ours.replace("-----END CERTIFICATE-----", "-----END CERTIFICATE----- "), true],
       // Real cert, just not ours: the stale-builder case.
       ["stale: a real cert that is not ours", other, false],
       ["empty bundle", "", false],
