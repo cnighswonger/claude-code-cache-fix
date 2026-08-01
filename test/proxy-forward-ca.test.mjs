@@ -385,6 +385,24 @@ test("ca-trust: the bundle guard never accepts a bundle NODE_EXTRA_CA_CERTS cann
       // CA loader skips any block not labelled exactly CERTIFICATE, leaving the
       // session trusting nothing and failing every request.
       ["our CA relabelled TRUSTED CERTIFICATE", ours.replaceAll("CERTIFICATE-----", "TRUSTED CERTIFICATE-----"), false],
+      // A CORRUPT non-certificate block. The "node ignores non-cert blocks"
+      // rule holds only for well-formed ones — node's reader aborts the whole
+      // extras load on any block it cannot decode, whatever the label. Skipping
+      // every non-CERTIFICATE block outright waved these through: measured,
+      // guard=accept while the handshake failed UNABLE_TO_VERIFY_LEAF_SIGNATURE.
+      ["corrupt PUBLIC KEY ahead", `-----BEGIN PUBLIC KEY-----\n!!!not base64!!!\n-----END PUBLIC KEY-----\n${ours}`, false],
+      ["corrupt X509 CRL ahead", `-----BEGIN X509 CRL-----\n!!!not base64!!!\n-----END X509 CRL-----\n${ours}`, false],
+      // ...but a WELL-FORMED one must still be accepted, or the fix above turns
+      // into the over-strict guard this PR set out to remove.
+      ["valid PUBLIC KEY ahead", `${pubKeyPem(ourCa)}${ours}`, true],
+      // A trailing space on the marker line. openssl still reacts to it, so a
+      // `$`-anchored pattern made the block invisible to us while node still
+      // tried to load it — the corrupt block then rode through unseen.
+      ["corrupt block, BEGIN has a trailing space", `-----BEGIN CERTIFICATE----- \n!!!not base64!!!\n-----END CERTIFICATE-----\n${ours}`, false],
+      // An unterminated block whose END line belongs to a LATER entry. Searching
+      // to end-of-file let the torn block borrow it, so the unterminated check
+      // never fired and the slice spanned two entries.
+      ["torn block borrowing a later END", `-----BEGIN CERTIFICATE-----\n${body}\n${other}${ours}`, false],
       // Real cert, just not ours: the stale-builder case.
       ["stale: a real cert that is not ours", other, false],
       ["empty bundle", "", false],

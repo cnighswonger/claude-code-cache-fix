@@ -322,6 +322,14 @@ if (remoteControl) {
     new X509Certificate(ourCa);
   } catch (e) {
     ourCa = null;
+    // And do NOT hand claude the file that just failed to parse. Node reads
+    // NODE_EXTRA_CA_CERTS once at startup and warns-and-continues on a bad one,
+    // so pointing at it buys nothing and costs the ambient roots nothing either
+    // way — but naming it implies it is a CA we vouch for. Leaving the variable
+    // unset falls back to node's built-in store, which is the honest state: we
+    // have no usable CA to add. The proxy will have failed to attach its MITM
+    // for the same reason, so the session needs the ambient roots, not ours.
+    caForClaude = null;
     process.stderr.write(
       `cache-fix: our own CA at ${caPem} does not parse (${e.message}); ` +
         `remove ${caDir} and relaunch to regenerate it\n`,
@@ -351,7 +359,8 @@ if (remoteControl) {
       }
     }
   }
-  claudeEnv.NODE_EXTRA_CA_CERTS = caForClaude;
+  if (caForClaude) claudeEnv.NODE_EXTRA_CA_CERTS = caForClaude;
+  else delete claudeEnv.NODE_EXTRA_CA_CERTS;
   // Exclude localhost from the proxy. Without this, HTTPS_PROXY routes EVERY
   // connection claude makes — including to local services like HTTP/SSE-transport
   // MCP servers (e.g. an MCP on 127.0.0.1) — at the cache-fix proxy, which only

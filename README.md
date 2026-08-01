@@ -226,18 +226,27 @@ The check mirrors what Node's `NODE_EXTRA_CA_CERTS` loader does, which is
 narrower than "is this valid PEM" in one direction and wider in another, and both
 were measured against a real handshake rather than read off the spec:
 
-- **Non-certificate blocks are ignored, not fatal.** A merged bundle legitimately
-  carries CRLs, public keys and key material next to the roots; Node skips them
-  and verifies fine. Parsing every block as a certificate rejected those bundles
-  outright, and rejecting is not the safe direction here — it drops every sibling
-  and corporate CA for the whole session.
+- **Well-formed non-certificate blocks are ignored, not fatal.** A merged bundle
+  legitimately carries CRLs, public keys and key material next to the roots; Node
+  skips them and verifies fine. Parsing every block as a certificate rejected
+  those bundles outright, and rejecting is not the safe direction here — it drops
+  every sibling and corporate CA for the whole session. A *damaged* one is a
+  different matter: Node aborts the whole load on any block it cannot decode,
+  whatever the label, so every block must decode even though only certificates
+  are compared.
 - **The `CERTIFICATE` label is load-bearing.** Our own CA relabelled
   `TRUSTED CERTIFICATE` parses to byte-identical DER, so a label-blind comparison
   reports "carries us" — while Node's loader skips the block entirely and the
   session then fails every request. A DER match on a non-`CERTIFICATE` block does
   not count.
-- **Markers are line-anchored.** A provenance header that merely mentions
-  `-----BEGIN ` is prose, not a block.
+- **Markers are line-anchored, but tolerate trailing whitespace.** A provenance
+  header that merely mentions `-----BEGIN ` is prose, not a block. A real marker
+  wearing a trailing space still is one — openssl reacts to it, so a strict
+  end-of-line anchor would hide that block from the guard while Node still tried
+  to load it.
+- **Each block ends at its own `END`.** The terminator is searched for only up to
+  the next `BEGIN`, so an unterminated entry cannot borrow the `END` line of a
+  later one and pass as intact.
 
 Where the guard cannot tell (a block damaged *after* ours, whose truncated body
 may or may not still decode) it refuses. Refusing costs the other components'

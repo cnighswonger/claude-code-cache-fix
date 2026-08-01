@@ -577,6 +577,25 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
       `a healthy bundle must not be blamed for our own CA failing to parse; stderr: ${err}`);
   });
 
+  it("--remote-control does not hand claude a ca.pem that failed to parse", async () => {
+    // Naming the broken file in the warning was only half the fix. caForClaude
+    // still defaulted to it, so the session was wired to a PEM we had just
+    // proven unreadable — the message was right and the behavior was unchanged.
+    // Unset is the honest state: we have no usable CA to add, so node falls back
+    // to its built-in store rather than to a file we vouch for and cannot read.
+    const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
+    const caDir = mkdtempSync(join(tmpdir(), "cffca-"));
+    // ca.key beside it, or the proxy regenerates and the state is unreachable.
+    writeFileSync(join(caDir, "ca.key"), "-----BEGIN PRIVATE KEY-----\nplaceholder\n-----END PRIVATE KEY-----\n");
+    writeFileSync(join(caDir, "ca.pem"), "-----BEGIN CERTIFICATE-----\ntruncated\n");
+
+    const script = 'process.stdout.write("CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")+"\\n")';
+    const { out } = await runWrapper(script, { CLAUDE_CONFIG_DIR: configDir, CACHE_FIX_CA_DIR: caDir });
+
+    assert.match(out, /CA=UNSET/,
+      `claude must not be pointed at an unparseable CA; got: ${out.trim()}`);
+  });
+
   it("--remote-control ignores a merged bundle that does NOT contain our own CA", async () => {
     // The dangerous case, and worse than falling back: the bundle exists and is
     // non-empty, so a size-only gate accepts it — but it was built BEFORE we
