@@ -391,6 +391,13 @@ test("ca-trust: the bundle guard never accepts a bundle NODE_EXTRA_CA_CERTS cann
       // every non-CERTIFICATE block outright waved these through: measured,
       // guard=accept while the handshake failed UNABLE_TO_VERIFY_LEAF_SIGNATURE.
       ["corrupt PUBLIC KEY ahead", `-----BEGIN PUBLIC KEY-----\n!!!not base64!!!\n-----END PUBLIC KEY-----\n${ours}`, false],
+      // Alphabet-valid but not whole 4-char quanta. Every character is legal
+      // base64, so an alphabet-only test called this decodable — measured, node
+      // reported `bad base64 decode` and loaded zero extra CAs. Without this row
+      // the length check can be deleted with the suite still green.
+      ["PUBLIC KEY body of one char", `-----BEGIN PUBLIC KEY-----\nA\n-----END PUBLIC KEY-----\n${ours}`, false],
+      // Padding is positional, not merely present: `AAA=` loads, `A===` does not.
+      ["PUBLIC KEY body with misplaced padding", `-----BEGIN PUBLIC KEY-----\nA===\n-----END PUBLIC KEY-----\n${ours}`, false],
       ["corrupt X509 CRL ahead", `-----BEGIN X509 CRL-----\n!!!not base64!!!\n-----END X509 CRL-----\n${ours}`, false],
       // ...but a WELL-FORMED one must still be accepted, or the fix above turns
       // into the over-strict guard this PR set out to remove.

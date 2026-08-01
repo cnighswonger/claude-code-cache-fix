@@ -133,11 +133,13 @@ if (proxyUpstream) proxyEnv.CACHE_FIX_PROXY_UPSTREAM = proxyUpstream;
 // Forward-proxy mode: the spawned proxy must attach the CONNECT/MITM handler,
 // or the HTTPS_PROXY wiring below would tunnel to a proxy that only speaks
 // reverse-proxy and never terminates TLS for the upstream host.
-if (remoteControl) proxyEnv.CACHE_FIX_FORWARD_PROXY = "on";
-// Tell the proxy we will wire claude ourselves, so it does not print a recipe
-// that would undo that. Internal handshake between these two files, deliberately
-// not documented as an operator knob — see the banner in proxy/server.mjs.
-if (remoteControl) proxyEnv.CACHE_FIX_WIRED_BY_LAUNCHER = "1";
+if (remoteControl) {
+  proxyEnv.CACHE_FIX_FORWARD_PROXY = "on";
+  // ...and tell it we will wire claude ourselves, so it does not print a recipe
+  // that would undo that. Internal handshake between these two files,
+  // deliberately not an operator knob — see the banner in proxy/server.mjs.
+  proxyEnv.CACHE_FIX_WIRED_BY_LAUNCHER = "1";
+}
 
 const proxyProc = fork(SERVER_PATH, [], {
   stdio: ["ignore", "pipe", "pipe", "ipc"],

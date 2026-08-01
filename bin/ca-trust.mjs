@@ -15,13 +15,9 @@ import { X509Certificate } from "node:crypto";
 // A body containing `-` reads as damaged here even though node accepts it
 // (openssl stops at the dash), which is the conservative direction and the only
 // measured disagreement.
-function isBase64Body(block, endMarker) {
-  const bodyStart = block.indexOf("\n") + 1;
-  const bodyEnd = block.lastIndexOf(endMarker);
-  if (bodyStart === 0 || bodyEnd < bodyStart) return false;
-  const body = block.slice(bodyStart, bodyEnd).replace(/\s+/g, "");
-  if (body.length === 0 || body.length % 4 !== 0) return false;
-  return /^[A-Za-z0-9+/]+={0,2}$/.test(body);
+function isBase64Body(body) {
+  const b = body.replace(/\s+/g, "");
+  return b.length > 0 && b.length % 4 === 0 && /^[A-Za-z0-9+/]+={0,2}$/.test(b);
 }
 
 // Is this merged CA bundle safe to hand claude as NODE_EXTRA_CA_CERTS?
@@ -123,7 +119,7 @@ export function bundleCarriesOurCA(text, ourCaPem) {
       try { der = new X509Certificate(block).raw; }
       catch { return { ok: false, reason: "undecodable CERTIFICATE block" }; }
       if (der.equals(ourDer)) carriesUs = true;
-    } else if (!isBase64Body(block, endMarker)) {
+    } else if (!isBase64Body(text.slice(m.index + m[0].length, end))) {
       return { ok: false, reason: `undecodable ${label} block` };
     }
   }
