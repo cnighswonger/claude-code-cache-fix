@@ -132,11 +132,26 @@ that case, and when no bundle exists at all, the launcher falls back to our own
 CA and behaves exactly as it did before any of this existed. **A host with no
 other MITM and no bundle builder sees no change.**
 
+Both paths are fixed names under `<config>`, deliberately with no env override
+of their own. They are two halves of one rendezvous: a knob on either half alone
+lets a participant publish where no builder looks, or read a file no builder
+writes, while still appearing to implement the contract. `CLAUDE_CONFIG_DIR`
+already relocates the pair, and it moves both halves together.
+
 Note the limit of what a consumer can check: intact, and carries my CA. Whether
 the bundle is *complete* — that no corporate root went missing — is the
 builder's guarantee, not something a reader can verify, because a reader has no
 previous state to compare against and a legitimately small bundle is
 indistinguishable from a narrowed one.
+
+**This is a cooperative convention among same-user processes, not a trust
+boundary.** The check proves *parses, and carries us* — never *contains only
+approved writers*. Anyone who can write `<config>` can hand us a well-formed
+bundle holding our CA plus their own and it will be accepted, exactly as they
+could already have replaced `ca-trust.d/ccf.pem`, the CA dir, or this file. The
+contract defends against components accidentally untrusting each other, which is
+the failure that actually happens; it does not defend against a local attacker,
+who has simpler routes.
 
 #### `CACHE_FIX_DOWNLOAD_REWRITE` breaks `claude update` — leave it off
 
@@ -311,7 +326,6 @@ All proxy settings are controlled via environment variables. Set them before sta
 | `CACHE_FIX_PROXY_UPSTREAM` | `https://api.anthropic.com` | Upstream URL. Change to chain another proxy (e.g. `http://localhost:8080`) |
 | `CACHE_FIX_FORWARD_PROXY` | unset | Set to `on` for forward-proxy mode (HTTP CONNECT + selective MITM of the upstream host) so the client points `HTTPS_PROXY` at the proxy instead of `ANTHROPIC_BASE_URL`, keeping Remote Control enabled. See [Forward-proxy mode](#forward-proxy-mode-keeps-remote-control-working). |
 | `CACHE_FIX_CA_DIR` | `~/.claude/cache-fix-ca` | Directory for the forward-proxy CA/leaf cert (generated once on first start). The client trusts `ca.pem` via `NODE_EXTRA_CA_CERTS`. |
-| `CACHE_FIX_CA_TRUST_DIR` | `$CLAUDE_CONFIG_DIR/ca-trust.d` | Where `--remote-control` publishes our CA as `ccf.pem` so another MITM on the same host can merge it. See [Coexisting with another MITM](#coexisting-with-another-mitm-on-the-same-machine-ca-trustd). |
 | `CACHE_FIX_PROXY_TIMEOUT` | `600000` | Request timeout in milliseconds |
 | `CACHE_FIX_EXTENSIONS_DIR` | `proxy/extensions/` | Directory for extension `.mjs` files |
 | `CACHE_FIX_EXTENSIONS_CONFIG` | `proxy/extensions.json` | Extension configuration file |

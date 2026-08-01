@@ -4,7 +4,7 @@ import { fork, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
 import { homedir } from "node:os";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { X509Certificate, randomUUID } from "node:crypto";
 import http from "node:http";
 
@@ -223,8 +223,15 @@ if (remoteControl) {
   // We write EXACTLY ONE path, ca-trust.d/ccf.pem, and never a sibling's.
   // Rewritten every launch, not once: the proxy regenerates its CA whenever
   // caDir is wiped, and a stale pem would advertise a key nothing signs with.
+  //
+  // Fixed name, no env override, for the same reason the merged bundle below has
+  // none: both halves are a rendezvous, and a knob on one half only lets this
+  // launcher publish where no builder is looking while still consuming the
+  // canonical bundle — dropping out of the contract while appearing to implement
+  // it. Relocating the pair is what CLAUDE_CONFIG_DIR already does, and it moves
+  // both sides together.
   const configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
-  const caTrustDir = process.env.CACHE_FIX_CA_TRUST_DIR || join(configDir, "ca-trust.d");
+  const caTrustDir = join(configDir, "ca-trust.d");
   try {
     mkdirSync(caTrustDir, { recursive: true });
     const ours = readFileSync(caPem);
@@ -257,8 +264,20 @@ if (remoteControl) {
     // Reap temps orphaned by a kill between the write and the rename. They do
     // not match a *.pem glob so a builder ignores them, but nothing else would
     // ever remove them.
+    //
+    // Age-gated, because a temp is indistinguishable from an orphan by name: a
+    // CONCURRENT launcher has its own ccf.pem.<pid>.<uuid> on disk in the window
+    // between its writeFileSync and its renameSync, and deleting that makes its
+    // rename throw a publish failure we caused. The window is one small write to
+    // the same directory, microseconds; a minute is four orders of magnitude of
+    // headroom and still collects the orphan on the next launch. Deleting late
+    // costs nothing — nothing reads these — while deleting early breaks a peer.
+    const orphanAgeMs = 60_000;
     for (const f of readdirSync(caTrustDir)) {
-      if (f.startsWith("ccf.pem.")) try { rmSync(join(caTrustDir, f)); } catch { /* raced */ }
+      if (!f.startsWith("ccf.pem.")) continue;
+      const p = join(caTrustDir, f);
+      try { if (Date.now() - statSync(p).mtimeMs > orphanAgeMs) rmSync(p); }
+      catch { /* raced: someone renamed or removed it first */ }
     }
   } catch (e) {
     // Non-fatal: publishing is how OTHERS trust us. This session only needs its

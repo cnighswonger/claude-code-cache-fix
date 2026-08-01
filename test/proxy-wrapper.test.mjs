@@ -4,7 +4,7 @@ import { fork } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
 import { tmpdir } from "node:os";
-import { closeSync, existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import http from "node:http";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -465,6 +465,38 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
     const ends = (pem.match(/-----END CERTIFICATE-----/g) || []).length;
     assert.equal(begins, ends, `published pem must have balanced BEGIN/END, got ${begins}/${ends}`);
     assert.ok(begins >= 1, "published pem must contain at least one certificate");
+  });
+
+  it("--remote-control reaps an old orphan temp but leaves a concurrent publisher's fresh one alone", async () => {
+    // The reaper cannot tell an orphan from a live temp by NAME — both are
+    // ccf.pem.<pid>.<uuid>. A second launcher publishing at the same moment has
+    // written its temp and not yet renamed it; deleting that makes ITS
+    // renameSync throw a publish failure we caused, and leaves whichever
+    // launcher won first on disk rather than the current publisher's bytes.
+    // Age is the only signal available: the write-to-rename window is one small
+    // write to the same directory, so anything older than the gate is genuinely
+    // abandoned and anything younger may be in flight.
+    //
+    // Both fixtures exist in the same directory across one launch, so the test
+    // fails if the reaper is unconditional (fresh one dies) OR absent (old one
+    // survives) — one launch, two opposite outcomes.
+    const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
+    const trustDir = join(configDir, "ca-trust.d");
+    mkdirSync(trustDir, { recursive: true });
+    const stale = join(trustDir, "ccf.pem.99999.aaaaaaaa-orphan");
+    const fresh = join(trustDir, "ccf.pem.99998.bbbbbbbb-inflight");
+    writeFileSync(stale, "# abandoned by a kill between write and rename\n");
+    writeFileSync(fresh, "# a concurrent launcher's temp, not yet renamed\n");
+    // Backdate past the gate. Real time cannot be used — the gate is a minute and
+    // a test may not sleep for one.
+    const longAgo = new Date(Date.now() - 3600_000);
+    utimesSync(stale, longAgo, longAgo);
+
+    const { code, err } = await runWrapper('process.stdout.write("OK\\n")', { CLAUDE_CONFIG_DIR: configDir });
+    assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${err}`);
+
+    assert.ok(!existsSync(stale), "a temp older than the gate is abandoned and must be reaped");
+    assert.ok(existsSync(fresh), "a temp younger than the gate may belong to a live publisher and must survive");
   });
 
   it("--remote-control ignores a merged bundle that does NOT contain our own CA", async () => {
