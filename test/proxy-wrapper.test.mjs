@@ -598,6 +598,49 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
       `a healthy bundle must not be blamed for our own CA failing to parse; stderr: ${err}`);
   });
 
+  it("--remote-control does not publish a ca.pem that failed to parse", async () => {
+    // Blaming the right file and not consuming it (the two tests above) covered
+    // what THIS session does with a corrupt ca.pem. It still published those
+    // bytes: the copy into ca-trust.d/ccf.pem happens before the X509 parse, so
+    // an unparseable CA was handed to every OTHER component on the machine.
+    //
+    // That is the worse half. Our own session degrades to node's built-in store
+    // and keeps working; the bundle builder concatenates sort(*.pem) and "ccf"
+    // sorts first, so a corrupt entry in the leading position aborts node's
+    // whole extras load for every sibling — measured on this box, a fused
+    // bundle loads 0 extra CAs and warns `bad base64 decode`. One broken file
+    // here costs every other component its CA, and its corporate roots with it.
+    //
+    // Publishing nothing is the honest state, and it is strictly better than
+    // publishing garbage: a builder that finds no ccf.pem simply builds a bundle
+    // without us, which our own guard then rejects (it does not carry our CA)
+    // and we fall back to our own — exactly the no-builder path that already
+    // works. Any PREVIOUS good ccf.pem must survive, because it is what siblings
+    // are currently trusting and a stale-but-valid CA beats none.
+    const configDir = tempDir("cfftrust-");
+    const caDir = tempDir("cffca-");
+    // Same reuse-guard reasoning as the blame test above: the key must be
+    // present or the proxy regenerates a healthy ca.pem and this exercises
+    // nothing.
+    writeFileSync(join(caDir, "ca.key"), "-----BEGIN PRIVATE KEY-----\nplaceholder\n-----END PRIVATE KEY-----\n");
+    writeFileSync(join(caDir, "ca.pem"), "-----BEGIN CERTIFICATE-----\ntruncated\n");
+    // A previously-published, well-formed entry. Whatever we do with the corrupt
+    // one, this must still be here afterwards.
+    const trustDir = join(configDir, "ca-trust.d");
+    mkdirSync(trustDir, { recursive: true });
+    const priorGood = "-----BEGIN CERTIFICATE-----\ncHJldmlvdXNseS1wdWJsaXNoZWQtb3Vycw==\n-----END CERTIFICATE-----\n";
+    writeFileSync(join(trustDir, "ccf.pem"), priorGood);
+
+    await runWrapper('process.stdout.write("OK\\n")',
+      { CLAUDE_CONFIG_DIR: configDir, CACHE_FIX_CA_DIR: caDir });
+
+    const published = readFileSync(join(trustDir, "ccf.pem"), "utf8");
+    assert.doesNotMatch(published, /truncated/,
+      "the unparseable ca.pem must never reach ca-trust.d — it voids every sibling's CA");
+    assert.equal(published, priorGood,
+      "the last known-good published CA must survive a corrupt ca.pem");
+  });
+
   it("--remote-control does not hand claude a ca.pem that failed to parse", async () => {
     // Naming the broken file in the warning was only half the fix. caForClaude
     // still defaulted to it, so the session was wired to a PEM we had just

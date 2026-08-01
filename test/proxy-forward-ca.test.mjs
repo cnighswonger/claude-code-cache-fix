@@ -399,6 +399,25 @@ test("ca-trust: the bundle guard never accepts a bundle NODE_EXTRA_CA_CERTS cann
       // Padding is positional, not merely present: `AAA=` loads, `A===` does not.
       ["PUBLIC KEY body with misplaced padding", `-----BEGIN PUBLIC KEY-----\nA===\n-----END PUBLIC KEY-----\n${ours}`, false],
       ["corrupt X509 CRL ahead", `-----BEGIN X509 CRL-----\n!!!not base64!!!\n-----END X509 CRL-----\n${ours}`, false],
+      // Whitespace inside a body is stripped before the alphabet test, and WHICH
+      // whitespace decides the verdict. JavaScript's `\s` covers the Unicode set;
+      // node's PEM reader accepts only ASCII space, tab, CR and LF. Measured, one
+      // character at a time, against a real NODE_EXTRA_CA_CERTS load:
+      //
+      //   space, tab, CR, LF                                    -> loads 1
+      //   U+00A0 U+2003 U+2028 U+2029 U+FEFF U+1680 U+205F      -> loads 0
+      //   U+3000, and ASCII VTAB (\x0b) and FORMFEED (\x0c)     -> loads 0
+      //
+      // Every one of those ten is stripped by `\s`, so stripping with `\s` makes
+      // the guard read a damaged body as clean. A NBSP is what a paste through a
+      // rich-text field leaves behind, which is exactly how a bundle acquires one.
+      ["PUBLIC KEY body with U+00A0", `-----BEGIN PUBLIC KEY-----\nMFkw EwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE\n-----END PUBLIC KEY-----\n${ours}`, false],
+      ["PUBLIC KEY body with a vertical tab", `-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE\n-----END PUBLIC KEY-----\n${ours}`, false],
+      ["our CA with U+2028 in its body", ours.replace(/\n/, "\n "), false],
+      // ...and the other direction, or the fix above becomes an over-strict guard
+      // that drops the sibling CAs this PR exists to keep. A tab and a bare CR
+      // inside a body are both loader-legal.
+      ["PUBLIC KEY body with a tab", `-----BEGIN PUBLIC KEY-----\nMFkw\tEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE\n-----END PUBLIC KEY-----\n${ours}`, true],
       // ...but a WELL-FORMED one must still be accepted, or the fix above turns
       // into the over-strict guard this PR set out to remove.
       ["valid PUBLIC KEY ahead", `${pubKeyPem(ourCa)}${ours}`, true],

@@ -15,8 +15,14 @@ import { X509Certificate } from "node:crypto";
 // A body containing `-` reads as damaged here even though node accepts it
 // (openssl stops at the dash), which is the conservative direction and the only
 // measured disagreement.
+//
+// Whitespace is stripped as `[ \t\r\n]`, NOT `\s`: node's reader accepts those
+// four, and rejects every other character `\s` covers. Measured one at a time —
+// U+00A0 U+2003 U+2028 U+2029 U+FEFF U+1680 U+205F U+3000 and ASCII VTAB and
+// FORMFEED each load 0 with `bad base64 decode`. Stripping them read a damaged
+// body as clean, and a NBSP is what a paste through a rich-text field leaves.
 function isBase64Body(body) {
-  const b = body.replace(/\s+/g, "");
+  const b = body.replace(/[ \t\r\n]+/g, "");
   return b.length > 0 && b.length % 4 === 0 && /^[A-Za-z0-9+/]+={0,2}$/.test(b);
 }
 

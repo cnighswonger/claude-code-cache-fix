@@ -242,6 +242,15 @@ if (remoteControl) {
   try {
     mkdirSync(caTrustDir, { recursive: true });
     const ours = readFileSync(caPem);
+    // Parse BEFORE publishing. Validating later (we do, at the own-CA step
+    // below) still handed a corrupt ca.pem to every OTHER component: "ccf" sorts
+    // first in the builder's sort(*.pem), so a bad entry lands in the same fatal
+    // leading position the torn-write guard above protects — measured, such a
+    // bundle loads 0 extra CAs and warns `bad base64 decode`. Atomicity
+    // guarantees whole bytes, never loadable ones. Throwing lands in the catch
+    // below, leaving any previous good ccf.pem in place for siblings to keep
+    // trusting.
+    new X509Certificate(ours);
     const dst = join(caTrustDir, "ccf.pem");
     // Byte-compare skip so a bundle builder keying on mtime is not woken by a
     // launch that changed nothing.
