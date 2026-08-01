@@ -614,20 +614,20 @@ export async function startProxy(options = {}) {
 
   const addr = server.address();
   if (forwardProxyCA) {
-    // The caveat is part of the recipe, not a footnote: NODE_EXTRA_CA_CERTS
-    // takes exactly one file, so an operator who follows these two lines on a
-    // host where something else also MITMs api.anthropic.com silently untrusts
-    // that component. --remote-control exists precisely to avoid that, and the
-    // launcher filters this recipe out of its relayed stderr since it has
-    // already wired the client via ca-trust.d.
-    process.stderr.write(
-      "[cache-fix] forward-proxy: on. Wire the client (leave ANTHROPIC_BASE_URL UNSET so Remote Control stays enabled):\n" +
-      `  export HTTPS_PROXY=http://${addr.address}:${addr.port}\n` +
-      `  export NODE_EXTRA_CA_CERTS=${forwardProxyCA}\n` +
-      "  (if anything else on this host also MITMs api.anthropic.com, use\n" +
-      "   `claude-via-proxy --remote-control` instead — that variable takes\n" +
-      "   one file, so setting it here would untrust the other CA)\n",
-    );
+    const wiredByLauncher = process.channel !== undefined;
+    // Only when the operator is the one wiring. process.channel is set exactly
+    // when our launcher fork()ed us, and it has already wired claude via
+    // ca-trust.d — printing `export NODE_EXTRA_CA_CERTS=<our ca.pem>` into its
+    // relayed stderr tells the operator to undo that: the variable takes one
+    // file, so pinning it to our CA alone untrusts every other MITM on the host.
+    process.stderr.write(wiredByLauncher
+      ? "[cache-fix] forward-proxy: on. Client wired by the launcher (ca-trust.d).\n"
+      : "[cache-fix] forward-proxy: on. Wire the client (leave ANTHROPIC_BASE_URL UNSET so Remote Control stays enabled):\n" +
+        `  export HTTPS_PROXY=http://${addr.address}:${addr.port}\n` +
+        `  export NODE_EXTRA_CA_CERTS=${forwardProxyCA}\n` +
+        "  (if anything else on this host also MITMs api.anthropic.com, use\n" +
+        "   `claude-via-proxy --remote-control` instead — that variable takes\n" +
+        "   one file, so setting it here would untrust the other CA)\n");
   }
   let closed = false;
   return {

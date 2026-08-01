@@ -18,14 +18,18 @@ import { X509Certificate } from "node:crypto";
 //
 // It stays a pre-flight guard, never proof: it establishes the file parses and
 // carries us, never that node will verify a given leaf with it.
-export function bundleCarriesOurCA(merged, ourCaPem) {
-  const text = merged.replace(/\r\n/g, "\n");
+export function bundleCarriesOurCA(text, ourCaPem) {
   const ourDer = new X509Certificate(ourCaPem).raw;
   // Line-anchored. openssl only honours a marker that begins a line, so a
   // marker quoted inside prose is not a block. The previous count-based check
   // read the raw file and rejected any bundle whose provenance header happened
   // to name the marker — measured: `# see -----BEGIN CERTIFICATE-----` ahead of
   // a healthy CA was refused while node authorized the same bytes.
+  //
+  // No CRLF normalization: `$` in a /m regex matches before a `\r`, and the END
+  // search below is anchored on the leading `\n`, so both halves already read a
+  // CRLF file the same as an LF one. Measured across 102 shapes (34 bundle
+  // layouts x LF/CRLF/mixed): identical verdicts with and without the replace.
   const marker = /^-----BEGIN ([A-Z0-9 ]*)-----$/gm;
   let carriesUs = false;
   for (let m; (m = marker.exec(text)); ) {

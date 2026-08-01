@@ -158,28 +158,8 @@ proxyProc.on("exit", (code) => {
   }
 });
 
-// The proxy's "wire the client" recipe is correct standalone advice and exactly
-// wrong relayed from here: we have already wired claude via ca-trust.d and the
-// merged bundle, so an `export NODE_EXTRA_CA_CERTS=<our ca.pem>` printed right
-// after that work tells the operator to undo it — the variable takes one file,
-// so pinning it to our CA alone silently untrusts every other MITM on the host.
-// Dropped here rather than suppressed at the source: the launcher is the one
-// with the context, and a new env var to carry it would be permanent surface
-// area for a presentation detail. Only the recipe goes; the mode line stays, so
-// forward-proxy mode is still visible in the output.
-const WIRING_RECIPE = /^\s*(export (HTTPS_PROXY|NODE_EXTRA_CA_CERTS)=|\(if anything else on this host|\s*`claude-via-proxy --remote-control`|\s*one file, so setting it here)/;
-let stderrTail = "";
 proxyProc.stderr.on("data", (chunk) => {
-  const text = stderrTail + chunk.toString();
-  // Keep a trailing partial line for the next chunk so a recipe line split
-  // across two reads is still matched whole.
-  const nl = text.lastIndexOf("\n");
-  stderrTail = nl === -1 ? text : text.slice(nl + 1);
-  const complete = nl === -1 ? "" : text.slice(0, nl + 1);
-  if (!complete) return;
-  const kept = complete.split("\n").filter((l, i, a) =>
-    !(i === a.length - 1 && l === "") && !WIRING_RECIPE.test(l));
-  if (kept.length) process.stderr.write(kept.join("\n") + "\n");
+  process.stderr.write(chunk);
 });
 
 function waitForReady() {
