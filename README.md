@@ -259,11 +259,18 @@ lets a participant publish where no builder looks, or read a file no builder
 writes, while still appearing to implement the contract. `CLAUDE_CONFIG_DIR`
 already relocates the pair, and it moves both halves together.
 
-Note the limit of what a consumer can check: intact, and carries my CA. Whether
-the bundle is *complete* — that no corporate root went missing — is the
-builder's guarantee, not something a reader can verify, because a reader has no
-previous state to compare against and a legitimately small bundle is
-indistinguishable from a narrowed one.
+Note the limit of what a consumer checks: intact, and carries my CA. Whether the
+bundle is *complete* — that no corporate root went missing — is the builder's
+guarantee, and a consumer must not act on it even where it could.
+
+That is a design choice, not a missing capability, and the distinction matters
+because the other reading is an invitation: someone adds the previous bundle as
+state, believes the limitation is lifted, and adds a floor. It would still be
+wrong. A shrink is *legitimate* whenever a root is retired or a component is
+uninstalled, and only the builder knows which happened — so a reader holding
+both bundles still cannot tell a regression from a fact. Measured: a legitimate
+bundle is 5 certs on one machine here and 168 on another, so any floor that
+catches narrowing on one host rejects a healthy bundle on the next.
 
 **This is a cooperative convention among same-user processes, not a trust
 boundary.** The check proves *parses, and carries us* — never *contains only
