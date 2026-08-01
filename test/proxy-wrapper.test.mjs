@@ -1,15 +1,36 @@
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { fork } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
 import { tmpdir } from "node:os";
-import { closeSync, existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import http from "node:http";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const WRAPPER_PATH = resolve(__dirname, "../bin/claude-via-proxy.mjs");
 const SERVER_PATH = resolve(__dirname, "../proxy/server.mjs");
+
+// Every temp dir this file makes, removed once at the end.
+//
+// Registered centrally rather than rmSync'd per test: forward mode mints an RSA
+// CA and leaf inside each config dir, so a leak is not an empty directory, it is
+// private key material. Measured before this: one `node --test` of this file
+// left 38 dirs behind, and a /tmp that had accumulated 1954 of them held 432
+// ca.key / leaf.key files. Per-test cleanup would also skip exactly the runs
+// that matter — a failing test throws before its own rmSync — and every future
+// test would have to remember. after() runs on pass and on fail.
+const tempDirs = [];
+function tempDir(prefix) {
+  const d = mkdtempSync(join(tmpdir(), prefix));
+  tempDirs.push(d);
+  return d;
+}
+after(() => {
+  for (const d of tempDirs) {
+    try { rmSync(d, { recursive: true, force: true }); } catch { /* already gone */ }
+  }
+});
 
 describe("proxy server lifecycle", () => {
   it("starts and responds to health check", async () => {
@@ -78,7 +99,7 @@ function cleanEnv(overrides) {
   // bundle advertising a CA nothing signs with — precisely the failure this
   // feature exists to prevent. It also silently poisons the suite itself: two
   // cases were reading the host's real merged bundle instead of a fixture.
-  env.CLAUDE_CONFIG_DIR = mkdtempSync(join(tmpdir(), "cffcfg-"));
+  env.CLAUDE_CONFIG_DIR = tempDir("cffcfg-");
   return { ...env, ...overrides };
 }
 
@@ -171,7 +192,7 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
     // developer's real ~/.claude/ca-trust.pem. On a machine where a bundle builder
     // has run, that file exists and legitimately wins — the assertion would fail
     // for a host-state reason, not a code reason.
-    const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
+    const configDir = tempDir("cfftrust-");
     const wrapperProc = fork(WRAPPER_PATH, ["--remote-control", "--proxy-port", "0"], {
       stdio: ["ignore", "pipe", "pipe", "ipc"],
       env: cleanEnv({ CACHE_FIX_CLAUDE_CMD: `${NODE} -e ${script}`, CLAUDE_CONFIG_DIR: configDir }),
@@ -199,7 +220,7 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
     // same order, or it points claude at a different (or absent) CA than the one
     // the spawned proxy generated — a hard fail, or a silent trust mismatch when
     // a stale default CA exists. This test pins the override path exactly.
-    const caDir = mkdtempSync(join(tmpdir(), "cffcadir-"));
+    const caDir = tempDir("cffcadir-");
     const script =
       'process.stdout.write("BASE="+(process.env.ANTHROPIC_BASE_URL||"UNSET")+' +
       '"|CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")+"\\n")';
@@ -240,7 +261,7 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
     // Publishing is how OTHER components learn to trust us, and it must happen
     // before the client runs — a bundle builder that reads the dir on a cold
     // start would otherwise miss us and produce a bundle without our CA.
-    const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
+    const configDir = tempDir("cfftrust-");
     const script = 'process.stdout.write("OK\\n")';
     const wrapperProc = fork(WRAPPER_PATH, ["--remote-control", "--proxy-port", "0"], {
       stdio: ["ignore", "pipe", "pipe", "ipc"],
@@ -276,7 +297,7 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
     // fixture without it is the stale-bundle case, which is correctly rejected
     // (see the test below). So: run once to let the proxy generate + publish our
     // CA, then build the bundle from it the way the launcher would, then re-run.
-    const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
+    const configDir = tempDir("cfftrust-");
     const bundle = join(configDir, "ca-trust.pem");
     const script = 'process.stdout.write("CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")+"\\n")';
     const runOnce = () => runWrapper(script, { CLAUDE_CONFIG_DIR: configDir });
@@ -295,7 +316,7 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
     // Single-writer invariant. Two launchers both "helpfully" rebuilding the
     // merged file race one output, and a component that rewrites a sibling's pem
     // can untrust it. So: we write exactly one path, ca-trust.d/ccf.pem.
-    const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
+    const configDir = tempDir("cfftrust-");
     const trustDir = join(configDir, "ca-trust.d");
     mkdirSync(trustDir, { recursive: true });
     const sibling = join(trustDir, "other-component.pem");
@@ -324,7 +345,7 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
   it("--remote-control falls back to its own CA when no merged bundle exists (unchanged standalone behaviour)", async () => {
     // A plain CCF user with no other MITM and no bundle builder must see exactly
     // what they saw before this contract existed.
-    const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
+    const configDir = tempDir("cfftrust-");
     const script = 'process.stdout.write("CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")+"\\n")';
     const wrapperProc = fork(WRAPPER_PATH, ["--remote-control", "--proxy-port", "0"], {
       stdio: ["ignore", "pipe", "pipe", "ipc"],
@@ -377,7 +398,7 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
     // the very bytes that reader is consuming or leaves it on a deleted inode
     // whose content is gone. So: hold a descriptor open across the launch, then
     // read it to the end.
-    const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
+    const configDir = tempDir("cfftrust-");
     const trustDir = join(configDir, "ca-trust.d");
     const dst = join(trustDir, "ccf.pem");
     mkdirSync(trustDir, { recursive: true });
@@ -480,7 +501,7 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
     // Both fixtures exist in the same directory across one launch, so the test
     // fails if the reaper is unconditional (fresh one dies) OR absent (old one
     // survives) — one launch, two opposite outcomes.
-    const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
+    const configDir = tempDir("cfftrust-");
     const trustDir = join(configDir, "ca-trust.d");
     mkdirSync(trustDir, { recursive: true });
     const stale = join(trustDir, "ccf.pem.99999.aaaaaaaa-orphan");
@@ -511,7 +532,7 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
     // portably: rename() onto it fails EISDIR, and unlike a permission fixture
     // it behaves the same when the suite runs as root (measured: chmod-based
     // fixtures pass vacuously in a root container, which is how CI runs).
-    const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
+    const configDir = tempDir("cfftrust-");
     const trustDir = join(configDir, "ca-trust.d");
     mkdirSync(join(trustDir, "ccf.pem"), { recursive: true });
     const stale = join(trustDir, "ccf.pem.99999.aaaaaaaa-orphan");
@@ -534,7 +555,7 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
     // bundle. An operator following the line on screen pins the variable to our
     // CA alone for every later process, silently untrusting every other MITM —
     // the exact failure the contract exists to prevent.
-    const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
+    const configDir = tempDir("cfftrust-");
     const { code, err } = await runWrapper('process.stdout.write("OK\\n")', { CLAUDE_CONFIG_DIR: configDir });
     assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${err}`);
     assert.doesNotMatch(err, /export NODE_EXTRA_CA_CERTS=/,
@@ -553,8 +574,8 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
     // failed to parse. The session then failed every request with
     // UNABLE_TO_VERIFY_LEAF_SIGNATURE while the only diagnostic pointed at the
     // wrong component.
-    const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
-    const caDir = mkdtempSync(join(tmpdir(), "cffca-"));
+    const configDir = tempDir("cfftrust-");
+    const caDir = tempDir("cffca-");
     // ca.key must be present alongside it: the proxy's reuse guard keys on
     // existsSync(ca.pem) && existsSync(ca.key), so a corrupt ca.pem with its key
     // still beside it is REUSED rather than regenerated. That is what makes this
@@ -583,8 +604,8 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
     // proven unreadable — the message was right and the behavior was unchanged.
     // Unset is the honest state: we have no usable CA to add, so node falls back
     // to its built-in store rather than to a file we vouch for and cannot read.
-    const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
-    const caDir = mkdtempSync(join(tmpdir(), "cffca-"));
+    const configDir = tempDir("cfftrust-");
+    const caDir = tempDir("cffca-");
     // ca.key beside it, or the proxy regenerates and the state is unreachable.
     writeFileSync(join(caDir, "ca.key"), "-----BEGIN PRIVATE KEY-----\nplaceholder\n-----END PRIVATE KEY-----\n");
     writeFileSync(join(caDir, "ca.pem"), "-----BEGIN CERTIFICATE-----\ntruncated\n");
@@ -605,7 +626,7 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
     // normal state right after a CCF upgrade, so this is not a corner case.
     // (a sibling component hit the same hazard from the other side and guards
     // it identically.)
-    const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
+    const configDir = tempDir("cfftrust-");
     const bundle = join(configDir, "ca-trust.pem");
     // A plausible stale bundle: real PEM content, just not ours.
     writeFileSync(bundle, "-----BEGIN CERTIFICATE-----\nc3RhbGUtYnVuZGxlLXdpdGhvdXQtb3VyLUNB\n-----END CERTIFICATE-----\n");
@@ -650,7 +671,7 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
     // and containment together still do not prove Node verifies with the result —
     // only a handshake does. They are here to keep a KNOWN-bad bundle from ever
     // reaching the client.
-    const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
+    const configDir = tempDir("cfftrust-");
     const bundle = join(configDir, "ca-trust.pem");
     const script = 'process.stdout.write("CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")+"\\n")';
     const runOnce = () => runWrapper(script, { CLAUDE_CONFIG_DIR: configDir });
@@ -782,5 +803,53 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
     const occurrences = np.split(",").filter((h) => h === "127.0.0.1").length;
     assert.equal(occurrences, 1, `127.0.0.1 should appear exactly once, got NP=${np}`);
     assert.ok(np.split(",").includes("localhost"), `localhost should be added, got NP=${np}`);
+  });
+
+  it("a plain fork of the server still gets the wiring recipe", async () => {
+    // The suppression must key on the launcher, not on "someone fork()ed me".
+    // Keying it on process.channel was measured suppressing the recipe for THIS
+    // suite's own forks and for any supervisor's — the operator got no wiring
+    // instructions plus a false claim that a launcher had wired the client.
+    const caDir = tempDir("cffca-");
+    const p = fork(SERVER_PATH, [], {
+      stdio: ["ignore", "pipe", "pipe", "ipc"],
+      env: cleanEnv({ CACHE_FIX_FORWARD_PROXY: "on", CACHE_FIX_CA_DIR: caDir, CACHE_FIX_PROXY_PORT: "0" }),
+    });
+    let err = "";
+    p.stderr.on("data", (c) => { err += c.toString(); });
+    await new Promise((res) => setTimeout(res, 6000));
+    p.kill("SIGTERM");
+    await new Promise((res) => p.on("exit", res));
+
+    assert.match(err, /export NODE_EXTRA_CA_CERTS=/,
+      `a non-launcher fork must still be told how to wire; stderr: ${err}`);
+    assert.doesNotMatch(err, /Client wired by the launcher/,
+      `nothing wired this client, so it must not claim otherwise; stderr: ${err}`);
+  });
+
+  it("creates every temp dir through the registrar, so none outlive the run", () => {
+    // A leak is invisible to every other assertion in this file — measured: with
+    // the cleanup neutered the suite still reported 23 pass / 0 fail while
+    // leaving 39 directories behind. So the thing to pin is not "the dirs are
+    // gone" (after() has not run yet when a test executes) but "nothing bypasses
+    // the registrar", which is the only way one can survive.
+    //
+    // Source-level on purpose: forward mode mints an RSA CA and leaf inside each
+    // config dir, so a bypassed site leaks private key material, and the next
+    // person to add a test is exactly who would reintroduce it.
+    // Matched on the call shape taking a string literal, which the registrar
+    // itself does not have (it takes `prefix`). Comment lines are skipped and
+    // the pattern is assembled rather than written out, so neither this
+    // assertion nor the prose above it can flag itself.
+    const src = readFileSync(new URL(import.meta.url), "utf8");
+    const call = new RegExp(["mkdtempSync\\(join\\(tmpdir\\(\\),", "\\s*\"[^\"]+\"\\s*\\)\\)"].join(""));
+    const raw = src.split("\n")
+      .map((line, i) => [i + 1, line])
+      .filter(([, line]) => !line.trim().startsWith("//"))
+      .filter(([, line]) => call.test(line))
+      .map(([n]) => n);
+    assert.deepEqual(raw, [],
+      `every temp dir must go through tempDir(); raw mkdtempSync at line(s): ${raw.join(", ")}`);
+    assert.ok(tempDirs.length > 0, "premise: this file does create temp dirs");
   });
 });

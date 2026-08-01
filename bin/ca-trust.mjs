@@ -3,15 +3,25 @@ import { X509Certificate } from "node:crypto";
 // Does a non-certificate block's armor decode? Node only needs that much from a
 // CRL or key block, so this is deliberately weaker than parsing it as whatever
 // it claims to be — the guard's job is to predict node's loader, not to
-// validate the block's contents. A body with a `-` in it reads as decodable
-// here and node agrees, but openssl stops at the dash, so we call it damaged;
-// that is the conservative direction and the only measured disagreement.
+// validate the block's contents.
+//
+// Base64 is checked as whole 4-character quanta, not merely as an alphabet. An
+// alphabet-only test accepted a one-character body: measured, `A` in a
+// PUBLIC KEY block ahead of our CA gave guard=accept while node reported
+// `bad base64 decode` and loaded zero extra CAs. Padding is equally positional —
+// `AAA=` and `AA==` load, `A===`, `=AAA` and `AA=A` do not. Measured 16/16
+// agreement with a real handshake on the rule below.
+//
+// A body containing `-` reads as damaged here even though node accepts it
+// (openssl stops at the dash), which is the conservative direction and the only
+// measured disagreement.
 function isBase64Body(block, endMarker) {
   const bodyStart = block.indexOf("\n") + 1;
   const bodyEnd = block.lastIndexOf(endMarker);
   if (bodyStart === 0 || bodyEnd < bodyStart) return false;
   const body = block.slice(bodyStart, bodyEnd).replace(/\s+/g, "");
-  return body.length > 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(body);
+  if (body.length === 0 || body.length % 4 !== 0) return false;
+  return /^[A-Za-z0-9+/]+={0,2}$/.test(body);
 }
 
 // Is this merged CA bundle safe to hand claude as NODE_EXTRA_CA_CERTS?
@@ -49,7 +59,17 @@ export function bundleCarriesOurCA(text, ourCaPem) {
   // pattern made that block invisible to us while node still tried to load it
   // — measured: a corrupt block wearing a trailing space was skipped by the
   // guard and failed the handshake.
-  const marker = /^-----BEGIN ([A-Z0-9 ]*)-----[ \t]*$/gm;
+  // The label pattern is permissive on purpose. Restricting it to uppercase,
+  // digits and spaces made every other legal label invisible to us while
+  // openssl still treated the block as real — measured: a malformed `X-FOO`
+  // block ahead of our CA gave guard=accept while node loaded zero extra CAs.
+  // Every label tried behaved as a real block (hyphenated, lowercase,
+  // underscored, dotted, punctuated, even empty), so the label decides only
+  // WHICH check a block gets, never whether it is one.
+  // `-` is legal INSIDE a label, so the stop condition is the `-----` run, not
+  // the first hyphen: `[^-]*` failed to match `X-FOO` at all, which is the same
+  // blind spot in a new place.
+  const marker = /^-----BEGIN ((?:(?!-----).)*)-----[ \t]*$/gm;
   let carriesUs = false;
   for (let m; (m = marker.exec(text)); ) {
     const label = m[1];

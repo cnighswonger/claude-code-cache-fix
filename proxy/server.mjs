@@ -614,12 +614,20 @@ export async function startProxy(options = {}) {
 
   const addr = server.address();
   if (forwardProxyCA) {
-    const wiredByLauncher = process.channel !== undefined;
-    // Only when the operator is the one wiring. process.channel is set exactly
-    // when our launcher fork()ed us, and it has already wired claude via
-    // ca-trust.d — printing `export NODE_EXTRA_CA_CERTS=<our ca.pem>` into its
-    // relayed stderr tells the operator to undo that: the variable takes one
-    // file, so pinning it to our CA alone untrusts every other MITM on the host.
+    // Only when the operator is the one wiring. Under --remote-control the
+    // launcher has already wired claude via ca-trust.d and relays this stderr,
+    // so printing `export NODE_EXTRA_CA_CERTS=<our ca.pem>` there tells the
+    // operator to undo it: the variable takes one file, so pinning it to our CA
+    // alone untrusts every other MITM on the host.
+    //
+    // Keyed on a signal the launcher sets explicitly, NOT on `process.channel`.
+    // A channel only proves some parent opened an IPC descriptor — measured, a
+    // plain `fork()` of this file (which the test suite does, and any supervisor
+    // may) got the suppressed banner plus the false claim that a launcher had
+    // wired the client, leaving an operator with no wiring instructions at all.
+    // This is an internal handshake, not an operator knob: it asserts "my parent
+    // already wired me", which nothing but the launcher can truthfully say.
+    const wiredByLauncher = process.env.CACHE_FIX_WIRED_BY_LAUNCHER === "1";
     process.stderr.write(wiredByLauncher
       ? "[cache-fix] forward-proxy: on. Client wired by the launcher (ca-trust.d).\n"
       : "[cache-fix] forward-proxy: on. Wire the client (leave ANTHROPIC_BASE_URL UNSET so Remote Control stays enabled):\n" +
