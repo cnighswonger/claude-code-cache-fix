@@ -33,7 +33,7 @@ int main(int argc, char *argv[]) {
         "%s\\npm\\node_modules\\claude-code-cache-fix\\preload.mjs", appdata);
 
     char preload_url[MAX_PATH];
-    strcpy(preload_url, preload);
+    snprintf(preload_url, sizeof(preload_url), "%s", preload);
     for (char *p = preload_url; *p; p++) {
         if (*p == '\\') *p = '/';
     }
@@ -61,7 +61,7 @@ int main(int argc, char *argv[]) {
         "%s\\npm\\node_modules\\@anthropic-ai\\claude-code\\cli.js", appdata);
 
     /* Build argv: skip argv[1] (original claude path passed by extension) */
-    char **new_argv = malloc(sizeof(char *) * (argc + 2));
+    char **new_argv = calloc((size_t)argc + 2, sizeof(char *));
     if (!new_argv) return 1;
 
     new_argv[0] = "node";
