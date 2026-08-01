@@ -7,6 +7,7 @@ import { homedir } from "node:os";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { X509Certificate, randomUUID } from "node:crypto";
 import http from "node:http";
+import { bundleCarriesOurCA } from "./ca-trust.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SERVER_PATH = resolve(__dirname, "../proxy/server.mjs");
@@ -157,8 +158,28 @@ proxyProc.on("exit", (code) => {
   }
 });
 
+// The proxy's "wire the client" recipe is correct standalone advice and exactly
+// wrong relayed from here: we have already wired claude via ca-trust.d and the
+// merged bundle, so an `export NODE_EXTRA_CA_CERTS=<our ca.pem>` printed right
+// after that work tells the operator to undo it — the variable takes one file,
+// so pinning it to our CA alone silently untrusts every other MITM on the host.
+// Dropped here rather than suppressed at the source: the launcher is the one
+// with the context, and a new env var to carry it would be permanent surface
+// area for a presentation detail. Only the recipe goes; the mode line stays, so
+// forward-proxy mode is still visible in the output.
+const WIRING_RECIPE = /^\s*(export (HTTPS_PROXY|NODE_EXTRA_CA_CERTS)=|\(if anything else on this host|\s*`claude-via-proxy --remote-control`|\s*one file, so setting it here)/;
+let stderrTail = "";
 proxyProc.stderr.on("data", (chunk) => {
-  process.stderr.write(chunk);
+  const text = stderrTail + chunk.toString();
+  // Keep a trailing partial line for the next chunk so a recipe line split
+  // across two reads is still matched whole.
+  const nl = text.lastIndexOf("\n");
+  stderrTail = nl === -1 ? text : text.slice(nl + 1);
+  const complete = nl === -1 ? "" : text.slice(0, nl + 1);
+  if (!complete) return;
+  const kept = complete.split("\n").filter((l, i, a) =>
+    !(i === a.length - 1 && l === "") && !WIRING_RECIPE.test(l));
+  if (kept.length) process.stderr.write(kept.join("\n") + "\n");
 });
 
 function waitForReady() {
@@ -261,17 +282,29 @@ if (remoteControl) {
       writeFileSync(tmp, ours);
       renameSync(tmp, dst);
     }
-    // Reap temps orphaned by a kill between the write and the rename. They do
-    // not match a *.pem glob so a builder ignores them, but nothing else would
-    // ever remove them.
-    //
-    // Age-gated, because a temp is indistinguishable from an orphan by name: a
-    // CONCURRENT launcher has its own ccf.pem.<pid>.<uuid> on disk in the window
-    // between its writeFileSync and its renameSync, and deleting that makes its
-    // rename throw a publish failure we caused. The window is one small write to
-    // the same directory, microseconds; a minute is four orders of magnitude of
-    // headroom and still collects the orphan on the next launch. Deleting late
-    // costs nothing — nothing reads these — while deleting early breaks a peer.
+  } catch (e) {
+    // Non-fatal: publishing is how OTHERS trust us. This session only needs its
+    // own CA, so a failure to publish must not stop it.
+    process.stderr.write(`cache-fix: could not publish CA to ${caTrustDir}: ${e.message}\n`);
+  }
+  // Reap temps orphaned by a kill between the write and the rename. They do not
+  // match a *.pem glob so a builder ignores them, but nothing else would ever
+  // remove them.
+  //
+  // Its OWN try, deliberately outside the publish one. Sharing that block made
+  // reaping conditional on the rename succeeding, so exactly when publishing is
+  // persistently broken — a root-owned ccf.pem, a read-only mount, ENOSPC — the
+  // launcher abandoned one full-CA temp per launch and cleaned up none of them,
+  // growing without bound in the directory a builder globs.
+  //
+  // Age-gated, because a temp is indistinguishable from an orphan by name: a
+  // CONCURRENT launcher has its own ccf.pem.<pid>.<uuid> on disk in the window
+  // between its writeFileSync and its renameSync, and deleting that makes its
+  // rename throw a publish failure we caused. The window is one small write to
+  // the same directory, microseconds; a minute is four orders of magnitude of
+  // headroom and still collects the orphan on the next launch. Deleting late
+  // costs nothing — nothing reads these — while deleting early breaks a peer.
+  try {
     const orphanAgeMs = 60_000;
     for (const f of readdirSync(caTrustDir)) {
       if (!f.startsWith("ccf.pem.")) continue;
@@ -279,11 +312,7 @@ if (remoteControl) {
       try { if (Date.now() - statSync(p).mtimeMs > orphanAgeMs) rmSync(p); }
       catch { /* raced: someone renamed or removed it first */ }
     }
-  } catch (e) {
-    // Non-fatal: publishing is how OTHERS trust us. This session only needs its
-    // own CA, so a failure to publish must not stop it.
-    process.stderr.write(`cache-fix: could not publish CA to ${caTrustDir}: ${e.message}\n`);
-  }
+  } catch { /* unreadable dir: the publish warning above already said so */ }
   // Read the merged bundle if something built one, so a session trusts every
   // component's CA and not only ours.
   //
@@ -302,60 +331,44 @@ if (remoteControl) {
   // sides at different files.
   const caTrustBundle = join(configDir, "ca-trust.pem");
   let caForClaude = caPem;
-  // Accept the bundle only if OUR CA is actually in it. A bundle that exists and
-  // is non-empty but predates our publish (the normal state right after a CCF
-  // upgrade, or on the very first launch on a host whose builder ran earlier) is
-  // WORSE than no bundle: handing it to claude makes the client distrust the very
-  // proxy it is being routed through, so every request fails TLS instead of
-  // merely losing some other component's CA. Size alone cannot tell the two
-  // apart. readFileSync throws when absent, which is the same "use our own CA"
-  // answer as an empty, stale, or unreadable bundle — one catch covers them all.
-  //
-  // Both conditions are checked by PARSING, not by matching substrings. Node's
-  // PEM reader aborts the whole extras load on one block it cannot decode, so a
-  // damaged entry does not merely lose itself — it can void every other component
-  // CA and corporate root in the file, our own included. Counting BEGIN/END says
-  // nothing about whether a body decodes, and hard-coding the CERTIFICATE label
-  // makes any other label a corporate bundle carries invisible to the count; both
-  // gaps were measured accepting bundles that fail a real handshake. The shapes
-  // and their handshake results are in test/proxy-forward-ca.test.mjs, which
-  // asserts this decision agrees with an actual TLS verify on every one.
-  //
-  // Torn blocks have no END line, so the regex never yields them — that is why
-  // the block count is compared against the BEGIN count rather than trusted
-  // directly. A count mismatch means something in there is unterminated.
-  //
-  // Still only a pre-flight guard, not proof: it establishes the file parses and
-  // carries us, never that Node will verify a given leaf with it. Only a
-  // handshake shows that, and the launcher does not perform one.
-  //
-  // This block is a top-level script, so a test cannot import it — the same
-  // decision is mirrored in test/proxy-forward-ca.test.mjs `bundleIsUsable`.
-  // Change one, change both.
+  // Our own CA is parsed in its OWN step, before the bundle is even read.
+  // Folded into the bundle try (as it was), a corrupt or zero-byte ca.pem threw
+  // from the X509 parse and printed `ignoring <ca-trust.pem> (no start line)` —
+  // naming a file that may be perfectly healthy — and then fell back to the very
+  // ca.pem that had just failed to parse. Same failure, wrong component blamed.
+  let ourCa = null;
   try {
-    const merged = readFileSync(caTrustBundle, "utf8").replace(/\r\n/g, "\n");
-    const blocks = merged.match(/-----BEGIN [^-]*-----[\s\S]*?-----END [^-]*-----/g) || [];
-    if (blocks.length !== (merged.match(/-----BEGIN /g) || []).length) throw new Error("torn block");
-    // Throws on an empty or malformed ca.pem, which must fall through rather than
-    // match everything — a zero-byte CA made the old substring test vacuously true.
-    const oursDer = new X509Certificate(readFileSync(caPem)).raw;
-    let carriesUs = false;
-    for (const block of blocks) {
-      // One unparseable block is enough to void the load, so refuse the file.
-      if (new X509Certificate(block).raw.equals(oursDer)) carriesUs = true;
-    }
-    if (!carriesUs) throw new Error("bundle does not carry our CA");
-    caForClaude = caTrustBundle;
+    ourCa = readFileSync(caPem);
+    new X509Certificate(ourCa);
   } catch (e) {
-    // Absent is the normal case on a host with no builder — silent, and the same
-    // answer as every other unusable state. But a bundle that EXISTS and was
-    // refused means the one component allowed to write it produced something
-    // broken, and in a multi-component contract that has to be visible: the
-    // session still works (we fall back to our own CA) while every other
-    // component's CA is silently gone, which is precisely the failure nobody
-    // would otherwise notice.
-    if (existsSync(caTrustBundle)) {
-      process.stderr.write(`cache-fix: ignoring ${caTrustBundle} (${e.message}); using our own CA only\n`);
+    ourCa = null;
+    process.stderr.write(
+      `cache-fix: our own CA at ${caPem} does not parse (${e.message}); ` +
+        `remove ${caDir} and relaunch to regenerate it\n`,
+    );
+  }
+  // Accept the bundle only if it parses the way node's loader will and OUR CA is
+  // actually in it. readFileSync throws when absent, which is the same "use our
+  // own CA" answer as an empty, stale, or unreadable bundle — one catch covers
+  // them all. The decision itself lives in bin/ca-trust.mjs so the tests drive
+  // this exact code; it used to be inline here with a hand-copied twin in the
+  // test file, and mutating this one left the whole suite green.
+  if (ourCa) {
+    try {
+      const verdict = bundleCarriesOurCA(readFileSync(caTrustBundle, "utf8"), ourCa);
+      if (!verdict.ok) throw new Error(verdict.reason);
+      caForClaude = caTrustBundle;
+    } catch (e) {
+      // Absent is the normal case on a host with no builder — silent, and the same
+      // answer as every other unusable state. But a bundle that EXISTS and was
+      // refused means the one component allowed to write it produced something
+      // broken, and in a multi-component contract that has to be visible: the
+      // session still works (we fall back to our own CA) while every other
+      // component's CA is silently gone, which is precisely the failure nobody
+      // would otherwise notice.
+      if (existsSync(caTrustBundle)) {
+        process.stderr.write(`cache-fix: ignoring ${caTrustBundle} (${e.message}); using our own CA only\n`);
+      }
     }
   }
   claudeEnv.NODE_EXTRA_CA_CERTS = caForClaude;

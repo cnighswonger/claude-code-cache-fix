@@ -18,6 +18,9 @@ import { spawn, spawnSync } from "node:child_process";
 const REPO = new URL("..", import.meta.url).pathname;
 const FWD = join(REPO, "proxy/forward-proxy.mjs");
 
+// The launcher's own trust decision, imported rather than re-implemented.
+import { bundleCarriesOurCA } from "../bin/ca-trust.mjs";
+
 const ENV_KEYS = [
   "CACHE_FIX_CA_DIR", "CACHE_FIX_FORWARD_PROXY", "CLAUDE_CONFIG_DIR",
   "CACHE_FIX_DOWNLOAD_REWRITE", "CACHE_FIX_CA_LOCK_WAIT_MS", "CACHE_FIX_CA_FORCE_ROTATE",
@@ -273,79 +276,158 @@ test("ca-trust: a bundle torn AHEAD of our CA does NOT verify (why the marker ch
   });
 });
 
-// The three shapes a substring-based guard gets WRONG. Each row was measured
-// against a real handshake before the guard was rewritten to parse; two of them
-// are the dangerous direction (a bundle that kills the session, waved through)
-// and one is a healthy bundle needlessly refused:
+// Verify a leaf the way the LAUNCHER does: hand the bundle to a fresh node via
+// NODE_EXTRA_CA_CERTS, not via tls.connect({ca}).
 //
-//   bundle                                  substring guard | handshake
-//   corrupt base64 ahead, markers intact  |  accept         | FAIL
-//   torn BEGIN TRUSTED CERTIFICATE ahead  |  accept         | FAIL
-//   whole bundle CRLF-normalized          |  reject         | authorized
-//
-// This test pins the DECISION the launcher makes, mirroring bin/claude-via-proxy
-// exactly, and asserts the decision agrees with the handshake in every row. The
-// decision lives in the launcher (a child process there, so not importable), so
-// it is duplicated here deliberately — if the two ever drift, the row whose
-// handshake disagrees fails, which is the point.
-function bundleIsUsable(merged, caPemPath) {
+// The distinction is load-bearing, not pedantry. Measured (node v24.11.1,
+// openssl 3.6.1) on our own CA relabelled to TRUSTED CERTIFICATE, byte-identical
+// DER otherwise: the `ca` option ACCEPTS it and authorizes, NODE_EXTRA_CA_CERTS
+// SKIPS it and fails UNABLE_TO_VERIFY_LEAF_SIGNATURE. So the two paths genuinely
+// disagree, and the previous version of this table cross-checked the guard
+// against the option the launcher does not use — which is why it certified a
+// guard that accepted a bundle every real session would have failed on.
+async function handshakeViaExtraCerts(bundle, r) {
+  const dir = mkdtempSync(join(tmpdir(), "fwd-extra-"));
+  const bundlePath = join(dir, "trust.pem");
+  const keyPath = join(dir, "leaf.key");
+  const certPath = join(dir, "leaf.pem");
+  writeFileSync(bundlePath, bundle);
+  writeFileSync(keyPath, r.key);
+  writeFileSync(certPath, r.cert);
+  // The server must live in a child that has NODE_EXTRA_CA_CERTS set from birth:
+  // node reads the variable once at startup, so assigning it in this process
+  // after boot would have no effect and every row would silently test nothing.
+  const script = `
+    import { createServer, connect } from "node:tls";
+    import { readFileSync } from "node:fs";
+    const srv = createServer({ key: readFileSync(${JSON.stringify(keyPath)}),
+                               cert: readFileSync(${JSON.stringify(certPath)}) }, (s) => s.end());
+    await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+    const { port } = srv.address();
+    const c = connect({ host: "127.0.0.1", port, servername: "api.anthropic.com" });
+    const out = await new Promise((res) => {
+      c.on("secureConnect", () => res({ ok: c.authorized, err: c.authorizationError }));
+      // A rejected chain surfaces as 'error', never 'secureConnect', so the
+      // timeout must not be the thing that ends a failing row — it would add ten
+      // seconds per negative case and report every real failure as "timeout".
+      c.on("error", (e) => res({ ok: false, err: e.code || e.message }));
+      c.on("close", () => res({ ok: false, err: "closed before handshake" }));
+      setTimeout(() => res({ ok: false, err: "timeout" }), 10000).unref();
+    });
+    console.log(JSON.stringify(out));
+    c.destroy(); srv.close();
+  `;
   try {
-    const norm = merged.replace(/\r\n/g, "\n");
-    const blocks = norm.match(/-----BEGIN [^-]*-----[\s\S]*?-----END [^-]*-----/g) || [];
-    if (blocks.length !== (norm.match(/-----BEGIN /g) || []).length) return false;
-    const oursDer = new X509Certificate(readFileSync(caPemPath)).raw;
-    let carriesUs = false;
-    for (const b of blocks) if (new X509Certificate(b).raw.equals(oursDer)) carriesUs = true;
-    return carriesUs;
-  } catch { return false; }
+    const p = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+      env: { ...process.env, NODE_EXTRA_CA_CERTS: bundlePath },
+      encoding: "utf8",
+    });
+    return JSON.parse(p.stdout.trim());
+  } catch (e) {
+    return { ok: false, err: `probe failed: ${e.message}` };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
-test("ca-trust: the bundle guard agrees with a real handshake on every known-bad shape", async () => {
+// A PUBLIC KEY block, the cheapest stand-in for the non-certificate blocks a
+// real merged bundle carries (CRLs, keys, DH params). Derived from the CA's own
+// key so the fixture needs no extra material.
+function pubKeyPem(caPem) {
+  return new X509Certificate(caPem).publicKey.export({ type: "spki", format: "pem" });
+}
+
+// The guard's decision, cross-checked against a real handshake on every shape.
+//
+// This drives bin/ca-trust.mjs — the module the launcher imports — rather than a
+// copy of it. It used to be a hand-maintained duplicate under a "change one,
+// change both" comment, and measured: mutating the launcher's copy to accept
+// everything left the entire suite green, so the trust path had no regression
+// cover at all. Two call sites is below this repo's bar for a new module; the
+// justification is that a test cannot import a top-level script, and a copy is
+// not the thing that ships.
+//
+// The asymmetry in what each verdict must mean is deliberate. An accept MUST
+// verify: waving through a bundle node cannot load makes claude distrust the
+// very proxy it is routed through and every request fails TLS. A reject need not
+// mean the handshake fails — refusing a usable-but-odd bundle only costs the
+// other components' CAs for that session. Conservative is allowed, permissive is
+// not, so only the accepts are cross-checked.
+test("ca-trust: the bundle guard never accepts a bundle NODE_EXTRA_CA_CERTS cannot load", async () => {
   await withCA({}, async (dir) => {
     const r = ensureCA();
-    const caPemPath = join(dir, "ca.pem");
-    const ours = readFileSync(caPemPath, "utf8");
+    const ourCa = readFileSync(join(dir, "ca.pem"));
+    const ours = ourCa.toString("utf8");
+    const other = readFileSync(join(dir, "leaf.pem"), "utf8");
     // A PEM body with no END line — the shape that makes a block unterminated.
     const body = ours.split("\n").slice(1, -2).join("\n");
 
     const rows = [
       ["healthy: ours alone", ours, true],
+      ["healthy: unrelated root ahead of ours", `${other}${ours}`, true],
+      ["CRLF line endings", ours.replace(/\n/g, "\r\n"), true],
+      // Non-certificate blocks. A real corporate bundle carries these; node's
+      // loader skips them and verifies fine. Parsing every block as a
+      // certificate rejected the whole file, which does not fail safe — it drops
+      // every sibling and corporate CA for the session.
+      ["PUBLIC KEY block ahead of ours", `${pubKeyPem(ourCa)}${ours}`, true],
+      // A provenance header that happens to name the marker. Counting raw
+      // occurrences of "-----BEGIN " saw two markers and one parsed block and
+      // called a healthy file torn.
+      ["comment naming the marker", `# see -----BEGIN CERTIFICATE-----\n${ours}`, true],
       // Markers balanced and our CA present verbatim, but the FIRST block's body
       // is not base64. Node aborts the whole extras load on it.
       ["corrupt base64 ahead", `-----BEGIN CERTIFICATE-----\n!!!not base64!!!\n-----END CERTIFICATE-----\n${ours}`, false],
-      // A label other than CERTIFICATE, torn. A CERTIFICATE-only marker count
-      // cannot see this at all.
+      // A label other than CERTIFICATE, torn.
       ["torn TRUSTED CERTIFICATE ahead", `-----BEGIN TRUSTED CERTIFICATE-----\n${body}\n${ours}`, false],
-      // Perfectly good bundle that a byte-exact containment check refuses.
-      ["CRLF line endings", ours.replace(/\n/g, "\r\n"), true],
+      // THE false accept this guard exists to prevent. Same DER as our CA, so a
+      // parse-and-compare that ignores the label says "carries us" — while node's
+      // CA loader skips any block not labelled exactly CERTIFICATE, leaving the
+      // session trusting nothing and failing every request.
+      ["our CA relabelled TRUSTED CERTIFICATE", ours.replaceAll("CERTIFICATE-----", "TRUSTED CERTIFICATE-----"), false],
       // Real cert, just not ours: the stale-builder case.
-      ["stale, does not carry us", "-----BEGIN CERTIFICATE-----\nc3RhbGU=\n-----END CERTIFICATE-----\n", false],
+      ["stale: a real cert that is not ours", other, false],
+      ["empty bundle", "", false],
     ];
 
     for (const [name, bundle, expectUsable] of rows) {
-      assert.equal(bundleIsUsable(bundle, caPemPath), expectUsable, `guard verdict wrong for: ${name}`);
-      // And the guard's YES must mean the handshake really works. Its NO is not
-      // required to mean the handshake fails — refusing a usable-but-odd bundle
-      // only costs the other components' CAs, while accepting a broken one costs
-      // the session. The guard is allowed to be conservative, never permissive.
+      const verdict = bundleCarriesOurCA(bundle, ourCa);
+      assert.equal(verdict.ok, expectUsable,
+        `guard verdict wrong for "${name}"${verdict.ok ? "" : ` (reason: ${verdict.reason})`}`);
       if (expectUsable) {
-        const res = await handshakeTrusting(bundle, r);
-        assert.equal(res.ok, true, `guard accepted "${name}" but the handshake failed: ${res.err}`);
+        const res = await handshakeViaExtraCerts(bundle, r);
+        assert.equal(res.ok, true, `guard accepted "${name}" but NODE_EXTRA_CA_CERTS failed: ${res.err}`);
       }
     }
   });
 });
 
-test("ca-trust: an empty ca.pem does not make the guard vacuously accept", async () => {
+// The row above proves the guard refuses the relabelled bundle. This proves the
+// refusal is EARNED — that the shape really is fatal — so the row cannot decay
+// into asserting its own fixture.
+test("ca-trust: the relabelled-CA bundle really does fail NODE_EXTRA_CA_CERTS", async () => {
   await withCA({}, async (dir) => {
-    ensureCA();
-    // "".includes("") is true, so a zero-byte CA made the old substring check
-    // pass against ANY bundle — including one that does not carry us at all.
-    // Parsing rejects it instead: X509Certificate throws on empty input.
-    const emptyCa = join(dir, "empty-ca.pem");
-    writeFileSync(emptyCa, "");
-    const stale = "-----BEGIN CERTIFICATE-----\nc3RhbGU=\n-----END CERTIFICATE-----\n";
-    assert.equal("".includes(""), true, "premise: the old check was vacuous on an empty CA");
-    assert.equal(bundleIsUsable(stale, emptyCa), false, "an empty ca.pem must not accept a bundle that lacks us");
+    const r = ensureCA();
+    const ours = readFileSync(join(dir, "ca.pem"), "utf8");
+    const relabelled = ours.replaceAll("CERTIFICATE-----", "TRUSTED CERTIFICATE-----");
+    assert.ok(
+      new X509Certificate(relabelled).raw.equals(new X509Certificate(ours).raw),
+      "premise: relabelling leaves the DER identical, which is why a label-blind compare accepts it",
+    );
+    const control = await handshakeViaExtraCerts(ours, r);
+    assert.equal(control.ok, true, `control must verify, got err=${control.err}`);
+    const res = await handshakeViaExtraCerts(relabelled, r);
+    assert.equal(res.ok, false, "a TRUSTED CERTIFICATE block must NOT be loaded by NODE_EXTRA_CA_CERTS");
   });
+});
+
+test("ca-trust: an empty ca.pem does not make the guard vacuously accept", () => {
+  // "".includes("") is true, so a zero-byte CA made the old substring check pass
+  // against ANY bundle — including one that does not carry us at all. Parsing
+  // rejects it instead: X509Certificate throws on empty input, and the guard
+  // lets that throw rather than treating it as a verdict.
+  const stale = "-----BEGIN CERTIFICATE-----\nc3RhbGU=\n-----END CERTIFICATE-----\n";
+  assert.equal("".includes(""), true, "premise: the old check was vacuous on an empty CA");
+  assert.throws(() => bundleCarriesOurCA(stale, Buffer.from("")),
+    "an empty ca.pem must not yield a verdict at all");
 });

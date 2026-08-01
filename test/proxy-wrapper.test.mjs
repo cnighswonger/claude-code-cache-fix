@@ -499,6 +499,84 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
     assert.ok(existsSync(fresh), "a temp younger than the gate may belong to a live publisher and must survive");
   });
 
+  it("--remote-control still reaps orphans when publishing itself fails", async () => {
+    // Reaping used to share the publish try-block, so renameSync throwing jumped
+    // straight past it. That made cleanup conditional on the one thing whose
+    // failure creates the mess: on a host where publishing is persistently
+    // broken — a root-owned ccf.pem, a read-only mount, ENOSPC — every launch
+    // abandoned one full-CA temp and collected none, growing without bound in
+    // the directory a bundle builder globs.
+    //
+    // A directory at the publish target reproduces that class of failure
+    // portably: rename() onto it fails EISDIR, and unlike a permission fixture
+    // it behaves the same when the suite runs as root (measured: chmod-based
+    // fixtures pass vacuously in a root container, which is how CI runs).
+    const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
+    const trustDir = join(configDir, "ca-trust.d");
+    mkdirSync(join(trustDir, "ccf.pem"), { recursive: true });
+    const stale = join(trustDir, "ccf.pem.99999.aaaaaaaa-orphan");
+    writeFileSync(stale, "# abandoned by an earlier kill\n");
+    const longAgo = new Date(Date.now() - 3600_000);
+    utimesSync(stale, longAgo, longAgo);
+
+    const { code, err } = await runWrapper('process.stdout.write("OK\\n")', { CLAUDE_CONFIG_DIR: configDir });
+    // Publishing is how OTHERS trust us; this session only needs its own CA, so
+    // the failure must stay non-fatal and merely visible.
+    assert.equal(code, 0, `publish failure must not fail the session, got ${code}. stderr: ${err}`);
+    assert.match(err, /could not publish CA/, "a publish failure must be reported, not swallowed");
+    assert.ok(!existsSync(stale), "orphans must be reaped even on the launches where publishing fails");
+  });
+
+  it("--remote-control does not print the wiring banner that would undo its own coexistence", async () => {
+    // The launcher relays the spawned proxy's stderr, so the server's standalone
+    // `export NODE_EXTRA_CA_CERTS=<ca.pem>` advice used to appear immediately
+    // after the launcher had published to ca-trust.d and adopted the merged
+    // bundle. An operator following the line on screen pins the variable to our
+    // CA alone for every later process, silently untrusting every other MITM —
+    // the exact failure the contract exists to prevent.
+    const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
+    const { code, err } = await runWrapper('process.stdout.write("OK\\n")', { CLAUDE_CONFIG_DIR: configDir });
+    assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${err}`);
+    assert.doesNotMatch(err, /export NODE_EXTRA_CA_CERTS=/,
+      `the launcher must not tell the operator to pin the variable; stderr: ${err}`);
+    // The proxy is still in forward-proxy mode — the banner is suppressed, not
+    // the feature. Without this the assertion above would also pass if the
+    // launcher silently stopped starting a forward proxy at all.
+    assert.match(err, /forward-proxy/, `forward-proxy must still be on; stderr: ${err}`);
+  });
+
+  it("--remote-control blames our own CA, not the bundle, when ca.pem is the unparseable one", async () => {
+    // Parsing our own CA used to sit inside the bundle try-block, so a corrupt
+    // or zero-byte ca.pem threw from OUR parse and was reported as
+    // `ignoring <ca-trust.pem> (no start line)` — naming a file that may be
+    // perfectly healthy — and then fell back to the very ca.pem that had just
+    // failed to parse. The session then failed every request with
+    // UNABLE_TO_VERIFY_LEAF_SIGNATURE while the only diagnostic pointed at the
+    // wrong component.
+    const configDir = mkdtempSync(join(tmpdir(), "cfftrust-"));
+    const caDir = mkdtempSync(join(tmpdir(), "cffca-"));
+    // ca.key must be present alongside it: the proxy's reuse guard keys on
+    // existsSync(ca.pem) && existsSync(ca.key), so a corrupt ca.pem with its key
+    // still beside it is REUSED rather than regenerated. That is what makes this
+    // state reachable at all — corrupt the pem alone and the proxy quietly mints
+    // a fresh one before the launcher ever reads it, and the test would pass
+    // while exercising nothing.
+    writeFileSync(join(caDir, "ca.key"), "-----BEGIN PRIVATE KEY-----\nplaceholder\n-----END PRIVATE KEY-----\n");
+    // Truncated mid-block: exists, non-empty, and does not parse.
+    writeFileSync(join(caDir, "ca.pem"), "-----BEGIN CERTIFICATE-----\ntruncated\n");
+    // A healthy bundle, present so the message cannot be excused as "absent".
+    writeFileSync(join(configDir, "ca-trust.pem"),
+      "-----BEGIN CERTIFICATE-----\nc3RhbGUtYnV0LXdlbGwtZm9ybWVk\n-----END CERTIFICATE-----\n");
+
+    const { err } = await runWrapper('process.stdout.write("OK\\n")',
+      { CLAUDE_CONFIG_DIR: configDir, CACHE_FIX_CA_DIR: caDir });
+
+    assert.match(err, /our own CA at .*ca\.pem does not parse/,
+      `the unparseable file must be named as ours; stderr: ${err}`);
+    assert.doesNotMatch(err, /ignoring .*ca-trust\.pem/,
+      `a healthy bundle must not be blamed for our own CA failing to parse; stderr: ${err}`);
+  });
+
   it("--remote-control ignores a merged bundle that does NOT contain our own CA", async () => {
     // The dangerous case, and worse than falling back: the bundle exists and is
     // non-empty, so a size-only gate accepts it — but it was built BEFORE we

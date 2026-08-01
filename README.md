@@ -160,7 +160,14 @@ The generated systemd unit / launchd agent carries `CACHE_FIX_FORWARD_PROXY=on`,
 - `HTTPS_PROXY` — where the proxy listens: `http://127.0.0.1:<port>` (default port `9801`, or your `CACHE_FIX_PROXY_PORT`).
 - `NODE_EXTRA_CA_CERTS` — the CA the proxy generated on first start: `~/.claude/cache-fix-ca/ca.pem` (or `$CACHE_FIX_CA_DIR/ca.pem`).
 
-Three ways to wire it, depending on how broadly you want the vars to apply:
+Three ways to wire it, depending on how broadly you want the vars to apply.
+
+> **If anything else on this host also MITMs `api.anthropic.com`** — a corporate
+> TLS-inspecting agent, an account-switching pin proxy — do not use these
+> recipes. `NODE_EXTRA_CA_CERTS` takes one file, so pinning it to our CA alone
+> silently untrusts every other component. Use `--remote-control`, which
+> publishes into `ca-trust.d/` and consumes the merged bundle instead. See
+> [Coexisting with another MITM](#coexisting-with-another-mitm-on-the-same-machine-ca-trustd).
 
 ```bash
 # a) per-invocation — scoped to just this claude run
@@ -207,13 +214,35 @@ environment-specific (a Linux host may keep them outside the bundle a shell
 points at; a Mac keeps them in the keychain), and two components both rebuilding
 it would race one output.
 
-The bundle is used only if it is intact (balanced `BEGIN`/`END` markers) **and**
-carries our own CA. A bundle failing either check is worse than no bundle — it
-would make the client distrust the very proxy it is being routed through, so
-every request fails TLS rather than merely losing some other component's CA. In
-that case, and when no bundle exists at all, the launcher falls back to our own
-CA and behaves exactly as it did before any of this existed. **A host with no
-other MITM and no bundle builder sees no change.**
+The bundle is used only if every PEM block in it is terminated **and** one of its
+`CERTIFICATE` blocks is our own CA. A bundle failing either check is worse than
+no bundle — it would make the client distrust the very proxy it is being routed
+through, so every request fails TLS rather than merely losing some other
+component's CA. In that case, and when no bundle exists at all, the launcher
+falls back to our own CA and behaves exactly as it did before any of this
+existed. **A host with no other MITM and no bundle builder sees no change.**
+
+The check mirrors what Node's `NODE_EXTRA_CA_CERTS` loader does, which is
+narrower than "is this valid PEM" in one direction and wider in another, and both
+were measured against a real handshake rather than read off the spec:
+
+- **Non-certificate blocks are ignored, not fatal.** A merged bundle legitimately
+  carries CRLs, public keys and key material next to the roots; Node skips them
+  and verifies fine. Parsing every block as a certificate rejected those bundles
+  outright, and rejecting is not the safe direction here — it drops every sibling
+  and corporate CA for the whole session.
+- **The `CERTIFICATE` label is load-bearing.** Our own CA relabelled
+  `TRUSTED CERTIFICATE` parses to byte-identical DER, so a label-blind comparison
+  reports "carries us" — while Node's loader skips the block entirely and the
+  session then fails every request. A DER match on a non-`CERTIFICATE` block does
+  not count.
+- **Markers are line-anchored.** A provenance header that merely mentions
+  `-----BEGIN ` is prose, not a block.
+
+Where the guard cannot tell (a block damaged *after* ours, whose truncated body
+may or may not still decode) it refuses. Refusing costs the other components'
+CAs for one session; accepting a bundle Node cannot load costs the session
+entirely, so the guard is allowed to be conservative and never permissive.
 
 Both paths are fixed names under `<config>`, deliberately with no env override
 of their own. They are two halves of one rendezvous: a knob on either half alone
