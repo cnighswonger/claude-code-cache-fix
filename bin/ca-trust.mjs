@@ -1,26 +1,17 @@
 import { X509Certificate } from "node:crypto";
 
-// Does a non-certificate block's armor decode? Node only needs that much from a
-// CRL or key block, so this is deliberately weaker than parsing it as whatever
-// it claims to be — the guard's job is to predict node's loader, not to
-// validate the block's contents.
+// Does a non-certificate block's armor decode? Weaker than parsing it as what
+// it claims to be, on purpose: the guard predicts node's loader, it does not
+// validate contents. Every clause below was measured against a real handshake.
 //
-// Base64 is checked as whole 4-character quanta, not merely as an alphabet. An
-// alphabet-only test accepted a one-character body: measured, `A` in a
-// PUBLIC KEY block ahead of our CA gave guard=accept while node reported
-// `bad base64 decode` and loaded zero extra CAs. Padding is equally positional —
-// `AAA=` and `AA==` load, `A===`, `=AAA` and `AA=A` do not. Measured 16/16
-// agreement with a real handshake on the rule below.
+//   whole 4-char quanta, not just the alphabet — a 1-char body loads 0
+//   padding is positional — `AAA=` loads, `A===` `=AAA` `AA=A` do not
+//   `[ \t\r\n]`, not `\s` — the other ten chars `\s` strips each load 0
 //
-// A body containing `-` reads as damaged here even though node accepts it
-// (openssl stops at the dash), which is the conservative direction and the only
-// measured disagreement.
-//
-// Whitespace is stripped as `[ \t\r\n]`, NOT `\s`: node's reader accepts those
-// four, and rejects every other character `\s` covers. Measured one at a time —
-// U+00A0 U+2003 U+2028 U+2029 U+FEFF U+1680 U+205F U+3000 and ASCII VTAB and
-// FORMFEED each load 0 with `bad base64 decode`. Stripping them read a damaged
-// body as clean, and a NBSP is what a paste through a rich-text field leaves.
+// A NBSP is what a paste through a rich-text field leaves, so that last one is
+// a shape bundles really acquire. A body containing `-` reads as damaged here
+// though node accepts it (openssl stops at the dash): conservative, and the
+// only measured disagreement.
 function isBase64Body(body) {
   const b = body.replace(/[ \t\r\n]+/g, "");
   return b.length > 0 && b.length % 4 === 0 && /^[A-Za-z0-9+/]+={0,2}$/.test(b);
@@ -46,57 +37,33 @@ function isBase64Body(body) {
 // carries us, never that node will verify a given leaf with it.
 export function bundleCarriesOurCA(text, ourCaPem) {
   const ourDer = new X509Certificate(ourCaPem).raw;
-  // Line-anchored. openssl only honours a marker that begins a line, so a
-  // marker quoted inside prose is not a block. The previous count-based check
-  // read the raw file and rejected any bundle whose provenance header happened
-  // to name the marker — measured: `# see -----BEGIN CERTIFICATE-----` ahead of
-  // a healthy CA was refused while node authorized the same bytes.
+  // Every clause defends a measured false accept. Do not tighten one without
+  // re-running test/proxy-forward-ca.test.mjs — each was found by a bundle this
+  // guard passed and node then refused.
   //
-  // No CRLF normalization: `$` in a /m regex matches before a `\r`, and the END
-  // search below is anchored on the leading `\n`, so both halves already read a
-  // CRLF file the same as an LF one. Measured across 102 shapes (34 bundle
-  // layouts x LF/CRLF/mixed): identical verdicts with and without the replace.
-  // Trailing whitespace is tolerated on the marker line. openssl still reacts
-  // to `-----BEGIN CERTIFICATE----- ` (one trailing space), so a `$`-anchored
-  // pattern made that block invisible to us while node still tried to load it
-  // — measured: a corrupt block wearing a trailing space was skipped by the
-  // guard and failed the handshake.
-  // The label pattern is permissive on purpose. Restricting it to uppercase,
-  // digits and spaces made every other legal label invisible to us while
-  // openssl still treated the block as real — measured: a malformed `X-FOO`
-  // block ahead of our CA gave guard=accept while node loaded zero extra CAs.
-  // Every label tried behaved as a real block (hyphenated, lowercase,
-  // underscored, dotted, punctuated, even empty), so the label decides only
-  // WHICH check a block gets, never whether it is one.
-  // `-` is legal INSIDE a label, so the stop condition is the `-----` run, not
-  // the first hyphen: `[^-]*` failed to match `X-FOO` at all, which is the same
-  // blind spot in a new place.
-  // The trailing `.*` is load-bearing: it makes a malformed opener VISIBLE so
-  // the existing per-block checks can reject it. Without it the pattern
-  // described only a well-formed marker, so `-----BEGIN CERTIFICATE-------`
-  // matched nothing at all, the block was skipped, and our CA later in the file
-  // carried the verdict. openssl does not skip it — it consumes the line as an
-  // opener and fails the entire extras load on the END it cannot match.
-  // Measured, node v24.11.1: guard=accept, loader=0 CAs, `bad end line`; now the
-  // block is seen and rejected as an undecodable CERTIFICATE.
+  //   `^`/`/m`   a marker quoted in prose is not a block (`# see -----BEGIN …`)
+  //   `[ \t]*`   openssl reacts to a marker wearing a trailing space
+  //   `(?!-----)`  labels are near-arbitrary; `-` is legal INSIDE one, so the
+  //              stop condition is the dash RUN. `[^-]*` missed `X-FOO` entirely
+  //   `.*`       makes a MALFORMED opener visible (`-----BEGIN CERT-------`) so
+  //              the per-block checks below can reject it. Without it the block
+  //              was skipped and our CA later in the file carried the verdict
   //
-  // Exactly the defect already fixed on the END side, in its mirror position.
-  // The lesson worth keeping: a shape fixed at one marker is a shape to go and
-  // check at the other. Being SEEN is what a guard needs; skipping is what lets
-  // a bad block through.
+  // No CRLF normalization: `$` matches before `\r` and the END search is
+  // anchored on `\n`. Measured identical across 102 shapes.
+  //
+  // The `.*` clause is the END-side defect in its mirror position. A shape fixed
+  // at one marker is a shape to go and check at the other; being SEEN is what a
+  // guard needs, skipping is what lets a bad block through.
   const marker = /^-----BEGIN ((?:(?!-----).)*)-----[ \t]*.*$/gm;
   let carriesUs = false;
   for (let m; (m = marker.exec(text)); ) {
     const label = m[1];
-    // Bounded by the NEXT marker, not by a search to end-of-file. An unbounded
-    // indexOf lets a torn block borrow the END line of a later one, so the
-    // unterminated check never fires and the slice spans two entries.
-    // The END marker must also END ITS LINE, bar trailing whitespace. indexOf
-    // alone ignored whatever followed it, so `-----END CERTIFICATE-----garbage`
-    // and `-----END CERTIFICATE-------` both read as terminators here while
-    // openssl rejected the block and node loaded zero CAs — measured, both as
-    // false accepts on an otherwise healthy bundle. Whitespace is fine (13/13
-    // agreement with a real handshake on what may follow), anything else is not.
+    // Two measured false accepts, both fixed here: bound the search by the NEXT
+    // BEGIN (unbounded, a torn block borrows a later END and spans two entries),
+    // and require the END to end its own line bar whitespace (`-----END X-----`
+    // followed by garbage or extra dashes read as terminators while node loaded
+    // zero CAs).
     const endMarker = `\n-----END ${label}-----`;
     const nextBegin = text.indexOf("\n-----BEGIN ", m.index + 1);
     let end = -1;
@@ -107,32 +74,23 @@ export function bundleCarriesOurCA(text, ourCaPem) {
       if (/^[ \t\r]*$/.test(tail)) { end = at; break; }
     }
     if (end !== -1 && nextBegin !== -1 && end > nextBegin) end = -1;
-    // Unterminated, or closed by a different label. Fatal whatever the label
-    // is, and deliberately not analyzed further: openssl's base64 decoder
-    // treats the next '-' as end-of-data instead of an error, so a torn block
-    // yields a valid entry when its truncated body happens to be a complete
-    // DER and garbage when it does not. Measured both outcomes from the same
-    // tear position with only the body length changed. Since the result is not
-    // knowable from out here, a damaged file is refused rather than guessed at.
+    // Unterminated, or closed by a different label: fatal, and not analyzed
+    // further. openssl's decoder treats the next `-` as end-of-data rather than
+    // an error, so a tear yields a valid entry or garbage depending only on
+    // whether the truncated body happens to be complete DER — measured both from
+    // the same tear position. Not knowable from out here, so refuse.
     if (end === -1) return { ok: false, reason: `unterminated ${label} block` };
     const block = text.slice(m.index, end + endMarker.length);
-    // EVERY block must decode, whatever its label. Node's PEM reader aborts the
-    // whole extras load on any block it cannot decode — a truncated CRL or key
-    // block ahead of our CA takes the entire file down with it, our own entry
-    // included. Skipping non-certificate blocks outright (as this did) waved
-    // those bundles through: measured, a corrupt PUBLIC KEY and a corrupt
-    // X509 CRL each gave guard=accept while the handshake failed
-    // UNABLE_TO_VERIFY_LEAF_SIGNATURE.
+    // EVERY block must decode, whatever its label: node aborts the whole extras
+    // load on one it cannot, so a truncated CRL ahead of our CA takes our own
+    // entry down with it. Skipping non-certificate blocks waved exactly those
+    // bundles through — measured, guard=accept and the handshake failed.
     //
-    // What "decodes" means differs by label, and both halves were measured
-    // against a real handshake rather than reasoned from the spec. For a
-    // CERTIFICATE, base64 validity is not enough — a well-formed base64 body
-    // that is not a certificate still kills the load, so it must parse as X509.
-    // For everything else node only needs the armor to decode, so valid base64
-    // is the whole bar; demanding more would reject the CRLs and key blocks a
-    // real corporate bundle legitimately carries, and rejecting does not fail
-    // safe here — it drops every sibling and corporate CA for the session,
-    // which is the failure this contract exists to prevent.
+    // The BAR differs by label, both halves measured. CERTIFICATE must parse as
+    // X509: valid base64 that is not a cert still kills the load. Everything
+    // else needs only decodable armor — demanding more rejects the CRLs and key
+    // blocks a real corporate bundle carries, and rejecting is not the safe
+    // direction here, it drops every sibling CA for the session.
     if (label === "CERTIFICATE") {
       let der;
       try { der = new X509Certificate(block).raw; }
@@ -142,16 +100,12 @@ export function bundleCarriesOurCA(text, ourCaPem) {
       return { ok: false, reason: `undecodable ${label} block` };
     }
   }
-  // A bundle that exists but predates our publish is WORSE than no bundle:
-  // handing it to claude makes the client distrust the very proxy it is routed
-  // through, so every request fails TLS rather than merely losing some other
-  // component's CA.
+  // A bundle that predates our publish is WORSE than no bundle: it makes the
+  // client distrust the very proxy it is routed through, failing every request
+  // rather than losing one component's CA.
   //
-  // Matched on DER, and only on a CERTIFICATE block, because neither weaker
-  // check is sound. Measured: relabelling our own CA to TRUSTED CERTIFICATE
-  // leaves X509Certificate parsing it into byte-identical DER while node's CA
-  // loader skips it entirely — the old guard accepted that bundle and the
-  // handshake then failed with UNABLE_TO_VERIFY_LEAF_SIGNATURE. That is the
-  // exact outcome this check exists to prevent, so the label is load-bearing.
+  // On DER and only on a CERTIFICATE block, both load-bearing: relabelling our
+  // CA to TRUSTED CERTIFICATE gives byte-identical DER while node's loader skips
+  // it entirely — measured as an accept whose handshake then failed.
   return carriesUs ? { ok: true } : { ok: false, reason: "bundle does not carry our CA" };
 }
