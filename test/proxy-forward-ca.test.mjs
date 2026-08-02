@@ -434,6 +434,18 @@ test("ca-trust: the bundle guard never accepts a bundle NODE_EXTRA_CA_CERTS cann
       // of these were measured as false accepts on an otherwise healthy bundle.
       ["END marker with trailing garbage", ours.replace("-----END CERTIFICATE-----", "-----END CERTIFICATE-----garbage"), false],
       ["END marker with extra dashes", ours.replace("-----END CERTIFICATE-----", "-----END CERTIFICATE-------"), false],
+      // The SAME defect on the BEGIN side, which the END fix above did not cover.
+      // `$`-anchoring the marker made an over-dashed opener invisible to us — the
+      // block was skipped entirely, so nothing was ever checked and our CA later
+      // in the file carried the verdict. openssl does NOT skip it: it consumes
+      // the line as an opener and then fails the whole extras load on the END it
+      // cannot match. Measured, node v24.11.1: guard=accept, loader=0 CAs,
+      // `bad end line`. A block we cannot parse must never be one we ignore.
+      ["BEGIN marker with extra dashes", `-----BEGIN CERTIFICATE-------\nZm9vYmFy\n-----END CERTIFICATE-----\n${ours}`, false],
+      // ...and the trailing-whitespace tolerance on BEGIN must survive the fix,
+      // for the same reason the END side keeps it: openssl accepts it and so
+      // must we, or we drop a healthy bundle.
+      ["BEGIN marker with a trailing space", ours.replace("-----BEGIN CERTIFICATE-----", "-----BEGIN CERTIFICATE----- "), true],
       // ...but trailing whitespace is fine, and must stay fine: node loads it.
       ["END marker with a trailing space", ours.replace("-----END CERTIFICATE-----", "-----END CERTIFICATE----- "), true],
       // Real cert, just not ours: the stale-builder case.

@@ -71,7 +71,20 @@ export function bundleCarriesOurCA(text, ourCaPem) {
   // `-` is legal INSIDE a label, so the stop condition is the `-----` run, not
   // the first hyphen: `[^-]*` failed to match `X-FOO` at all, which is the same
   // blind spot in a new place.
-  const marker = /^-----BEGIN ((?:(?!-----).)*)-----[ \t]*$/gm;
+  // The trailing `.*` is load-bearing: it makes a malformed opener VISIBLE so
+  // the existing per-block checks can reject it. Without it the pattern
+  // described only a well-formed marker, so `-----BEGIN CERTIFICATE-------`
+  // matched nothing at all, the block was skipped, and our CA later in the file
+  // carried the verdict. openssl does not skip it — it consumes the line as an
+  // opener and fails the entire extras load on the END it cannot match.
+  // Measured, node v24.11.1: guard=accept, loader=0 CAs, `bad end line`; now the
+  // block is seen and rejected as an undecodable CERTIFICATE.
+  //
+  // Exactly the defect already fixed on the END side, in its mirror position.
+  // The lesson worth keeping: a shape fixed at one marker is a shape to go and
+  // check at the other. Being SEEN is what a guard needs; skipping is what lets
+  // a bad block through.
+  const marker = /^-----BEGIN ((?:(?!-----).)*)-----[ \t]*.*$/gm;
   let carriesUs = false;
   for (let m; (m = marker.exec(text)); ) {
     const label = m[1];
