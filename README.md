@@ -6,6 +6,81 @@ English | [中文](./README.zh.md) | [한국어](./README.ko.md) | [Português](
 
 Cache optimization proxy for [Claude Code](https://github.com/anthropics/claude-code). Fixes prompt cache bugs that cause excessive quota burn, stabilizes the request prefix, and monitors for silent regressions. Works with all CC versions including the v2.1.113+ Bun binary.
 
+*This README documents current `main`; release availability is noted per feature.*
+
+## What it does to your traffic
+
+A local proxy sits between Claude Code and Anthropic. Before you read further,
+here is exactly what that means — the full treatment is in
+[Security model](#security-model).
+
+- **Binds to `127.0.0.1`** by default.
+- **Forwards Claude Code traffic to Anthropic, and makes no other outbound
+  calls.** Telemetry is written to local files under `~/.claude/`.
+- **Can read and rewrite `POST /v1/messages`.** That capability *is* the cache
+  repair — there is no version of this that works without it.
+- **It is idempotent: if nothing needs fixing, the request passes through
+  unmodified.** It normalizes request structure (block order, fingerprint, TTL);
+  it does not modify your conversation.
+- **Each transform is one file** in `proxy/extensions/`, readable in isolation.
+- [Independently assessed as a legitimate tool](https://github.com/anthropics/claude-code/issues/38335#issuecomment-4244413605)
+  by @TheAuditorTool (2026-04-14).
+
+Forward-proxy mode (`--remote-control`) additionally terminates TLS for
+`api.anthropic.com` using a locally-generated CA, which your client must trust.
+Everything else is blind-tunnelled. That mode is opt-in and off by default.
+
+## Do you need this?
+
+**Install or test it if:** resumed or long-running sessions show repeated
+`cache_creation_input_tokens` spikes; your cache-read ratio is low or unstable;
+you see unexpected TTL 5m downgrades, thinking-desync `400`s, or image-retry
+storms; or one of the non-cache surfaces documented below applies.
+
+**You can skip it if:** your sessions already hold a stable high cache-read
+ratio; you rarely resume long sessions; you are not under quota pressure; or you
+would rather not place a local proxy in the API path. **All four are good
+reasons not to install this.**
+
+If you are not sure which applies, measure it — you do not need this project
+installed to find out.
+
+## Check whether you have this problem
+
+Claude Code already records per-request cache accounting in its own session
+transcripts, so you can measure your cache health right now, before installing
+anything.
+
+```bash
+# Replace <session-uuid>, or use a glob to pick your most recent session.
+jq -r 'select(.message.usage.cache_read_input_tokens != null) |
+  "\(.requestId)\t\(.message.usage.cache_read_input_tokens) \(.message.usage.cache_creation_input_tokens)"' \
+  ~/.claude/projects/*/<session-uuid>.jsonl |
+  sort -u -k1,1 | cut -f2 |
+  awk '{r+=$1; c+=$2} END {printf "cache_read=%d creation=%d read-ratio=%.0f%%\n", r, c, 100*r/(r+c)}'
+```
+
+`sort -u -k1,1` counts each API call once — Claude Code writes multiple
+transcript rows per request, and **not always the same number of times per
+request** ([ArkNill's analysis](https://github.com/ArkNill/claude-code-hidden-problem-analysis)).
+Summing raw rows weights each call by its own duplicate count. Measured across
+183 local sessions (2026-08-02): **90% of sessions under 20 requests** shifted by
+a point or more without the dedup, worst case **41 points**; long sessions were
+almost all sub-point. Short sessions are exactly what a first-time reader will
+run this against.
+
+Reading the result:
+
+- **Fewer than ~20 requests: the number is meaningless.** A cold start has
+  nothing to read yet, so creation dominates and every healthy session looks
+  broken. Use a long or resumed session.
+- **Sustained low ratio on a long session, or `creation` spiking on every
+  `--resume`** — that is the problem this project exists to fix.
+- **High ratio on a long session** — you do not need this. See *Do you need
+  this?* above.
+
+## Current advisories
+
 > **v4.0.0** — Local HTTP proxy with a pipeline of cost-impact and observability extensions. Two long-standing defaults flipped: `thinking-block-sanitize` v1 is on by default (mitigates the thinking-desync `400` wedge — [#63147](https://github.com/anthropics/claude-code/issues/63147)) and in-process extension hot-reload is opt-in (`CACHE_FIX_HOT_RELOAD=on`). A/B baseline (v3.0.0 on v2.1.117): **95.5% cache hit rate through proxy vs 82.3% direct** on first warm turn. [Full release notes →](https://github.com/cnighswonger/claude-code-cache-fix/releases/tag/v4.0.0)
 
 > **Opus 4.7 advisory:** Metered data shows 4.7 burns Q5h quota at **~2.4x the rate of 4.6** for equivalent visible token counts ([independently confirmed by @ArkNill](https://github.com/ArkNill/claude-code-hidden-problem-analysis/blob/main/16_OPUS-47-ADVISORY.md)). Two factors: a new tokenizer (up to 35% more tokens, [documented](https://platform.claude.com/docs/en/about-claude/models/whats-new-claude-4-7)) and adaptive thinking overhead (~105%, not documented in usage response). The Q5h impact compounds into **Q7d** — the weekly quota ceiling that most heavy users will hit first. Workaround: `CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1` reduces burn by ~3.3x but may reduce quality on complex tasks. See [Discussion #25](https://github.com/cnighswonger/claude-code-cache-fix/discussions/25) (initial observation) and [Discussion #42](https://github.com/cnighswonger/claude-code-cache-fix/discussions/42) (controlled A/B data + Q7d analysis).
