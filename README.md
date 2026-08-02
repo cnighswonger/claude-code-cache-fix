@@ -15,8 +15,13 @@ here is exactly what that means — the full treatment is in
 [Security model](#security-model).
 
 - **Binds to `127.0.0.1`** by default.
-- **Forwards Claude Code traffic to Anthropic, and makes no other outbound
-  calls.** Telemetry is written to local files under `~/.claude/`.
+- **Forwards Claude Code traffic to Anthropic. On the default path it makes no
+  other outbound calls** — telemetry is written to local files under
+  `~/.claude/`, never sent anywhere. Two opt-in features do perform their own
+  egress, both off unless you enable them: OAuth refresh
+  (`CACHE_FIX_OAUTH_REFRESH=on`) posts to Anthropic's token endpoint, and
+  forward-proxy download acceleration re-issues release downloads to
+  `downloads.claude.ai` / `storage.googleapis.com`.
 - **Can read and rewrite `POST /v1/messages`.** That capability *is* the cache
   repair — there is no version of this that works without it.
 - **It is idempotent: if nothing needs fixing, the request passes through
@@ -57,17 +62,20 @@ jq -r 'select(.message.usage.cache_read_input_tokens != null) |
   "\(.requestId)\t\(.message.usage.cache_read_input_tokens) \(.message.usage.cache_creation_input_tokens)"' \
   ~/.claude/projects/*/<session-uuid>.jsonl |
   sort -u -k1,1 | cut -f2 |
-  awk '{r+=$1; c+=$2} END {printf "cache_read=%d creation=%d read-ratio=%.0f%%\n", r, c, 100*r/(r+c)}'
+  awk '{n++; r+=$1; c+=$2}
+       END {if (n==0) print "no usage rows found — check the session path";
+            else printf "requests=%d cache_read=%d creation=%d read-ratio=%.0f%%\n", n, r, c, 100*r/(r+c)}'
 ```
 
 `sort -u -k1,1` counts each API call once — Claude Code writes multiple
 transcript rows per request, and **not always the same number of times per
 request** ([ArkNill's analysis](https://github.com/ArkNill/claude-code-hidden-problem-analysis)).
-Summing raw rows weights each call by its own duplicate count. Measured across
-183 local sessions (2026-08-02): **90% of sessions under 20 requests** shifted by
-a point or more without the dedup, worst case **41 points**; long sessions were
-almost all sub-point. Short sessions are exactly what a first-time reader will
-run this against.
+Summing raw rows weights each call by its own duplicate count. Two independent
+sweeps of the local transcripts on one machine (2026-08-02) agreed on the shape:
+**short sessions are where this bites** — over half of sessions under 20 requests
+shifted by a point or more without the dedup, worst case **41 points**, while
+long sessions were almost all sub-point (3 of ~37). Short sessions are exactly
+what a first-time reader will run this against.
 
 Reading the result:
 
