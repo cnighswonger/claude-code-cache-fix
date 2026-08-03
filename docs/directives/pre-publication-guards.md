@@ -65,11 +65,17 @@ finds.
 **Explicitly out of scope:**
 
 - **Writing a scanner.** `tools/absence-scan.mjs` already exists in
-  @Gunther-Schulz's fork, is class-based and importable, and already runs as his
-  own pre-push guard — exercised against real captures. Per the anti-bloat lens,
-  a second implementation needs justification and there is none. This directive
-  **depends on** that scanner landing (asked on #292); it does not reimplement
-  it.
+  @Gunther-Schulz's fork (visible in #276), is class-based and importable, and
+  already runs as his own pre-push guard — exercised against real captures. Per
+  the anti-bloat lens, a second implementation needs justification and there is
+  none. This directive **depends on** that scanner landing (asked on #292); it
+  does not reimplement it.
+- **Adding capability to that scanner.** Measured 2026-08-03 against the #292
+  file: it already has the shebang, the `import.meta.url` main-module guard,
+  `0`/`2`/`1` exit codes, and a **`--git-range <old>..<new>`** mode built for a
+  pre-push caller. It reported class, JSON path, and length for all 10 findings
+  and never echoed a value. Every design constraint below was already satisfied
+  by it before this directive was written; nothing here asks for new features.
 - History rewriting. Not available on a public repo.
 - Secret scanning generally. GitHub's own scanning covers credentials; this is
   about capture-derived identifiers, which are not secrets and which no
@@ -119,6 +125,42 @@ what makes bypassing it survivable.
   the push, not silently pass.
 - **Load-bearing?** — **yes.** It gates what becomes public, and its failure
   mode is irreversible.
+
+## Fork-vs-upstream boundary conditions
+
+Two settings in the scanner are correct for the fork it was written in and
+wrong here. Both are recorded because they would otherwise survive the move by
+inertia.
+
+**1. The `#292` file is allowlisted.** `tools/absence-scan.mjs:50-55` exempts
+`test/fixtures/cc-transcript-shape-snapshot.json` by name. Measured — running
+the range that introduced it returns clean:
+
+```
+$ node tools/absence-scan.mjs --git-range edf3ed7..16ad235
+allowlisted: test/fixtures/cc-transcript-shape-snapshot.json
+absence-scan: clean                                             exit 0
+```
+
+The rationale is documented and sound for a fork: the file is upstream's, was
+public before the scan existed, and a new-branch push scans `EMPTY..tip`, so it
+would go red forever on content the fork cannot change. Upstream it inverts —
+once the fixture is synthesized (#292), **that entry must be removed** or the
+guard is permanently blind to the one file known to have leaked.
+
+**2. Corpus scoping has no upstream equivalent.**
+`CORPUS_SCOPE = /(^|\/)test\/fixtures\/harvested\//` limits three of the five
+classes to the fork's harvest tree; elsewhere only `b64-run` and `capture-uuid`
+fire. The rationale is the strongest measurement in the file: **219 findings
+unscoped, ~205 of them synthetic hand-authored test data**, and a guard that
+fires on non-defects trains the `--no-verify` reflex that kills it. False-fire
+rate on the two byte-level classes was zero.
+
+This repo has no `test/fixtures/harvested/`. So upstream must either scope the
+semantic classes to an equivalent or accept byte-level-only coverage. Note
+byte-level-only would still have caught #292 — 9 of its 10 findings are
+byte-level. The decision must be explicit, not discovered later as three
+classes that never ran.
 
 ## Open questions
 
