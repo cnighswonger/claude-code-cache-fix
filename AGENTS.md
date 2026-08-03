@@ -210,6 +210,38 @@ shapes the last missed. When that pattern appears, stop asking whether
 reviewers were diligent and ask whether the design is a model of an
 oracle that already exists.
 
+### Read the README before reviewing the code
+
+**When a change depends on what some other program does — a runtime, a
+client, an upstream API — read this repo's own README and CHANGELOG
+history for that program before reviewing the diff.** The project's
+accumulated knowledge of it lives there, and a reviewer who skips it
+re-derives from the code alone and will re-derive wrong.
+
+Concretely: five review rounds on the CA guard argued about node's CA
+loader semantics. The client stopped being node at CC v2.1.113 — the
+Bun binary switch — which is documented in this file, in
+`README.md`, in `CHANGELOG.md`, and is the reason the `NODE_OPTIONS`
+preload was abandoned and this proxy exists in its current form. Every
+round had that available and none consulted it. The launcher comment at
+`bin/claude-via-proxy.mjs:329` still says *"never that **Node** will
+verify a given leaf with it."*
+
+The failure is not that the fact was hidden. It is that reviewing a
+diff invites reasoning from the diff, and project history is exactly
+the context a diff does not carry.
+
+### The expectations are part of what gets checked
+
+Corollary B says mutate the code to prove the test reaches it. That is
+not sufficient on its own: **when a test asserts what another program
+does, the expectation itself must have come from that program.**
+
+A row in the CA guard's shape table recorded the predicate's own
+behaviour as the expected value. Every round compared the code to the
+table; no round compared the table to node. Five rounds re-certified a
+wrong expectation, and the suite was green throughout.
+
 ### Where else it applies
 
 The CA guard is one instance. The unifying property is that **the
