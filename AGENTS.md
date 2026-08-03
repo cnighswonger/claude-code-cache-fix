@@ -150,6 +150,75 @@ When several reviewers are on one PR, the classes are what make their
 findings cheap to reconcile — *Measured* from one and *Read* from
 another on the same point is a signal, not a contradiction.
 
+## Predicates That Predict Another Program
+
+**When a change decides trust, admission, or rejection — or more
+generally when any predicate's job is to predict another program's
+behavior — the review must run adversarial inputs through the real
+decision path and compare against the oracle production actually uses.
+A code read is not sufficient evidence for a claim about which inputs
+it accepts.**
+
+Two corollaries. They are the load-bearing part; the rule above them
+would not have caught the case that produced it.
+
+- **A. The oracle must be the *same API* production calls, not merely
+  a real one.** A real check through the wrong entry point is a green
+  test that certifies nothing.
+- **B. Before relying on a test as evidence, verify it reaches the
+  shipped code — mutate the code and confirm the test fails.**
+
+**"We have tests" is the most common form the reassurance takes, and
+it is the one that failed here.** Measured on merged `23346ac9`:
+mutating the launcher's CA guard to accept unconditionally left
+`test/proxy-forward-ca.test.mjs` passing **12/12**, because the test
+exercised a hand-copied twin of the logic rather than the shipped
+function. Both reviewers counted that suite as reassurance.
+
+### Phrasing
+
+Claims of the form *"conservative, never permissive"* / *"fails
+closed"* / *"cannot accept X"* are universal quantifications over an
+input space. State them **Measured with the input set named**, or
+downgrade to a floor: *"these shapes were checked; the set is not
+known to be complete."*
+
+### Why this rule exists
+
+PR #283's `ca-trust` guard merged with two approvals and independent
+verification of every blocker. It is wrong in **both** directions, and
+both reproduce on `main`:
+
+- **False reject** — `new X509Certificate(block)` runs on every PEM
+  block and the throw escapes; one CRL in a bundle voids the whole
+  file. Rejection is not the safe direction: the fallback drops every
+  sibling CA, which is the failure the contract exists to prevent.
+- **False accept** — `X509Certificate` ignores the PEM label, so our
+  CA relabelled `TRUSTED CERTIFICATE` yields byte-identical DER and
+  passes, while node's loader skips any block not labelled exactly
+  `CERTIFICATE`.
+
+We were not careless. We measured a write→rename race at 0.88 ms over
+5,000 iterations, grepped the rendezvous path, checked file modes —
+**and never fed the guard a realistic bundle.** The shape to watch for
+is *verifying the checkable parts and reasoning about the deciding
+part*, and it is invisible from inside because the deciding function
+usually looks readable.
+
+Round counts on that one predicate: 5 rounds, 3 parties, each finding
+shapes the last missed. When that pattern appears, stop asking whether
+reviewers were diligent and ask whether the design is a model of an
+oracle that already exists.
+
+### Where else it applies
+
+The CA guard is one instance. The unifying property is that **the
+oracle exists and we chose to model it instead of calling it.** Also
+in this class: `git push --dry-run` as a test of a branch ruleset (it
+reports success against a ruleset the server never consulted — read
+`gh api repos/<o>/<r>/rulesets` instead); a schema pre-check ahead of
+a strict parse; any validator predicting a downstream parser.
+
 ## Anti-Bloat Lens (no-directive PRs)
 
 The global baseline's bloat bar is *"larger than the directive's
