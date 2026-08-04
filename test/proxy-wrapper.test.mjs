@@ -6,6 +6,14 @@ import { dirname, resolve, join } from "node:path";
 import { tmpdir } from "node:os";
 import { chmodSync, closeSync, existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import http from "node:http";
+import tls from "node:tls";
+
+// The keep-the-merge branch needs a census that can say YES, and
+// `tls.getCACertificates` arrived in v22.15 while `engines` allows >=18. Below
+// that the census answers `null` for every healthy bundle, so the branch cannot
+// fire and the two rows that assert it would fail describing a defect that is
+// not there. Asked of the runtime, not of its version string.
+const canCountCAs = typeof tls.getCACertificates === "function";
 // The launcher's own trust question, asked the same way it asks it.
 import { bundleUsable } from "../bin/ca-trust.mjs";
 
@@ -1195,7 +1203,8 @@ describe("launch wrapper (claude-via-proxy)", () => {
       `and the re-minted leaf disagree. got: ${other.out} stderr: ${other.err}`);
   });
 
-  it("--remote-control keeps a merge that carries our CA when nothing can judge it", async () => {
+  it("--remote-control keeps a merge that carries our CA when nothing can judge it",
+     { skip: canCountCAs ? false : "runtime has no tls.getCACertificates, so the census cannot vouch for any bundle" }, async () => {
     // The two rows this branch has to separate, and the question that separates
     // them. An earlier version asked "does node load ANYTHING from it":
     //
@@ -1238,7 +1247,8 @@ describe("launch wrapper (claude-via-proxy)", () => {
     }
   });
 
-  it("--remote-control keeps a merge nothing faulted, even when salvage produced a rebuild", async () => {
+  it("--remote-control keeps a merge nothing faulted, even when salvage produced a rebuild",
+     { skip: canCountCAs ? false : "runtime has no tls.getCACertificates, so the census cannot vouch for any bundle" }, async () => {
     // `salvaged ||` short-circuits, so on `unknown` a rebuild pre-empted a merge
     // the launcher had POSITIVE evidence for — the census says it carries our CA
     // and nothing refused it. The rebuild can only hold what `ca-trust.d`

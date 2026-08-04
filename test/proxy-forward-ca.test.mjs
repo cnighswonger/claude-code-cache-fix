@@ -102,6 +102,12 @@ function withCA(overrides, fn) {
 // once is enough since ensureCA() re-reads config.caDir on every call.
 const { ensureCA } = await import(FWD);
 
+// Asked of the runtime, not derived from its version string: `engines` allows
+// >=18 and `tls.getCACertificates` arrived in v22.15, where the CA census
+// answers `null` for everything. A test whose control needs a YES cannot
+// establish its premise there.
+const canCountCAs = typeof (await import("node:tls")).getCACertificates === "function";
+
 function spkiDer(keyLike) {
   return createPublicKey(keyLike).export({ type: "spki", format: "der" });
 }
@@ -1056,7 +1062,7 @@ test("ca-trust: the operator's environment cannot forge either probe's answer", 
   });
 });
 
-test("ca-trust: the operator's proxy env cannot redirect the probe's own handshake", () => {
+test("ca-trust: the operator's proxy env cannot redirect the probe's own handshake", (t) => {
   const keys = ["NODE_USE_ENV_PROXY", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY",
                 "http_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"];
   const saved = {};
@@ -1109,15 +1115,13 @@ test("ca-trust: the operator's proxy env cannot redirect the probe's own handsha
       // POSITIVE CONTROL, and it is the whole reason this test is trustworthy.
       // The assertion below is a NEGATIVE — "the env did not reach the probe" —
       // and a negative from an instrument never shown capable of a positive is
-      // not a measurement. Measured the hard way: three times this round I
-      // reported this very defect as "does not reproduce", because my fake
-      // proxy could not register a connection at all and I read its silence as
-      // absence.
+      // not a measurement.
       //
       // So plant the state first: a child that DOES honour this env must fail
-      // to reach a dead proxy port. If that comes back reachable, the env is
-      // inert here (an ambient NO_PROXY exempting loopback does exactly that)
-      // and the assertion below would pass against unfixed code.
+      // to reach a dead proxy port. Reachable means the env is inert here — an
+      // ambient NO_PROXY exempting loopback, or a runtime with no
+      // NODE_USE_ENV_PROXY at all (it arrived in 22; `engines` allows >=18) —
+      // and the assertion below would then pass against unfixed code.
       const control = spawnSync(process.execPath, ["-e",
         'require("node:https").get({host:"127.0.0.1",port:44599,path:"/"},'
         + '()=>console.log("REACHED")).on("error",e=>console.log("ERR "+e.code))'],
@@ -1127,10 +1131,14 @@ test("ca-trust: the operator's proxy env cannot redirect the probe's own handsha
       // — measured, a dead proxy port and an empty env give the identical
       // string. Reaching a live listener that hangs up yields ECONNRESET (or a
       // tunnel error), which only happens if the env WAS honoured.
-      assert.doesNotMatch(control.stdout || "", /REACHED|ECONNREFUSED/,
-        `control: this env must actually route a child through the proxy, got ${JSON.stringify(control.stdout)}`);
-
       try {
+        // Skip, not fail: an unplantable control means this runtime cannot host
+        // the measurement, which is not the defect under test.
+        if (/REACHED|ECONNREFUSED/.test(control.stdout || "")) {
+          t.skip(`this runtime does not route a child through proxy env (${process.version}), ` +
+                 `so the control cannot be planted; got ${JSON.stringify(control.stdout)}`);
+          return;
+        }
         assert.equal(bundleUsable(healthy, leafOf(dir)).ok, true,
           "the operator's proxy env reached the probe and changed its verdict");
       } finally { px.kill("SIGTERM"); }
@@ -1269,7 +1277,8 @@ test("ca-trust: salvage refuses to hand back an unjudged rebuild of a merge it c
 //
 // So it returns `true` / `false` / `null`, and each call site says out loud what
 // it does with `null` rather than inheriting one global guess.
-test("ca-trust: the CA probe answers 'could not ask' rather than guessing yes", () => {
+test("ca-trust: the CA probe answers 'could not ask' rather than guessing yes",
+     { skip: canCountCAs ? false : "runtime has no tls.getCACertificates, so every answer here is already null" }, () => {
   withCA({}, (dir) => {
     ensureCA();
     const ours = readFileSync(join(dir, "ca.pem"), "utf8");
@@ -1400,7 +1409,8 @@ test("ca-trust: the probe still sees a client-fatal bundle when it cannot count"
 // takes down CAs supplied through `SSL_CERT_FILE` or `SSL_CERT_DIR` — measured,
 // two independent sources. So the happy path could hand `claude` a bundle that
 // leaves it trusting nothing at all.
-test("ca-trust: a bundle that verifies our leaf is still refused when the client would discard it", () => {
+test("ca-trust: a bundle that verifies our leaf is still refused when the client would discard it",
+     { skip: canCountCAs ? false : "runtime has no tls.getCACertificates, so every answer here is already null" }, () => {
   withCA({}, (dir) => {
     ensureCA();
     const ours = readFileSync(join(dir, "ca.pem"), "utf8");
@@ -1444,7 +1454,8 @@ test("ca-trust: a bundle that verifies our leaf is still refused when the client
 // it warns `Ignoring extra certs ... load failed` for exactly the files
 // BoringSSL discards, and stays silent for exactly the ones it accepts —
 // including three where a marker COUNT got the answer wrong.
-test("ca-trust: a bundle the real client would discard is refused, even when node keeps part of it", () => {
+test("ca-trust: a bundle the real client would discard is refused, even when node keeps part of it",
+     { skip: canCountCAs ? false : "runtime has no tls.getCACertificates, so every answer here is already null" }, () => {
   withCA({}, (dir) => {
     ensureCA();
     const ours = readFileSync(join(dir, "ca.pem"), "utf8");
