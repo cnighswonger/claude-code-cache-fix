@@ -266,9 +266,13 @@ loader semantics. The client stopped being node at CC v2.1.113 — the
 Bun binary switch — which is documented in this file, in
 `README.md`, in `CHANGELOG.md`, and is the reason the `NODE_OPTIONS`
 preload was abandoned and this proxy exists in its current form. Every
-round had that available and none consulted it. The launcher comment at
-`bin/claude-via-proxy.mjs:329` still says *"never that **Node** will
-verify a given leaf with it."*
+round had that available and none consulted it. The launcher said so
+about itself, too: until #296 replaced it, the guard carried the comment
+*"Still only a pre-flight guard, not proof… never that **Node** will
+verify a given leaf with it. Only a handshake shows that, and the
+launcher does not perform one"* (`23346ac:bin/claude-via-proxy.mjs`,
+since rewritten). Five rounds read past a function that documented its
+own limitation.
 
 The failure is not that the fact was hidden. It is that reviewing a
 diff invites reasoning from the diff, and project history is exactly
