@@ -574,6 +574,29 @@ function removeSelfHeal() {
  *   await startProxy({ port: 0 })                    // OS-assigned port
  *   await startProxy({ port: 0, watch: false })      // embedded, no fs.watch
  */
+// Is a DIFFERENT-MODE cache-fix proxy already on this port? `reusePort` lets a
+// successor co-bind, which is the point, but a plain proxy and a forward proxy
+// sharing a port makes the kernel round-robin CONNECT between one that speaks it
+// and one that does not. Asks the incumbent rather than predicting it — the
+// answer is on `/health`, which every version of this proxy has served.
+//
+// Returns FALSE on any doubt: nothing listening, a timeout, a non-proxy service,
+// unparseable JSON. A guard that blocked startup on an unanswered probe would
+// turn a slow box into a proxy that will not start, which is worse than the
+// mismatch it prevents.
+async function modeConflict(port, bind, weAreForward) {
+  const body = await new Promise((res) => {
+    const req = http.get({ host: bind, port, path: "/health", timeout: 1000 }, (r) => {
+      let b = ""; r.on("data", (d) => (b += d)); r.on("end", () => res(b));
+    });
+    req.on("error", () => res(null));
+    req.on("timeout", () => { req.destroy(); res(null); });
+  });
+  if (!body) return false;
+  try { return JSON.parse(body).forward_proxy !== weAreForward; }
+  catch { return false; }
+}
+
 export async function startProxy(options = {}) {
   const port = options.port ?? config.port;
   const bind = options.bind ?? config.bind;
@@ -664,35 +687,51 @@ export async function startProxy(options = {}) {
     if (forwardAttached) installSelfHeal();
   }
 
+  // EADDRINUSE used to refuse a second launch on this port, and `reusePort`
+  // removes that. Losing it entirely is not acceptable: a plain proxy and a
+  // `--remote-control` forward proxy on one port makes the kernel round-robin
+  // CONNECT between a process that speaks it and one that does not — measured,
+  // 17 of 40 attempts died `ECONNRESET`.
+  //
+  // But refusing every occupied port would also refuse the handover this change
+  // exists to enable. The distinction is MODE, not count: two proxies in the
+  // same mode ARE the handover, and only a mode MISMATCH produces the failure
+  // above. So the guard asks `/health` what is already there and refuses only
+  // when its `forward_proxy` disagrees with ours.
+  if (await modeConflict(port, bind, forwardAttached)) {
+    throw new Error(
+      `another cache-fix proxy is already on ${bind}:${port} in the other mode ` +
+      `(forward_proxy=${!forwardAttached}). Two modes on one port make the kernel ` +
+      `round-robin CONNECT between them; stop that one first.`);
+  }
+
   await new Promise((resolve, reject) => {
-    server.once("error", reject);
     // SO_REUSEPORT so a successor can bind this port WHILE we are still serving,
     // which is what makes a reload survivable for the sessions using it. Without
     // it the only reload is kill-then-respawn, and the port is unbound for the
-    // gap: measured against a 12-chunk stream, SIGTERM + a 5 s force-close
-    // delivered 7 chunks and cut the rest, which reaches a session as
-    // "Connection closed mid-response". With it, the successor is already
-    // accepting before we stop, and the same stream delivered 10 of 10.
+    // gap: measured against a 12-chunk stream through this proxy, the reload
+    // ended it at `ECONNRESET` after 18 chunks, which reaches a session as
+    // "Connection closed mid-response". With it, the same stream ran to
+    // completion.
     //
     // `listen({port})` and `listen(port)` are not interchangeable here: the
     // option form is the only one that carries `reusePort`.
     //
-    // Not gated on a flag. A kernel without SO_REUSEPORT fails the listen
-    // outright rather than silently ignoring the option, and the catch below
-    // retries without it, so an old kernel keeps exactly today's behaviour.
+    // A runtime without it IGNORES the option rather than failing — measured,
+    // not assumed: `reusePort` landed in node 22.12/23.1, and CI's 18.20.8 and
+    // 20.20.2 both listen successfully and then refuse the successor with
+    // EADDRINUSE. So there is nothing to catch and no fallback to write; those
+    // runtimes simply keep today's kill-then-respawn behaviour. An earlier
+    // version of this comment claimed the opposite and shipped a catch that
+    // could never fire — and the catch was itself broken, registering a second
+    // `error` handler after `reject`, which wins on registration order.
     const opts = { port, host: bind, reusePort: true };
-    const onFail = (e) => {
-      // ENOTSUP / EINVAL: this kernel has no SO_REUSEPORT. Fall back rather than
-      // refusing to start — a proxy that will not listen is worse than a reload
-      // that drops connections.
-      if (e.code !== "ENOTSUP" && e.code !== "EINVAL") return reject(e);
-      server.listen(port, bind, () => resolve());
-      server.once("error", reject);
-    };
-    server.once("error", onFail);
+    // ONE error handler. Two handlers on one event is not a fallback: both fire,
+    // in registration order, so whichever settles the promise first decides and
+    // the other runs against a settled promise.
+    server.once("error", reject);
     server.listen(opts, () => {
       server.off("error", reject);
-      server.off("error", onFail);
       resolve();
     });
   });
@@ -789,22 +828,19 @@ if (invokedAsScript) {
       return;
     }
     active.close().finally(() => process.exit(0));
-    // The grace window before laggards are forced. 5 s was chosen when the only
-    // reload was kill-then-respawn, where a longer wait meant a longer outage:
-    // the port stayed unbound until this process died. With SO_REUSEPORT the
-    // successor is ALREADY accepting, so waiting costs nothing but this
-    // process's own lifetime — and 5 s is far shorter than a streaming
-    // /v1/messages response, which is exactly the request a reload must not
-    // cut. Measured against a 12-chunk stream: 5 s delivered 7 chunks and cut
-    // the rest.
-    //
-    // Overridable so an operator who needs the old timing (or a much longer
-    // drain) has it without a redeploy; the default is what a session actually
-    // needs rather than what the old reload could afford.
-    const graceMs = Number(process.env.CACHE_FIX_SHUTDOWN_GRACE_MS) || 120_000;
+    // The 5 s grace is DELIBERATELY UNCHANGED. Raising it looked free once a
+    // successor is already accepting — the predecessor is invisible to new
+    // connections while it drains — but a supervised stop is SERIAL: systemd
+    // stops, waits for exit, then starts. Measured on this box, where
+    // `DefaultTimeoutStopSec` is 90 s and no unit template overrides it: at
+    // 120 s the stop is SIGKILLed at the cap (90006 ms, stream ECONNRESET),
+    // and a serial restart went from 5.0 s of downtime to 53.9 s. So a longer
+    // grace makes `systemctl restart` worse while helping only the
+    // side-by-side handover — which SO_REUSEPORT already fixes, measured, at
+    // 5 s. Any future increase has to move the unit's TimeoutStopSec with it.
     setTimeout(() => {
       process.stderr.write(
-        `[cache-fix] shutdown: in-flight connections still open after ${graceMs} ms — forcing close\n`,
+        "[cache-fix] shutdown: in-flight connections still open after 5s — forcing close\n",
       );
       // Node >=18.2; package.json engines allows 18.0/18.1, where the
       // pre-existing behavior (exit without forcing) is the only option.
@@ -812,7 +848,7 @@ if (invokedAsScript) {
         active.server.closeAllConnections();
       }
       process.exit(0);
-    }, graceMs).unref();
+    }, 5000).unref();
   };
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);
