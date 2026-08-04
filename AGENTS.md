@@ -261,11 +261,11 @@ is *verifying the checkable parts and reasoning about the deciding
 part*, and it is invisible from inside because the deciding function
 usually looks readable.
 
-Round counts on that one predicate: **10 formal reviews across #283 and
-#296** (3 + 7, countable via `gh api .../pulls/<N>/reviews`), by three
-parties, each round finding shapes the last missed. When that pattern
-appears, stop asking whether reviewers were diligent and ask whether the
-design is a model of an oracle that already exists.
+That predicate shipped in #283 and was still being corrected in #296 —
+two PRs, and the defects above were found after both had been approved.
+When a single function keeps producing new defects after review has
+signed off on it, stop asking whether reviewers were diligent and ask
+whether the design is a model of an oracle that already exists.
 
 ### Read the README before reviewing the code
 
@@ -308,9 +308,10 @@ not sufficient on its own: **when a test asserts what another program
 does, the expectation itself must have come from that program.**
 
 A row in the CA guard's shape table recorded the predicate's own
-behaviour as the expected value. Every round compared the code to the
-table; no round compared the table to node. Five rounds re-certified a
-wrong expectation, and the suite was green throughout.
+behaviour as the expected value. It survived every review that reached
+it, and was found only when @codeslake ran the table against the real
+loader while building #296's oracle — reported on that PR. The suite was
+green throughout.
 
 ### Where else it applies
 
