@@ -593,8 +593,21 @@ async function modeConflict(port, bind, weAreForward) {
     req.on("timeout", () => { req.destroy(); res(null); });
   });
   if (!body) return false;
-  try { return JSON.parse(body).forward_proxy !== weAreForward; }
-  catch { return false; }
+  // A REAL boolean, or no opinion. `/health` has two shapes: the ok body carries
+  // `forward_proxy`, and the degraded body (503, an extension failed to load)
+  // does not — and `undefined !== false` is true, so reading absence as a
+  // mismatch refused BOTH modes and left the port unstartable. That body's own
+  // hint says "restart the proxy via your supervisor to recover", which is
+  // exactly the restart this guard would have blocked. Same for any pre-4.3.0
+  // cache-fix, whose `/health` predates the key, and for any foreign JSON.
+  //
+  // Refusing those is not load-bearing anyway: `reusePort` needs BOTH sides to
+  // opt in — measured, incumbent false / successor true gives EADDRINUSE — so a
+  // non-cache-fix incumbent cannot be co-bound with in the first place.
+  try {
+    const f = JSON.parse(body)?.forward_proxy;
+    return typeof f === "boolean" && f !== weAreForward;
+  } catch { return false; }
 }
 
 export async function startProxy(options = {}) {
@@ -699,10 +712,19 @@ export async function startProxy(options = {}) {
   // above. So the guard asks `/health` what is already there and refuses only
   // when its `forward_proxy` disagrees with ours.
   if (await modeConflict(port, bind, forwardAttached)) {
+    // Retire what the forward attach claimed, BEFORE leaving. `startProxy` is an
+    // exported library API, so a caller can survive this throw — and both
+    // `_forwardActive` and the self-heal handler are process-wide. The close()
+    // path already retires them; this is a second exit from the same critical
+    // section and has to do the same. Left leaking, `_forwardActive` stays
+    // above zero and a later REVERSE-only instance reports forward_proxy:true
+    // and passthrough-relays paths it should 404, while an orphaned
+    // uncaughtException handler swallows crashes that should restart the proxy.
+    if (forwardAttached) { _forwardActive--; removeSelfHeal(); }
     throw new Error(
-      `another cache-fix proxy is already on ${bind}:${port} in the other mode ` +
-      `(forward_proxy=${!forwardAttached}). Two modes on one port make the kernel ` +
-      `round-robin CONNECT between them; stop that one first.`);
+      `another cache-fix proxy is already on ${bind}:${port} in the other mode; ` +
+      `two modes on one port make the kernel round-robin CONNECT between them. ` +
+      `Stop that one first.`);
   }
 
   await new Promise((resolve, reject) => {
