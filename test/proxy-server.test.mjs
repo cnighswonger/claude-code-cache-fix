@@ -342,3 +342,98 @@ describe("proxy server /health degraded (#196)", () => {
     assert.ok(!/cache-fix-proxy\.service/.test(parsed.hint), "hint must not be systemd-specific");
   });
 });
+
+describe("zero-downtime reload", () => {
+  // A reload must not cut a response that is already streaming. This is not a
+  // hypothetical: a reload on a shared host cut three live sessions, surfacing
+  // as "Connection closed mid-response", because the only reload available was
+  // kill-then-respawn — the successor could not bind the port until the old
+  // process was gone, so every in-flight body died with it.
+  //
+  // Driven with two REAL server processes, not two `startProxy()` handles in
+  // one process: the whole question is whether two separate processes can hold
+  // the same port at once, which an in-process test cannot ask.
+  it("a successor binds the same port while the old process is still serving", async () => {
+    const { spawn } = await import("node:child_process");
+    const { fileURLToPath } = await import("node:url");
+    const { dirname, join: pjoin } = await import("node:path");
+    const here = dirname(fileURLToPath(import.meta.url));
+    const serverPath = pjoin(here, "..", "proxy", "server.mjs");
+
+    // A deliberately slow upstream, so the response is still open when the
+    // reload happens. 12 chunks at 250 ms is ~3 s of streaming against a
+    // handover that takes well under one.
+    const CHUNKS = 12;
+    const upstream = http.createServer((q, r) => {
+      r.writeHead(200, { "content-type": "text/event-stream" });
+      let n = 0;
+      const t = setInterval(() => {
+        r.write(`data: ${++n}\n\n`);
+        if (n >= CHUNKS) { clearInterval(t); r.end(); }
+      }, 250);
+      q.resume();
+    });
+    await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
+    const upPort = upstream.address().port;
+
+    // Port 0 cannot be used here — both processes must be told the SAME port,
+    // and the point is that the second one binds it. Ask the kernel for a free
+    // one, then release it.
+    const scout = http.createServer();
+    await new Promise((r) => scout.listen(0, "127.0.0.1", r));
+    const PORT = scout.address().port;
+    await new Promise((r) => scout.close(r));
+
+    const env = { ...process.env,
+      CACHE_FIX_PROXY_PORT: String(PORT),
+      CACHE_FIX_PROXY_BIND: "127.0.0.1",
+      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upPort}` };
+    // The ambient proxy vars would send this test's own requests through a real
+    // proxy on the developer's box, which hangs forever.
+    for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]) delete env[k];
+
+    const started = (p) => new Promise((res, rej) => {
+      const to = setTimeout(() => rej(new Error("proxy did not report listening")), 15_000);
+      p.stdout.on("data", (d) => { if (/listening/.test(String(d))) { clearTimeout(to); res(); } });
+      p.on("error", rej);
+    });
+    const older = spawn(process.execPath, [serverPath], { env, stdio: ["ignore", "pipe", "pipe"] });
+    const kids = [older];
+    try {
+      await started(older);
+
+      // Start streaming, and wait until bytes are actually flowing — a request
+      // that has not been answered yet would prove nothing about in-flight.
+      let chunks = 0, ended = false, failure = null;
+      const req = http.request(
+        { host: "127.0.0.1", port: PORT, path: "/v1/messages", method: "POST",
+          headers: { "content-type": "application/json" } },
+        (res) => {
+          res.on("data", () => chunks++);
+          res.on("end", () => { ended = true; });
+          res.on("error", (e) => { failure = e.code || e.message; });
+        });
+      req.on("error", (e) => { failure = e.code || e.message; });
+      req.end(JSON.stringify({ model: "x", messages: [], stream: true }));
+      const flowing = Date.now() + 10_000;
+      while (chunks === 0 && Date.now() < flowing) await new Promise((r) => setTimeout(r, 100));
+      assert.ok(chunks > 0, `premise: the response must be streaming before the reload. failure=${failure}`);
+
+      const newer = spawn(process.execPath, [serverPath], { env, stdio: ["ignore", "pipe", "pipe"] });
+      kids.push(newer);
+      // THE assertion: this resolves only if the successor bound a port the
+      // predecessor still holds. Before SO_REUSEPORT it rejected with EADDRINUSE.
+      await started(newer);
+
+      older.kill("SIGTERM");
+      const done = Date.now() + 20_000;
+      while (!ended && !failure && Date.now() < done) await new Promise((r) => setTimeout(r, 100));
+
+      assert.equal(failure, null, `the reload cut a response that was already streaming (${failure})`);
+      assert.ok(ended, "the streaming response never completed across the reload");
+    } finally {
+      for (const k of kids) { try { k.kill("SIGKILL"); } catch {} }
+      await new Promise((r) => upstream.close(r));
+    }
+  });
+});
