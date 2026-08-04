@@ -201,9 +201,6 @@ Two consequences worth internalizing:
   design were one command each; run on day one they would have prevented
   most of five review rounds.
 
-When several reviewers are on one PR, the classes are what make their
-findings cheap to reconcile — *Measured* from one and *Read* from
-another on the same point is a signal, not a contradiction.
 
 ## Predicates That Predict Another Program
 
@@ -254,8 +251,8 @@ both reproduce on `main`:
   passes, while node's loader skips any block not labelled exactly
   `CERTIFICATE`.
 
-We were not careless. We measured a write→rename race at 0.88 ms over
-5,000 iterations, grepped the rendezvous path, checked file modes —
+That review was not lazy — it measured a write→rename race at 0.88 ms
+over 5,000 iterations, grepped the rendezvous path, checked file modes —
 **and never fed the guard a realistic bundle.** The shape to watch for
 is *verifying the checkable parts and reasoning about the deciding
 part*, and it is invisible from inside because the deciding function
@@ -297,9 +294,6 @@ answered with the wrong oracle.
 The runtime fact stayed unexamined for three further rounds, until it
 was measured directly against the shipped binary.
 
-The failure is not that the fact was hidden. It is that reviewing a
-diff invites reasoning from the diff, and project history is exactly
-the context a diff does not carry.
 
 ### The expectations are part of what gets checked
 
