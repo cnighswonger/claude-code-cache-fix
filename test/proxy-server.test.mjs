@@ -520,10 +520,19 @@ describe("zero-downtime reload", () => {
         let b = ""; r.on("data", (d) => (b += d)); r.on("end", () => res(b));
       }).on("error", (e) => res(`ERR:${e.code}`));
     });
+    // pgrep, never a pid arithmetic shortcut: `process.kill(0, ...)` signals the
+    // caller's whole process group — the test runner included — and Number("")
+    // and Number(undefined) are both 0.
+    const proxyPid = () => {
+      let out = "";
+      try { out = execFileSync("pgrep", ["-P", String(launcher.pid)]).toString(); } catch { return 0; }
+      const pid = Number(out.trim().split("\n")[0]);
+      return Number.isInteger(pid) && pid > 1 ? pid : 0;
+    };
     const killProxy = () => {
-      const kid = execFileSync("pgrep", ["-P", String(launcher.pid)]).toString().trim().split("\n")[0];
-      assert.ok(kid, "no proxy child to kill, so nothing was restarted");
-      process.kill(Number(kid), "SIGKILL");
+      const pid = proxyPid();
+      assert.ok(pid, "no proxy child to kill, so nothing was restarted");
+      process.kill(pid, "SIGKILL");
     };
     try {
       const up = Date.now() + 20_000;
@@ -601,6 +610,10 @@ describe("zero-downtime reload", () => {
       /const SERVER_PATH = .*/, `const SERVER_PATH = ${JSON.stringify(failing)};`));
     const port = await freePort();
     const env = { ...process.env, CACHE_FIX_HOLD_PORT: "on", CACHE_FIX_PROXY_PORT: String(port) };
+    // An ambient LISTEN_FDS sends the launcher down the socket-activation path
+    // instead of the holder, and an ambient proxy var routes its own requests
+    // through a proxy that is not there.
+    for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "LISTEN_FDS", "LISTEN_PID"]) delete env[k];
     const launcher = spawn(process.execPath, [copy, "server"], { env, stdio: ["ignore", "pipe", "pipe"] });
     let err = "";
     launcher.stderr.on("data", (d) => (err += d));
@@ -649,9 +662,11 @@ describe("zero-downtime reload", () => {
       async ({ launcher, bound, stderr }) => {
         // Let the one good generation come up, then kill it: every restart now fails.
         await new Promise((r) => setTimeout(r, 2_500));
-        const kid = execFileSync("pgrep", ["-P", String(launcher.pid)]).toString().trim().split("\n")[0];
-        assert.ok(kid, "the fake proxy never started, so this measures nothing");
-        process.kill(Number(kid), "SIGKILL");
+        let out = "";
+        try { out = execFileSync("pgrep", ["-P", String(launcher.pid)]).toString(); } catch {}
+        const kid = Number(out.trim().split("\n")[0]);
+        assert.ok(Number.isInteger(kid) && kid > 1, "the fake proxy never started, so this measures nothing");
+        process.kill(kid, "SIGKILL");
         await new Promise((r) => setTimeout(r, 12_000));
 
         assert.equal(launcher.exitCode, null, "the launcher gave the port up, stranding every wired session");
