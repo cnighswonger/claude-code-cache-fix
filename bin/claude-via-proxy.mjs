@@ -7,6 +7,7 @@ import { homedir, tmpdir } from "node:os";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { X509Certificate, randomUUID } from "node:crypto";
 import http from "node:http";
+import net from "node:net";
 import { bundleUsable, carriesOurCA, salvageBundle } from "./ca-trust.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -15,41 +16,164 @@ const SERVER_PATH = resolve(__dirname, "../proxy/server.mjs");
 const args = process.argv.slice(2);
 const SUBCOMMAND = args[0];
 
+// CACHE_FIX_HOLD_PORT=on: keep the advertised port bound HERE and relay to a
+// proxy on an ephemeral one, so restarting the proxy never unbinds it. A client
+// resolves HTTPS_PROXY once at exec and never re-reads it, so a port with no
+// owner — even for the moment a restart takes — strands it for good.
+//
+// A relay rather than handing the listening socket down: two processes holding
+// one socket both accept, and the kernel splits connections between them.
+//
+// Opt-in: it only pays where something restarts this command, and systemd
+// socket activation already gives the same guarantee.
+function holdPort(rest) {
+  // The proxy's own default: holding a different port than the proxy would have
+  // served leaves nothing at the documented address.
+  const port = Number(process.env.CACHE_FIX_PROXY_PORT) || 9801;
+  const bind = process.env.CACHE_FIX_PROXY_BIND || "127.0.0.1";
+
+  return new Promise((resolveP) => {
+    let child = null, childPort = 0, stopping = false, restart = null, failures = 0, served = false;
+    const settle = (code) => { stopping = true; resolveP(code ?? 0); };
+    const forward = (sig) => {
+      stopping = true;
+      clearTimeout(restart);
+      // Between the proxy's death and its respawn there is no child to forward
+      // to; stop now rather than wait for one that would never answer.
+      if (!child || child.exitCode !== null || child.signalCode) return settle(0);
+      try { child.kill(sig); } catch { settle(0); }
+    };
+    process.on("SIGTERM", () => forward("SIGTERM"));
+    process.on("SIGINT", () => forward("SIGINT"));
+
+    const start = () => {
+      if (stopping) return;
+      childPort = 0;
+      // Piped only to read the ephemeral port back; every byte is written on.
+      // The child binds loopback on its own ephemeral port; we advertise $bind.
+      // Pinning it here keeps the dial address below correct whatever $bind is.
+      child = spawn(process.execPath, [SERVER_PATH, ...rest], {
+        stdio: ["inherit", "pipe", "inherit"],
+        env: { ...process.env, CACHE_FIX_PROXY_PORT: "0", CACHE_FIX_PROXY_BIND: "127.0.0.1" },
+      });
+      // Buffered until a newline: the port arrives on stdout, and a chunk
+      // boundary inside that line would otherwise lose it silently — every
+      // connection would then wait out the relay's deadline.
+      let line = "";
+      child.stdout.on("data", (chunk) => {
+        process.stdout.write(chunk);
+        if (childPort) return;
+        line += chunk;
+        const m = /listening on [\d.]+:(\d+)\n/.exec(line);
+        if (m) { childPort = Number(m[1]); served = true; failures = 0; line = ""; }
+        else if (line.length > 4096) line = line.slice(-256);
+      });
+      child.on("error", (err) => {
+        process.stderr.write(`Failed to start proxy server: ${err.message}\n`);
+        settle(1);
+      });
+      child.on("close", (code, sig) => {
+        childPort = 0;
+        // Only OUR being signalled ends this. The proxy exiting is what the held
+        // port exists to survive — including the clean exit 0 a reload produces.
+        if (stopping) return settle(code);
+        // Two different failures, deliberately handled differently.
+        //
+        // Never served: the port has no sessions on it, so holding it open in
+        // front of a proxy that cannot start only makes callers wait out the
+        // relay deadline instead of failing over. Give it up.
+        if (!served && ++failures >= 5) {
+          process.stderr.write("[cache-fix] proxy failed to start 5 times; releasing the port\n");
+          return settle(code || 1);
+        }
+        // Served before: sessions ARE wired to this port and releasing it
+        // strands them for good, so keep holding and keep retrying — a later
+        // deploy is picked up by the next respawn. Back off so a proxy that is
+        // broken for hours costs one attempt every 5s, not four a second.
+        if (served) failures++;
+        restart = setTimeout(start, Math.min(250 * 2 ** Math.min(failures, 5), 5000));
+      });
+    };
+
+    // Wait for the proxy rather than refusing: to a client that baked
+    // HTTPS_PROXY at exec, a refusal is as fatal as an unbound port.
+    const relay = (sock) => {
+      const deadline = Date.now() + 15000;
+      let up = null;
+      sock.on("error", () => {});
+      // pipe() forwards end-of-stream but not destroy, so an aborted client
+      // would leave its upstream open forever — a long-lived holder then runs
+      // out of descriptors and stops accepting on the port it exists to keep.
+      // Registered once: dial() may retry, and a handler per attempt leaks too.
+      sock.on("close", () => up?.destroy());
+      const dial = () => {
+        if (sock.destroyed) return;
+        if (Date.now() > deadline) return sock.destroy();
+        if (!childPort) return setTimeout(dial, 25);
+        up = net.connect(childPort, "127.0.0.1");
+        const mine = up;
+        let piped = false;
+        // Before the pipe the proxy is still coming up, so retry; after it, the
+        // connection is genuinely broken.
+        mine.on("error", () => (piped ? sock.destroy() : setTimeout(dial, 25)));
+        mine.on("close", () => { if (piped) sock.destroy(); });
+        mine.on("connect", () => { piped = true; sock.pipe(mine); mine.pipe(sock); });
+      };
+      dial();
+    };
+
+    const holder = net.createServer(relay);
+    // Only the BIND may fall back: another proxy owns the port, so run ours on
+    // it directly and let the collision be reported the way it always has been.
+    // A later server error must not start a second proxy beside the first.
+    const bindFailed = () => { holder.off("error", bindFailed); resolveP(runProxy(rest)); };
+    holder.on("error", bindFailed);
+    holder.listen({ port, host: bind }, () => { holder.off("error", bindFailed); start(); });
+  });
+}
+
+function runProxy(rest) {
+  return new Promise((resolveP) => {
+    // "inherit" passes fds 0-2 only, so an inherited socket would stop here
+    // and the server would bind its own port. LISTEN_PID is dropped rather
+    // than re-stamped: a parent cannot know its child's pid before spawning.
+    const socketActivated = Number(process.env.LISTEN_FDS) >= 1;
+    const env = { ...process.env };
+    if (socketActivated) delete env.LISTEN_PID;
+    const serverProc = spawn(process.execPath, [SERVER_PATH, ...rest], {
+      stdio: socketActivated ? ["inherit", "inherit", "inherit", 3] : "inherit",
+      env,
+    });
+    // Forward termination to the child so a supervisor killing THIS launcher
+    // doesn't leak the actual server process. Without this, `kill <launcher>`
+    // leaves the listening child orphaned (it reparents to init and keeps the
+    // port bound). Each handler is idempotent; the child's exit resolves us.
+    const forward = (sig) => { try { serverProc.kill(sig); } catch {} };
+    const onSIGTERM = () => forward("SIGTERM");
+    const onSIGINT = () => forward("SIGINT");
+    process.on("SIGTERM", onSIGTERM);
+    process.on("SIGINT", onSIGINT);
+    serverProc.on("close", (code) => {
+      process.off("SIGTERM", onSIGTERM);
+      process.off("SIGINT", onSIGINT);
+      resolveP(code ?? 0);
+    });
+    serverProc.on("error", (err) => {
+      process.stderr.write(`Failed to start proxy server: ${err.message}\n`);
+      resolveP(1);
+    });
+  });
+}
+
 // Subcommand dispatch (must come before the wrapper-arg parser so subcommand
 // names don't get treated as claude args). Returns null when no subcommand
 // matched, signaling fall-through to wrapper mode below.
 async function dispatch() {
   if (SUBCOMMAND === "server") {
-    return new Promise((resolveP) => {
-      // "inherit" passes fds 0-2 only, so an inherited socket would stop here
-      // and the server would bind its own port. LISTEN_PID is dropped rather
-      // than re-stamped: a parent cannot know its child's pid before spawning.
-      const socketActivated = Number(process.env.LISTEN_FDS) >= 1;
-      const env = { ...process.env };
-      if (socketActivated) delete env.LISTEN_PID;
-      const serverProc = spawn(process.execPath, [SERVER_PATH, ...args.slice(1)], {
-        stdio: socketActivated ? ["inherit", "inherit", "inherit", 3] : "inherit",
-        env,
-      });
-      // Forward termination to the child so a supervisor killing THIS launcher
-      // doesn't leak the actual server process. Without this, `kill <launcher>`
-      // leaves the listening child orphaned (it reparents to init and keeps the
-      // port bound). Each handler is idempotent; the child's exit resolves us.
-      const forward = (sig) => { try { serverProc.kill(sig); } catch {} };
-      const onSIGTERM = () => forward("SIGTERM");
-      const onSIGINT = () => forward("SIGINT");
-      process.on("SIGTERM", onSIGTERM);
-      process.on("SIGINT", onSIGINT);
-      serverProc.on("close", (code) => {
-        process.off("SIGTERM", onSIGTERM);
-        process.off("SIGINT", onSIGINT);
-        resolveP(code ?? 0);
-      });
-      serverProc.on("error", (err) => {
-        process.stderr.write(`Failed to start proxy server: ${err.message}\n`);
-        resolveP(1);
-      });
-    });
+    if (process.env.CACHE_FIX_HOLD_PORT === "on" && !(Number(process.env.LISTEN_FDS) >= 1)) {
+      return holdPort(args.slice(1));
+    }
+    return runProxy(args.slice(1));
   }
   if (SUBCOMMAND === "install-service") {
     const force = args.includes("--force");
@@ -60,6 +184,7 @@ async function dispatch() {
     const { uninstall } = await import("./install-service.mjs");
     return uninstall();
   }
+
   if (SUBCOMMAND === "--help" || SUBCOMMAND === "-h" || SUBCOMMAND === "help") {
     process.stdout.write(
       "Usage: cache-fix-proxy [subcommand] [args]\n\n" +
@@ -88,6 +213,10 @@ async function dispatch() {
         "  CACHE_FIX_PROXY_UPSTREAM Upstream URL\n" +
         "  CACHE_FIX_DEBUG=1        Verbose proxy logging\n" +
         "  CACHE_FIX_HOT_RELOAD=on  Enable in-process extension hot-reload (off by default; see #196)\n" +
+        "  CACHE_FIX_HOLD_PORT=on   `server` keeps the port bound and relays to the proxy, so\n" +
+        "                           restarting the proxy never unbinds it. For supervisors that\n" +
+        "                           restart this command; systemd socket activation already\n" +
+        "                           provides the same guarantee.\n" +
         "  CACHE_FIX_CLAUDE_CMD     Override the `claude` command for the wrapper\n" +
         "\nNotes on --remote-control:\n" +
         "  Remote Control performs a trusted-device enrollment handshake on first\n" +
