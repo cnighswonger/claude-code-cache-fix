@@ -1,0 +1,224 @@
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import http from "node:http";
+import net from "node:net";
+import { execFileSync, spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { writeFile, rm } from "node:fs/promises";
+import { readdirSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, dirname } from "node:path";
+
+const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
+
+async function freePort() {
+  const s = net.createServer();
+  await new Promise((r) => s.listen(0, "127.0.0.1", r));
+  const p = s.address().port;
+  await new Promise((r) => s.close(r));
+  return p;
+}
+
+// Its own file: every case here drives a REAL launcher holding a REAL port, so
+// a mis-signalled pid or a stuck child aborts the whole runner process. Node
+// runs each test file in its own process, which keeps that blast radius here.
+describe("held port (CACHE_FIX_HOLD_PORT)", () => {
+// The default is declared in proxy/config.mjs and repeated in the launcher.
+// If they drift, an unset CACHE_FIX_PROXY_PORT binds one port while callers
+// dial the other.
+it("holds the same default port the proxy would bind", () => {
+  const launcher = readFileSync(launcherPath, "utf8");
+  const cfg = readFileSync(join(dirname(launcherPath), "..", "proxy", "config.mjs"), "utf8");
+  const want = /envInt\("CACHE_FIX_PROXY_PORT",\s*(\d+)\)/.exec(cfg)?.[1];
+  assert.ok(want, "proxy/config.mjs no longer declares a CACHE_FIX_PROXY_PORT default");
+  // Not assert.match: a failing match prints the whole launcher.
+  const held = /Number\(process\.env\.CACHE_FIX_PROXY_PORT\) \|\| (\d+)/.exec(launcher)?.[1];
+  assert.equal(held, want, `the holder falls back to ${held}, the proxy to ${want}`);
+});
+
+// A launcher holding a real port, its /health probe, and its reaper. The
+// held-port tests need all three; `get` answers "ERR:<code>" rather than
+// throwing so a caller can count failures instead of catching them.
+async function withHeldPort(fn) {
+  const port = await freePort();          // a real number: the holder owns the ADVERTISED port
+  const env = { ...process.env, CACHE_FIX_HOLD_PORT: "on", CACHE_FIX_PROXY_PORT: String(port) };
+  for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "LISTEN_FDS", "LISTEN_PID"]) delete env[k];
+  const launcher = spawn(process.execPath, [launcherPath, "server"], { env, stdio: ["ignore", "pipe", "pipe"] });
+  const exited = new Promise((r) => launcher.on("exit", () => r(true)));
+  const get = () => new Promise((res) => {
+    http.get({ host: "127.0.0.1", port, path: "/health", timeout: 8_000 }, (r) => {
+      let b = ""; r.on("data", (d) => (b += d)); r.on("end", () => res(b));
+    }).on("error", (e) => res(`ERR:${e.code}`));
+  });
+  // pgrep, never a pid arithmetic shortcut: `process.kill(0, ...)` signals the
+  // caller's whole process group — the test runner included — and Number("")
+  // and Number(undefined) are both 0.
+  const proxyPid = () => {
+    let out = "";
+    try { out = execFileSync("pgrep", ["-P", String(launcher.pid)]).toString(); } catch { return 0; }
+    const pid = Number(out.trim().split("\n")[0]);
+    return Number.isInteger(pid) && pid > 1 ? pid : 0;
+  };
+  const killProxy = () => {
+    const pid = proxyPid();
+    assert.ok(pid, "no proxy child to kill, so nothing was restarted");
+    process.kill(pid, "SIGKILL");
+  };
+  try {
+    const up = Date.now() + 20_000;
+    let body = await get();
+    while (body.startsWith("ERR:") && Date.now() < up) body = await get();
+    assert.equal(JSON.parse(body).status, "ok", "the held port never came up");
+    await fn({ get, killProxy, launcher, exited, port });
+  } finally {
+    // SIGTERM first: SIGKILL cannot be forwarded, so the proxy would outlive
+    // its parent and keep this file's event loop alive on its pipes.
+    launcher.kill("SIGTERM");
+    await Promise.race([exited, new Promise((r) => setTimeout(r, 8_000))]);
+    try { launcher.kill("SIGKILL"); } catch {}
+    await Promise.race([exited, new Promise((r) => setTimeout(r, 2_000))]);
+  }
+}
+
+// The launcher holds the advertised port and relays, so a proxy that dies
+// never unbinds it — and a client that baked HTTPS_PROXY at exec, for which
+// one refusal is fatal for good, keeps reaching it.
+it("cuts nothing on the held port while the proxy restarts", async () => {
+  await withHeldPort(async ({ get, killProxy }) => {
+    killProxy();
+    // Every failure counts, not just ECONNREFUSED: a holder that accepts then
+    // drops turns a refusal into a reset while serving nobody. The one allowed
+    // is the request in flight at the SIGKILL, which no holder can save.
+    const cut = [];
+    let served = false;
+    const until = Date.now() + 10_000;
+    while (!served && Date.now() < until) {
+      const b = await get();
+      if (b.startsWith("ERR:")) cut.push(b);
+      else served = JSON.parse(b).status === "ok";
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    assert.ok(cut.length <= 1, `the held port cut ${cut.length} connection(s) during the restart: ` +
+      `${[...new Set(cut)].join(", ")}`);
+    assert.ok(served, "the proxy never came back on the held port");
+  });
+});
+
+// A client that aborts mid-request (Ctrl-C, a cancelled tool call) sends RST,
+// and pipe() does not propagate destroy — so the upstream half would stay
+// open. A holder that runs out of descriptors stops accepting on the very
+// port it exists to keep alive.
+it("leaks no descriptor when a client aborts", async () => {
+  await withHeldPort(async ({ get, launcher, port }) => {
+    const fds = () => readdirSync(`/proc/${launcher.pid}/fd`).length;
+    let before;
+    try { before = fds(); } catch { return; }   // /proc-less platform
+    const abort = (port) => new Promise((done) => {
+      const s = net.connect(port, "127.0.0.1");
+      s.on("error", () => done());
+      s.on("connect", () => {
+        s.write("GET /health HTTP/1.1\r\nHost: x\r\n\r\n");
+        // SO_LINGER 0: close sends RST, not FIN — the case pipe() drops.
+        setTimeout(() => { s.resetAndDestroy?.() ?? s.destroy(); done(); }, 5);
+      });
+    });
+    for (let i = 0; i < 60; i++) await abort(port);
+    await new Promise((r) => setTimeout(r, 1_500));
+    assert.ok(fds() <= before + 5, `descriptors grew ${before} -> ${fds()} over 60 aborted clients`);
+    assert.equal(JSON.parse(await get()).status, "ok", "the holder stopped serving after the aborts");
+  });
+});
+
+// A launcher whose proxy is a stand-in script, so a start failure can be
+// driven on demand. The copy sits beside the real launcher for its relative
+// imports; both files are removed again.
+async function withFakeProxy(serverSrc, fn) {
+  const failing = join(dirname(launcherPath), ".test-fake-server.mjs");
+  const copy = join(dirname(launcherPath), ".test-launcher.mjs");
+  await writeFile(failing, serverSrc);
+  await writeFile(copy, readFileSync(launcherPath, "utf8").replace(
+    /const SERVER_PATH = .*/, `const SERVER_PATH = ${JSON.stringify(failing)};`));
+  const port = await freePort();
+  const env = { ...process.env, CACHE_FIX_HOLD_PORT: "on", CACHE_FIX_PROXY_PORT: String(port) };
+  // An ambient LISTEN_FDS sends the launcher down the socket-activation path
+  // instead of the holder, and an ambient proxy var routes its own requests
+  // through a proxy that is not there.
+  for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "LISTEN_FDS", "LISTEN_PID"]) delete env[k];
+  const launcher = spawn(process.execPath, [copy, "server"], { env, stdio: ["ignore", "pipe", "pipe"] });
+  let err = "";
+  launcher.stderr.on("data", (d) => (err += d));
+  const bound = () => new Promise((r) => {
+    const s = net.createServer();
+    s.once("error", () => r(true));
+    s.listen({ port, host: "127.0.0.1" }, () => s.close(() => r(false)));
+  });
+  try {
+    await fn({ launcher, port, bound, stderr: () => err });
+  } finally {
+    try { launcher.kill("SIGKILL"); } catch {}
+    await rm(failing, { force: true });
+    await rm(copy, { force: true });
+  }
+}
+
+// Never served: no session is wired to the port, so holding it in front of a
+// proxy that cannot start only makes callers wait out the relay deadline
+// instead of failing over at once.
+it("gives the port up when the proxy never starts", async () => {
+  await withFakeProxy('process.stderr.write("simulated\\n"); process.exit(1);\n',
+    async ({ launcher, bound, stderr }) => {
+      const exited = await Promise.race([
+        new Promise((r) => launcher.on("exit", () => r(true))),
+        new Promise((r) => setTimeout(() => r(false), 15_000)),
+      ]);
+      assert.ok(exited, "the launcher respawned a hopeless proxy forever, holding the port");
+      assert.match(stderr(), /releasing the port/);
+      assert.equal(await bound(), false, "the port was still bound after the launcher gave up");
+    });
+});
+
+// Served before: sessions ARE wired to this port, and releasing it strands
+// them for good — so a proxy that breaks on a later restart must keep the
+// port and keep retrying, backed off rather than spinning.
+it("keeps the port and backs off when a proxy that had served stops starting", async () => {
+  const flag = join(tmpdir(), `ccf-flip-${process.pid}`);
+  await rm(flag, { force: true });
+  await withFakeProxy(
+    `import fs from "node:fs"; import net from "node:net";\n` +
+    `if (fs.existsSync(${JSON.stringify(flag)})) { process.stderr.write("cannot start\\n"); process.exit(1); }\n` +
+    `fs.writeFileSync(${JSON.stringify(flag)}, "1");\n` +
+    `const s = net.createServer((c) => c.end("HTTP/1.1 200 OK\\r\\ncontent-length:2\\r\\n\\r\\nok"));\n` +
+    `s.listen(0, "127.0.0.1", () => process.stdout.write("proxy listening on 127.0.0.1:" + s.address().port + "\\n"));\n`,
+    async ({ launcher, bound, stderr }) => {
+      // Let the one good generation come up, then kill it: every restart now fails.
+      await new Promise((r) => setTimeout(r, 2_500));
+      let out = "";
+      try { out = execFileSync("pgrep", ["-P", String(launcher.pid)]).toString(); } catch {}
+      const kid = Number(out.trim().split("\n")[0]);
+      assert.ok(Number.isInteger(kid) && kid > 1, "the fake proxy never started, so this measures nothing");
+      process.kill(kid, "SIGKILL");
+      await new Promise((r) => setTimeout(r, 12_000));
+
+      assert.equal(launcher.exitCode, null, "the launcher gave the port up, stranding every wired session");
+      assert.equal(await bound(), true, "the port was released while sessions were still wired to it");
+      // Backed off: an unbounded loop reaches ~40 in this window.
+      const tries = (stderr().match(/cannot start/g) || []).length;
+      assert.ok(tries <= 10, `respawned ${tries} times in 12s — the backoff is not applied`);
+    });
+  await rm(flag, { force: true });
+});
+
+// ...and it must still be stoppable. Holding a port across the proxy's death
+// means a window with no child to forward a signal to; a stop arriving there
+// must still be obeyed, or the holder keeps the port through a supervisor's
+// shutdown — the original failure with one more process in the way.
+it("stops when signalled between the proxy's death and its respawn", async () => {
+  await withHeldPort(async ({ killProxy, launcher, exited }) => {
+    killProxy();
+    await new Promise((r) => setTimeout(r, 50));   // inside the restart delay
+    launcher.kill("SIGTERM");
+    const stopped = await Promise.race([exited, new Promise((r) => setTimeout(() => r(false), 10_000))]);
+    assert.ok(stopped, "the holder ignored SIGTERM and kept the port through a supervisor's stop");
+  });
+});
+});
