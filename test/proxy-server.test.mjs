@@ -560,8 +560,89 @@ describe("zero-downtime reload", () => {
       const other = boot(true); kids.push(other.proc);
       assert.equal(await other.verdict, "REFUSED",
         "a forward proxy co-bound with a plain one; CONNECT would round-robin between them");
+
+      // NO OPINION is not a mismatch. `/health` has two shapes: the ok body
+      // carries `forward_proxy`, the degraded one (503, an extension failed to
+      // load) does not — and `undefined !== false` is true, so absence read as a
+      // mismatch and refused BOTH modes, leaving the port unstartable. That
+      // body's own hint says "restart the proxy via your supervisor to recover",
+      // the very restart the guard blocked. Pre-4.3.0 cache-fix hits it too:
+      // the key entered `/health` in 4.3.0, so an upgrade could not start on its
+      // own port. Stood up here rather than as its own test because it is the
+      // third row of the same table — same guard, same fixture shape, one more
+      // incumbent answer.
+      const http2 = await import("node:http");
+      const degraded = http2.createServer((q, r) => {
+        r.writeHead(503, { "content-type": "application/json" });
+        r.end(JSON.stringify({ status: "degraded", failed_extensions: [{ file: "boom.mjs" }],
+                               hint: "restart the proxy via your supervisor to recover (#196)" }));
+      });
+      // reusePort on the incumbent too, or the KERNEL refuses the successor
+      // before the guard is asked — measured, and it reads as "the guard
+      // refused" while the guard had passed.
+      if (canCoBind) {
+        const scout2 = net.createServer();
+        await new Promise((r) => scout2.listen(0, "127.0.0.1", r));
+        const P2 = scout2.address().port;
+        await new Promise((r) => scout2.close(r));
+        await new Promise((res, rej) => {
+          degraded.once("error", rej);
+          degraded.listen({ port: P2, host: "127.0.0.1", reusePort: true }, res);
+        });
+        try {
+          const env2 = { ...process.env, CACHE_FIX_PROXY_PORT: String(P2), CACHE_FIX_PROXY_BIND: "127.0.0.1" };
+          for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]) delete env2[k];
+          const p2 = spawn(process.execPath, [serverPath], { env: env2, stdio: ["ignore", "pipe", "pipe"] });
+          kids.push(p2);
+          const v2 = await new Promise((res) => {
+            let done = false;
+            const settle = (v) => { if (!done) { done = true; res(v); } };
+            p2.stdout.on("data", (d) => { if (/listening/.test(String(d))) settle("LISTENING"); });
+            p2.stderr.on("data", (d) => { if (/already on|failed to start/.test(String(d))) settle("REFUSED"); });
+            p2.on("exit", () => settle("EXITED"));
+            setTimeout(() => settle("TIMEOUT"), 15_000);
+          });
+          assert.notEqual(v2, "REFUSED",
+            "an incumbent whose /health carries no forward_proxy was read as a mismatch, " +
+            "so the port cannot be started in EITHER mode — including by the restart it asks for");
+        } finally {
+          await new Promise((r) => degraded.close(r));
+        }
+      }
+
+      // ...and a REFUSAL must not leak what the forward attach claimed.
+      // `startProxy` is an exported API, so a caller survives the throw, and
+      // `_forwardActive` plus the self-heal handler are process-wide. The
+      // close() path already retires them; the guard's throw is a second exit
+      // from the same critical section. Leaked, a later reverse-only instance
+      // reports forward_proxy:true and relays paths it should 404.
+      const { startProxy } = await import("../proxy/server.mjs");
+      const beforeHandlers = process.listenerCount("uncaughtException");
+      const savedFwd = process.env.CACHE_FIX_FORWARD_PROXY;
+      process.env.CACHE_FIX_FORWARD_PROXY = "on";
+      let threw = false;
+      try { await startProxy({ port: PORT, bind: "127.0.0.1", watch: false }); }
+      catch { threw = true; }
+      finally {
+        if (savedFwd === undefined) delete process.env.CACHE_FIX_FORWARD_PROXY;
+        else process.env.CACHE_FIX_FORWARD_PROXY = savedFwd;
+      }
+      assert.ok(threw, "premise: the guard must refuse in-process too, or this row measures nothing");
+      assert.equal(process.listenerCount("uncaughtException"), beforeHandlers,
+        "the self-heal handler outlived the refusal — a later reverse-only proxy inherits it");
+      const rev = await startProxy({ port: 0, bind: "127.0.0.1", watch: false });
+      try {
+        const body = await new Promise((res) => {
+          http2.get({ host: "127.0.0.1", port: rev.port, path: "/health" }, (r) => {
+            let b = ""; r.on("data", (d) => (b += d)); r.on("end", () => res(b));
+          });
+        });
+        assert.equal(JSON.parse(body).forward_proxy, false,
+          "a reverse-only proxy reported forward_proxy:true — the refused attach leaked its count");
+      } finally { await rev.close(); }
     } finally {
       for (const k of kids) { try { k.kill("SIGKILL"); } catch {} }
     }
   });
+
 });
