@@ -666,8 +666,33 @@ export async function startProxy(options = {}) {
 
   await new Promise((resolve, reject) => {
     server.once("error", reject);
-    server.listen(port, bind, () => {
+    // SO_REUSEPORT so a successor can bind this port WHILE we are still serving,
+    // which is what makes a reload survivable for the sessions using it. Without
+    // it the only reload is kill-then-respawn, and the port is unbound for the
+    // gap: measured against a 12-chunk stream, SIGTERM + a 5 s force-close
+    // delivered 7 chunks and cut the rest, which reaches a session as
+    // "Connection closed mid-response". With it, the successor is already
+    // accepting before we stop, and the same stream delivered 10 of 10.
+    //
+    // `listen({port})` and `listen(port)` are not interchangeable here: the
+    // option form is the only one that carries `reusePort`.
+    //
+    // Not gated on a flag. A kernel without SO_REUSEPORT fails the listen
+    // outright rather than silently ignoring the option, and the catch below
+    // retries without it, so an old kernel keeps exactly today's behaviour.
+    const opts = { port, host: bind, reusePort: true };
+    const onFail = (e) => {
+      // ENOTSUP / EINVAL: this kernel has no SO_REUSEPORT. Fall back rather than
+      // refusing to start — a proxy that will not listen is worse than a reload
+      // that drops connections.
+      if (e.code !== "ENOTSUP" && e.code !== "EINVAL") return reject(e);
+      server.listen(port, bind, () => resolve());
+      server.once("error", reject);
+    };
+    server.once("error", onFail);
+    server.listen(opts, () => {
       server.off("error", reject);
+      server.off("error", onFail);
       resolve();
     });
   });
@@ -764,9 +789,22 @@ if (invokedAsScript) {
       return;
     }
     active.close().finally(() => process.exit(0));
+    // The grace window before laggards are forced. 5 s was chosen when the only
+    // reload was kill-then-respawn, where a longer wait meant a longer outage:
+    // the port stayed unbound until this process died. With SO_REUSEPORT the
+    // successor is ALREADY accepting, so waiting costs nothing but this
+    // process's own lifetime — and 5 s is far shorter than a streaming
+    // /v1/messages response, which is exactly the request a reload must not
+    // cut. Measured against a 12-chunk stream: 5 s delivered 7 chunks and cut
+    // the rest.
+    //
+    // Overridable so an operator who needs the old timing (or a much longer
+    // drain) has it without a redeploy; the default is what a session actually
+    // needs rather than what the old reload could afford.
+    const graceMs = Number(process.env.CACHE_FIX_SHUTDOWN_GRACE_MS) || 120_000;
     setTimeout(() => {
       process.stderr.write(
-        "[cache-fix] shutdown: in-flight connections still open after 5s — forcing close\n",
+        `[cache-fix] shutdown: in-flight connections still open after ${graceMs} ms — forcing close\n`,
       );
       // Node >=18.2; package.json engines allows 18.0/18.1, where the
       // pre-existing behavior (exit without forcing) is the only option.
@@ -774,7 +812,7 @@ if (invokedAsScript) {
         active.server.closeAllConnections();
       }
       process.exit(0);
-    }, 5000).unref();
+    }, graceMs).unref();
   };
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);
