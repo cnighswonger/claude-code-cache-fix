@@ -137,11 +137,21 @@ This is the cheapest control available and the easiest to skip, because
 a PR page shows a review box and a checks box and only one of them asks
 for your attention.
 
-Measured on #296: every approval on that PR — two reviewers, three
-label applications — was granted while CI was either **cancelled** or
-**still running**. Nobody looked. The matrix was at that moment sitting
-on a defect that made the suite hang forever on two of the three
-supported runtimes.
+Measured on #296, from the review and workflow timestamps:
+
+```
+head       CI                    approvals                  green first?
+82c9f27e   cancelled   11:06Z    10:46Z, 15:18Z             no
+4a32d142   never completed       16:39Z, 17:18Z             no
+5e6a2e04   success     17:56Z    19:13Z, 19:18Z             yes
+```
+
+Four of the six approvals landed against a matrix that was cancelled or
+still running, and no review on those two heads cited a check status.
+`4a32d142` was approved twice while its run sat `in_progress` — on a
+defect that made the suite hang forever on two of the three supported
+runtimes, which is why that run never finished. The last head is what
+the rule looks like when it is followed.
 
 Approving ahead of CI is sometimes right; a fork PR whose workflow needs
 maintainer authorisation cannot go green before someone acts. Then say
@@ -216,7 +226,8 @@ it is the one that failed here.** Measured on merged `23346ac9`:
 mutating the launcher's CA guard to accept unconditionally left
 `test/proxy-forward-ca.test.mjs` passing **12/12**, because the test
 exercised a hand-copied twin of the logic rather than the shipped
-function. Both reviewers counted that suite as reassurance.
+function. Both reviews cited the suite's pass count; neither established
+that it reached the shipped guard.
 
 ### Phrasing
 
@@ -261,18 +272,19 @@ history for that program before reviewing the diff.** The project's
 accumulated knowledge of it lives there, and a reviewer who skips it
 re-derives from the code alone and will re-derive wrong.
 
-Concretely: five review rounds on the CA guard argued about node's CA
-loader semantics. The client stopped being node at CC v2.1.113 — the
-Bun binary switch — which is documented in this file, in
-`README.md`, in `CHANGELOG.md`, and is the reason the `NODE_OPTIONS`
-preload was abandoned and this proxy exists in its current form. Every
-round had that available and none consulted it. The launcher said so
-about itself, too: until #296 replaced it, the guard carried the comment
-*"Still only a pre-flight guard, not proof… never that **Node** will
-verify a given leaf with it. Only a handshake shows that, and the
-launcher does not perform one"* (`23346ac:bin/claude-via-proxy.mjs`,
-since rewritten). Five rounds read past a function that documented its
-own limitation.
+Concretely: five review rounds on the CA guard argued node CA-loader
+semantics, and **no round's written findings mention the Bun switch.**
+The client stopped being node at CC v2.1.113, which is documented in
+this file, in `README.md`, in `CHANGELOG.md`, and is the reason the
+`NODE_OPTIONS` preload was abandoned and this proxy exists in its
+current form.
+
+The guard also documented its own limitation. Until #296 replaced it,
+it carried the comment *"Still only a pre-flight guard, not proof…
+never that **Node** will verify a given leaf with it. Only a handshake
+shows that, and the launcher does not perform one"*
+(`23346ac:bin/claude-via-proxy.mjs`, since rewritten). No round's
+findings quote or answer it.
 
 The failure is not that the fact was hidden. It is that reviewing a
 diff invites reasoning from the diff, and project history is exactly
