@@ -1,11 +1,13 @@
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { fork } from "node:child_process";
+import { fork, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
 import { tmpdir } from "node:os";
-import { closeSync, existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import http from "node:http";
+// The launcher's own trust question, asked the same way it asks it.
+import { bundleUsable } from "../bin/ca-trust.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const WRAPPER_PATH = resolve(__dirname, "../bin/claude-via-proxy.mjs");
@@ -89,7 +91,12 @@ function cleanEnv(overrides) {
   // otherwise reaches the child and the merge assertions read the host's value
   // instead of the fixture's — the lowercase-no_proxy case fails that way on any
   // machine that exports NO_PROXY.
-  for (const k of ["CACHE_FIX_PROXY_PORT", "CACHE_FIX_PROXY_UPSTREAM", "NO_PROXY", "no_proxy"]) delete env[k];
+  // CACHE_FIX_CA_PROBE_UNANSWERABLE is here for the same reason, from the other
+  // direction: it is a seam ONE test sets, and a leak would make every later
+  // test's CA probe answer "could not ask" — silently turning the assertions
+  // that follow into measurements of the fallback rather than of the guard.
+  for (const k of ["CACHE_FIX_PROXY_PORT", "CACHE_FIX_PROXY_UPSTREAM", "NO_PROXY", "no_proxy",
+                   "CACHE_FIX_CA_PROBE_UNANSWERABLE"]) delete env[k];
   env.CACHE_FIX_PROXY_BIND = "127.0.0.1";
   // A config dir per invocation, by DEFAULT — not opt-in per test. Forward mode
   // publishes our CA into <config>/ca-trust.d/ccf.pem, so any test that forgot to
@@ -342,6 +349,91 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
     assert.ok(existsSync(join(trustDir, "ccf.pem")), "our own pem should still be published");
   });
 
+  it("--remote-control hands claude a bundle node actually loads CAs from", async () => {
+    // COUNT THE CERTIFICATES, do not check the path. Every other launcher test
+    // here asserts WHICH file was handed over, and a mutant that accepts an
+    // unjudgeable merge unconditionally satisfies all of them while handing
+    // claude a bundle node loads ZERO certificates from — measured, and the
+    // session then cannot verify the very proxy it is routed through.
+    //
+    // So the child reports what the LOADER read, not what the env says. The two
+    // are different questions and only the second one has ever been asked here.
+    const configDir = tempDir("cfftrust-");
+    const bundle = join(configDir, "ca-trust.pem");
+    // `getCACertificates` does not exist before v22.15 and `engines` says >=18,
+    // so the count comes from a real handshake against a leaf our CA issued —
+    // the same question the shipped probe asks, asked the same way.
+    // No spaces: runWrapper splits CACHE_FIX_CLAUDE_CMD on whitespace, so a
+    // script with any in it reaches node truncated (measured — `const` alone,
+    // "Unexpected token <eof>"). Every sibling test is written this way for the
+    // same reason.
+    const script = 'process.stdout.write("N="+(require("node:tls").getCACertificates?'
+      + 'require("node:tls").getCACertificates("extra").length:-1)+"\\n")';
+    const runOnce = () => runWrapper(script, { CLAUDE_CONFIG_DIR: configDir });
+
+    const first = await runOnce();
+    assert.equal(first.code, 0, `first run should exit 0, got ${first.code}. stderr: ${first.err}`);
+    const n0 = Number(/N=(-?\d+)/.exec(first.out)?.[1]);
+    if (n0 === -1) return;   // pre-v22.15: the count is unavailable, not wrong
+
+    // A merge that is BROKEN, not stale: it carries our CA, so a
+    // "does it contain us" check passes, and it is torn AHEAD of that CA, so
+    // node loads nothing at all from it.
+    //
+    // TWO publishers, not one. With only ours in ca-trust.d, salvage rebuilding
+    // and salvage being deleted outright both end at 1 certificate — the
+    // fallback is our own CA, which is also the whole rebuild — so no count can
+    // tell them apart. Measured: deleting the salvage call left this test green
+    // until the peer was added.
+    const ours = readFileSync(join(configDir, "ca-trust.d", "ccf.pem"), "utf8");
+    const peer = readFileSync(join(configDir, "cache-fix-ca", "leaf.pem"), "utf8");
+    writeFileSync(join(configDir, "ca-trust.d", "zpeer.pem"), peer);
+    writeFileSync(bundle, "-----BEGIN CERTIFICATE-----\nQUFB\n" + ours + peer);
+    // ...and the probe must be UNABLE TO JUDGE it, because `unknown` and
+    // `ok:false` are different branches and only the first can see a mutant
+    // that accepts unjudgeable merges. With a serveable leaf this same bundle
+    // yields `{ok:false}` — measured, and that is why the first version of this
+    // test killed nothing.
+    //
+    // A DIRECTORY at leaf.pem, not a delete and not a chmod. The proxy runs
+    // ensureCA() on every launch and publishes by rename, so both of those are
+    // undone inside the very run they were meant to affect — measured: after
+    // `rm` the file is back, after `chmod 0` the mode reads 0600 again, and the
+    // launcher lands on `{ok:false}` either way. Renaming ONTO a directory
+    // fails with EISDIR, so this one survives, and the probe's own readFileSync
+    // then throws — which is exactly what `unknown` means.
+    const leafPem = join(configDir, "cache-fix-ca", "leaf.pem");
+    rmSync(leafPem, { force: true });
+    mkdirSync(leafPem);
+    assert.equal(bundleUsable(bundle, {
+      keyPath: join(configDir, "cache-fix-ca", "leaf.key"),
+      certPath: leafPem, host: "api.anthropic.com",
+    }).unknown, true, "premise: this fixture must be UNJUDGEABLE, not refused");
+
+    const second = await runOnce();
+    assert.equal(second.code, 0, `Expected exit 0, got ${second.code}. stderr: ${second.err}`);
+    const n = Number(/N=(-?\d+)/.exec(second.out)?.[1]);
+    // COUNT, do not test for non-zero. `n > 0` is satisfied by the bare
+    // fallback (our own CA alone, 1 certificate), so it cannot tell a rebuild
+    // from no rebuild — measured, it left salvage-deleted green. Both publishers
+    // must survive: that is what salvage is for.
+    assert.ok(n >= 2,
+      `expected both publishers to survive, node loaded ${n}. stderr: ${second.err}`);
+    // ...and the sentence has to name what it chose. This is the SECOND arm of
+    // the message ternary; the third is asserted where the census cannot save a
+    // refused merge. Both were unmeasured until a mutation swapped their two
+    // strings and left the whole suite green — the value and the sentence are
+    // built by separate expressions, so only an assertion per arm ties them
+    // together. Round 14 was this same disagreement in the FIRST arm.
+    //
+    // Asserted HERE and not on the torn-ahead test, which looks like it
+    // rebuilds and does not: its trust dir holds only our own CA, so salvage
+    // returns null and the launcher correctly says "using our own CA only".
+    // Measured — the assertion was written there first and failed.
+    assert.ok(/rebuilt from the publishers that work/.test(second.err),
+      `handed a rebuild but did not say so. got stderr: ${second.err}`);
+  });
+
   it("--remote-control falls back to its own CA when no merged bundle exists (unchanged standalone behaviour)", async () => {
     // A plain CCF user with no other MITM and no bundle builder must see exactly
     // what they saw before this contract existed.
@@ -510,14 +602,33 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
     writeFileSync(fresh, "# a concurrent launcher's temp, not yet renamed\n");
     // Backdate past the gate. Real time cannot be used — the gate is a minute and
     // a test may not sleep for one.
+    // A sibling publisher's file, aged past the gate. Named to share the prefix
+    // the sweep matches on, because that is the boundary under test.
+    const peerAged = join(trustDir, "ccf.pemcorp.pem");
+    writeFileSync(peerAged, "# another component's published CA\n");
     const longAgo = new Date(Date.now() - 3600_000);
     utimesSync(stale, longAgo, longAgo);
+    utimesSync(peerAged, longAgo, longAgo);
 
     const { code, err } = await runWrapper('process.stdout.write("OK\\n")', { CLAUDE_CONFIG_DIR: configDir });
     assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${err}`);
 
     assert.ok(!existsSync(stale), "a temp older than the gate is abandoned and must be reaped");
     assert.ok(existsSync(fresh), "a temp younger than the gate may belong to a live publisher and must survive");
+    // ...and the PUBLISHED CA must survive, which the prefix is the only thing
+    // protecting. Measured with `ccf.pem.` shortened to `ccf.pem`: the sweep
+    // removed ccf.pem itself — the file every other component on the machine
+    // reads. Same two-literals hazard as SCRATCH_PREFIX, 50 lines earlier, and
+    // this assertion is what makes the prefix boundary testable rather than
+    // merely intended.
+    // ...and a SIBLING publisher's file must survive. `ccf.pem` itself cannot
+    // test the prefix here — the launcher republishes it in this very run, so it
+    // is always younger than the 60 s gate and no prefix can reach it. A peer's
+    // pem can be old, and it is what a widened prefix would eat next: measured
+    // with the sweep prefix shortened by one character, an aged `ccf.pem`-named
+    // file is removed, and the only reason our own survives is timing.
+    assert.ok(existsSync(peerAged),
+      "the orphan sweep deleted a sibling publisher's pem — the prefix is not specific enough");
   });
 
   it("--remote-control still reaps orphans when publishing itself fails", async () => {
@@ -690,30 +801,39 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
     });
 
     assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
-    assert.ok(
-      stdout.includes(`CA=${join(configDir, "cache-fix-ca", "ca.pem")}`),
-      `a bundle missing our CA must be ignored in favour of our own CA, got: ${stdout}`,
-    );
+    const handed = (stdout.match(/CA=(.*)/) || [])[1];
+    assert.ok(handed && handed !== bundle,
+      `a bundle missing our CA must not be handed to claude, got: ${stdout}`);
+    // The contract is that claude TRUSTS our CA, not that it was handed one
+    // particular path. Asserting the path pinned an implementation detail: the
+    // launcher may now rebuild from ca-trust.d instead of falling back to our
+    // CA alone, which satisfies the contract and keeps every other publisher.
+    // Asked the way the shipped guard asks — a handshake through
+    // NODE_EXTRA_CA_CERTS — not `tls.getCACertificates`, which does not exist
+    // before v22.15 while this package declares `engines: >=18`. A test using
+    // that API is red on the runtimes CI runs, against an implementation that
+    // deliberately avoids it for the same reason.
+    assert.equal(bundleUsable(handed, {
+      keyPath: join(configDir, "cache-fix-ca", "leaf.key"),
+      certPath: join(configDir, "cache-fix-ca", "leaf.pem"),
+      host: "api.anthropic.com",
+    }).ok, true, `the launcher chose ${handed}, but node loads no CA of ours from it`);
   });
 
   it("--remote-control ignores a merged bundle torn AHEAD of our own entry", async () => {
-    // The case containment CANNOT see. A bundle whose earlier entry is missing its
-    // END line still literally contains our CA further down, so the "is our CA in
-    // there" gate accepts it — and that is the FATAL position, not the benign one:
-    // measured here on node v24 / openssl 3.5, an unterminated block ahead of a
-    // good one fails the handshake outright (UNABLE_TO_VERIFY_LEAF_SIGNATURE),
-    // whereas one after it merely warns. So the session would be handed a bundle
-    // that trusts nothing at all, including our own proxy.
+    // A bundle whose earlier entry is missing its END line still literally
+    // contains our CA further down, and that is the FATAL position, not the
+    // benign one: measured on node v24 / openssl 3.5, an unterminated block
+    // ahead of a good one takes the WHOLE extras load down (loader reads 0
+    // certificates), so the session would trust nothing at all, including our
+    // own proxy.
     //
-    // Counting BEGIN vs END markers catches exactly this and nothing else; the
-    // containment check catches the stale bundle and cannot see a tear. Both are
-    // needed, neither subsumes the other (independently reproduced by a sibling
-    // component that is both producer and consumer of the same directory).
-    //
-    // Reader beware: this is a cheap pre-flight guard, not proof. Balanced markers
-    // and containment together still do not prove Node verifies with the result —
-    // only a handshake does. They are here to keep a KNOWN-bad bundle from ever
-    // reaching the client.
+    // What the launcher does about it is the point of this test. It asks the
+    // loader (not a parser) and, on a refusal, REBUILDS from the ca-trust.d
+    // files that individually load rather than falling back to our CA alone.
+    // Both paths leave our CA trusted; they differ for every OTHER publisher,
+    // which the fallback silently dropped. Measured on this fixture: the merged
+    // bundle loads 0 certificates, ca-trust.d/ccf.pem alone loads 1.
     const configDir = tempDir("cfftrust-");
     const bundle = join(configDir, "ca-trust.pem");
     const script = 'process.stdout.write("CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")+"\\n")';
@@ -726,23 +846,59 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
     const ours = readFileSync(join(configDir, "ca-trust.d", "ccf.pem"), "utf8");
     const torn = "-----BEGIN CERTIFICATE-----\nc3RvbGVuLW1pZC13cml0ZQ==\n";
     writeFileSync(bundle, `${torn}${ours}`);
-    // Precondition: containment alone WOULD accept this, so the test can only pass
-    // for the reason it claims — the marker counts, not some other rejection.
+    // Precondition: the bundle still CONTAINS our CA verbatim, so a containment
+    // test would accept it. The launcher must refuse anyway, for the reason this
+    // test claims — the loader reads nothing from it — and not by accident.
     const raw = readFileSync(bundle, "utf8");
     assert.ok(raw.includes(readFileSync(join(configDir, "cache-fix-ca", "ca.pem"), "utf8").trim()),
-      "fixture must still contain our CA verbatim, or this test proves nothing about the marker check");
-    assert.notEqual(
-      (raw.match(/-----BEGIN CERTIFICATE-----/g) || []).length,
-      (raw.match(/-----END CERTIFICATE-----/g) || []).length,
-      "fixture must be marker-unbalanced",
-    );
+      "fixture must still contain our CA verbatim, or this test proves nothing");
 
     const second = await runOnce();
     assert.equal(second.code, 0, `Expected exit 0, got ${second.code}. stderr: ${second.err}`);
-    assert.ok(
-      second.out.includes(`CA=${join(configDir, "cache-fix-ca", "ca.pem")}`),
-      `a torn bundle must be ignored in favour of our own CA, got: ${second.out}`,
-    );
+    const handed = (second.out.match(/CA=(.*)/) || [])[1];
+    assert.ok(handed && handed !== bundle,
+      `the torn bundle must not be handed to claude, got: ${second.out}`);
+    // Whatever it chose, the loader must actually load our CA from it — the
+    // assertion the old expectation could not make, because it compared a path
+    // instead of asking. A rebuilt bundle and our own CA both satisfy this; a
+    // path that trusts nothing does not.
+    // Asked the way the shipped guard asks — a handshake through
+    // NODE_EXTRA_CA_CERTS — not `tls.getCACertificates`, which does not exist
+    // before v22.15 while this package declares `engines: >=18`. A test using
+    // that API is red on the runtimes CI runs, against an implementation that
+    // deliberately avoids it for the same reason.
+    assert.equal(bundleUsable(handed, {
+      keyPath: join(configDir, "cache-fix-ca", "leaf.key"),
+      certPath: join(configDir, "cache-fix-ca", "leaf.pem"),
+      host: "api.anthropic.com",
+    }).ok, true, `the launcher chose ${handed}, but node loads no CA of ours from it`);
+  });
+
+  it("--remote-control survives an unwritable TMPDIR on the salvage path", async () => {
+    // This path runs at TOP LEVEL, after the proxy has been forked. A throw
+    // here does not merely lose the bundle — it skips cleanup() and leaves the
+    // proxy orphaned, turning "the merged bundle is broken" (recoverable, warn
+    // and fall back) into "the launcher does not start". Reproduced by removing
+    // the guard: exit 1, no claude, and a live proxy/server.mjs left behind.
+    //
+    // Salvage is reached by giving it a merge to refuse, and its temp write is
+    // made to fail by pointing TMPDIR at a path that does not exist.
+    const configDir = tempDir("cfftmp-");
+    const script = 'process.stdout.write("CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")+"\\n")';
+    const first = await runWrapper(script, { CLAUDE_CONFIG_DIR: configDir });
+    assert.equal(first.code, 0, `first run should exit 0, got ${first.code}. stderr: ${first.err}`);
+    writeFileSync(join(configDir, "ca-trust.pem"),
+      "-----BEGIN PUBLIC KEY----------BEGIN CERTIFICATE-----\nAAAA\n-----END PUBLIC KEY-----\n" +
+      readFileSync(join(configDir, "ca-trust.d", "ccf.pem"), "utf8"));
+
+    const r = await runWrapper(script, {
+      CLAUDE_CONFIG_DIR: configDir,
+      TMPDIR: join(configDir, "no-such-tmpdir"),
+    });
+    assert.equal(r.code, 0, `must not crash on an unwritable TMPDIR, got ${r.code}. stderr: ${r.err}`);
+    assert.match(r.out, /CA=/, "claude must still have been launched");
+    // ...and it must say so rather than silently continuing.
+    assert.match(r.err, /cache-fix:/, `expected a warning, got: ${r.err}`);
   });
 
   it("--remote-control excludes localhost via NO_PROXY (so local HTTP MCP servers aren't misrouted)", async () => {
@@ -895,4 +1051,497 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
       `every temp dir must go through tempDir(); raw mkdtempSync at line(s): ${raw.join(", ")}`);
     assert.ok(tempDirs.length > 0, "premise: this file does create temp dirs");
   });
+  it("--remote-control reaps an old salvage scratch dir but leaves a fresh one alone", async () => {
+    // One scratch dir per salvage launch, and nothing else on the machine
+    // removes them — 81 had accumulated on this box while this feature was being
+    // written. They are cert text, mode 0700, so this is litter rather than a
+    // leak, but the sibling reaper for ccf.pem.* exists for exactly the same
+    // argument and this path had none.
+    //
+    // The gate is a DAY, not the sibling's minute: the holder is a whole claude
+    // session, not a write-to-rename window. Both fixtures live through one
+    // launch, so the test fails if the reaper is unconditional (fresh one dies)
+    // OR absent (old one survives).
+    const configDir = tempDir("cfftrust-");
+    // TMPDIR of our own: the reaper sweeps `tmpdir()`, and a test that swept the
+    // real /tmp would delete scratch dirs belonging to live sessions on this
+    // machine — which is precisely the thing the day-long gate exists to avoid.
+    const tmp = tempDir("cffreap-");
+    const old = join(tmp, "cache-fix-ca-scratch-oldoldold");
+    const fresh = join(tmp, "cache-fix-ca-scratch-freshfresh");
+    // A DECOY that must survive: an operator CA dir. README documents
+    // `CACHE_FIX_CA_DIR=/tmp/cache-fix-ca`, so any suffixed variant lives under
+    // tmpdir() with that prefix. Measured against the first version of this
+    // reaper: the whole directory went, ca.key included — the private key the
+    // running proxy signs leaves with. It is backdated PAST the gate, because a
+    // real CA dir is old by definition and "it was too new to delete" is not a
+    // property this test may lean on.
+    const caDir = join(tmp, "cache-fix-ca-prod");
+    mkdirSync(caDir);
+    for (const f of ["ca.key", "ca.pem"]) writeFileSync(join(caDir, f), "# operator key material\n");
+    for (const d of [old, fresh]) { mkdirSync(d); writeFileSync(join(d, "b1.pem"), "# scratch\n"); }
+    // Straddle the gate rather than clearing it by a mile. A 30-day fixture and
+    // a fresh one leave every gate from a minute to a month passing, so the
+    // stated 7 days was untested — measured, `scratchAgeMs = 1 day` changed no
+    // test. These sit 2 days either side of it.
+    const past = (d) => new Date(Date.now() - d * 86_400_000);
+    utimesSync(old, past(9), past(9));      // older than 7d: must be reaped
+    utimesSync(fresh, past(5), past(5));    // younger than 7d: must survive
+    utimesSync(caDir, past(30), past(30));  // old, but not ours to touch at all
+
+    // Salvage must actually RUN, or writeTmp is never called and the reaper
+    // beside it never executes: a broken merged bundle is what puts the launcher
+    // on that path.
+    const script = 'process.stdout.write("OK\\n")';
+    const first = await runWrapper(script, { CLAUDE_CONFIG_DIR: configDir, TMPDIR: tmp });
+    assert.equal(first.code, 0, `first run should exit 0, got ${first.code}. stderr: ${first.err}`);
+    const ours = readFileSync(join(configDir, "ca-trust.d", "ccf.pem"), "utf8");
+    writeFileSync(join(configDir, "ca-trust.pem"), "-----BEGIN CERTIFICATE-----\nQUFB\n" + ours);
+
+    const { code, err } = await runWrapper(script, { CLAUDE_CONFIG_DIR: configDir, TMPDIR: tmp });
+    assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${err}`);
+    assert.ok(!existsSync(old), "a scratch dir older than the gate is abandoned and must be reaped");
+    assert.ok(existsSync(fresh), "a scratch dir younger than the gate may belong to a live session");
+    assert.ok(existsSync(join(caDir, "ca.key")),
+      "the reaper deleted an operator CA directory — the prefix is not specific enough");
+  });
+
+  it("--remote-control still salvages when its own leaf key cannot be read", async () => {
+    // An unusable leaf.key is a probe that CANNOT BE RUN, not a verdict about
+    // the bundle. Measured on the launcher: a healthy 2-CA merge on disk, the
+    // block skipped, claude handed 1 CA, nothing printed — an unrunnable probe
+    // narrowing trust, which is the one thing the three-outcome contract
+    // forbids. Letting the block run reports `unknown` and salvages 3.
+    //
+    // A DIRECTORY at leaf.key, not a delete: ensureCA regenerates a deleted key
+    // on the very next launch (measured), so the absent state cannot exist by
+    // the time the launcher looks. This test therefore CANNOT kill a mutation
+    // that restores `existsSync(probeLeaf.keyPath)` — `existsSync` on a
+    // directory is true, so that guard never saw this case either. It is
+    // recorded rather than hidden: the guard's removal is covered by the module
+    // -level "cannot serve our own leaf" test, and what this one guards is that
+    // an unreadable key still reaches salvage through the launcher.
+    const configDir = tempDir("cfftrust-");
+    const script = 'process.stdout.write("N="+(require("node:tls").getCACertificates?'
+      + 'require("node:tls").getCACertificates("extra").length:-1)+"\\n")';
+    const runOnce = () => runWrapper(script, { CLAUDE_CONFIG_DIR: configDir });
+    const first = await runOnce();
+    assert.equal(first.code, 0, `first run should exit 0, got ${first.code}. stderr: ${first.err}`);
+    const n0 = Number(/N=(-?\d+)/.exec(first.out)?.[1]);
+    if (n0 === -1) return;   // pre-v22.15: the count is unavailable, not wrong
+
+    const ours = readFileSync(join(configDir, "ca-trust.d", "ccf.pem"), "utf8");
+    const peer = readFileSync(join(configDir, "cache-fix-ca", "leaf.pem"), "utf8");
+    writeFileSync(join(configDir, "ca-trust.d", "zpeer.pem"), peer);
+    writeFileSync(join(configDir, "ca-trust.pem"), ours + peer);   // healthy merge
+    // A DIRECTORY at leaf.key: ensureCA publishes by rename, so a delete is undone
+    // before the launcher looks (measured). EISDIR survives, and it is also the
+    // shape the old existsSync guard waved through while calling itself a check.
+    const leafKey = join(configDir, "cache-fix-ca", "leaf.key");
+    rmSync(leafKey, { force: true });
+    mkdirSync(leafKey);
+
+    const { code, out, err } = await runOnce();
+    assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${err}`);
+    const n = Number(/N=(-?\d+)/.exec(out)?.[1]);
+    assert.ok(n >= 2,
+      `an unrunnable probe narrowed the session to ${n} CAs from a healthy merge. stderr: ${err}`);
+  });
+
+  it("--remote-control resolves the probe host from the upstream, not a constant", async () => {
+    // The leaf's SAN is the UPSTREAM host (forward-proxy.mjs `mitmHosts`), so a
+    // probe that always asks for api.anthropic.com fails the name check on any
+    // host launched with --proxy-upstream and refuses a perfectly good bundle
+    // EVERY launch. Measured with the resolution deleted: a healthy merge, and
+    // `is unusable ... using our own CA only` — every peer publisher dropped, on
+    // exactly the hosts using a custom upstream.
+    //
+    // The module-level test covers `bundleUsable` honouring a host argument.
+    // This one covers the LAUNCHER computing it, which is where the constant
+    // was: mutating the launcher left all 56 green.
+    const configDir = tempDir("cfftrust-");
+    const UP = "https://api.example.internal";
+    const script = 'process.stdout.write("CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")+"\\n")';
+    const runOnce = () => runWrapper(script, { CLAUDE_CONFIG_DIR: configDir, CACHE_FIX_PROXY_UPSTREAM: UP });
+    const first = await runOnce();
+    assert.equal(first.code, 0, `first run should exit 0, got ${first.code}. stderr: ${first.err}`);
+
+    const bundle = join(configDir, "ca-trust.pem");
+    writeFileSync(bundle, readFileSync(join(configDir, "ca-trust.d", "ccf.pem"), "utf8"));
+    const { code, out, err } = await runOnce();
+    assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${err}`);
+    assert.ok(out.includes(`CA=${bundle}`),
+      `a healthy bundle was refused under --proxy-upstream, so the probe host is not following it. got: ${out} stderr: ${err}`);
+
+    // A CHANGED upstream must also work, and this is the case that decides
+    // where the host comes from. Reading it off the leaf's SAN was proposed as
+    // strictly better — ask the certificate rather than re-derive the proxy's
+    // own `proxyUpstream || env || default`. It is not reachable: `ensureCA`'s
+    // `leafCoversAllHosts()` re-mints the leaf as soon as its SAN stops covering
+    // the current upstream, so both sources agree by construction at every point
+    // this code runs. Asserted here so the equivalence is a measurement rather
+    // than a claim in a comment.
+    const other = await runWrapper(script, { CLAUDE_CONFIG_DIR: configDir,
+                                             CACHE_FIX_PROXY_UPSTREAM: "https://elsewhere.invalid" });
+    assert.equal(other.code, 0, `Expected exit 0, got ${other.code}. stderr: ${other.err}`);
+    assert.ok(other.out.includes(`CA=${bundle}`),
+      `a healthy bundle was refused after the upstream changed, so the probe host ` +
+      `and the re-minted leaf disagree. got: ${other.out} stderr: ${other.err}`);
+  });
+
+  it("--remote-control keeps a merge that carries our CA when nothing can judge it", async () => {
+    // The two rows this branch has to separate, and the question that separates
+    // them. An earlier version asked "does node load ANYTHING from it":
+    //
+    //   merge carries OURS + a peer   loads 2   verifies our proxy: true
+    //   merge carries only a peer     loads 1   verifies our proxy: FALSE
+    //
+    // Both load something, so that question shipped the second row to `claude`
+    // and the session failed TLS against its own proxy. The answer then was to
+    // narrow to our CA in BOTH rows — honest, but it costs the first row every
+    // other publisher on the box: measured 2 CAs on disk, 1 handed over, and
+    // the corporate root the builder exists to merge in is not in `ca-trust.d`
+    // to be salvaged back.
+    //
+    // `carriesOurCA` asks the question that actually separates them, and it
+    // needs no handshake, so it still answers here — where the handshake is
+    // precisely what cannot run. Row one is kept whole; row two is narrowed by
+    // the sibling test below.
+    const configDir = tempDir("cfftrust-");
+    const script = 'process.stdout.write("CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")+"\\n")';
+    const runOnce = () => runWrapper(script, { CLAUDE_CONFIG_DIR: configDir });
+    const first = await runOnce();
+    assert.equal(first.code, 0, `first run should exit 0, got ${first.code}. stderr: ${first.err}`);
+
+    const ours = readFileSync(join(configDir, "ca-trust.d", "ccf.pem"), "utf8");
+    const peer = readFileSync(join(configDir, "cache-fix-ca", "leaf.pem"), "utf8");
+    writeFileSync(join(configDir, "ca-trust.pem"), ours + peer);   // healthy, loads 2
+    const trustDir = join(configDir, "ca-trust.d");
+    const leafKey = join(configDir, "cache-fix-ca", "leaf.key");
+    rmSync(leafKey, { force: true });
+    mkdirSync(leafKey);                 // EISDIR survives ensureCA's rename
+    chmodSync(trustDir, 0);             // salvage returns null
+    try {
+      const { code, out, err } = await runOnce();
+      assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${err}`);
+      assert.ok(out.includes(`CA=${join(configDir, "ca-trust.pem")}`),
+        `narrowed away a merge that carries our CA — every other publisher on ` +
+        `the box lost for a probe that could not run. got: ${out} stderr: ${err}`);
+    } finally {
+      chmodSync(trustDir, 0o700);
+    }
+  });
+
+  it("--remote-control keeps a merge nothing faulted, even when salvage produced a rebuild", async () => {
+    // `salvaged ||` short-circuits, so on `unknown` a rebuild pre-empted a merge
+    // the launcher had POSITIVE evidence for — the census says it carries our CA
+    // and nothing refused it. The rebuild can only hold what `ca-trust.d`
+    // supplies, and the corporate roots the builder merged in are not there
+    // (claude-via-proxy.mjs says so where the salvage call sits), so the rebuild
+    // is a strict SUBSET whenever the merge carries an ambient root.
+    //
+    // This is the rule that deleted the `dupes` counter, applied generally
+    // rather than to one instance: narrowing on an answer we did not get is R2
+    // broken, and "we could not ask" is not evidence against the file.
+    //
+    // Measured on this box's real ambient bundle: merge 132 CAs, rebuild 2 —
+    // 130 dropped with nothing refused. The fixture below uses three synthetic
+    // CAs for speed; the shape is the same.
+    const configDir = tempDir("cfftrust-");
+    const script = 'process.stdout.write("CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")+"\\n")';
+    const first = await runWrapper(script, { CLAUDE_CONFIG_DIR: configDir });
+    assert.equal(first.code, 0, `first run should exit 0, got ${first.code}. stderr: ${first.err}`);
+
+    const ours = readFileSync(join(configDir, "ca-trust.d", "ccf.pem"), "utf8");
+    const peer = readFileSync(join(configDir, "cache-fix-ca", "leaf.pem"), "utf8");
+    // A publisher the trust dir HAS, so salvage produces a rebuild...
+    writeFileSync(join(configDir, "ca-trust.d", "a-peer.pem"), peer);
+    // ...and an ambient root it does NOT have, only in the merge.
+    const corp = spawnSync("bash", ["-c",
+      "d=$(mktemp -d); openssl req -x509 -newkey rsa:2048 -nodes -keyout $d/k -out $d/c " +
+      "-days 3650 -subj /CN=corp-root -addext basicConstraints=critical,CA:TRUE 2>/dev/null; " +
+      "cat $d/c; rm -rf $d"], { encoding: "utf8" }).stdout;
+    const bundle = join(configDir, "ca-trust.pem");
+    writeFileSync(bundle, corp + ours + peer);
+    // Make the handshake abstain: EISDIR on the leaf survives ensureCA's rename.
+    const leafKey = join(configDir, "cache-fix-ca", "leaf.key");
+    rmSync(leafKey, { force: true });
+    mkdirSync(leafKey);
+    const { code, out, err } = await runWrapper(script, { CLAUDE_CONFIG_DIR: configDir });
+    assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${err}`);
+    assert.ok(out.includes(`CA=${bundle}`),
+      `handed a rebuild instead of a merge nothing faulted — the rebuild cannot ` +
+      `carry the ambient roots, so this narrows trust on an answer we did not get. ` +
+      `got: ${out} stderr: ${err}`);
+    // The value and the sentence are computed by two different ternaries, and
+    // this is the one branch where they disagreed: `salvaged` is truthy here
+    // (the trust dir HAS a-peer.pem), so a message that tests it first says
+    // "rebuilt" about the merge it just kept. This line is the operator's only
+    // readout of what their session trusts, so a wrong answer here is worse
+    // than none — the same reason the third message exists at all.
+    assert.ok(/keeping it/.test(err) && !/rebuilt from/.test(err),
+      `kept the merge but reported a rebuild. got stderr: ${err}`);
+    // The same line is assembled from a SECOND ternary, and that one had no
+    // assertion at all: swapping its arms left the whole suite green while the
+    // mutant printed "is unusable ... keeping it" — one sentence calling the
+    // bundle unusable and saying it is being handed over. Counting the arms of
+    // the construct you are looking at is the wrong unit; count the independent
+    // expressions concatenated into the OUTPUT.
+    assert.ok(/could not be verified/.test(err) && !/is unusable/.test(err),
+      `an unjudgeable merge was reported as definitively unusable. got stderr: ${err}`);
+    // That line concatenates FOUR independent expressions and the two above pin
+    // only two of them. The remaining pair — which FILE is being judged, and WHY
+    // — were each mutable with the whole suite green: naming our own CA as the
+    // unusable file, and pasting a constant reason over the real one. Both are
+    // the round-14 disagreement (sentence vs value) at a different site.
+    assert.ok(new RegExp(`cache-fix: ${bundle} `).test(err),
+      `the message named a file other than the bundle it judged. got stderr: ${err}`);
+    assert.ok(/\(our own leaf key\/cert pair does not serve\)/.test(err),
+      `the reason does not say why the probe abstained. got stderr: ${err}`);
+  });
+
+  it("--remote-control does not let the CA census overrule a handshake REFUSAL", async () => {
+    // A PROBE MAY VETO, NEVER APPROVE ALONE.
+    //
+    // The two probes ask different questions — "does node load our CA" and
+    // "does node verify our proxy with this file" — so one answering yes is not
+    // evidence for the other. The refused branch was letting the census
+    // re-approve the very bundle the handshake had just refused. Measured, a
+    // merge that genuinely carries our CA probed against a host the leaf does
+    // not cover: handshake `NOT OK`, census `true`, launcher handed the merge.
+    //
+    // Driven by replacing the CA the leaf chains to. Moving the probe host with
+    // `--proxy-upstream` does NOT work: `ensureCA`'s `leafCoversAllHosts()`
+    // re-mints the leaf for the new host before the probe runs, so the handshake
+    // succeeds and this branch is never reached — measured, and it is why the
+    // first version of this test failed with the fix in place.
+    //
+    // A DIFFERENT CA in `ca.pem` is a definitive `not ok` (the leaf no longer
+    // chains to it) while the census still answers true about the merge, because
+    // the merge carries that same replacement CA.
+    const configDir = tempDir("cfftrust-");
+    const script = 'process.stdout.write("CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")+"\\n")';
+    const first = await runWrapper(script, { CLAUDE_CONFIG_DIR: configDir });
+    assert.equal(first.code, 0, `first run should exit 0, got ${first.code}. stderr: ${first.err}`);
+
+    // An unrelated CA, written where the launcher reads OUR CA from. The leaf on
+    // disk was signed by the original, so the handshake refuses definitively;
+    // the merge below carries this replacement, so the census answers true.
+    const caPath = join(configDir, "cache-fix-ca", "ca.pem");
+    const other = spawnSync("bash", ["-c",
+      "d=$(mktemp -d); openssl req -x509 -newkey rsa:2048 -nodes -keyout $d/k -out $d/c " +
+      "-days 3650 -subj /CN=other -addext basicConstraints=critical,CA:TRUE 2>/dev/null; " +
+      "cat $d/c; rm -rf $d"], { encoding: "utf8" }).stdout;
+    writeFileSync(caPath, other);
+    const bundle = join(configDir, "ca-trust.pem");
+    writeFileSync(bundle, other);                 // census: true, handshake: not ok
+    const trustDir = join(configDir, "ca-trust.d");
+    chmodSync(trustDir, 0);                       // salvage returns null
+    try {
+      const { code, out, err } = await runWrapper(script, { CLAUDE_CONFIG_DIR: configDir });
+      assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${err}`);
+      assert.ok(!out.includes(`CA=${bundle}`),
+        `the census overruled a handshake refusal — "our CA is loaded" is not ` +
+        `evidence that our proxy verifies. got: ${out} stderr: ${err}`);
+      // The THIRD arm: trust dir unreadable, so salvage returned null and our
+      // own CA is all that is left. Asserted here rather than in a fixture of
+      // its own because this test already produces exactly that state.
+      assert.ok(/using our own CA only/.test(err),
+        `handed our own CA but did not say so. got stderr: ${err}`);
+      // ...and the OTHER arm of the definitive/unjudgeable ternary. This is a
+      // real refusal, so the operator must not read "could not be verified" —
+      // the two words carry opposite instructions about whether to go looking
+      // for a broken bundle. Its sibling is asserted where a merge is KEPT.
+      assert.ok(/is unusable/.test(err) && !/could not be verified/.test(err),
+        `a definitive refusal was reported as merely unverifiable. got stderr: ${err}`);
+    } finally {
+      chmodSync(trustDir, 0o700);
+    }
+  });
+
+  it("--remote-control never hands over a merge that does not carry our CA", async () => {
+    // A STALE merge — built before we published, the normal state right after a
+    // CCF upgrade — loads a corporate cert and carries none of ours. "Does node
+    // load anything from it" says yes about that file, and it is the wrong
+    // question: the session then fails TLS against the very proxy it is routed
+    // through, while our own CA sat right there and verifies.
+    //
+    // Measured before this test existed: N=1 handed over, our CA absent,
+    // bundleUsable on the handed file {ok:false} while the skipped caPem was
+    // {ok:true}. On pre-v22.15 runtimes the same line handed over a bundle
+    // loading ZERO — `engines: >=18`, so that is most of the supported range.
+    const configDir = tempDir("cfftrust-");
+    const script = 'process.stdout.write("CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")+"\\n")';
+    const runOnce = () => runWrapper(script, { CLAUDE_CONFIG_DIR: configDir });
+    const first = await runOnce();
+    assert.equal(first.code, 0, `first run should exit 0, got ${first.code}. stderr: ${first.err}`);
+
+    // A merge carrying a real certificate that is NOT ours, and an unanswerable
+    // probe so the launcher lands on the unknown branch.
+    const peer = readFileSync(join(configDir, "cache-fix-ca", "leaf.pem"), "utf8");
+    const bundle = join(configDir, "ca-trust.pem");
+    writeFileSync(bundle, peer);
+    const trustDir = join(configDir, "ca-trust.d");
+    const leafKey = join(configDir, "cache-fix-ca", "leaf.key");
+    rmSync(leafKey, { force: true });
+    mkdirSync(leafKey);                 // EISDIR survives ensureCA's rename
+    chmodSync(trustDir, 0);             // salvage returns null
+    try {
+      const { code, out, err } = await runOnce();
+      assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${err}`);
+      assert.ok(!out.includes(`CA=${bundle}`),
+        `handed over a merge that carries none of our CA. got: ${out} stderr: ${err}`);
+    } finally {
+      chmodSync(trustDir, 0o700);
+    }
+  });
+
+  it("--remote-control refuses a merge the client would discard, even when the handshake passes", async () => {
+    // THE HAPPY PATH, which nine measurements about the refused path never
+    // touched. `bundleUsable` verdict ok means "node verified our leaf with
+    // this file" — a node question. The consumer is Bun/BoringSSL, and the two
+    // disagree on one shape:
+    //
+    //   our CA, then a fatal block   node keeps ours   client discards the FILE
+    //
+    // So the merge passed the handshake gate and shipped, while the client that
+    // reads it ends up trusting nothing — and a discarded file also takes down
+    // CAs supplied via SSL_CERT_FILE or SSL_CERT_DIR (measured, two independent
+    // sources), so this is worse than handing over our own CA alone.
+    const configDir = tempDir("cfftrust-");
+    const script = 'process.stdout.write("CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")+"\\n")';
+    const runOnce = () => runWrapper(script, { CLAUDE_CONFIG_DIR: configDir });
+    const first = await runOnce();
+    assert.equal(first.code, 0, `first run should exit 0, got ${first.code}. stderr: ${first.err}`);
+
+    const ours = readFileSync(join(configDir, "ca-trust.d", "ccf.pem"), "utf8");
+    const peer = readFileSync(join(configDir, "cache-fix-ca", "leaf.pem"), "utf8");
+    const bundle = join(configDir, "ca-trust.pem");
+    // Our CA FIRST so the handshake still succeeds; damage after it, so the
+    // client discards the whole file.
+    writeFileSync(bundle, ours + peer.slice(0, peer.length - 120));
+    const { code, out, err } = await runOnce();
+    assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${err}`);
+    assert.ok(!out.includes(`CA=${bundle}`),
+      `handed over a merge the real client discards entirely — the session would ` +
+      `trust nothing at all. got: ${out} stderr: ${err}`);
+  });
+
+  it("--remote-control still hands over a healthy merge (control for the case above)", async () => {
+    // Without this, the assertion above is satisfied by a launcher that refuses
+    // every merge — which is the failure the salvage path exists to prevent.
+    const configDir = tempDir("cfftrust-");
+    const script = 'process.stdout.write("CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")+"\\n")';
+    const runOnce = () => runWrapper(script, { CLAUDE_CONFIG_DIR: configDir });
+    const first = await runOnce();
+    assert.equal(first.code, 0, `first run should exit 0, got ${first.code}. stderr: ${first.err}`);
+
+    const ours = readFileSync(join(configDir, "ca-trust.d", "ccf.pem"), "utf8");
+    const peer = readFileSync(join(configDir, "cache-fix-ca", "leaf.pem"), "utf8");
+    const bundle = join(configDir, "ca-trust.pem");
+    writeFileSync(bundle, ours + peer);            // undamaged
+    const { code, out, err } = await runOnce();
+    assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${err}`);
+    assert.ok(out.includes(`CA=${bundle}`),
+      `refused a healthy merge, so the refusal above measured nothing. got: ${out} stderr: ${err}`);
+  });
+
+  it("--remote-control does not widen onto a REFUSED merge when the probe cannot answer", async () => {
+    // The keep-the-merge branch consults a probe that fails open, and this
+    // branch is reached on a definitive refusal as well as on `unknown`. So on
+    // any runtime that cannot answer, "could not ask" widened onto a bundle
+    // already MEASURED unusable — the R1 violation the whole change exists to
+    // prevent, re-entered through its own fix.
+    //
+    //   merge {ok:false}, carries none of ours, our own CA verifies
+    //   probe answers        -> our CA        (correct)
+    //   probe cannot answer  -> THE MERGE     (before this test)
+    //
+    // Pre-v22.15 is most of what `engines: >=18` promises, so this is not an
+    // edge case there but every launch with a stale merge. Driven through the
+    // seam rather than by faking a runtime: the launcher must narrow whenever
+    // the probe did not answer, whatever made it unable to.
+    const configDir = tempDir("cfftrust-");
+    const script = 'process.stdout.write("CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")+"\\n")';
+    const runOnce = () => runWrapper(script, { CLAUDE_CONFIG_DIR: configDir,
+                                               CACHE_FIX_CA_PROBE_UNANSWERABLE: "1" });
+    const first = await runWrapper(script, { CLAUDE_CONFIG_DIR: configDir });
+    assert.equal(first.code, 0, `first run should exit 0, got ${first.code}. stderr: ${first.err}`);
+
+    // A merge carrying a real certificate that is NOT ours: definitively
+    // refused, and our own CA is right there and verifies.
+    const peer = readFileSync(join(configDir, "cache-fix-ca", "leaf.pem"), "utf8");
+    const bundle = join(configDir, "ca-trust.pem");
+    writeFileSync(bundle, peer);
+    const trustDir = join(configDir, "ca-trust.d");
+    chmodSync(trustDir, 0);             // salvage returns null
+    try {
+      const { code, out, err } = await runOnce();
+      assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${err}`);
+      assert.ok(!out.includes(`CA=${bundle}`),
+        `widened onto a merge measured unusable because the probe could not answer. ` +
+        `got: ${out} stderr: ${err}`);
+      assert.ok(out.includes(join(configDir, "cache-fix-ca", "ca.pem")),
+        `expected our own CA, got: ${out} stderr: ${err}`);
+    } finally {
+      chmodSync(trustDir, 0o700);
+    }
+  });
+
+  it("--remote-control narrows when NEITHER probe could answer, rather than assuming the merge", async () => {
+    // The census gate is `unknown && carriesOurCA(...)`, and it must require a
+    // YES. Relaxing it to "did not say no" (`!== false`) reads as equivalent and
+    // is not: `carriesOurCA` is TRI-state, so `null` — could not ask — then
+    // widens onto a merge nobody has vouched for.
+    //
+    // The neighbouring seam test cannot reach this. It drives a definitive
+    // REFUSAL, where `verdict.unknown` is false and `&&` short-circuits before
+    // the census runs at all, so the census's own default is unmeasured there.
+    // This one needs BOTH probes silent at once:
+    //
+    //   handshake  abstains  (EISDIR on leaf.key — ensureCA's rename cannot undo it)
+    //   census     abstains  (the shipped seam, which is what a pre-v22.15 host is)
+    //   merge      STALE     (a corporate root, none of ours — the state right
+    //                         after an upgrade, before the builder re-merges)
+    //
+    // Under the relaxed gate this hands `claude` a bundle node loads NO CA of
+    // ours from, so the session distrusts the very proxy it is routed through —
+    // and the stderr line then claims "node loads our CA from it" about a file
+    // where it demonstrably does not. Pre-v22.15 is most of what `engines: >=18`
+    // promises, so this is the ordinary case there, not an edge.
+    const configDir = tempDir("cfftrust-");
+    const script = 'process.stdout.write("CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")+"\\n")';
+    const first = await runWrapper(script, { CLAUDE_CONFIG_DIR: configDir });
+    assert.equal(first.code, 0, `first run should exit 0, got ${first.code}. stderr: ${first.err}`);
+
+    // A merge that carries a real CA which is NOT ours. Not damaged — nothing
+    // faults it — it is simply stale, which is why only the census can speak to
+    // it and why "could not ask" must not be read as "fine".
+    const corp = spawnSync("bash", ["-c",
+      "d=$(mktemp -d); openssl req -x509 -newkey rsa:2048 -nodes -keyout $d/k -out $d/c " +
+      "-days 3650 -subj /CN=corp-root -addext basicConstraints=critical,CA:TRUE 2>/dev/null; " +
+      "cat $d/c; rm -rf $d"], { encoding: "utf8" }).stdout;
+    const bundle = join(configDir, "ca-trust.pem");
+    writeFileSync(bundle, corp);
+    // Make the handshake abstain rather than refuse: a DIRECTORY at leaf.key
+    // survives ensureCA's publish-by-rename (EISDIR), where a delete or a chmod
+    // is undone inside the same run.
+    const leafKey = join(configDir, "cache-fix-ca", "leaf.key");
+    rmSync(leafKey, { force: true });
+    mkdirSync(leafKey);
+
+    const { code, out, err } = await runWrapper(script,
+      { CLAUDE_CONFIG_DIR: configDir, CACHE_FIX_CA_PROBE_UNANSWERABLE: "1" });
+    assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${err}`);
+    assert.ok(!out.includes(`CA=${bundle}`),
+      `kept a stale merge although NEITHER probe vouched for it — "could not ask" ` +
+      `is not evidence the file carries our CA. got: ${out} stderr: ${err}`);
+    assert.ok(out.includes(join(configDir, "cache-fix-ca", "ca.pem")),
+      `expected our own CA, got: ${out} stderr: ${err}`);
+    // ...and the sentence must not claim the merge was kept for a reason that
+    // never held.
+    assert.ok(!/keeping it/.test(err),
+      `reported keeping a merge it did not keep. got stderr: ${err}`);
+  });
+
 });

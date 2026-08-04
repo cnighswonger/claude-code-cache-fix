@@ -214,44 +214,39 @@ environment-specific (a Linux host may keep them outside the bundle a shell
 points at; a Mac keeps them in the keychain), and two components both rebuilding
 it would race one output.
 
-The bundle is used only if every PEM block in it is terminated **and** one of its
-`CERTIFICATE` blocks is our own CA. A bundle failing either check is worse than
-no bundle — it would make the client distrust the very proxy it is being routed
-through, so every request fails TLS rather than merely losing some other
-component's CA. In that case, and when no bundle exists at all, the launcher
-falls back to our own CA and behaves exactly as it did before any of this
-existed. **A host with no other MITM and no bundle builder sees no change.**
+The bundle is used only if node, handed that file, will actually verify our
+proxy's leaf. The launcher does not predict that — it asks: a child process with
+`NODE_EXTRA_CA_CERTS` set from birth stands up a TLS server holding our leaf and
+connects to it. Only a bundle from which the loader really loaded our CA can
+complete that handshake.
 
-The check mirrors what Node's `NODE_EXTRA_CA_CERTS` loader does, which is
-narrower than "is this valid PEM" in one direction and wider in another, and both
-were measured against a real handshake rather than read off the spec:
+A bundle failing that is worse than no bundle — it would make the client
+distrust the very proxy it is being routed through, so every request fails TLS
+rather than merely losing some other component's CA.
 
-- **Well-formed non-certificate blocks are ignored, not fatal.** A merged bundle
-  legitimately carries CRLs, public keys and key material next to the roots; Node
-  skips them and verifies fine. Parsing every block as a certificate rejected
-  those bundles outright, and rejecting is not the safe direction here — it drops
-  every sibling and corporate CA for the whole session. A *damaged* one is a
-  different matter: Node aborts the whole load on any block it cannot decode,
-  whatever the label, so every block must decode even though only certificates
-  are compared.
-- **The `CERTIFICATE` label is load-bearing.** Our own CA relabelled
-  `TRUSTED CERTIFICATE` parses to byte-identical DER, so a label-blind comparison
-  reports "carries us" — while Node's loader skips the block entirely and the
-  session then fails every request. A DER match on a non-`CERTIFICATE` block does
-  not count.
-- **Markers are line-anchored, but tolerate trailing whitespace.** A provenance
-  header that merely mentions `-----BEGIN ` is prose, not a block. A real marker
-  wearing a trailing space still is one — openssl reacts to it, so a strict
-  end-of-line anchor would hide that block from the guard while Node still tried
-  to load it.
-- **Each block ends at its own `END`.** The terminator is searched for only up to
-  the next `BEGIN`, so an unterminated entry cannot borrow the `END` line of a
-  later one and pass as intact.
+**Why ask rather than parse.** The previous version modelled node's loader in a
+regex: base64 quanta, padding position, dash runs in markers, which of ten
+whitespace characters openssl tolerates. It took five review rounds and was
+still wrong in *both* directions on a real bundle — accepting one node loads
+nothing from, and refusing one node loads fine. The rule it was reaching for
+turns out not to be expressible from outside: an identical tear is recovered or
+fatal depending only on whether its truncated body happens to be complete DER,
+which is a question about bytes the parser cannot answer. The loader can, in one
+spawn (~25 ms over a bare `node -e ''` — measured, 40 interleaved pairs: 17.3 ms
+bare, 42.4 ms probed). What that is 25 ms *of*: a `--remote-control` launch is
+~520 ms end to end, of which ~493 ms is forking the proxy and waiting for it to
+listen. So the probe is ~8% of a launch and very nearly all of the CA work.
 
-Where the guard cannot tell (a block damaged *after* ours, whose truncated body
-may or may not still decode) it refuses. Refusing costs the other components'
-CAs for one session; accepting a bundle Node cannot load costs the session
-entirely, so the guard is allowed to be conservative and never permissive.
+**Three outcomes, never two.** `ok`, `not ok`, and `unknown` — the last meaning
+the probe could not be run at all. A guard that answers "unusable" when it could
+not ask drops every corporate root on a machine whose bundle was fine.
+
+**A damaged merge does not cost the other publishers their CAs.** The damage
+lives in the merge, not in the files that fed it, so the launcher rebuilds from
+the `ca-trust.d/` publishers that still work rather than falling back to its own
+CA alone. The saving is one certificate per surviving publisher: measured on
+this box (ours plus one peer), one certificate under the old fallback against
+two under the rebuild; on a three-publisher host, one against three.
 
 Both paths are fixed names under `<config>`, deliberately with no env override
 of their own. They are two halves of one rendezvous: a knob on either half alone
