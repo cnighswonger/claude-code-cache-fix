@@ -12,6 +12,7 @@ import { startWatcher } from "../proxy/watcher.mjs";
 import { loadExtensions, getRegistry } from "../proxy/pipeline.mjs";
 
 const serverPath = join(dirname(fileURLToPath(import.meta.url)), "..", "proxy", "server.mjs");
+const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
 async function freePort() {
   const s = net.createServer();
@@ -20,27 +21,6 @@ async function freePort() {
   await new Promise((r) => s.close(r));
   return p;
 }
-
-// Can two listeners hold one port on THIS runtime and kernel? Asked by binding
-// twice for real, because a version comparison answers a different question —
-// it would skip on a new node over an old kernel and run on the reverse. Three
-// answers seen: honoured (Linux, node >= 22.12), ignored so the second bind is
-// EADDRINUSE (node 18/20), and ENOTSUP on the FIRST bind (macOS).
-const canCoBind = await (async () => {
-  const a = net.createServer(), b = net.createServer();
-  try {
-    await new Promise((res, rej) => { a.once("error", rej); a.listen({ port: 0, host: "127.0.0.1", reusePort: true }, res); });
-    const ok = await new Promise((res) => {
-      b.once("error", () => res(false));
-      b.listen({ port: a.address().port, host: "127.0.0.1", reusePort: true }, () => res(true));
-    });
-    return ok;
-  } catch { return false; }
-  finally {
-    try { b.close(); } catch {}
-    await new Promise((r) => a.close(r)).catch(() => {});
-  }
-})();
 
 let handle;
 let proxyPort;
@@ -378,77 +358,14 @@ describe("proxy server /health degraded (#196)", () => {
 });
 
 describe("zero-downtime reload", () => {
-  // A reload must not cut a response that is already streaming. This is not a
-  // hypothetical: a reload on a shared host cut three live sessions, surfacing
-  // as "Connection closed mid-response", because the only reload available was
-  // kill-then-respawn — the successor could not bind the port until the old
-  // process was gone, so every in-flight body died with it.
+  // A reload must not cut a response that is already streaming. Kill-then-respawn
+  // does: the port is unbound between the two, and every in-flight body dies.
   //
-  // Driven with two REAL server processes, not two `startProxy()` handles in
-  // one process: the whole question is whether two separate processes can hold
-  // the same port at once, which an in-process test cannot ask.
-  // What a FAILING `reusePort` listen does. macOS throws ENOTSUP on the FIRST
-  // one (measured, Darwin 23.5.0 and 24.6.0), so an unguarded option does not
-  // cost the handover there — it costs the proxy. Run on every runtime by
-  // making the option fail on the one under test; gating on `!canCoBind` would
-  // leave it unrun exactly where it passes.
-  //
-  // Both rows, because the retry must be narrow: retrying EADDRINUSE without
-  // `reusePort` would bind a port a mismatched proxy already holds, silently
-  // dropping the option this change exists for.
-  for (const [code, expect] of [["ENOTSUP", "serves"], ["EADDRINUSE", "throws"]]) {
-    it(`a reusePort listen that fails ${code} ${expect}`, async () => {
-      const realListen = net.Server.prototype.listen;
-      let refused = false, retried = false;
-      net.Server.prototype.listen = function (opts, ...rest) {
-        if (opts && typeof opts === "object" && opts.reusePort) {
-          refused = true;
-          process.nextTick(() => {
-            const e = new Error(`listen ${code}`);
-            e.code = code;
-            this.emit("error", e);
-          });
-          return this;
-        }
-        if (refused) retried = true;
-        return realListen.call(this, opts, ...rest);
-      };
-      let handle = null, thrown = null;
-      try {
-        handle = await startProxy({ port: 0, bind: "127.0.0.1", watch: false });
-      } catch (err) { thrown = err; }
-      finally { net.Server.prototype.listen = realListen; }
-      try {
-        assert.ok(refused, "premise: the reusePort listen must have been the one that failed");
-        if (expect === "throws") {
-          assert.equal(thrown?.code, code,
-            "a listen error that is not ENOTSUP was retried without reusePort, " +
-            "so the successor co-bind this change exists for was silently dropped");
-          assert.ok(!retried, "the failing listen must not have been retried at all");
-          return;
-        }
-        assert.ok(retried, "premise: the fallback listen never ran");
-        const body = await new Promise((res) => {
-          http.get({ host: "127.0.0.1", port: handle.port, path: "/health" }, (r) => {
-            let b = ""; r.on("data", (d) => (b += d)); r.on("end", () => res(b));
-          }).on("error", (e) => res(`ERR:${e.code}`));
-        });
-        assert.equal(JSON.parse(body).status, "ok",
-          "the proxy did not serve after falling back — macOS gets no proxy at all");
-      } finally { if (handle) await handle.close(); }
-    });
-  }
-
-  it("a successor binds the same port while the old process is still serving", async (t) => {
-    if (!canCoBind) {
-      t.skip(`this runtime cannot hold one port from two listeners (${process.version}); ` +
-             `reload stays kill-then-respawn here`);
-      return;
-    }
-
-    // A deliberately slow upstream, so the response is still open when the
-    // reload happens. 12 chunks at 250 ms is ~3 s of streaming against a
-    // handover that takes well under one.
+  // Driven with two REAL server processes over a socket THIS test binds and
+  // never closes, because the question is whether a successor can serve a
+  // listener it did not bind — which an in-process test cannot ask.
+  it("a successor serves the inherited socket while the old process is still streaming", async () => {
+    // A deliberately slow upstream, so the response is still open at the reload.
     const CHUNKS = 12;
     const upstream = http.createServer((q, r) => {
       r.writeHead(200, { "content-type": "text/event-stream" });
@@ -462,24 +379,44 @@ describe("zero-downtime reload", () => {
     await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
     const upPort = upstream.address().port;
 
-    // Port 0 cannot be used here — both processes must be told the SAME port,
-    // and the point is that the second one binds it.
-    const PORT = await freePort();
+    // The supervisor's socket. Bound once here and never closed — that is the
+    // whole mechanism, so nothing in this test may close it early.
+    //
+    // The real supervisor is a shell: it holds the fd and never accepts. This
+    // parent is a node server, which does — and the kernel shares accepts with
+    // the proxy, so one it takes would go unanswered and read as a dropped
+    // request. Measured on a probe of this shape: misses tracked steals 1:1.
+    const listener = net.createServer();
+    let stolen = 0;
+    listener.on("connection", (c) => {
+      stolen++;
+      c.end("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n" +
+            "content-length: 15\r\n\r\n{\"status\":\"ok\"}");
+    });
+    await new Promise((r) => listener.listen({ port: 0, host: "127.0.0.1" }, r));
+    const PORT = listener.address().port;
+    const fd = listener._handle.fd;
+    assert.ok(fd >= 0, `no numeric fd for the listening socket on ${process.platform}`);
 
     const env = { ...process.env,
-      CACHE_FIX_PROXY_PORT: String(PORT),
-      CACHE_FIX_PROXY_BIND: "127.0.0.1",
-      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upPort}` };
-    // The ambient proxy vars would send this test's own requests through a real
+      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upPort}`,
+      LISTEN_FDS: "1" };
+    // Ambient proxy vars would send this test's own requests through a real
     // proxy on the developer's box, which hangs forever.
     for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]) delete env[k];
 
+    // Through the LAUNCHER, which is what a supervisor actually runs. `stdio:
+    // "inherit"` there passes fds 0-2 only, so this is where a handed-down
+    // socket is silently lost and the server binds its own port instead.
+    const boot = () => spawn(process.execPath, [launcherPath, "server"], {
+      env, stdio: ["ignore", "pipe", "pipe", fd] });
     const started = (p) => new Promise((res, rej) => {
       const to = setTimeout(() => rej(new Error("proxy did not report listening")), 15_000);
       p.stdout.on("data", (d) => { if (/listening/.test(String(d))) { clearTimeout(to); res(); } });
       p.on("error", rej);
     });
-    const older = spawn(process.execPath, [serverPath], { env, stdio: ["ignore", "pipe", "pipe"] });
+
+    const older = boot();
     const kids = [older];
     try {
       await started(older);
@@ -501,18 +438,15 @@ describe("zero-downtime reload", () => {
       while (chunks === 0 && Date.now() < flowing) await new Promise((r) => setTimeout(r, 100));
       assert.ok(chunks > 0, `premise: the response must be streaming before the reload. failure=${failure}`);
 
-      const newer = spawn(process.execPath, [serverPath], { env, stdio: ["ignore", "pipe", "pipe"] });
+      const newer = boot();
       kids.push(newer);
-      // THE assertion: this resolves only if the successor bound a port the
-      // predecessor still holds. Before SO_REUSEPORT it rejected with EADDRINUSE.
       await started(newer);
 
       // PRECONDITION, asserted rather than assumed: the stream must still be
-      // OPEN when the reload happens, or "it completed" is satisfied by a
-      // response that had already finished and the test measures nothing.
-      // An accidental control is invisible until timing changes — a slower box
-      // or a faster upstream turns this into a green that proves nothing, and
-      // reading the numbers afterwards is not a mechanism.
+      // OPEN at the reload, or "it completed" is satisfied by a response that
+      // had already finished and the test measures nothing. An accidental
+      // control is invisible until a slower box or a faster upstream turns this
+      // green without exercising anything.
       assert.ok(!ended, `premise: the stream must still be open at the reload; it had already ` +
         `finished after ${chunks} chunks, so this run measured a completed response`);
       const midflight = chunks;
@@ -524,145 +458,70 @@ describe("zero-downtime reload", () => {
       assert.equal(failure, null, `the reload cut a response that was already streaming (${failure})`);
       assert.ok(ended, "the streaming response never completed across the reload");
       // ...and it kept going AFTER the reload rather than having been complete
-      // at the moment of it. Without this, a stream that delivered its last
-      // chunk in the same tick as the SIGTERM would satisfy both assertions
-      // above while proving nothing about the handover.
+      // at the moment of it.
       assert.ok(chunks > midflight,
         `no chunk arrived after the reload (${midflight} before, ${chunks} total), ` +
         `so the handover was never exercised`);
+
+      // The successor is serving, and it is the one still alive.
+      const health = await new Promise((res) => {
+        http.get({ host: "127.0.0.1", port: PORT, path: "/health" }, (r) => {
+          let b = ""; r.on("data", (d) => (b += d)); r.on("end", () => res(b));
+        }).on("error", (e) => res(`ERR:${e.code}`));
+      });
+      assert.equal(JSON.parse(health).status, "ok",
+        "nothing served the port after the predecessor exited");
+      // A steal means some row above was answered by the fixture, not the
+      // proxy. Not a failure — it makes the run weaker evidence, and silence
+      // about it is what turns a weak run into a confident one.
+      if (stolen) process.stderr.write(
+        `[test] the supervisor fixture accepted ${stolen} connection(s); ` +
+        `those were not served by the proxy\n`);
     } finally {
-      for (const k of kids) { try { k.kill("SIGKILL"); } catch {} }
+      // SIGTERM, not SIGKILL: the launcher forwards it to the server it spawned.
+      // SIGKILL cannot be forwarded, so the server would outlive its parent and
+      // keep this test's event loop alive on its pipes.
+      for (const k of kids) { try { k.kill("SIGTERM"); } catch {} }
+      await Promise.all(kids.map((k) => new Promise((r) => {
+        if (k.exitCode !== null || k.signalCode) return r();
+        const t = setTimeout(() => { try { k.kill("SIGKILL"); } catch {} r(); }, 8_000);
+        k.on("exit", () => { clearTimeout(t); r(); });
+      })));
       await new Promise((r) => upstream.close(r));
+      await new Promise((r) => listener.close(r));
     }
   });
 
-  // `reusePort` removes EADDRINUSE, which used to be the only thing stopping a
-  // second proxy on this port. Losing it entirely is a real regression: a plain
-  // proxy and a `--remote-control` forward proxy on one port make the kernel
-  // round-robin CONNECT between a process that speaks it and one that does not
-  // (measured: 17 of 40 attempts ECONNRESET).
-  //
-  // The guard keys on MODE, not occupancy, and this test is the pair that
-  // proves it — refusing every occupied port would also refuse the handover
-  // this change exists to enable, and a test for only the refusal would pass on
-  // a guard that broke it.
-  it("refuses a second proxy in the OTHER mode, and allows one in the same mode", async () => {
-    const PORT = await freePort();
-
-    const boot = (forward, port = PORT) => {
-      const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port), CACHE_FIX_PROXY_BIND: "127.0.0.1" };
-      for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]) delete env[k];
-      if (forward) { env.CACHE_FIX_FORWARD_PROXY = "on"; env.CACHE_FIX_WIRED_BY_LAUNCHER = "1"; }
-      else delete env.CACHE_FIX_FORWARD_PROXY;
-      const proc = spawn(process.execPath, [serverPath], { env, stdio: ["ignore", "pipe", "pipe"] });
-      const verdict = new Promise((res) => {
-        let done = false;
-        const settle = (v) => { if (!done) { done = true; res(v); } };
-        proc.stdout.on("data", (d) => { if (/listening/.test(String(d))) settle("LISTENING"); });
-        proc.stderr.on("data", (d) => { if (/already on|failed to start/.test(String(d))) settle("REFUSED"); });
-        proc.on("exit", () => settle("EXITED"));
-        setTimeout(() => settle("TIMEOUT"), 15_000);
-      });
-      return { proc, verdict };
-    };
-
-    const kids = [];
-    try {
-      const first = boot(false); kids.push(first.proc);
-      assert.equal(await first.verdict, "LISTENING", "premise: the first proxy must come up");
-
-      // SAME mode: this IS the handover, and it must be allowed — but only on a
-      // runtime that can hold one port from two listeners. Where `reusePort` is
-      // ignored (node < 22.12) the kernel refuses the co-bind with EADDRINUSE
-      // before the guard is ever consulted, so asserting LISTENING there tests
-      // the runtime, not this change. Measured on CI: node 18.20.8 and 20.20.2
-      // fail this row for that reason while the mismatch row below still holds.
-      if (canCoBind) {
-        const same = boot(false); kids.push(same.proc);
-        assert.equal(await same.verdict, "LISTENING",
-          "the guard refused a same-mode co-bind, which is the handover this change exists to enable");
-        same.proc.kill("SIGKILL");
-        await new Promise((r) => setTimeout(r, 700));
-      }
-
-      // OTHER mode: the kernel would round-robin CONNECT between them.
-      const other = boot(true); kids.push(other.proc);
-      assert.equal(await other.verdict, "REFUSED",
-        "a forward proxy co-bound with a plain one; CONNECT would round-robin between them");
-
-      // NO OPINION is not a mismatch. The degraded `/health` (503) carries no
-      // `forward_proxy`, and `undefined !== false` is true — so absence read as
-      // a mismatch refused BOTH modes, blocking the restart that body's own hint
-      // asks for. Pre-4.3.0 cache-fix predates the key and hits the same.
-      // reusePort on the incumbent too, or the KERNEL refuses the successor
-      // before the guard is asked — measured, and it reads as "the guard
-      // refused" while the guard had passed.
-      if (canCoBind) {
-        const degraded = http.createServer((q, r) => {
-          r.writeHead(503, { "content-type": "application/json" });
-          r.end(JSON.stringify({ status: "degraded", failed_extensions: [{ file: "boom.mjs" }],
-                                 hint: "restart the proxy via your supervisor to recover (#196)" }));
-        });
-        const P2 = await freePort();
-        await new Promise((res, rej) => {
-          degraded.once("error", rej);
-          degraded.listen({ port: P2, host: "127.0.0.1", reusePort: true }, res);
-        });
-        try {
-          const noOpinion = boot(false, P2); kids.push(noOpinion.proc);
-          assert.notEqual(await noOpinion.verdict, "REFUSED",
-            "an incumbent whose /health carries no forward_proxy was read as a mismatch, " +
-            "so the port cannot be started in EITHER mode — including by the restart it asks for");
-        } finally {
-          await new Promise((r) => degraded.close(r));
-        }
-      }
-
-      // ...and a REFUSAL must claim NOTHING process-wide. `startProxy` is an
-      // exported API, so a caller survives the throw; the self-heal handler,
-      // `_forwardActive` and the fs watcher all outlive it. Leaked, a later
-      // reverse-only instance reports forward_proxy:true and relays paths it
-      // should 404, and a dead startup keeps reloading extensions forever.
-      const beforeHandlers = process.listenerCount("uncaughtException");
-      const saved = { fwd: process.env.CACHE_FIX_FORWARD_PROXY, hot: process.env.CACHE_FIX_HOT_RELOAD };
-      process.env.CACHE_FIX_FORWARD_PROXY = "on";
-      process.env.CACHE_FIX_HOT_RELOAD = "on";
-      const wdir = join(tmpdir(), `guard-leak-${process.pid}`);
-      await mkdir(wdir, { recursive: true });
-      await writeFile(join(wdir, "extensions.json"), "{}");
-      let threw = false;
+  // `LISTEN_FDS` reaches every descendant, so a proxy can be handed a claim for
+  // a socket it does not have. Both doors: named for another pid, and named for
+  // us but pointing at something unservable (fd 3 in an IPC-forked child is the
+  // IPC channel — `listen({fd:3})` fails EEXIST there). Either way it must end
+  // up serving a port of its own, never nothing.
+  for (const [name, env] of [
+    ["addressed to another process", { LISTEN_FDS: "1", LISTEN_PID: String(process.pid + 1) }],
+    ["pointing at an unservable fd", { LISTEN_FDS: "1" }],
+  ]) {
+    it(`binds its own port when LISTEN_FDS is ${name}`, async () => {
+      const saved = { fds: process.env.LISTEN_FDS, pid: process.env.LISTEN_PID };
+      Object.assign(process.env, env);
+      if (!("LISTEN_PID" in env)) delete process.env.LISTEN_PID;
+      let handle = null;
       try {
-        await startProxy({ port: PORT, bind: "127.0.0.1",
-                           extensionsDir: wdir, extensionsConfig: join(wdir, "extensions.json") });
-      } catch { threw = true; }
-      finally {
-        for (const [k, v] of [["CACHE_FIX_FORWARD_PROXY", saved.fwd], ["CACHE_FIX_HOT_RELOAD", saved.hot]]) {
+        handle = await startProxy({ port: 0, bind: "127.0.0.1", watch: false });
+        assert.ok(handle.port > 0, "bound nothing of its own, so the port is unserved");
+        const body = await new Promise((res) => {
+          http.get({ host: "127.0.0.1", port: handle.port, path: "/health" }, (r) => {
+            let b = ""; r.on("data", (d) => (b += d)); r.on("end", () => res(b));
+          }).on("error", (e) => res(`ERR:${e.code}`));
+        });
+        assert.equal(JSON.parse(body).status, "ok", "the port it bound does not serve");
+      } finally {
+        for (const [k, v] of [["LISTEN_FDS", saved.fds], ["LISTEN_PID", saved.pid]]) {
           if (v === undefined) delete process.env[k]; else process.env[k] = v;
         }
+        if (handle) await handle.close();
       }
-      assert.ok(threw, "premise: the guard must refuse in-process too, or this row measures nothing");
-      assert.equal(process.listenerCount("uncaughtException"), beforeHandlers,
-        "the self-heal handler outlived the refusal — a later reverse-only proxy inherits it");
-      const seen = getRegistry().length;
-      await writeFile(join(wdir, "post-refusal.mjs"),
-        `export default { name: "post-refusal", order: 1000, onRequest(ctx) {} };`);
-      await new Promise((r) => setTimeout(r, 400));
-      assert.ok(!getRegistry().some((e) => e.name === "post-refusal"),
-        `the fs watcher outlived the refusal and reloaded (${seen} -> ${getRegistry().length})`);
-      await rm(wdir, { recursive: true, force: true });
-      const rev = await startProxy({ port: 0, bind: "127.0.0.1", watch: false });
-      try {
-        const body = await new Promise((res) => {
-          http.get({ host: "127.0.0.1", port: rev.port, path: "/health" }, (r) => {
-            let b = ""; r.on("data", (d) => (b += d)); r.on("end", () => res(b));
-          });
-        });
-        assert.equal(JSON.parse(body).forward_proxy, false,
-          "a reverse-only proxy reported forward_proxy:true — the refused attach leaked its count");
-      } finally { await rev.close(); }
-    } finally {
-      for (const k of kids) { try { k.kill("SIGKILL"); } catch {} }
-    }
-  });
+    });
+  }
 
 });

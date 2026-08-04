@@ -579,29 +579,19 @@ function removeSelfHeal() {
  *   await startProxy({ port: 0 })                    // OS-assigned port
  *   await startProxy({ port: 0, watch: false })      // embedded, no fs.watch
  */
-// Is a DIFFERENT-MODE cache-fix proxy already on this port? Asks the incumbent's
-// `/health` rather than predicting it.
+// A socket a supervisor bound and still holds, via the systemd socket-activation
+// convention (LISTEN_FDS, first fd is 3). We never bind and never close it, so
+// the port stays bound across a restart.
 //
-// FALSE on any doubt (nothing listening, timeout, non-proxy service, bad JSON):
-// blocking startup on an unanswered probe would turn a slow box into a proxy
-// that will not start, which is worse than the mismatch it prevents.
-async function modeConflict(port, bind, weAreForward) {
-  const body = await new Promise((res) => {
-    const req = http.get({ host: bind, port, path: "/health", timeout: 1000 }, (r) => {
-      let b = ""; r.on("data", (d) => (b += d)); r.on("end", () => res(b));
-    });
-    req.on("error", () => res(null));
-    req.on("timeout", () => { req.destroy(); res(null); });
-  });
-  if (!body) return false;
-  // A REAL boolean, or no opinion. The degraded `/health` (503, extension load
-  // failure) carries no `forward_proxy`, and `undefined !== false` is true — so
-  // reading absence as a mismatch refused BOTH modes, blocking the very restart
-  // that body's hint asks for. Pre-4.3.0 cache-fix and foreign JSON, likewise.
-  try {
-    const f = JSON.parse(body)?.forward_proxy;
-    return typeof f === "boolean" && f !== weAreForward;
-  } catch { return false; }
+// The env reaches every descendant, so the claim is checked against our pid and
+// cleared once taken — otherwise a child listens on whatever its own fd 3 is.
+function inheritedFd() {
+  if (!(Number(process.env.LISTEN_FDS) >= 1)) return null;
+  const pid = process.env.LISTEN_PID;
+  if (pid && Number(pid) !== process.pid) return null;
+  delete process.env.LISTEN_FDS;
+  delete process.env.LISTEN_PID;
+  return 3;
 }
 
 export async function startProxy(options = {}) {
@@ -664,24 +654,7 @@ export async function startProxy(options = {}) {
     );
   }
 
-  // `reusePort` (below) removes the EADDRINUSE that used to refuse a second
-  // proxy here. Same mode is the handover this PR exists for; a MODE MISMATCH
-  // makes the kernel round-robin CONNECT between a process that speaks it and
-  // one that does not (measured: 17 of 40 ECONNRESET), so only that is refused.
-  //
-  // Runs before the watcher, `_forwardActive` and the self-heal handler are
-  // claimed, so the throw has nothing to unwind — `startProxy` is an exported
-  // API and a caller survives it. Hence the REQUESTED mode, config.forwardProxy.
-  //
-  // Best-effort, not a lock: probe and bind are not atomic, so simultaneous
-  // starts can both pass. Re-probing after listen would make them refuse each
-  // other and leave the port unserved.
-  if (await modeConflict(port, bind, config.forwardProxy)) {
-    throw new Error(
-      `another cache-fix proxy is already on ${bind}:${port} in the other mode; ` +
-      `two modes on one port make the kernel round-robin CONNECT between them. ` +
-      `Stop that one first.`);
-  }
+  const listenFd = options.fd ?? inheritedFd();
 
   let watcher = null;
   try {
@@ -713,31 +686,28 @@ export async function startProxy(options = {}) {
     if (forwardAttached) installSelfHeal();
   }
 
-  // SO_REUSEPORT so a successor binds this port WHILE we are still serving.
-  // Without it the only reload is kill-then-respawn and the port is unbound for
-  // the gap: measured, a stream through this proxy died ECONNRESET after 18
-  // chunks; with it the same stream ran to completion.
-  //
-  // `listen({port})` and `listen(port)` are not interchangeable — only the
-  // option form carries `reusePort`.
-  //
-  // Three runtime behaviours, all measured, hence the retry:
-  //   node >= 22.12 on Linux  — honoured; the successor co-binds.
-  //   node 18.20.8 / 20.20.2  — IGNORED; listen succeeds, successor EADDRINUSE.
-  //   node 25/26 on macOS     — listen throws ENOTSUP, on the FIRST listen.
-  // Only the third needs handling, and it must not be a bare catch-all: an
-  // EADDRINUSE retried without `reusePort` would silently drop the option this
-  // change exists for, and every other listen error must still reject.
+  // Serving an inherited socket leaves the port bound across the handover, so
+  // no request lands on an unbound port. Binding ourselves is the direct-run
+  // path. SO_REUSEPORT is not used: measured, macOS throws ENOTSUP on the first
+  // listen and node 18/20 ignore the flag, so it co-binds on Linux only.
   const listenOnce = (opts) => new Promise((resolve, reject) => {
     const onError = (err) => { server.off("error", onError); reject(err); };
     server.once("error", onError);
     server.listen(opts, () => { server.off("error", onError); resolve(); });
   });
-  try {
-    await listenOnce({ port, host: bind, reusePort: true });
-  } catch (err) {
-    if (err?.code !== "ENOTSUP") throw err;
+  if (listenFd === null) {
     await listenOnce({ port, host: bind });
+  } else {
+    // fd 3 may not be servable — in an IPC-forked child it is the IPC channel
+    // and listen fails EEXIST. Binding our own port is degraded; no proxy at
+    // all is not.
+    try {
+      await listenOnce({ fd: listenFd });
+    } catch (err) {
+      process.stderr.write(
+        `[cache-fix] socket handover refused (${err?.code || err?.message}); binding ${bind}:${port} instead\n`);
+      await listenOnce({ port, host: bind });
+    }
   }
 
   // Proxy-owned OAuth refresher — default OFF. Started after the server is

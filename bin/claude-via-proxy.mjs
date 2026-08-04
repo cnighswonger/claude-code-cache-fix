@@ -21,9 +21,15 @@ const SUBCOMMAND = args[0];
 async function dispatch() {
   if (SUBCOMMAND === "server") {
     return new Promise((resolveP) => {
+      // "inherit" passes fds 0-2 only, so an inherited socket would stop here
+      // and the server would bind its own port. LISTEN_PID is dropped rather
+      // than re-stamped: a parent cannot know its child's pid before spawning.
+      const socketActivated = Number(process.env.LISTEN_FDS) >= 1;
+      const env = { ...process.env };
+      if (socketActivated) delete env.LISTEN_PID;
       const serverProc = spawn(process.execPath, [SERVER_PATH, ...args.slice(1)], {
-        stdio: "inherit",
-        env: process.env,
+        stdio: socketActivated ? ["inherit", "inherit", "inherit", 3] : "inherit",
+        env,
       });
       // Forward termination to the child so a supervisor killing THIS launcher
       // doesn't leak the actual server process. Without this, `kill <launcher>`
