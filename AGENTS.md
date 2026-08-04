@@ -272,19 +272,27 @@ history for that program before reviewing the diff.** The project's
 accumulated knowledge of it lives there, and a reviewer who skips it
 re-derives from the code alone and will re-derive wrong.
 
-Concretely: five review rounds on the CA guard argued node CA-loader
-semantics, and **no round's written findings mention the Bun switch.**
-The client stopped being node at CC v2.1.113, which is documented in
-this file, in `README.md`, in `CHANGELOG.md`, and is the reason the
-`NODE_OPTIONS` preload was abandoned and this proxy exists in its
-current form.
+Concretely, and measured against the review bodies themselves: **no
+review on #283 mentions Bun or BoringSSL** (0 of 3 — two written Codex
+rounds and one empty-bodied approval), while both written rounds reason
+about node's `X509Certificate` and node's CA loader. The client stopped
+being node at CC v2.1.113, which is documented in this file, in
+`README.md`, in `CHANGELOG.md`, and is the reason the `NODE_OPTIONS`
+preload was abandoned and this proxy exists in its current form.
 
-The guard also documented its own limitation. Until #296 replaced it,
-it carried the comment *"Still only a pre-flight guard, not proof…
-never that **Node** will verify a given leaf with it. Only a handshake
-shows that, and the launcher does not perform one"*
-(`23346ac:bin/claude-via-proxy.mjs`, since rewritten). No round's
-findings quote or answer it.
+The guard documented its own limitation too. It carried the comment
+*"Still only a pre-flight guard, not proof… never that **Node** will
+verify a given leaf with it. Only a handshake shows that, and the
+launcher does not perform one"* (`23346ac:bin/claude-via-proxy.mjs`,
+replaced by #296). That comment was **partly answered and partly
+misread**: #283 round 1 credits the new tests with verifying "the guard
+against real TLS authorization outcomes," so the handshake gap was
+noticed — but the handshake in question ran through `tls.connect({ca})`,
+which is not the API the launcher uses. The limitation was read, and
+answered with the wrong oracle.
+
+The runtime fact stayed unexamined for three further rounds, until it
+was measured directly against the shipped binary.
 
 The failure is not that the fact was hidden. It is that reviewing a
 diff invites reasoning from the diff, and project history is exactly
