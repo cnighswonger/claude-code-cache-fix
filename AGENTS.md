@@ -128,6 +128,49 @@ This binds every reviewer — Codex, the implementation agent's own
 maintainer comments, and any third model added later. A finding relayed
 without its class is not usable by the next reader.
 
+### Look at CI before approving
+
+**Check the status rollup on the head you are approving. Cancelled,
+pending, queued, and absent are all "not green."** Say which you saw.
+
+This is the cheapest control available and the easiest to skip, because
+a PR page shows a review box and a checks box and only one of them asks
+for your attention.
+
+Measured on #296: every approval on that PR — two reviewers, three
+label applications — was granted while CI was either **cancelled** or
+**still running**. Nobody looked. The matrix was at that moment sitting
+on a defect that made the suite hang forever on two of the three
+supported runtimes.
+
+Approving ahead of CI is sometimes right; a fork PR whose workflow needs
+maintainer authorisation cannot go green before someone acts. Then say
+so — *"approved with CI pending, on the following local run"* — so the
+next reader knows the checkmark was not part of the evidence.
+
+### A local run is evidence only for the runtime it ran on
+
+**State the runtime beside the count.** `1543/1543` is not a result;
+`1543/1543 on node v24.11.1` is.
+
+When the package declares an `engines` range, exercise the **floor**
+before approving, not just whatever is on your PATH. A version-specific
+defect is invisible to any number of runs on one version — repetition
+measures flakiness, not portability.
+
+Measured on #296: the full suite passed 1543/1543 across thirteen local
+runs on node 24, and both independent reviewers ran it too. On node 20
+all 36 CA tests pass and **the process never exits** — a child process
+handle that node 24 reaps and node ≤20 does not. `npx node@20 --test`
+took under a minute and would have caught it. `package.json` declares
+`engines: >=18`.
+
+This is an Evidence Class failure of exactly the shape this section
+exists for: the measurement was real, honestly reported, and certified
+nothing about two thirds of the supported surface. Same family as
+running a genuine TLS handshake through the API production does not
+call.
+
 ### Why this rule exists
 
 On PR #270 the reviewer **endorsed** a claim about agent-id availability
