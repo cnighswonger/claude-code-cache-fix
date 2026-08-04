@@ -795,23 +795,6 @@ test("ca-trust: salvage accepts our CA as a Buffer, the way the launcher reads i
 // silently, with no warning, on exactly the corporate-MITM machines this
 // feature exists for. The predicate this replaced was immune because it parsed
 // rather than connected, so this is a regression the rewrite introduced.
-test("ca-trust: the operator's TLS-bypass env cannot make the guard vacuous", () => {
-  withCA({}, (dir) => {
-    ensureCA();
-    const stale = join(scratchDir("ca-bypass-"), "stale.pem");
-    writeFileSync(stale, "-----BEGIN CERTIFICATE-----\nc3RhbGU=\n-----END CERTIFICATE-----\n");
-    assert.equal(bundleUsable(stale, leafOf(dir)).ok, false, "premise: this bundle carries nothing of ours");
-    const saved = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-    process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
-    try {
-      assert.equal(bundleUsable(stale, leafOf(dir)).ok, false,
-        "NODE_TLS_REJECT_UNAUTHORIZED=0 in the parent must not reach the probe");
-    } finally {
-      if (saved === undefined) delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-      else process.env.NODE_TLS_REJECT_UNAUTHORIZED = saved;
-    }
-  });
-});
 
 // The leaf's SAN is the UPSTREAM host (forward-proxy.mjs `mitmHosts`), so a
 // probe that always requests api.anthropic.com fails the name check on any host
@@ -957,25 +940,6 @@ test("ca-trust: salvage does not mistake 'could not ask' for 'broken'", () => {
 // prints `CATRUST-OK 1`, the regex matches it, and a bundle whose true verdict
 // is refuse is accepted. Its sibling NODE_TLS_REJECT_UNAUTHORIZED is covered
 // above; this one was not, and both are one line in the same object.
-test("ca-trust: a NODE_OPTIONS preload cannot forge the probe's answer", () => {
-  withCA({}, (dir) => {
-    ensureCA();
-    const stale = join(scratchDir("ca-forge-"), "stale.pem");
-    writeFileSync(stale, "-----BEGIN CERTIFICATE-----\nc3RhbGU=\n-----END CERTIFICATE-----\n");
-    assert.equal(bundleUsable(stale, leafOf(dir)).ok, false, "premise: this bundle is refused");
-    const preload = join(scratchDir("ca-forge-"), "forge.cjs");
-    writeFileSync(preload, 'process.stdout.write("CATRUST-OK 1");\n');
-    const saved = process.env.NODE_OPTIONS;
-    process.env.NODE_OPTIONS = `--require ${preload}`;
-    try {
-      assert.equal(bundleUsable(stale, leafOf(dir)).ok, false,
-        "a NODE_OPTIONS preload forged an accept — the probe env must clear it");
-    } finally {
-      if (saved === undefined) delete process.env.NODE_OPTIONS;
-      else process.env.NODE_OPTIONS = saved;
-    }
-  });
-});
 
 // `verifiesOurLeaf` answers FOUR values — true / false / null / "local" — and
 // the keep rule admits two of them by name. `"local"` matches neither arm, so
@@ -1040,6 +1004,58 @@ test("ca-trust: salvage keeps publishers when the probe cannot serve our own lea
 // measured: this case passed alone and failed the premise inside the full file,
 // on both env-mutating siblings. The listener therefore has to be started with
 // a blocking handshake rather than awaited.
+test("ca-trust: the operator's environment cannot forge either probe's answer", () => {
+  // Both probes run in a CHILD, and the parent's environment is what an operator
+  // controls. Three variables can each turn a refusal into an accept, and the
+  // guard is only worth having if none of them reach the child.
+  //
+  // One test, not three, because the three were the same fourteen lines with a
+  // different variable name: build a file the probe REFUSES, assert that premise,
+  // set the variable, assert the answer did not move. Written as a table so a
+  // fourth variable is a row rather than another copy — and so the premise
+  // assertion, which is what makes each row non-vacuous, cannot be forgotten in
+  // one copy and kept in the others.
+  withCA({}, (dir) => {
+    ensureCA();
+    const scratch = scratchDir("ca-env-");
+    const ours = readFileSync(join(dir, "ca.pem"), "utf8");
+    // Refused by BOTH probes: node loads nothing of ours from it.
+    const stale = join(scratch, "stale.pem");
+    writeFileSync(stale, "-----BEGIN CERTIFICATE-----\nc3RhbGU=\n-----END CERTIFICATE-----\n");
+
+    // A preload that prints each probe's own success marker. If the child ever
+    // inherited NODE_OPTIONS, this would be read as the probe's answer.
+    const forgeUsable = join(scratch, "forge-usable.cjs");
+    writeFileSync(forgeUsable, 'process.stdout.write("CATRUST-OK 1");\n');
+    const forgeCarries = join(scratch, "forge-carries.cjs");
+    writeFileSync(forgeCarries,
+      `process.stdout.write("CATRUST-C " + JSON.stringify([${JSON.stringify(ours)}]));\n`);
+
+    const ask = {
+      bundleUsable: () => bundleUsable(stale, leafOf(dir)).ok,
+      carriesOurCA: () => carriesOurCA(stale, ours),
+    };
+    const rows = [
+      ["NODE_TLS_REJECT_UNAUTHORIZED", "0", "bundleUsable"],
+      ["NODE_OPTIONS", `--require ${forgeUsable}`, "bundleUsable"],
+      ["NODE_OPTIONS", `--require ${forgeCarries}`, "carriesOurCA"],
+    ];
+    for (const [key, value, probe] of rows) {
+      assert.equal(ask[probe](), false,
+        `premise: ${probe} must REFUSE this file before ${key} is set, or the row proves nothing`);
+      const saved = process.env[key];
+      process.env[key] = value;
+      try {
+        assert.equal(ask[probe](), false,
+          `${key}=${value} in the parent reached the child and moved ${probe}'s answer`);
+      } finally {
+        if (saved === undefined) delete process.env[key];
+        else process.env[key] = saved;
+      }
+    }
+  });
+});
+
 test("ca-trust: the operator's proxy env cannot redirect the probe's own handshake", () => {
   const keys = ["NODE_USE_ENV_PROXY", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY",
                 "http_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"];
@@ -1237,28 +1253,6 @@ test("ca-trust: salvage refuses to hand back an unjudged rebuild of a merge it c
 // The sibling handshake probe clears NODE_OPTIONS for the same reason and has a
 // test; the predecessor of this one cleared it with no test, and the mutation
 // survived a full suite.
-test("ca-trust: a NODE_OPTIONS preload cannot forge the loaded certificate list", () => {
-  withCA({}, (dir) => {
-    ensureCA();
-    const ours = readFileSync(join(dir, "ca.pem"), "utf8");
-    const junk = join(scratchDir("ca-count-"), "junk.pem");
-    writeFileSync(junk, "-----BEGIN CERTIFICATE-----\nQUFB\n-----END CERTIFICATE-----\n");
-    assert.equal(carriesOurCA(junk, ours), false,
-      "premise: node loads nothing of ours from this file");
-    const preload = join(scratchDir("ca-count-"), "forge.cjs");
-    writeFileSync(preload,
-      `process.stdout.write("CATRUST-C " + JSON.stringify([${JSON.stringify(ours)}]));\n`);
-    const saved = process.env.NODE_OPTIONS;
-    process.env.NODE_OPTIONS = `--require ${preload}`;
-    try {
-      assert.equal(carriesOurCA(junk, ours), false,
-        "a NODE_OPTIONS preload forged our own CA into the loaded list — the probe env must clear it");
-    } finally {
-      if (saved === undefined) delete process.env.NODE_OPTIONS;
-      else process.env.NODE_OPTIONS = saved;
-    }
-  });
-});
 
 // THREE ANSWERS, NEVER TWO — the same contract `bundleUsable` already keeps,
 // and the reason this probe needed it too.
