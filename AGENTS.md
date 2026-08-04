@@ -168,12 +168,14 @@ before approving, not just whatever is on your PATH. A version-specific
 defect is invisible to any number of runs on one version — repetition
 measures flakiness, not portability.
 
-Measured on #296: the full suite passed 1543/1543 across thirteen local
-runs on node 24, and both independent reviewers ran it too. On node 20
-all 36 CA tests pass and **the process never exits** — a child process
-handle that node 24 reaps and node ≤20 does not. `npx node@20 --test`
-took under a minute and would have caught it. `package.json` declares
-`engines: >=18`.
+Measured on #296, and reproducible from the PR thread: the full suite
+passed `1543/1543` on node v24.11.1 — repeatedly, and for both
+independent reviewers. On node v20.20.2 all 36 CA tests pass and **the
+process never exits**, because a positive control the tests depend on
+cannot be established below v22.15. `npx node@20 --test` took under a
+minute and would have caught it. `package.json` declares
+`engines: >=18`, and the CI matrix is 18/20/22 — so the runtime that
+everyone measured on was the one runtime CI does not cover.
 
 This is an Evidence Class failure of exactly the shape this section
 exists for: the measurement was real, honestly reported, and certified
@@ -259,10 +261,11 @@ is *verifying the checkable parts and reasoning about the deciding
 part*, and it is invisible from inside because the deciding function
 usually looks readable.
 
-Round counts on that one predicate: 5 rounds, 3 parties, each finding
-shapes the last missed. When that pattern appears, stop asking whether
-reviewers were diligent and ask whether the design is a model of an
-oracle that already exists.
+Round counts on that one predicate: **10 formal reviews across #283 and
+#296** (3 + 7, countable via `gh api .../pulls/<N>/reviews`), by three
+parties, each round finding shapes the last missed. When that pattern
+appears, stop asking whether reviewers were diligent and ask whether the
+design is a model of an oracle that already exists.
 
 ### Read the README before reviewing the code
 
