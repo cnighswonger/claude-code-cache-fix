@@ -353,7 +353,37 @@ describe("zero-downtime reload", () => {
   // Driven with two REAL server processes, not two `startProxy()` handles in
   // one process: the whole question is whether two separate processes can hold
   // the same port at once, which an in-process test cannot ask.
-  it("a successor binds the same port while the old process is still serving", async () => {
+  it("a successor binds the same port while the old process is still serving", async (t) => {
+    // `reusePort` landed in node 22.12; on 18 and 20 the option is IGNORED, so
+    // the listen succeeds and the successor is refused EADDRINUSE. Those
+    // runtimes keep the old kill-then-respawn reload, which is a real
+    // limitation and not a test failure.
+    //
+    // Gated on a CAPABILITY PROBE rather than a version string: the question is
+    // whether two listeners can hold one port on THIS runtime and kernel, and a
+    // version comparison answers a different one — it would skip on a new node
+    // over an old kernel and run on an old node over a new one. The probe binds
+    // twice for real and reports what happened.
+    const net = await import("node:net");
+    const first = net.createServer();
+    await new Promise((res, rej) => {
+      first.once("error", rej);
+      first.listen({ port: 0, host: "127.0.0.1", reusePort: true }, res);
+    });
+    const probePort = first.address().port;
+    const second = net.createServer();
+    const capable = await new Promise((res) => {
+      second.once("error", () => res(false));
+      second.listen({ port: probePort, host: "127.0.0.1", reusePort: true }, () => res(true));
+    });
+    try { second.close(); } catch {}
+    await new Promise((r) => first.close(r));
+    if (!capable) {
+      t.skip(`this runtime cannot hold one port from two listeners (${process.version}); ` +
+             `reload stays kill-then-respawn here`);
+      return;
+    }
+
     const { spawn } = await import("node:child_process");
     const { fileURLToPath } = await import("node:url");
     const { dirname, join: pjoin } = await import("node:path");
@@ -425,15 +455,93 @@ describe("zero-downtime reload", () => {
       // predecessor still holds. Before SO_REUSEPORT it rejected with EADDRINUSE.
       await started(newer);
 
+      // PRECONDITION, asserted rather than assumed: the stream must still be
+      // OPEN when the reload happens, or "it completed" is satisfied by a
+      // response that had already finished and the test measures nothing.
+      // An accidental control is invisible until timing changes — a slower box
+      // or a faster upstream turns this into a green that proves nothing, and
+      // reading the numbers afterwards is not a mechanism.
+      assert.ok(!ended, `premise: the stream must still be open at the reload; it had already ` +
+        `finished after ${chunks} chunks, so this run measured a completed response`);
+      const midflight = chunks;
+
       older.kill("SIGTERM");
       const done = Date.now() + 20_000;
       while (!ended && !failure && Date.now() < done) await new Promise((r) => setTimeout(r, 100));
 
       assert.equal(failure, null, `the reload cut a response that was already streaming (${failure})`);
       assert.ok(ended, "the streaming response never completed across the reload");
+      // ...and it kept going AFTER the reload rather than having been complete
+      // at the moment of it. Without this, a stream that delivered its last
+      // chunk in the same tick as the SIGTERM would satisfy both assertions
+      // above while proving nothing about the handover.
+      assert.ok(chunks > midflight,
+        `no chunk arrived after the reload (${midflight} before, ${chunks} total), ` +
+        `so the handover was never exercised`);
     } finally {
       for (const k of kids) { try { k.kill("SIGKILL"); } catch {} }
       await new Promise((r) => upstream.close(r));
+    }
+  });
+
+  // `reusePort` removes EADDRINUSE, which used to be the only thing stopping a
+  // second proxy on this port. Losing it entirely is a real regression: a plain
+  // proxy and a `--remote-control` forward proxy on one port make the kernel
+  // round-robin CONNECT between a process that speaks it and one that does not
+  // (measured: 17 of 40 attempts ECONNRESET).
+  //
+  // The guard keys on MODE, not occupancy, and this test is the pair that
+  // proves it — refusing every occupied port would also refuse the handover
+  // this change exists to enable, and a test for only the refusal would pass on
+  // a guard that broke it.
+  it("refuses a second proxy in the OTHER mode, and allows one in the same mode", async () => {
+    const { spawn } = await import("node:child_process");
+    const { fileURLToPath } = await import("node:url");
+    const { dirname, join: pjoin } = await import("node:path");
+    const net = await import("node:net");
+    const here = dirname(fileURLToPath(import.meta.url));
+    const serverPath = pjoin(here, "..", "proxy", "server.mjs");
+
+    const scout = net.createServer();
+    await new Promise((r) => scout.listen(0, "127.0.0.1", r));
+    const PORT = scout.address().port;
+    await new Promise((r) => scout.close(r));
+
+    const boot = (forward) => {
+      const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(PORT), CACHE_FIX_PROXY_BIND: "127.0.0.1" };
+      for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]) delete env[k];
+      if (forward) { env.CACHE_FIX_FORWARD_PROXY = "on"; env.CACHE_FIX_WIRED_BY_LAUNCHER = "1"; }
+      else delete env.CACHE_FIX_FORWARD_PROXY;
+      const proc = spawn(process.execPath, [serverPath], { env, stdio: ["ignore", "pipe", "pipe"] });
+      const verdict = new Promise((res) => {
+        let done = false;
+        const settle = (v) => { if (!done) { done = true; res(v); } };
+        proc.stdout.on("data", (d) => { if (/listening/.test(String(d))) settle("LISTENING"); });
+        proc.stderr.on("data", (d) => { if (/already on|failed to start/.test(String(d))) settle("REFUSED"); });
+        proc.on("exit", () => settle("EXITED"));
+        setTimeout(() => settle("TIMEOUT"), 15_000);
+      });
+      return { proc, verdict };
+    };
+
+    const kids = [];
+    try {
+      const first = boot(false); kids.push(first.proc);
+      assert.equal(await first.verdict, "LISTENING", "premise: the first proxy must come up");
+
+      // SAME mode: this IS the handover, and it must be allowed.
+      const same = boot(false); kids.push(same.proc);
+      assert.equal(await same.verdict, "LISTENING",
+        "the guard refused a same-mode co-bind, which is the handover this change exists to enable");
+      same.proc.kill("SIGKILL");
+      await new Promise((r) => setTimeout(r, 700));
+
+      // OTHER mode: the kernel would round-robin CONNECT between them.
+      const other = boot(true); kids.push(other.proc);
+      assert.equal(await other.verdict, "REFUSED",
+        "a forward proxy co-bound with a plain one; CONNECT would round-robin between them");
+    } finally {
+      for (const k of kids) { try { k.kill("SIGKILL"); } catch {} }
     }
   });
 });
