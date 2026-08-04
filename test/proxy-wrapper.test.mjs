@@ -131,7 +131,7 @@ async function runWrapper(script, overrides) {
   return { code, out, err };
 }
 
-describe("launch wrapper (claude-via-proxy)", { concurrency: 1 }, () => {
+describe("launch wrapper (claude-via-proxy)", { concurrency: 8 }, () => {
   it("exits with error when claude command is not found", async () => {
     const wrapperProc = fork(WRAPPER_PATH, ["--proxy-port", "0"], {
       stdio: ["ignore", "pipe", "pipe", "ipc"],
