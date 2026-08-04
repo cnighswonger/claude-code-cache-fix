@@ -507,6 +507,19 @@ describe("zero-downtime reload", () => {
     const PORT = scout.address().port;
     await new Promise((r) => scout.close(r));
 
+    // Same probe the handover test uses: bind twice for real and read the
+    // answer, rather than comparing version strings — the question is what THIS
+    // runtime and kernel do, and a version number encodes neither.
+    const l1 = net.createServer();
+    await new Promise((res, rej) => { l1.once("error", rej); l1.listen({ port: 0, host: "127.0.0.1", reusePort: true }, res); });
+    const l2 = net.createServer();
+    const canCoBind = await new Promise((res) => {
+      l2.once("error", () => res(false));
+      l2.listen({ port: l1.address().port, host: "127.0.0.1", reusePort: true }, () => res(true));
+    });
+    try { l2.close(); } catch {}
+    await new Promise((r) => l1.close(r));
+
     const boot = (forward) => {
       const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(PORT), CACHE_FIX_PROXY_BIND: "127.0.0.1" };
       for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]) delete env[k];
@@ -529,12 +542,19 @@ describe("zero-downtime reload", () => {
       const first = boot(false); kids.push(first.proc);
       assert.equal(await first.verdict, "LISTENING", "premise: the first proxy must come up");
 
-      // SAME mode: this IS the handover, and it must be allowed.
-      const same = boot(false); kids.push(same.proc);
-      assert.equal(await same.verdict, "LISTENING",
-        "the guard refused a same-mode co-bind, which is the handover this change exists to enable");
-      same.proc.kill("SIGKILL");
-      await new Promise((r) => setTimeout(r, 700));
+      // SAME mode: this IS the handover, and it must be allowed — but only on a
+      // runtime that can hold one port from two listeners. Where `reusePort` is
+      // ignored (node < 22.12) the kernel refuses the co-bind with EADDRINUSE
+      // before the guard is ever consulted, so asserting LISTENING there tests
+      // the runtime, not this change. Measured on CI: node 18.20.8 and 20.20.2
+      // fail this row for that reason while the mismatch row below still holds.
+      if (canCoBind) {
+        const same = boot(false); kids.push(same.proc);
+        assert.equal(await same.verdict, "LISTENING",
+          "the guard refused a same-mode co-bind, which is the handover this change exists to enable");
+        same.proc.kill("SIGKILL");
+        await new Promise((r) => setTimeout(r, 700));
+      }
 
       // OTHER mode: the kernel would round-robin CONNECT between them.
       const other = boot(true); kids.push(other.proc);
