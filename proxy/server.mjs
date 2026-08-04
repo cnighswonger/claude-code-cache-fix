@@ -460,8 +460,13 @@ async function handlePassthrough(clientReq, clientRes) {
  * Bun-compiled binaries, test harnesses) without forking a child or
  * shelling out to the `cache-fix-proxy` bin.
  */
+// Responses still open, so a forced shutdown can FIN them instead of RST.
+export const liveResponses = new Set();
+
 export function createProxyServer() {
   return http.createServer((req, res) => {
+    liveResponses.add(res);
+    res.on("close", () => liveResponses.delete(res));
     // Async IIFE: handleMessages/handleBootstrap return promises, so we have
     // to await them inside the try/catch — a bare return would let rejections
     // escape to unhandledRejection and (on Node 15+) crash the process.
@@ -574,16 +579,12 @@ function removeSelfHeal() {
  *   await startProxy({ port: 0 })                    // OS-assigned port
  *   await startProxy({ port: 0, watch: false })      // embedded, no fs.watch
  */
-// Is a DIFFERENT-MODE cache-fix proxy already on this port? `reusePort` lets a
-// successor co-bind, which is the point, but a plain proxy and a forward proxy
-// sharing a port makes the kernel round-robin CONNECT between one that speaks it
-// and one that does not. Asks the incumbent rather than predicting it — the
-// answer is on `/health`, which every version of this proxy has served.
+// Is a DIFFERENT-MODE cache-fix proxy already on this port? Asks the incumbent's
+// `/health` rather than predicting it.
 //
-// Returns FALSE on any doubt: nothing listening, a timeout, a non-proxy service,
-// unparseable JSON. A guard that blocked startup on an unanswered probe would
-// turn a slow box into a proxy that will not start, which is worse than the
-// mismatch it prevents.
+// FALSE on any doubt (nothing listening, timeout, non-proxy service, bad JSON):
+// blocking startup on an unanswered probe would turn a slow box into a proxy
+// that will not start, which is worse than the mismatch it prevents.
 async function modeConflict(port, bind, weAreForward) {
   const body = await new Promise((res) => {
     const req = http.get({ host: bind, port, path: "/health", timeout: 1000 }, (r) => {
@@ -593,17 +594,10 @@ async function modeConflict(port, bind, weAreForward) {
     req.on("timeout", () => { req.destroy(); res(null); });
   });
   if (!body) return false;
-  // A REAL boolean, or no opinion. `/health` has two shapes: the ok body carries
-  // `forward_proxy`, and the degraded body (503, an extension failed to load)
-  // does not — and `undefined !== false` is true, so reading absence as a
-  // mismatch refused BOTH modes and left the port unstartable. That body's own
-  // hint says "restart the proxy via your supervisor to recover", which is
-  // exactly the restart this guard would have blocked. Same for any pre-4.3.0
-  // cache-fix, whose `/health` predates the key, and for any foreign JSON.
-  //
-  // Refusing those is not load-bearing anyway: `reusePort` needs BOTH sides to
-  // opt in — measured, incumbent false / successor true gives EADDRINUSE — so a
-  // non-cache-fix incumbent cannot be co-bound with in the first place.
+  // A REAL boolean, or no opinion. The degraded `/health` (503, extension load
+  // failure) carries no `forward_proxy`, and `undefined !== false` is true — so
+  // reading absence as a mismatch refused BOTH modes, blocking the very restart
+  // that body's hint asks for. Pre-4.3.0 cache-fix and foreign JSON, likewise.
   try {
     const f = JSON.parse(body)?.forward_proxy;
     return typeof f === "boolean" && f !== weAreForward;
@@ -670,6 +664,25 @@ export async function startProxy(options = {}) {
     );
   }
 
+  // `reusePort` (below) removes the EADDRINUSE that used to refuse a second
+  // proxy here. Same mode is the handover this PR exists for; a MODE MISMATCH
+  // makes the kernel round-robin CONNECT between a process that speaks it and
+  // one that does not (measured: 17 of 40 ECONNRESET), so only that is refused.
+  //
+  // Runs before the watcher, `_forwardActive` and the self-heal handler are
+  // claimed, so the throw has nothing to unwind — `startProxy` is an exported
+  // API and a caller survives it. Hence the REQUESTED mode, config.forwardProxy.
+  //
+  // Best-effort, not a lock: probe and bind are not atomic, so simultaneous
+  // starts can both pass. Re-probing after listen would make them refuse each
+  // other and leave the port unserved.
+  if (await modeConflict(port, bind, config.forwardProxy)) {
+    throw new Error(
+      `another cache-fix proxy is already on ${bind}:${port} in the other mode; ` +
+      `two modes on one port make the kernel round-robin CONNECT between them. ` +
+      `Stop that one first.`);
+  }
+
   let watcher = null;
   try {
     await loadExtensions(extensionsDir, extensionsConfig);
@@ -700,63 +713,32 @@ export async function startProxy(options = {}) {
     if (forwardAttached) installSelfHeal();
   }
 
-  // EADDRINUSE used to refuse a second launch on this port, and `reusePort`
-  // removes that. Losing it entirely is not acceptable: a plain proxy and a
-  // `--remote-control` forward proxy on one port makes the kernel round-robin
-  // CONNECT between a process that speaks it and one that does not — measured,
-  // 17 of 40 attempts died `ECONNRESET`.
+  // SO_REUSEPORT so a successor binds this port WHILE we are still serving.
+  // Without it the only reload is kill-then-respawn and the port is unbound for
+  // the gap: measured, a stream through this proxy died ECONNRESET after 18
+  // chunks; with it the same stream ran to completion.
   //
-  // But refusing every occupied port would also refuse the handover this change
-  // exists to enable. The distinction is MODE, not count: two proxies in the
-  // same mode ARE the handover, and only a mode MISMATCH produces the failure
-  // above. So the guard asks `/health` what is already there and refuses only
-  // when its `forward_proxy` disagrees with ours.
-  if (await modeConflict(port, bind, forwardAttached)) {
-    // Retire what the forward attach claimed, BEFORE leaving. `startProxy` is an
-    // exported library API, so a caller can survive this throw — and both
-    // `_forwardActive` and the self-heal handler are process-wide. The close()
-    // path already retires them; this is a second exit from the same critical
-    // section and has to do the same. Left leaking, `_forwardActive` stays
-    // above zero and a later REVERSE-only instance reports forward_proxy:true
-    // and passthrough-relays paths it should 404, while an orphaned
-    // uncaughtException handler swallows crashes that should restart the proxy.
-    if (forwardAttached) { _forwardActive--; removeSelfHeal(); }
-    throw new Error(
-      `another cache-fix proxy is already on ${bind}:${port} in the other mode; ` +
-      `two modes on one port make the kernel round-robin CONNECT between them. ` +
-      `Stop that one first.`);
-  }
-
-  await new Promise((resolve, reject) => {
-    // SO_REUSEPORT so a successor can bind this port WHILE we are still serving,
-    // which is what makes a reload survivable for the sessions using it. Without
-    // it the only reload is kill-then-respawn, and the port is unbound for the
-    // gap: measured against a 12-chunk stream through this proxy, the reload
-    // ended it at `ECONNRESET` after 18 chunks, which reaches a session as
-    // "Connection closed mid-response". With it, the same stream ran to
-    // completion.
-    //
-    // `listen({port})` and `listen(port)` are not interchangeable here: the
-    // option form is the only one that carries `reusePort`.
-    //
-    // A runtime without it IGNORES the option rather than failing — measured,
-    // not assumed: `reusePort` landed in node 22.12/23.1, and CI's 18.20.8 and
-    // 20.20.2 both listen successfully and then refuse the successor with
-    // EADDRINUSE. So there is nothing to catch and no fallback to write; those
-    // runtimes simply keep today's kill-then-respawn behaviour. An earlier
-    // version of this comment claimed the opposite and shipped a catch that
-    // could never fire — and the catch was itself broken, registering a second
-    // `error` handler after `reject`, which wins on registration order.
-    const opts = { port, host: bind, reusePort: true };
-    // ONE error handler. Two handlers on one event is not a fallback: both fire,
-    // in registration order, so whichever settles the promise first decides and
-    // the other runs against a settled promise.
-    server.once("error", reject);
-    server.listen(opts, () => {
-      server.off("error", reject);
-      resolve();
-    });
+  // `listen({port})` and `listen(port)` are not interchangeable — only the
+  // option form carries `reusePort`.
+  //
+  // Three runtime behaviours, all measured, hence the retry:
+  //   node >= 22.12 on Linux  — honoured; the successor co-binds.
+  //   node 18.20.8 / 20.20.2  — IGNORED; listen succeeds, successor EADDRINUSE.
+  //   node 25/26 on macOS     — listen throws ENOTSUP, on the FIRST listen.
+  // Only the third needs handling, and it must not be a bare catch-all: an
+  // EADDRINUSE retried without `reusePort` would silently drop the option this
+  // change exists for, and every other listen error must still reject.
+  const listenOnce = (opts) => new Promise((resolve, reject) => {
+    const onError = (err) => { server.off("error", onError); reject(err); };
+    server.once("error", onError);
+    server.listen(opts, () => { server.off("error", onError); resolve(); });
   });
+  try {
+    await listenOnce({ port, host: bind, reusePort: true });
+  } catch (err) {
+    if (err?.code !== "ENOTSUP") throw err;
+    await listenOnce({ port, host: bind });
+  }
 
   // Proxy-owned OAuth refresher — default OFF. Started after the server is
   // listening so a refresher startup failure can never prevent the proxy from
@@ -850,26 +832,29 @@ if (invokedAsScript) {
       return;
     }
     active.close().finally(() => process.exit(0));
-    // The 5 s grace is DELIBERATELY UNCHANGED. Raising it looked free once a
-    // successor is already accepting — the predecessor is invisible to new
-    // connections while it drains — but a supervised stop is SERIAL: systemd
-    // stops, waits for exit, then starts. Measured on this box, where
-    // `DefaultTimeoutStopSec` is 90 s and no unit template overrides it: at
-    // 120 s the stop is SIGKILLed at the cap (90006 ms, stream ECONNRESET),
-    // and a serial restart went from 5.0 s of downtime to 53.9 s. So a longer
-    // grace makes `systemctl restart` worse while helping only the
-    // side-by-side handover — which SO_REUSEPORT already fixes, measured, at
-    // 5 s. Any future increase has to move the unit's TimeoutStopSec with it.
+    // The 5 s grace is DELIBERATELY UNCHANGED. A supervised stop is SERIAL
+    // (stop, wait for exit, start), so a longer grace only extends the outage:
+    // measured at 120 s against `DefaultTimeoutStopSec=90s`, the stop was
+    // SIGKILLed at the cap and restart downtime went 5.0 s -> 53.9 s. Any future
+    // increase has to move the unit's TimeoutStopSec with it.
     setTimeout(() => {
       process.stderr.write(
         "[cache-fix] shutdown: in-flight connections still open after 5s — forcing close\n",
       );
-      // Node >=18.2; package.json engines allows 18.0/18.1, where the
-      // pre-existing behavior (exit without forcing) is the only option.
+      // End the laggards rather than destroying them. `closeAllConnections()`
+      // destroys the socket, and the kernel answers RST — measured, a client
+      // that had already received every byte still surfaced ECONNRESET and
+      // threw the delivered data away. `res.end()` sends FIN, which the same
+      // client reads as a clean EOF.
+      for (const res of liveResponses) { try { res.end(); } catch {} }
+      // Then force whatever did not take the FIN. Node >=18.2; package.json
+      // engines allows 18.0/18.1, where exiting without forcing is the only
+      // option.
       if (typeof active.server.closeAllConnections === "function") {
-        active.server.closeAllConnections();
+        setImmediate(() => { active.server.closeAllConnections(); process.exit(0); });
+      } else {
+        setImmediate(() => process.exit(0));
       }
-      process.exit(0);
     }, 5000).unref();
   };
   process.on("SIGTERM", shutdown);
