@@ -131,7 +131,7 @@ async function runWrapper(script, overrides) {
   return { code, out, err };
 }
 
-describe("launch wrapper (claude-via-proxy)", { concurrency: 8 }, () => {
+describe("launch wrapper (claude-via-proxy)", () => {
   it("exits with error when claude command is not found", async () => {
     const wrapperProc = fork(WRAPPER_PATH, ["--proxy-port", "0"], {
       stdio: ["ignore", "pipe", "pipe", "ipc"],
@@ -1016,7 +1016,13 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: 8 }, () => {
     });
     let err = "";
     p.stderr.on("data", (c) => { err += c.toString(); });
-    await new Promise((res) => setTimeout(res, 6000));
+    // Wait for the banner, not for a constant. It is written once the server is
+    // listening, so a fixed sleep only has to be longer than the slowest start —
+    // and then costs that long on every run.
+    const deadline = Date.now() + 15_000;
+    while (!/forward-proxy: on/.test(err) && Date.now() < deadline) {
+      await new Promise((res) => setTimeout(res, 50));
+    }
     p.kill("SIGTERM");
     await new Promise((res) => p.on("exit", res));
 
