@@ -189,9 +189,27 @@ function holdPort(rest) {
     // and 20ms both leave 5-6 refused per restart, as does closing before
     // announcing. The window is the RE-ACQUIRE itself — this holder gives the
     // socket up and has to win it back, and nothing owns the port in between.
-    // A holder that never lets go (keeps the listening fd, hands each child a
-    // dup) has nothing to re-acquire and measures 0; that is the next change,
-    // not a smaller number here.
+    //
+    // A HOLDER THAT NEVER LETS GO WAS TRIED HERE AND MEASURES WORSE IN NODE.
+    // cswap's pin does exactly that and measures 0, so it looked like the fix.
+    // Built end to end (keep the fd, hand each child a dup, forward what the
+    // holder accepts over IPC, queue anything arriving mid-handover):
+    //     this shape     5257 req   3 lost   max   83 ms
+    //     never-let-go   1543 req   6 lost   max 5004 ms
+    // Steady state is identical (4491 vs 4500, 0 lost), so the handoff itself is
+    // free; the cost is entirely the handover, where one request eats the full
+    // client timeout. An isolated prototype DID reproduce the 0, so the shape is
+    // sound — in a runtime that can hold a listening fd without accepting.
+    //
+    // Node cannot: readStop() and nulling _handle.onconnection both still steal,
+    // 92 of 200 measured. So our holder is FORCED to become an acceptor, and an
+    // accepted connection is one the successor cannot see — queueing it is a
+    // second implementation of the kernel backlog, and that duplicate is the
+    // outlier. The pin's holder never calls accept() at all (it blocks in
+    // Popen.wait(), no event loop), so the backlog stays the kernel's. Measured
+    // on their live pair: holder 0 accepted, daemon 20.
+    //
+    // Do not retry this without a way to hold a listening fd passively.
     //
     // Backs off after 100 tries (~0.1s) so a port taken by something else costs
     // one attempt per 20ms rather than a thousand a second.
