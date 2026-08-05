@@ -6,7 +6,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { writeFile, rm } from "node:fs/promises";
 import { readdirSync, readFileSync, existsSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, cpus } from "node:os";
 import { join, dirname } from "node:path";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
@@ -22,10 +22,14 @@ async function freePort() {
 // Its own file: every case here drives a REAL launcher holding a REAL port, so
 // a mis-signalled pid or a stuck child aborts the whole runner process. Node
 // runs each test file in its own process, which keeps that blast radius here.
-// Concurrent: every case takes its own free port and spawns its own launcher,
-// so they share nothing but the clock. Serial, the file pays the sum of the
-// waits instead of the longest one.
-describe("held port (CACHE_FIX_HOLD_PORT)", { concurrency: true }, () => {
+// Concurrent, but BOUNDED BY CORES: each case boots a real proxy under its own
+// 10s startup budget, and unbounded concurrency blew that budget on CI's 2-core
+// runner — measured, "Proxy failed to start within 10s" on every node, while a
+// 48-core box passed every time. Serial, the file pays the sum of the waits; at
+// cpus/2 it pays close to the longest one without starving any boot.
+const CONCURRENCY = Math.max(2, Math.floor(cpus().length / 2));
+
+describe("held port (CACHE_FIX_HOLD_PORT)", { concurrency: CONCURRENCY }, () => {
 // The default is declared in proxy/config.mjs and repeated in the launcher.
 // If they drift, an unset CACHE_FIX_PROXY_PORT binds one port while callers
 // dial the other.

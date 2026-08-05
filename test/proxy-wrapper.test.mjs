@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { fork, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
-import { tmpdir } from "node:os";
+import { tmpdir, cpus } from "node:os";
 import { chmodSync, closeSync, existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import tls from "node:tls";
@@ -147,10 +147,14 @@ async function runWrapper(script, overrides) {
   return { code: await waitClose(p), out, err };
 }
 
-// Concurrent: every case forks its own wrapper on `--proxy-port 0`, and
-// cleanEnv() hands each invocation its own CLAUDE_CONFIG_DIR by default, so
-// nothing is shared but the clock.
-describe("launch wrapper (claude-via-proxy)", { concurrency: true }, () => {
+// Concurrent, but BOUNDED BY CORES: each case boots a real proxy under its own
+// 10s startup budget, and unbounded concurrency blew that budget on CI's 2-core
+// runner — measured, "Proxy failed to start within 10s" on every node, while a
+// 48-core box passed every time. Serial, the file pays the sum of the waits; at
+// cpus/2 it pays close to the longest one without starving any boot.
+const CONCURRENCY = Math.max(2, Math.floor(cpus().length / 2));
+
+describe("launch wrapper (claude-via-proxy)", { concurrency: CONCURRENCY }, () => {
   it("exits with error when claude command is not found", async () => {
     const wrapperProc = fork(WRAPPER_PATH, ["--proxy-port", "0"], {
       stdio: ["ignore", "pipe", "pipe", "ipc"],
