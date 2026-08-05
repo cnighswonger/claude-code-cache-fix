@@ -4,6 +4,10 @@
 
 [English](./README.md) | 中文 | [한국어](./README.ko.md) | [Português](./docs/guia-pt-br.md)
 
+> **说明：** 本翻译由机器辅助生成，可能滞后于英文版 README。任何权威信息请参见 [README.md](./README.md)。欢迎修正——请提交 PR。
+>
+> **Note:** This translation is machine-assisted and may lag the English README. For anything authoritative, see [README.md](./README.md). Corrections are very welcome — please open a PR.
+
 为 [Claude Code](https://github.com/anthropics/claude-code) 打造的缓存优化代理。修复导致额度过度消耗的提示缓存 bug，稳定请求前缀，并监控静默回归。兼容所有 CC 版本，包括 v2.1.113+ 的 Bun 二进制版。
 
 > **v3.0.3** — 本地 HTTP 代理，含 7 个热重载扩展。在 v2.1.117 上经过 A/B 测试：**首次预热轮次中，通过代理的缓存命中率为 95.5%，直连为 82.3%**。[完整发布说明 →](https://github.com/cnighswonger/claude-code-cache-fix/releases/tag/v3.0.0)

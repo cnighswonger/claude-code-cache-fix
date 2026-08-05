@@ -1,5 +1,9 @@
 # Cache do Claude Code: o problema e a solução
 
+> **Nota:** Esta tradução foi gerada com auxílio de máquina e pode estar defasada em relação ao README em inglês. Para qualquer informação autoritativa, consulte [README.md](../README.md). Correções são muito bem-vindas — por favor, abra um PR.
+>
+> **Note:** This translation is machine-assisted and may lag the English README. For anything authoritative, see [README.md](../README.md). Corrections are very welcome — please open a PR.
+
 **TL;DR:** O Claude Code tem bugs que fazem o cache de prompt quebrar silenciosamente, especialmente quando você retoma sessões (`--resume` / `--continue`). Isso faz você gastar até 20x mais tokens do que deveria — e queima sua cota do plano Max muito mais rápido. Existe uma ferramenta da comunidade que corrige isso, e nós fizemos um fork com melhorias de segurança.
 
 ## O problema

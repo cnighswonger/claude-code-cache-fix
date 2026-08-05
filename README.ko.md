@@ -4,6 +4,10 @@
 
 [English](./README.md) | [中文](./README.zh.md) | 한국어 | [Português](./docs/guia-pt-br.md)
 
+> **참고:** 본 번역은 기계 지원으로 작성되었으며 영문 README보다 뒤처질 수 있습니다. 권위 있는 내용은 [README.md](./README.md)를 참조하세요. 수정 사항은 언제든 환영합니다 — PR을 열어 주세요.
+>
+> **Note:** This translation is machine-assisted and may lag the English README. For anything authoritative, see [README.md](./README.md). Corrections are very welcome — please open a PR.
+
 [Claude Code](https://github.com/anthropics/claude-code)용 캐시 최적화 프록시입니다. 과도한 쿼터 소모를 유발하는 프롬프트 캐시 버그를 수정하고, 요청 접두사를 안정화하며, 자동 회귀를 모니터링합니다. v2.1.113+ Bun 바이너리를 포함한 모든 CC 버전에서 동작합니다.
 
 > **v3.0.3** — 7개 핫리로드 확장을 갖춘 로컬 HTTP 프록시입니다. v2.1.117에서 A/B 테스트 결과: 첫 번째 웜 턴에서 **프록시 경유 95.5% 캐시 히트율 vs 직접 연결 82.3%**. [전체 릴리스 노트 →](https://github.com/cnighswonger/claude-code-cache-fix/releases/tag/v3.0.0)
