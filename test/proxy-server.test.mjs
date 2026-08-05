@@ -367,14 +367,18 @@ describe("zero-downtime reload", () => {
   // listener it did not bind — which an in-process test cannot ask.
   it("a successor serves the inherited socket while the old process is still streaming", async () => {
     // A deliberately slow upstream, so the response is still open at the reload.
-    const CHUNKS = 12;
+    //
+    // Ended on DEMAND, not on a chunk count: a fixed 12 x 250ms budget has to
+    // outlast a whole second proxy boot, and on CI's 2-core runner it did not —
+    // the stream finished first and the test's own premise check fired
+    // ("it had already finished after 1 chunks"). Now it streams until this
+    // test says stop, so the boot can take as long as the box needs.
+    let stopStream = () => {};
     const upstream = http.createServer((q, r) => {
       r.writeHead(200, { "content-type": "text/event-stream" });
       let n = 0;
-      const t = setInterval(() => {
-        r.write(`data: ${++n}\n\n`);
-        if (n >= CHUNKS) { clearInterval(t); r.end(); }
-      }, 250);
+      const t = setInterval(() => r.write(`data: ${++n}\n\n`), 250);
+      stopStream = () => { clearInterval(t); r.end(); };
       q.resume();
     });
     await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
@@ -460,6 +464,10 @@ describe("zero-downtime reload", () => {
       const midflight = chunks;
 
       older.kill("SIGTERM");
+      // Let a few more chunks cross the handover, THEN end it. The assertions
+      // below are "nothing was cut" and "chunks arrived after the reload";
+      // both need the stream to outlive the signal, not the clock.
+      setTimeout(() => stopStream(), 1_500);
       const done = Date.now() + 20_000;
       while (!ended && !failure && Date.now() < done) await new Promise((r) => setTimeout(r, 100));
 
@@ -495,6 +503,10 @@ describe("zero-downtime reload", () => {
         const t = setTimeout(() => { try { k.kill("SIGKILL"); } catch {} r(); }, 8_000);
         k.on("exit", () => { clearTimeout(t); r(); });
       })));
+      // Before close(): it waits on every open response, and an assertion that
+      // threw before the deliberate stop above leaves this one streaming
+      // forever — the cleanup would hang rather than report the failure.
+      stopStream();
       await new Promise((r) => upstream.close(r));
       for (const c of stolenSockets) c.destroy();
       await new Promise((r) => listener.close(r));
