@@ -1,5 +1,6 @@
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { withDeadline, exitWithin } from "./child-deadline.mjs";
 import { fork, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
@@ -70,7 +71,7 @@ describe("proxy server lifecycle", () => {
     assert.equal(res.statusCode, 200);
 
     proxyProc.kill("SIGTERM");
-    await new Promise((resolve) => proxyProc.on("exit", resolve));
+    await exitWithin(proxyProc, 30_000, "the proxy never exited after SIGTERM");
   });
 
   it("shuts down cleanly on SIGTERM", async () => {
@@ -100,32 +101,6 @@ describe("proxy server lifecycle", () => {
     assert.equal(code, 0);
   });
 });
-
-// Wait for `p`, but never forever.
-//
-// `node --test` has NO default test timeout, so a single await on a child's
-// `exit` that never arrives hangs the whole run — the case cannot fail, the
-// file never finishes, and the CI job idles until GitHub's 360-minute cap.
-// Measured on run 31018228595: node 22 finished its tests in 39 s while node 18
-// and 20 sat `in_progress` past 80 minutes and NOTHING was reported as failed.
-//
-// SIGKILL on the way out, not just a rejection: a child that ignored SIGTERM
-// still holds the runner's stdout pipe, and an unresolved pipe hangs the run for
-// the same reason the await did. Killing it is what makes the failure a failure
-// rather than a different hang. Same lesson as the held-port file, where
-// SIGKILLed launchers left proxies holding the pipes and one file took 300 s.
-function withDeadline(p, ms, child, what) {
-  let timer;
-  return Promise.race([
-    p.finally(() => clearTimeout(timer)),
-    new Promise((_, rej) => {
-      timer = setTimeout(() => {
-        try { child.kill("SIGKILL"); } catch { /* already gone */ }
-        rej(new Error(`${what} within ${ms}ms`));
-      }, ms);
-    }),
-  ]);
-}
 
 function cleanEnv(overrides) {
   const env = { ...process.env };

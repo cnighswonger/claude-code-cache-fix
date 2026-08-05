@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { withDeadline } from "./child-deadline.mjs";
 import net from "node:net";
 import http from "node:http";
 import { spawn } from "node:child_process";
@@ -35,9 +36,11 @@ function startProxy(extraEnv = {}) {
 }
 
 function exitOf(proc) {
-  return new Promise((resolve) => {
-    proc.on("exit", (code, signal) => resolve({ code, signal }));
-  });
+  // Bounded: this file exists to assert HOW the proxy exits, so a proxy that
+  // never exits must fail here rather than hang the whole run.
+  return withDeadline(
+    new Promise((resolve) => proc.on("exit", (code, signal) => resolve({ code, signal }))),
+    30_000, proc, "the proxy never exited");
 }
 
 describe("SIGTERM exit code", () => {

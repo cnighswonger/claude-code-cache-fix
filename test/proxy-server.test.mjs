@@ -708,12 +708,19 @@ describe("zero-downtime reload", () => {
       const port = process.env.CACHE_FIX_PROXY_PORT;
       delete process.env.CACHE_FIX_PROXY_PORT;
       try {
+        // Bounded: without a refusal this command HOLDS THE PORT FOREVER, and
+        // `node --test` has no default timeout, so the whole run would hang
+        // with nothing reported rather than failing.
         const r = execFileSync(process.execPath,
           [fileURLToPath(new URL("../bin/claude-via-proxy.mjs", import.meta.url)), "run-service"],
           { encoding: "utf8", env: { ...process.env, CACHE_FIX_FORWARD_PROXY: "on" },
-            stdio: ["ignore", "pipe", "pipe"] });
+            stdio: ["ignore", "pipe", "pipe"], timeout: 20_000, killSignal: "SIGKILL" });
         assert.fail(`run-service started without a port and printed: ${r.slice(0, 120)}`);
       } catch (e) {
+        // A timeout also lands here, and reading it as a refusal would let the
+        // exact failure this guards against pass as a success.
+        assert.notEqual(e.code, "ETIMEDOUT",
+          "run-service neither refused nor exited — it is holding a port it was never given");
         assert.match(String(e.stderr ?? e.message), /needs CACHE_FIX_PROXY_PORT/,
           "it did not refuse — a service bound a port nobody was told about");
       } finally {

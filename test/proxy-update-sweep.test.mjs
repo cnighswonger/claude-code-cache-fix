@@ -10,6 +10,7 @@
 // in-process call would test neither.
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { exitWithin } from "./child-deadline.mjs";
 import http from "node:http";
 import net from "node:net";
 import { spawn } from "node:child_process";
@@ -74,7 +75,7 @@ async function sweepLeaves({ record, diskVersion, channelVersion, sweep }) {
       return existsSync(result);
     } finally {
       proc.kill("SIGKILL");
-      await new Promise((r) => proc.on("exit", r));
+      await exitWithin(proc, 20_000, "the proxy never exited after SIGKILL");
     }
   });
 }
