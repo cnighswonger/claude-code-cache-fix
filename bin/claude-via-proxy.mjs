@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { X509Certificate, randomUUID } from "node:crypto";
+import { X509Certificate, createHash, randomUUID } from "node:crypto";
 import http from "node:http";
 import net from "node:net";
 import { bundleUsable, carriesOurCA, salvageBundle } from "./ca-trust.mjs";
@@ -76,7 +76,7 @@ function holderPidOn(port) {
     try {
       const parent = execFileSync("ps", ["-p", String(ppid), "-o", "command="],
                                   { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
-      if (/\brun-service\b/.test(parent)) return runningOurTree(pid) ? "holder" : ppid;
+      if (/\brun-service\b/.test(parent)) return runningOurCode(port) ? "holder" : ppid;
     } catch { /* parent gone: fall through and treat the listener on its own */ }
   }
   return pid;
@@ -92,31 +92,60 @@ function holderPidOn(port) {
 // that ACTED and moved the port); both leave the outcome depending on somebody
 // knowing to intervene.
 //
-// So compare TREES. A proxy's argv names its own server.mjs, which is the deploy
-// it came from; ours is SERVER_PATH. Same path means same code and there is
-// genuinely nothing to do. A different path means an older install is serving
-// and must be replaced.
+// Compare the CODE, by content hash of the file the proxy booted from.
 //
-// Unknown answers "yes": a listener we cannot read is one we must not signal,
-// and treating it as stale would make this the thing that kills an unrelated
-// process on the port.
-function runningOurTree(listenerPid) {
-  let kids = "";
+// Cheaper proxies for "is this the same code" are all wrong, and both of us
+// shipped one before measuring:
+//   PATH — mine. An in-place `git pull` does not move the file, so a real
+//     upgrade compares equal and the old process keeps serving. Measured on
+//     this box: disk at one commit, process running another, run-service
+//     exited 0.
+//   MTIME — cswap's pin. Wrong in BOTH directions, reproduced here: `rsync -a`
+//     preserves mtime, so new content compares equal and the upgrade is MISSED;
+//     and `touch` alone changes it, recycling a healthy daemon for nothing.
+//   A VERSION STRING the proxy prints at boot answers "what did it think it
+//     was", which cannot see a file replaced under a running process.
+//
+// So a holder publishes the sha256 of the server.mjs it is about to run, and
+// the next one compares. A running process cannot be asked for its bytes; the
+// record is it telling us what it booted with.
+//
+// The file lives beside the port it describes and is rewritten on every spawn,
+// so it cannot outlive the fact — and if it does (a holder killed -9 mid-write,
+// a stale file from a previous boot), the fallback below is "leave it alone",
+// which is the safe direction.
+//
+// Unknown answers "yes" — a listener we cannot identify is one we must not
+// signal, or this becomes the thing that kills an unrelated service on the port.
+function codeFingerprint(file) {
   try {
-    kids = execFileSync("pgrep", ["-P", String(listenerPid)],
-                        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
-  } catch { /* no children: the listener IS the proxy on some builds */ }
-  const pids = [listenerPid, ...kids.trim().split("\n").map(Number).filter(Boolean)];
-  for (const p of pids) {
-    let argv = "";
-    try {
-      argv = execFileSync("ps", ["-p", String(p), "-o", "command="],
-                          { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
-    } catch { continue; }
-    const m = /(\S*proxy\/server\.mjs)/.exec(argv);
-    if (m) return m[1] === SERVER_PATH;
-  }
-  return true;
+    return createHash("sha256").update(readFileSync(file)).digest("hex");
+  } catch { return ""; }
+}
+
+function fingerprintPath(port) {
+  return join(tmpdir(), `cache-fix-proxy-${port}.sha256`);
+}
+
+// Temp + rename: a reader that opens this mid-write would compare against a
+// truncated hash and retire a healthy proxy.
+function publishFingerprint(port) {
+  const fp = codeFingerprint(SERVER_PATH);
+  if (!fp) return;
+  const path = fingerprintPath(port);
+  try {
+    writeFileSync(`${path}.${process.pid}`, fp);
+    renameSync(`${path}.${process.pid}`, path);
+  } catch { /* best effort: an unwritable tmpdir must not stop a proxy starting */ }
+}
+
+function runningOurCode(port) {
+  let theirs = "";
+  try { theirs = readFileSync(fingerprintPath(port), "utf8").trim(); } catch { return true; }
+  if (!theirs) return true;                       // cannot tell: leave it alone
+  const ours = codeFingerprint(SERVER_PATH);
+  if (!ours) return true;                         // cannot read our own: same
+  return theirs === ours;
 }
 
 function holdPort(rest) {
@@ -224,6 +253,10 @@ function holdPort(rest) {
       // measured — and retrying could not fix it: once bytes have reached the
       // client the request is unrepeatable, and a retry sent it twice (80 of 80
       // failed).
+      // Publish BEFORE the spawn: the record must never claim a newer build
+      // than the process actually serving. Written on every spawn, so a restart
+      // that picks up a redeployed file republishes without anyone asking.
+      publishFingerprint(port);
       child = spawn(process.execPath, [SERVER_PATH, ...rest], {
         stdio: ["inherit", "pipe", "inherit", holder._handle.fd],
         // CACHE_FIX_HELD_PORT: the ADVERTISED port, so a child whose holder dies

@@ -5,7 +5,8 @@ import net from "node:net";
 import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { writeFile, rm } from "node:fs/promises";
-import { readdirSync, readFileSync, existsSync, mkdtempSync, writeFileSync, cpSync, symlinkSync } from "node:fs";
+import { readdirSync, readFileSync, existsSync, mkdtempSync, writeFileSync, rmSync, utimesSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir, cpus } from "node:os";
 import { join, dirname } from "node:path";
 
@@ -649,49 +650,77 @@ it("stops when signalled between the proxy's death and its respawn", async () =>
     // port, stranding every session for 76 minutes). Both leave the outcome
     // depending on somebody knowing to intervene at the right moment.
     //
-    // Driven against a FAKE process tree rather than two real deploys. The rule
-    // is a pure function of what `ps` reports, and the real-deploy version of
-    // this case booted two more proxies — enough extra load to starve two
-    // timing-sensitive cases elsewhere in the suite (measured: they failed only
-    // when it ran beside them, and `concurrency: false` merely moved the
-    // starvation onto a third). A fixture that fakes the tree asks the same
-    // question and costs nothing.
+    // Driven against REAL FILES and a faked process tree. Real files because
+    // the decision is a content hash and a stub cannot exercise hashing; a
+    // faked tree because the surrounding rule is a pure function of what `ps`
+    // reports, and the two-real-deploys version of this case starved two
+    // timing-sensitive cases elsewhere by load alone.
     it("takes the port from a holder running an older deploy", async () => {
       const src = readFileSync(launcherPath, "utf8");
       const rule = /function holderPidOn[\s\S]*?\n}/.exec(src)?.[0];
-      const helper = /function runningOurTree[\s\S]*?\n}/.exec(src)?.[0];
-      assert.ok(rule && helper,
-        "holderPidOn/runningOurTree are gone — the upgrade decision moved and this no longer tests it");
+      const fpFns = /function codeFingerprint[\s\S]*?\nfunction runningOurCode[\s\S]*?\n}/.exec(src)?.[0];
+      assert.ok(rule && fpFns,
+        "holderPidOn/runningOurCode are gone — the upgrade decision moved and this no longer tests it");
 
-      // Two trees, one live: whatever `ps` says the incumbent's proxy is.
-      const OURS = "/opt/new/proxy/server.mjs";
-      const OLD = "/opt/old/proxy/server.mjs";
-      const decide = (incumbentServerPath) => {
+      const dir = mkdtempSync(join(tmpdir(), "ccf-fp-"));
+      const ours = join(dir, "server.mjs");
+      writeFileSync(ours, "// build A\n");
+      const record = join(dir, `cache-fix-proxy-${9901}.sha256`);
+      const sha = (f) => createHash("sha256").update(readFileSync(f)).digest("hex");
+
+      // The incumbent published what IT booted with; we hash what WE would run.
+      const decide = () => {
         const fake = {
           execFileSync: (cmd, args) => {
             if (cmd === "lsof") return "4242\n";
             if (cmd === "pgrep") return "4243\n";
             if (cmd === "ps") {
               const pid = args[args.indexOf("-p") + 1];
-              // 4242 is the listener (the proxy), 4241 its run-service holder.
-              if (pid === "4242") return `4241 node ${incumbentServerPath}\n`;
+              if (pid === "4242") return "4241 node /any/proxy/server.mjs\n";
               if (pid === "4241") return "node /usr/local/bin/cache-fix-proxy run-service\n";
-              return `node ${incumbentServerPath}\n`;
+              return "node /any/proxy/server.mjs\n";
             }
             throw new Error("unexpected " + cmd);
           },
         };
         // eslint-disable-next-line no-new-func
-        return Function("execFileSync", "SERVER_PATH",
-          `${helper}\n${rule}\nreturn holderPidOn(9901);`)(fake.execFileSync, OURS);
+        return Function("execFileSync", "SERVER_PATH", "readFileSync", "createHash", "join", "tmpdir",
+          `${fpFns}\n${rule}\nreturn holderPidOn(9901);`)(
+            fake.execFileSync, ours, readFileSync, createHash, () => record, () => dir);
       };
 
-      assert.equal(decide(OURS), "holder",
-        "a holder already running THIS deploy must be left alone — otherwise every " +
-        "`run-service` churns a healthy proxy");
-      assert.equal(decide(OLD), 4241,
-        "a holder running an OLDER deploy was read as \"one of ours\", so run-service " +
-        "exits and installing a fix changes nothing until a human intervenes");
+      try {
+        // Same bytes: nothing to do. A run-service that churned here would
+        // restart a healthy proxy on every shell.
+        writeFileSync(record, sha(ours));
+        assert.equal(decide(), "holder",
+          "a holder already running THIS build must be left alone");
+
+        // The file is REPLACED IN PLACE — the shape a `git pull` produces, and
+        // the one a path comparison cannot see (measured on this box: disk at
+        // one commit, process at another, same path, run-service exited 0).
+        writeFileSync(ours, "// build B\n");
+        assert.equal(decide(), 4241,
+          "an in-place upgrade left the older build serving — installing a fix " +
+          "changes nothing until a human intervenes");
+
+        // mtime moved, bytes identical: must NOT churn. `touch`, a rebuild that
+        // reproduces, a restored backup. cswap's pin recycled a healthy daemon
+        // on exactly this.
+        writeFileSync(record, sha(ours));
+        const t = Date.now() / 1000 + 3600;
+        utimesSync(ours, t, t);
+        assert.equal(decide(), "holder",
+          "a newer mtime with identical bytes retired a healthy proxy");
+
+        // No record at all (killed -9 mid-write, first boot): leave it alone.
+        rmSync(record, { force: true });
+        assert.equal(decide(), "holder",
+          "an unreadable record must mean LEAVE ALONE — guessing here signals a " +
+          "process we cannot identify");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
     });
 
     it("exits 0 and starts nothing when a proxy is already serving", async () => {
