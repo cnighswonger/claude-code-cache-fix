@@ -87,7 +87,11 @@ function holdPort(rest) {
       // Pinning it here keeps the dial address below correct whatever $bind is.
       child = spawn(process.execPath, [SERVER_PATH, ...rest], {
         stdio: ["inherit", "pipe", "inherit"],
-        env: { ...process.env, CACHE_FIX_PROXY_PORT: "0", CACHE_FIX_PROXY_BIND: "127.0.0.1" },
+        // CACHE_FIX_HELD_PORT: the ADVERTISED port, passed down so the child can
+        // put a new holder back on it if we die. Without it the child can only
+        // exit, and the address stays unowned until a human opens a shell.
+        env: { ...process.env, CACHE_FIX_PROXY_PORT: "0", CACHE_FIX_PROXY_BIND: "127.0.0.1",
+               CACHE_FIX_HELD_PORT: String(port) },
       });
       // Buffered until a newline: the port arrives on stdout, and a chunk
       // boundary inside that line would otherwise lose it silently — every

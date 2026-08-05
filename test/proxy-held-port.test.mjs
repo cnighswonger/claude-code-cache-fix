@@ -338,6 +338,50 @@ it("stops when signalled between the proxy's death and its respawn", async () =>
       }
     });
 
+    // THE OUTAGE THIS EXISTS FOR. On <linux-host> the 9901 holder died, nothing revived
+    // it, and every session — HTTPS_PROXY baked at exec, so none of them can be
+    // re-pointed — fell into `attempt N/300` until a human woke up and started
+    // one by hand. Load reached 16,483 while the pin burned itself down retrying
+    // a hop that was never coming back.
+    //
+    // The surviving proxy child is what notices: it already watches its parent
+    // so it does not orphan a port, and the same tick puts a new holder on the
+    // advertised address before it goes.
+    it("puts a new holder back on the port when the old one is killed", async () => {
+      const port = await freePort();
+      const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port), CACHE_FIX_FORWARD_PROXY: "on" };
+      for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                       "ALL_PROXY", "all_proxy", "LISTEN_FDS", "LISTEN_PID"]) delete env[k];
+      const get = () => new Promise((res) => {
+        http.get({ host: "127.0.0.1", port, path: "/health", timeout: 3_000 }, (r) => {
+          let b = ""; r.on("data", (d) => (b += d)); r.on("end", () => res(b));
+        }).on("error", (e) => res(`ERR:${e.code}`));
+      });
+      const first = spawn(process.execPath, [launcherPath, "run-service"], { env, stdio: ["ignore", "pipe", "pipe"] });
+      try {
+        const up = Date.now() + 15_000;
+        let body = await get();
+        while (body.startsWith("ERR:") && Date.now() < up) body = await get();
+        assert.equal(JSON.parse(body).status, "ok", "the holder never came up");
+
+        // SIGKILL, the shape a supervisor cannot catch: OOM, container stop, kill -9.
+        first.kill("SIGKILL");
+        const healed = Date.now() + 20_000;
+        let back = false;
+        while (!back && Date.now() < healed) {
+          await new Promise((r) => setTimeout(r, 200));
+          back = !(await get()).startsWith("ERR:");
+        }
+        assert.ok(back,
+          "the port stayed unowned after its holder was killed — every session wired " +
+          "to that address is stranded, which is the outage this guards");
+      } finally {
+        try { first.kill("SIGKILL"); } catch {}
+        try { execFileSync("pkill", ["-f", `CACHE_FIX_HELD_PORT=${port}`], { stdio: "ignore" }); } catch {}
+        try { execFileSync("pkill", ["-f", `CACHE_FIX_PROXY_PORT=${port}`], { stdio: "ignore" }); } catch {}
+      }
+    });
+
     it("exits 0 and starts nothing when a proxy is already serving", async () => {
       await withHeldPort(async ({ get, port }) => {
         const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port) };

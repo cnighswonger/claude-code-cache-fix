@@ -18,6 +18,9 @@ import { publishableGates } from "./gate-allowlist.mjs";
 // runtime) see live behavior — same pattern as image-strip's #98 gate.
 import { appendFileSync, mkdirSync, readFileSync, readlinkSync, rmSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+const __dirname = dirname(fileURLToPath(import.meta.url));
 import { homedir } from "node:os";
 import util from "node:util";
 import { claudeHome } from "./claude-home.mjs";
@@ -848,9 +851,32 @@ const invokedAsScript =
 function exitWithParent() {
   if (process.env.CACHE_FIX_PROXY_PORT !== "0") return;
   const born = process.ppid;
+  // The advertised port, which the holder passed down so we can put a new
+  // holder back on it. Without it we can only exit, and the port stays dead
+  // until a human opens a shell — which is exactly the outage this exists for.
+  const advertised = process.env.CACHE_FIX_HELD_PORT;
   setInterval(() => {
     if (process.ppid === born) return;
-    process.stderr.write("[cache-fix] holder is gone; exiting rather than orphaning this port\n");
+    // The holder is gone and every session on this box has HTTPS_PROXY baked at
+    // exec — they cannot be re-pointed, so the address must get an owner back.
+    // Measured on <linux-host>: the holder died, nothing revived it, and every session
+    // fell into attempt N/300 until someone woke up and started one by hand.
+    //
+    // Detached and re-exec'd rather than adopted: a new holder must outlive us,
+    // and it is the holder that knows how to supervise a proxy. We hand the
+    // port over by exiting right after — the successor takes it the same way a
+    // deploy does.
+    if (advertised) {
+      try {
+        spawn(process.execPath, [join(__dirname, "..", "bin", "claude-via-proxy.mjs"), "run-service"], {
+          detached: true, stdio: "ignore",
+          env: { ...process.env, CACHE_FIX_PROXY_PORT: advertised, CACHE_FIX_HELD_PORT: undefined },
+        }).unref();
+        process.stderr.write(`[cache-fix] holder died; started a new one on ${advertised}\n`);
+      } catch (e) {
+        process.stderr.write(`[cache-fix] holder died and the respawn failed: ${e.message}\n`);
+      }
+    }
     process.exit(0);
   }, 1000).unref();
 }
