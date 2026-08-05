@@ -237,7 +237,15 @@ it("stops when signalled between the proxy's death and its respawn", async () =>
       }, { subcommand: "run-service", extraEnv: { CACHE_FIX_HOLD_PORT: "" } });
     });
 
-    // Idempotent, so an rc line can run on every shell. Without this the second
+    // Discoverable. An rc line must be able to ask whether this build has the
+  // subcommand before using it — an older one reads `run-service` as a claude
+  // argument and starts a proxy on its own default port instead.
+  it("is advertised in --help", () => {
+    const out = execFileSync(process.execPath, [launcherPath, "--help"], { encoding: "utf8" });
+    assert.match(out, /run-service/, "a caller cannot detect the subcommand before using it");
+  });
+
+  // Idempotent, so an rc line can run on every shell. Without this the second
     // caller falls back to running its own proxy on a port someone else holds —
     // two proxies, split cache.
     it("exits 0 and starts nothing when a proxy is already serving", async () => {

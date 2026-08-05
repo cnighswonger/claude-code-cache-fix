@@ -216,6 +216,11 @@ async function dispatch() {
         "  (no subcommand)        Spawn the proxy + launch claude with ANTHROPIC_BASE_URL set.\n" +
         "                         Pass any claude args after optional --proxy-port / --proxy-upstream.\n" +
         "  server                 Run just the proxy in the foreground (for systemd/launchd ExecStart).\n" +
+        "  run-service            What install-service's unit does, without a service manager:\n" +
+        "                         holds the port, restarts the proxy under it, and exits 0\n" +
+        "                         when one is already serving. For hosts with no systemd or\n" +
+        "                         launchd (containers, WSL, a non-root user). Mode comes from\n" +
+        "                         the environment: CACHE_FIX_FORWARD_PROXY=on cache-fix-proxy run-service\n" +
         "  install-service        Install a systemd user service (Linux) or launchd agent (macOS).\n" +
         "                         Pass --force to overwrite an existing config.\n" +
         "  uninstall-service      Stop, disable, and remove the installed service.\n" +
