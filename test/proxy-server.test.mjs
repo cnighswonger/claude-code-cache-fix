@@ -676,6 +676,29 @@ describe("zero-downtime reload", () => {
         "clearing without an escape hatch leaves an operator no way to set the upstream");
     });
 
+    // Both outages had every health field green, because they all reported what
+    // was CONFIGURED. These two report what IS: the port we took, and whether
+    // our own upstream loops back to us.
+    it("health reports the port it actually bound", async () => {
+      const handle = await startProxy({ port: 0, bind: "127.0.0.1", watch: false });
+      try {
+        const body = await new Promise((res) => {
+          http.get({ host: "127.0.0.1", port: handle.port, path: "/health" }, (r) => {
+            let b = ""; r.on("data", (d) => (b += d)); r.on("end", () => res(b));
+          }).on("error", (e) => res(`ERR:${e.code}`));
+        });
+        const h = JSON.parse(body);
+        assert.equal(h.listen_port, handle.port,
+          "health did not name the bound port — a proxy on the wrong port reads as healthy");
+        assert.notEqual(h.listen_port, 0,
+          "port 0 was echoed back rather than the ephemeral port actually taken");
+        assert.equal(h.upstream_is_self, false,
+          "a proxy with no self-referencing upstream reported one");
+      } finally {
+        await handle.close();
+      }
+    });
+
     // A service binds an address sessions were ALREADY told to use, so the
     // built-in default is a wrong answer rather than a missing one: it binds a
     // port nobody dials while every health field reports a healthy proxy.
