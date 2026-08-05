@@ -512,7 +512,18 @@ function holdPort(rest) {
     // Polled, not fs.watch: a watch fires on a touch that changed no bytes and
     // misses a replace-by-rename on some platforms. The hash answers the only
     // question that matters — are these the bytes the child booted from.
-    const watchMs = Number(process.env.CACHE_FIX_WATCH_DEPLOY_MS) || 0;
+    // CACHE_FIX_SELF_HEAL=off means "do not act on your own", and this acts on
+    // its own — so it has to ask. The switch predates this watcher and the
+    // proxy-side check honoured it, so a reader would assume it was covered:
+    // measured, it was not. An operator editing the file with the switch OFF
+    // still lost the proxy under them, which is the one thing the switch exists
+    // to prevent, reached through a path added later.
+    //
+    // cswap's pin had the identical defect and found it from this side of the
+    // conversation. Same shape, both codebases, both added after the switch.
+    const watchMs = process.env.CACHE_FIX_SELF_HEAL === "off"
+      ? 0
+      : Number(process.env.CACHE_FIX_WATCH_DEPLOY_MS) || 0;
     if (watchMs > 0) {
       const watcher = setInterval(() => {
         if (stopping || !child || !bootedHash) return;

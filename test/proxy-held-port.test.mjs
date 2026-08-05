@@ -186,7 +186,7 @@ it("leaks no descriptor when a client aborts", async () => {
 // Named per call, not per file: two cases running at once on one fixed name
 // would each write the other's stand-in and delete it in their own cleanup.
 let fakeSeq = 0;
-async function withFakeProxy(serverSrc, fn, { watchMs } = {}) {
+async function withFakeProxy(serverSrc, fn, { watchMs, selfHeal = "" } = {}) {
   const tag = `${process.pid}-${++fakeSeq}`;
   const failing = join(dirname(launcherPath), `.test-fake-server-${tag}.mjs`);
   const copy = join(dirname(launcherPath), `.test-launcher-${tag}.mjs`);
@@ -199,7 +199,7 @@ async function withFakeProxy(serverSrc, fn, { watchMs } = {}) {
   // seam shrinks the RUNGS, not the count, so the shape under assertion (does
   // it back off? does it give up after 5?) is the shipped one.
   const env = { ...process.env, CACHE_FIX_HOLD_PORT: "on", CACHE_FIX_PROXY_PORT: String(port),
-                CACHE_FIX_RESTART_BASE_MS: "25", CACHE_FIX_SELF_HEAL: "off",
+                CACHE_FIX_RESTART_BASE_MS: "25", CACHE_FIX_SELF_HEAL: selfHeal || "off",
                 ...(watchMs ? { CACHE_FIX_WATCH_DEPLOY_MS: String(watchMs) } : {}) };
   // An ambient LISTEN_FDS sends the launcher down the socket-activation path
   // instead of the holder, and an ambient proxy var routes its own requests
@@ -797,7 +797,7 @@ describe("deploy watcher (CACHE_FIX_WATCH_DEPLOY_MS)", () => {
       assert.notEqual(after, before,
         "a deploy landed on disk and the running proxy kept serving the old bytes — " +
         "the state this exists to end, and the one a human has to notice today");
-    }, { watchMs: 300 });
+    }, { watchMs: 300, selfHeal: "on" });
   });
 
   it("leaves a healthy proxy alone when only the mtime moved", async () => {
@@ -811,7 +811,24 @@ describe("deploy watcher (CACHE_FIX_WATCH_DEPLOY_MS)", () => {
       await new Promise((r) => setTimeout(r, 2_000));
       assert.equal(pidOn(launcher), before,
         "a newer mtime with identical bytes restarted a healthy proxy");
-    }, { watchMs: 300 });
+    }, { watchMs: 300, selfHeal: "on" });
+  });
+
+  // "Do not act on your own" has to cover every path that acts on its own. The
+  // switch predates this watcher and the proxy-side check honours it, so the
+  // watcher LOOKED covered — measured, it was not: an operator editing the file
+  // with the switch OFF still lost the proxy under them. cswap's pin had the
+  // identical defect, found from the other side of the same conversation.
+  it("honours CACHE_FIX_SELF_HEAL=off", async () => {
+    await withFakeProxy(serving, async ({ launcher, serverFile }) => {
+      const before = await settleFor(launcher, 0, 8_000);
+      assert.ok(before, "the stand-in proxy never started");
+      await writeFile(serverFile, serving + "\n// operator is editing\n");
+      await new Promise((r) => setTimeout(r, 2_000));
+      assert.equal(pidOn(launcher), before,
+        "the watcher replaced a proxy while self-heal was OFF — the one thing " +
+        "that switch exists to prevent");
+    }, { watchMs: 300, selfHeal: "off" });
   });
 
   it("is off unless asked for", async () => {
@@ -823,7 +840,7 @@ describe("deploy watcher (CACHE_FIX_WATCH_DEPLOY_MS)", () => {
       assert.equal(pidOn(launcher), before,
         "the watcher ran without being enabled — a restart is never free, so the " +
         "cost has to be opted into");
-    });
+    }, { selfHeal: "on" });
   });
 });
 });
