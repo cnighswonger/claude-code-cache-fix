@@ -54,9 +54,17 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
   // grandchild — measured, three leaked per run of this file, reparented to
   // init, accumulating until the box stalls. The cases that MEASURE self-heal
   // turn it back on through extraEnv, so the behaviour is still covered.
-  const env = { ...process.env, CACHE_FIX_HOLD_PORT: "on", CACHE_FIX_PROXY_PORT: String(port),
-                CACHE_FIX_SELF_HEAL: "off", ...extraEnv };
-  for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "LISTEN_FDS", "LISTEN_PID"]) delete env[k];
+  // CACHE_FIX_WATCH_DEPLOY_MS and CACHE_FIX_SELF_HEAL are scrubbed for the same
+  // reason as the proxy vars: an operator who exported one while debugging
+  // would change what these cases measure. Each test sets what it needs
+  // through extraEnv, so the ambient value must never reach the child —
+  // measured, an exported WATCH_DEPLOY_MS turns "is off unless asked for"
+  // into a failure about the shell rather than about the code.
+  const env = { ...process.env };
+  for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "LISTEN_FDS", "LISTEN_PID",
+                   "CACHE_FIX_WATCH_DEPLOY_MS", "CACHE_FIX_SELF_HEAL"]) delete env[k];
+  Object.assign(env, { CACHE_FIX_HOLD_PORT: "on", CACHE_FIX_PROXY_PORT: String(port),
+                       CACHE_FIX_SELF_HEAL: "off", ...extraEnv });
   const launcher = spawn(process.execPath, [launcherPath, subcommand], { env, stdio: ["ignore", "pipe", "pipe"] });
   const exited = new Promise((r) => launcher.on("exit", () => r(true)));
   const get = () => new Promise((res) => {
@@ -198,13 +206,21 @@ async function withFakeProxy(serverSrc, fn, { watchMs, selfHeal = "" } = {}) {
   // they measure it by sleeping through it — 22s of the file's runtime. The
   // seam shrinks the RUNGS, not the count, so the shape under assertion (does
   // it back off? does it give up after 5?) is the shipped one.
-  const env = { ...process.env, CACHE_FIX_HOLD_PORT: "on", CACHE_FIX_PROXY_PORT: String(port),
-                CACHE_FIX_RESTART_BASE_MS: "25", CACHE_FIX_SELF_HEAL: selfHeal || "off",
-                ...(watchMs ? { CACHE_FIX_WATCH_DEPLOY_MS: String(watchMs) } : {}) };
+  const env = { ...process.env };
+  for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "LISTEN_FDS", "LISTEN_PID",
+                   "CACHE_FIX_WATCH_DEPLOY_MS", "CACHE_FIX_SELF_HEAL"]) delete env[k];
+  Object.assign(env, { CACHE_FIX_HOLD_PORT: "on", CACHE_FIX_PROXY_PORT: String(port),
+                       CACHE_FIX_RESTART_BASE_MS: "25", CACHE_FIX_SELF_HEAL: selfHeal || "off",
+                       ...(watchMs ? { CACHE_FIX_WATCH_DEPLOY_MS: String(watchMs) } : {}) });
   // An ambient LISTEN_FDS sends the launcher down the socket-activation path
   // instead of the holder, and an ambient proxy var routes its own requests
   // through a proxy that is not there.
-  for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "LISTEN_FDS", "LISTEN_PID"]) delete env[k];
+  // CACHE_FIX_WATCH_DEPLOY_MS and CACHE_FIX_SELF_HEAL are scrubbed for the same
+  // reason as the proxy vars: an operator who exported one while debugging
+  // would change what these cases measure. Each test sets what it needs
+  // through extraEnv, so the ambient value must never reach the child —
+  // measured, an exported WATCH_DEPLOY_MS turns "is off unless asked for"
+  // into a failure about the shell rather than about the code.
   const launcher = spawn(process.execPath, [copy, "server"], { env, stdio: ["ignore", "pipe", "pipe"] });
   let err = "";
   launcher.stderr.on("data", (d) => (err += d));
@@ -358,8 +374,12 @@ it("stops when signalled between the proxy's death and its respawn", async () =>
     it("leaves no orphan when the holder is killed outright", async () => {
       const port = await freePort();
       const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port), CACHE_FIX_FORWARD_PROXY: "on" };
+      // SELF_HEAL too: this case MEASURES the self-heal, so an operator who
+      // exported the off switch while debugging would turn it into a failure
+      // about their shell. WATCH_DEPLOY_MS for the same reason.
       for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
-                       "ALL_PROXY", "all_proxy", "LISTEN_FDS", "LISTEN_PID"]) delete env[k];
+                       "ALL_PROXY", "all_proxy", "LISTEN_FDS", "LISTEN_PID",
+                       "CACHE_FIX_SELF_HEAL", "CACHE_FIX_WATCH_DEPLOY_MS"]) delete env[k];
       const holder = spawn(process.execPath, [launcherPath, "run-service"], { env, stdio: ["ignore", "pipe", "pipe"] });
       let kid = 0;
       try {
