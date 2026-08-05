@@ -1,5 +1,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { exitWithin } from "./child-deadline.mjs";
 import http from "node:http";
 
 let proxyPort;
@@ -90,7 +91,10 @@ describe("proxy integration with extensions", () => {
   after(async () => {
     if (proxyProcess) {
       proxyProcess.kill("SIGTERM");
-      await new Promise((resolve) => proxyProcess.on("exit", resolve));
+      // Bounded: this is an `after` hook, so a proxy that never exits does not
+      // fail a case — it stops the FILE from finishing, and with no default
+      // test timeout the whole run hangs with nothing reported.
+      await exitWithin(proxyProcess, 30_000, "the proxy never exited after SIGTERM");
     }
     if (fakeUpstream) {
       await new Promise((resolve) => fakeUpstream.close(resolve));
