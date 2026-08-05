@@ -645,6 +645,41 @@ async function dispatch() {
   if (SUBCOMMAND === "run-service") {
     process.env.CACHE_FIX_HOLD_PORT = "on";
     process.env.CACHE_FIX_EXIT_IF_RUNNING = "1";
+    // A SERVICE MUST NOT INHERIT THE SESSION'S WIRING.
+    //
+    // HTTPS_PROXY/ALL_PROXY name the hop a SESSION dials — us, or something in
+    // front of us. Reaching this process by inheritance, they become our own
+    // upstream, so what we forward to depends on which shell was open when
+    // someone typed the command. Measured twice on one box in a day: started
+    // from a wired shell we adopted the hop in front of us and every request
+    // looped, while the correct value sat unused in the same environment.
+    //
+    // Dropped rather than overridden, so the fallback chain the launcher
+    // computed is what decides. An operator who genuinely wants a specific
+    // upstream for the service says so with CACHE_FIX_UPSTREAM_PROXY, which
+    // nothing inherits by accident.
+    if (!process.env.CACHE_FIX_UPSTREAM_PROXY) {
+      for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                       "ALL_PROXY", "all_proxy"]) {
+        delete process.env[k];
+      }
+    }
+    // A SERVICE NEEDS ITS ADDRESS SAID OUT LOUD. Sessions bake a port at exec,
+    // so this one is not ours to guess: falling back to the built-in default
+    // binds a port nobody was told about, and every health field then reports a
+    // perfectly working proxy that no session can reach. Measured — a
+    // run-service started without it took 9801 while the fleet dialled 9901.
+    //
+    // Only here. Wrapper mode keeps the default because it wires the client it
+    // launches, so the number is private to that pair; a service is the case
+    // where something else already knows the address.
+    if (!process.env.CACHE_FIX_PROXY_PORT) {
+      process.stderr.write(
+        "[cache-fix] run-service needs CACHE_FIX_PROXY_PORT — a service must bind the " +
+        "port sessions were told to use, and that cannot be guessed. " +
+        "e.g. CACHE_FIX_PROXY_PORT=9901 CACHE_FIX_FORWARD_PROXY=on cache-fix-proxy run-service\n");
+      return 2;
+    }
     return holdPort(args.slice(1));
   }
   if (SUBCOMMAND === "install-service") {

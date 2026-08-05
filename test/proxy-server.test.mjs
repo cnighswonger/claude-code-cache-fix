@@ -643,6 +643,62 @@ describe("zero-downtime reload", () => {
       }
     });
 
+    // The self-loop guard only catches an upstream that is US. The process
+    // measured during the outage pointed at the hop IN FRONT of us (the pin),
+    // which is not our address and passes that guard — so the upstream must
+    // stop being whatever the launching shell exported.
+    it("a dedicated upstream variable outranks the session's wiring", async () => {
+      const saved = { u: process.env.CACHE_FIX_UPSTREAM_PROXY, s: process.env.HTTPS_PROXY };
+      process.env.CACHE_FIX_UPSTREAM_PROXY = "http://127.0.0.1:8118";
+      process.env.HTTPS_PROXY = "http://127.0.0.1:36301";
+      try {
+        const { default: fresh } = await import(`../proxy/config.mjs?u=${Date.now()}`);
+        assert.equal(fresh.httpsProxy, "http://127.0.0.1:8118",
+          "an inherited HTTPS_PROXY beat the dedicated variable — this is the outage");
+        assert.equal(fresh.httpProxy, "http://127.0.0.1:8118",
+          "httpProxy ignored the dedicated variable, so the fallthrough still loops");
+      } finally {
+        for (const [k, v] of [["CACHE_FIX_UPSTREAM_PROXY", saved.u], ["HTTPS_PROXY", saved.s]]) {
+          if (v === undefined) delete process.env[k]; else process.env[k] = v;
+        }
+      }
+    });
+
+    it("run-service drops inherited wiring, and says so in the source", () => {
+      const src = readFileSync(new URL("../bin/claude-via-proxy.mjs", import.meta.url), "utf8");
+      const branch = /SUBCOMMAND === "run-service"[\s\S]*?return holdPort/.exec(src)?.[0];
+      assert.ok(branch, "the run-service branch moved — this no longer tests it");
+      for (const k of ["HTTPS_PROXY", "ALL_PROXY", "HTTP_PROXY"]) {
+        assert.match(branch, new RegExp(`"${k}"`),
+          `run-service does not clear ${k}, so a wired shell still decides our upstream`);
+      }
+      assert.match(branch, /CACHE_FIX_UPSTREAM_PROXY/,
+        "clearing without an escape hatch leaves an operator no way to set the upstream");
+    });
+
+    // A service binds an address sessions were ALREADY told to use, so the
+    // built-in default is a wrong answer rather than a missing one: it binds a
+    // port nobody dials while every health field reports a healthy proxy.
+    // Measured — a run-service started without it took 9801 while the fleet was
+    // on 9901, and that process was still sitting there 9 hours later.
+    it("run-service refuses to guess its port", () => {
+      const port = process.env.CACHE_FIX_PROXY_PORT;
+      delete process.env.CACHE_FIX_PROXY_PORT;
+      try {
+        const r = execFileSync(process.execPath,
+          [fileURLToPath(new URL("../bin/claude-via-proxy.mjs", import.meta.url)), "run-service"],
+          { encoding: "utf8", env: { ...process.env, CACHE_FIX_FORWARD_PROXY: "on" },
+            stdio: ["ignore", "pipe", "pipe"] });
+        assert.fail(`run-service started without a port and printed: ${r.slice(0, 120)}`);
+      } catch (e) {
+        assert.match(String(e.stderr ?? e.message), /needs CACHE_FIX_PROXY_PORT/,
+          "it did not refuse — a service bound a port nobody was told about");
+      } finally {
+        if (port === undefined) delete process.env.CACHE_FIX_PROXY_PORT;
+        else process.env.CACHE_FIX_PROXY_PORT = port;
+      }
+    });
+
     // The polluted process had HTTPS_PROXY on the pin and HTTP_PROXY on itself.
     // selectProxyUrl falls through to httpProxy when httpsProxy is empty, so
     // that half alone still builds the loop.

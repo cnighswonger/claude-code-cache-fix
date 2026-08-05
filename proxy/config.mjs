@@ -31,8 +31,25 @@ const config = {
   extensionsDir: process.env.CACHE_FIX_EXTENSIONS_DIR || join(__dirname, "extensions"),
   extensionsConfig: process.env.CACHE_FIX_EXTENSIONS_CONFIG || join(__dirname, "extensions.json"),
   debug: process.env.CACHE_FIX_DEBUG === "1",
-  get httpsProxy() { return process.env.HTTPS_PROXY || process.env.https_proxy || ""; },
-  get httpProxy()  { return process.env.HTTP_PROXY  || process.env.http_proxy  || ""; },
+  // CACHE_FIX_UPSTREAM_PROXY wins over HTTPS_PROXY/HTTP_PROXY, which is the
+  // point: those two are the SESSION's wiring and they reach us by inheritance,
+  // so our upstream ends up being whatever shell happened to launch us.
+  // Measured twice on one box in a day — `run-service` started from a wired
+  // shell adopted the hop IN FRONT of us and every request looped. The right
+  // answer was in the same environment (CACHE_FIX_FALLBACK_PROXIES=…:8118) and
+  // lost to an inherited HTTPS_PROXY.
+  //
+  // A dedicated name cannot be inherited by accident: nothing but this proxy's
+  // own supervisor sets it. The old variables stay as the fallback so a direct
+  // `cache-fix-proxy server` in a shell still works the way it always has.
+  get httpsProxy() {
+    return process.env.CACHE_FIX_UPSTREAM_PROXY
+        || process.env.HTTPS_PROXY || process.env.https_proxy || "";
+  },
+  get httpProxy()  {
+    return process.env.CACHE_FIX_UPSTREAM_PROXY
+        || process.env.HTTP_PROXY  || process.env.http_proxy  || "";
+  },
   get noProxy()    { return process.env.NO_PROXY    || process.env.no_proxy    || ""; },
   get caFile()     { return process.env.CACHE_FIX_PROXY_CA_FILE || ""; },
   get rejectUnauthorized() {
