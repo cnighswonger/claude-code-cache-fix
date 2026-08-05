@@ -186,7 +186,7 @@ it("leaks no descriptor when a client aborts", async () => {
 // Named per call, not per file: two cases running at once on one fixed name
 // would each write the other's stand-in and delete it in their own cleanup.
 let fakeSeq = 0;
-async function withFakeProxy(serverSrc, fn) {
+async function withFakeProxy(serverSrc, fn, { watchMs } = {}) {
   const tag = `${process.pid}-${++fakeSeq}`;
   const failing = join(dirname(launcherPath), `.test-fake-server-${tag}.mjs`);
   const copy = join(dirname(launcherPath), `.test-launcher-${tag}.mjs`);
@@ -199,7 +199,8 @@ async function withFakeProxy(serverSrc, fn) {
   // seam shrinks the RUNGS, not the count, so the shape under assertion (does
   // it back off? does it give up after 5?) is the shipped one.
   const env = { ...process.env, CACHE_FIX_HOLD_PORT: "on", CACHE_FIX_PROXY_PORT: String(port),
-                CACHE_FIX_RESTART_BASE_MS: "25", CACHE_FIX_SELF_HEAL: "off" };
+                CACHE_FIX_RESTART_BASE_MS: "25", CACHE_FIX_SELF_HEAL: "off",
+                ...(watchMs ? { CACHE_FIX_WATCH_DEPLOY_MS: String(watchMs) } : {}) };
   // An ambient LISTEN_FDS sends the launcher down the socket-activation path
   // instead of the holder, and an ambient proxy var routes its own requests
   // through a proxy that is not there.
@@ -213,7 +214,7 @@ async function withFakeProxy(serverSrc, fn) {
     s.listen({ port, host: "127.0.0.1" }, () => s.close(() => r(false)));
   });
   try {
-    await fn({ launcher, port, bound, stderr: () => err });
+    await fn({ launcher, port, bound, stderr: () => err, serverFile: failing });
   } finally {
     // SIGTERM FIRST, and wait for it. SIGKILL cannot be forwarded, so a killed
     // launcher leaves its proxy running — and that grandchild holds the pipes
@@ -755,4 +756,74 @@ it("stops when signalled between the proxy's death and its respawn", async () =>
       }, { subcommand: "run-service", extraEnv: { CACHE_FIX_HOLD_PORT: "" } });
     });
   });
+
+// A DEPLOY THAT NOBODY RELAUNCHES NEVER RUNS.
+//
+// Node reads the proxy source once at startup, so `git pull` updates files the
+// live process is not executing — and the machine that most needs the upgrade
+// is the one whose sessions never restart. cswap's pin served code replaced 19
+// hours earlier for 22 hours with every health signal green; this fleet sat in
+// the same state on all three hosts the day this was written.
+//
+// Driven through withFakeProxy so the file being "deployed over" is a per-call
+// stand-in. Editing the real proxy/server.mjs here would deploy to every other
+// case in the suite at the same time.
+describe("deploy watcher (CACHE_FIX_WATCH_DEPLOY_MS)", () => {
+  const serving = 'process.stdout.write(`proxy listening on 127.0.0.1:${process.env.CACHE_FIX_PROXY_PORT}\\n`); setInterval(() => {}, 1e9);\n';
+
+  const pidOn = (launcher) => {
+    try {
+      const out = execFileSync("pgrep", ["-P", String(launcher.pid)], { encoding: "utf8" });
+      const p = Number(out.trim().split("\n")[0]);
+      return Number.isInteger(p) && p > 1 ? p : 0;
+    } catch { return 0; }
+  };
+  const settleFor = async (launcher, was, ms) => {
+    const until = Date.now() + ms;
+    while (Date.now() < until) {
+      const now = pidOn(launcher);
+      if (now && now !== was) return now;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    return pidOn(launcher);
+  };
+
+  it("restarts the proxy onto source whose BYTES changed", async () => {
+    await withFakeProxy(serving, async ({ launcher, serverFile }) => {
+      const before = await settleFor(launcher, 0, 8_000);
+      assert.ok(before, "the stand-in proxy never started, so this measures nothing");
+      await writeFile(serverFile, serving + "\n// deployed\n");
+      const after = await settleFor(launcher, before, 8_000);
+      assert.notEqual(after, before,
+        "a deploy landed on disk and the running proxy kept serving the old bytes — " +
+        "the state this exists to end, and the one a human has to notice today");
+    }, { watchMs: 300 });
+  });
+
+  it("leaves a healthy proxy alone when only the mtime moved", async () => {
+    await withFakeProxy(serving, async ({ launcher, serverFile }) => {
+      const before = await settleFor(launcher, 0, 8_000);
+      assert.ok(before, "the stand-in proxy never started");
+      // `touch` — what rsync -a, a rebuild that reproduces, or a restored backup
+      // do. cswap's pin recycled a healthy daemon on exactly this.
+      const t = Date.now() / 1000 + 3600;
+      utimesSync(serverFile, t, t);
+      await new Promise((r) => setTimeout(r, 2_000));
+      assert.equal(pidOn(launcher), before,
+        "a newer mtime with identical bytes restarted a healthy proxy");
+    }, { watchMs: 300 });
+  });
+
+  it("is off unless asked for", async () => {
+    await withFakeProxy(serving, async ({ launcher, serverFile }) => {
+      const before = await settleFor(launcher, 0, 8_000);
+      assert.ok(before, "the stand-in proxy never started");
+      await writeFile(serverFile, serving + "\n// deployed\n");
+      await new Promise((r) => setTimeout(r, 2_000));
+      assert.equal(pidOn(launcher), before,
+        "the watcher ran without being enabled — a restart is never free, so the " +
+        "cost has to be opted into");
+    });
+  });
+});
 });

@@ -162,6 +162,9 @@ function holdPort(rest) {
     // the port has to be ours again AND the old proxy has to be gone — so each
     // fires the same guarded spawn and only the later one gets through.
     let bound = false, reclaiming = null;
+    // The sha256 the CURRENT child booted from, so a deploy can reach the
+    // running process without a human. See the watcher below.
+    let bootedHash = "";
     // `run-service` is idempotent: re-running it must not put a second proxy
     // beside the first. Only the holder can answer that, because the bind is
     // the only thing that knows whether the port is already taken.
@@ -275,6 +278,7 @@ function holdPort(rest) {
       // than the process actually serving. Written on every spawn, so a restart
       // that picks up a redeployed file republishes without anyone asking.
       publishFingerprint(port);
+      bootedHash = codeFingerprint(SERVER_PATH);
       child = spawn(process.execPath, [SERVER_PATH, ...rest], {
         stdio: ["inherit", "pipe", "inherit", holder._handle.fd],
         // CACHE_FIX_HELD_PORT: the ADVERTISED port, so a child whose holder dies
@@ -489,6 +493,40 @@ function holdPort(rest) {
       };
       retry();
     };
+
+    // A DEPLOY THAT NOBODY RELAUNCHES NEVER RUNS.
+    //
+    // Node reads the proxy source once at startup, so `git pull` updates files
+    // the live process is not executing. The machine that most needs an upgrade
+    // is the one whose sessions never restart — cswap's pin served code replaced
+    // 19 hours earlier for 22 hours, with every health signal green, and this
+    // fleet is in that state right now on all three hosts.
+    //
+    // We already publish the sha256 at spawn; this is the missing half, the
+    // incumbent re-reading it. On a change, SIGTERM the child: the holder keeps
+    // the port, the proxy drains, and the successor comes up on the new file —
+    // the same path a crash already takes, measured at 3 lost of 5257 across 3
+    // restarts. That cost is why this is OPT-IN: a restart is never free, and
+    // whether stale code or a few dropped requests is worse depends on the host.
+    //
+    // Polled, not fs.watch: a watch fires on a touch that changed no bytes and
+    // misses a replace-by-rename on some platforms. The hash answers the only
+    // question that matters — are these the bytes the child booted from.
+    const watchMs = Number(process.env.CACHE_FIX_WATCH_DEPLOY_MS) || 0;
+    if (watchMs > 0) {
+      const watcher = setInterval(() => {
+        if (stopping || !child || !bootedHash) return;
+        const onDisk = codeFingerprint(SERVER_PATH);
+        if (!onDisk || onDisk === bootedHash) return;   // unreadable: leave alone
+        process.stderr.write(
+          `[cache-fix] proxy source changed (${bootedHash.slice(0, 12)} -> ` +
+          `${onDisk.slice(0, 12)}); restarting onto it\n`);
+        bootedHash = onDisk;   // once per change, not once per tick
+        try { child.kill("SIGTERM"); } catch { /* already gone; the exit path handles it */ }
+      }, watchMs);
+      watcher.unref();
+    }
+
     listen();
   });
 }
