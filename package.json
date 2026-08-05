@@ -26,7 +26,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "test": "node --test",
+    "test": "node --test --test-concurrency=8",
     "postinstall": "node postinstall.js"
   },
   "dependencies": {

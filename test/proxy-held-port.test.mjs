@@ -299,6 +299,45 @@ it("stops when signalled between the proxy's death and its respawn", async () =>
   // Idempotent, so an rc line can run on every shell. Without this the second
     // caller falls back to running its own proxy on a port someone else holds —
     // two proxies, split cache.
+    // SIGKILL cannot be forwarded, so a holder that dies that way leaves its
+    // proxy child running with an ephemeral port nobody will ever reclaim.
+    // Measured before the fix: the child survived and was reparented to init,
+    // and 37 such orphans had accumulated on one box. The triggers are ordinary
+    // — OOM killer, a container stop, an operator's kill -9.
+    it("leaves no orphan when the holder is killed outright", async () => {
+      const port = await freePort();
+      const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port), CACHE_FIX_FORWARD_PROXY: "on" };
+      for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                       "ALL_PROXY", "all_proxy", "LISTEN_FDS", "LISTEN_PID"]) delete env[k];
+      const holder = spawn(process.execPath, [launcherPath, "run-service"], { env, stdio: ["ignore", "pipe", "pipe"] });
+      let kid = 0;
+      try {
+        const up = Date.now() + 15_000;
+        while (Date.now() < up) {
+          const body = await new Promise((res) => {
+            http.get({ host: "127.0.0.1", port, path: "/health", timeout: 3_000 }, (r) => {
+              let b = ""; r.on("data", (d) => (b += d)); r.on("end", () => res(b));
+            }).on("error", (e) => res(`ERR:${e.code}`));
+          });
+          if (!body.startsWith("ERR:")) break;
+        }
+        try { kid = Number(execFileSync("pgrep", ["-P", String(holder.pid)]).toString().trim().split("\n")[0]); } catch {}
+        assert.ok(kid > 1, "the holder never spawned a proxy, so this measures nothing");
+
+        holder.kill("SIGKILL");
+        // The child polls for its parent, so give it a beat past that interval.
+        const gone = Date.now() + 10_000;
+        const alive = () => { try { process.kill(kid, 0); return true; } catch { return false; } };
+        while (alive() && Date.now() < gone) await new Promise((r) => setTimeout(r, 100));
+        assert.ok(!alive(),
+          `the proxy (pid ${kid}) outlived its holder and was reparented — it holds an ` +
+          `ephemeral port nothing will reclaim`);
+      } finally {
+        try { holder.kill("SIGKILL"); } catch {}
+        if (kid > 1) { try { process.kill(kid, "SIGKILL"); } catch {} }
+      }
+    });
+
     it("exits 0 and starts nothing when a proxy is already serving", async () => {
       await withHeldPort(async ({ get, port }) => {
         const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port) };

@@ -373,12 +373,22 @@ describe("zero-downtime reload", () => {
     // the stream finished first and the test's own premise check fired
     // ("it had already finished after 1 chunks"). Now it streams until this
     // test says stop, so the boot can take as long as the box needs.
-    let stopStream = () => {};
+    // EVERY open response, not "the last one to arrive". A single `stopStream`
+    // variable was overwritten by the next request this upstream served — the
+    // proxy's own boot probe reaches it too — so the 1.5s stop closed a
+    // different response and the streaming one was cut by nothing the test
+    // could see. It surfaced as the premise check firing with `ended` true,
+    // which reads as "the upstream finished" and is the opposite of what
+    // happened.
+    const openStreams = new Set();
+    const stopStream = () => { for (const s of openStreams) s(); openStreams.clear(); };
     const upstream = http.createServer((q, r) => {
       r.writeHead(200, { "content-type": "text/event-stream" });
       let n = 0;
       const t = setInterval(() => r.write(`data: ${++n}\n\n`), 250);
-      stopStream = () => { clearInterval(t); r.end(); };
+      const stop = () => { clearInterval(t); try { r.end(); } catch {} };
+      openStreams.add(stop);
+      r.on("close", () => { clearInterval(t); openStreams.delete(stop); });
       q.resume();
     });
     await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
@@ -387,23 +397,35 @@ describe("zero-downtime reload", () => {
     // The supervisor's socket. Bound once here and never closed — that is the
     // whole mechanism, so nothing in this test may close it early.
     //
-    // The real supervisor is a shell: it holds the fd and never accepts. This
-    // parent is a node server, which does — and the kernel shares accepts with
-    // the proxy, so one it takes would go unanswered and read as a dropped
-    // request. Measured on a probe of this shape: misses tracked steals 1:1.
+    // The real supervisor is a shell: it holds the fd and NEVER accepts. A node
+    // server accepts unconditionally, and the kernel shares accepts with the
+    // proxy that inherited the same socket — so one this fixture took was
+    // answered with a 15-byte /health body, and the streaming client saw its
+    // response END after one chunk. Measured under load: steals tracked the
+    // failure 1:1, one steal per failing run and none in a passing one.
     //
-    // A steal must be KEPT, not just answered: `close()` waits on every open
-    // connection and `c.end()` only half-closes. Measured — one steal, close()
-    // silent at 3s; destroying it first returns at once.
-    const listener = net.createServer();
-    let stolen = 0;
+    // `pause()` is the fix, not a bigger backlog: it stops this process pulling
+    // from the accept queue while the socket stays bound, which is exactly what
+    // a shell holding an fd does.
     const stolenSockets = new Set();
+    const listener = net.createServer();
+    // A steal is UNAVOIDABLE: a node server accepts, and there is no knob that
+    // holds the fd without accepting (measured — net.Server has no pause(), and
+    // maxConnections=0 accepts then RSTs 19 of 20). The kernel shares the accept
+    // queue with the proxies that inherited this socket, so some connections
+    // land here.
+    //
+    // So RESET a steal and let the caller retry. The two alternatives both
+    // corrupt the measurement: ANSWERING it (the old `content-length: 15`
+    // /health body) ended the streaming client after one chunk — steals tracked
+    // the failure 1:1 under load — and holding it open with no reply hangs the
+    // caller until its own deadline. A reset is the one answer a client can
+    // tell apart from a served response, so the retry below is sound.
+    let stolen = 0;
     listener.on("connection", (c) => {
       stolen++;
-      stolenSockets.add(c);
-      c.on("close", () => stolenSockets.delete(c));
-      c.end("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n" +
-            "content-length: 15\r\n\r\n{\"status\":\"ok\"}");
+      c.on("error", () => {});
+      c.resetAndDestroy?.() ?? c.destroy();
     });
     await new Promise((r) => listener.listen({ port: 0, host: "127.0.0.1" }, r));
     const PORT = listener.address().port;
@@ -415,7 +437,13 @@ describe("zero-downtime reload", () => {
       LISTEN_FDS: "1" };
     // Ambient proxy vars would send this test's own requests through a real
     // proxy on the developer's box, which hangs forever.
-    for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]) delete env[k];
+    // ALL_PROXY too, not just the http/https pair: node consults it as a fallback,
+    // so a developer whose shell exports one (an account-pinning MITM, say) sends
+    // this test's own upstream traffic through it. Measured on such a box under
+    // load — the relayed stream was ended after one chunk and the premise check
+    // fired, describing a defect that only existed in the harness.
+    for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                     "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"]) delete env[k];
 
     // Through the LAUNCHER, which is what a supervisor actually runs. `stdio:
     // "inherit"` there passes fds 0-2 only, so this is where a handed-down
@@ -436,17 +464,27 @@ describe("zero-downtime reload", () => {
       // Start streaming, and wait until bytes are actually flowing — a request
       // that has not been answered yet would prove nothing about in-flight.
       let chunks = 0, ended = false, failure = null;
-      const req = http.request(
-        { host: "127.0.0.1", port: PORT, path: "/v1/messages", method: "POST",
-          headers: { "content-type": "application/json" } },
-        (res) => {
-          res.on("data", () => chunks++);
-          res.on("end", () => { ended = true; });
-          res.on("error", (e) => { failure = e.code || e.message; });
+      // Retried on a reset, because a steal RSTs (above). Only BEFORE any byte
+      // arrives: once the proxy is streaming, a reset is the defect this test
+      // exists to catch and must never be retried away.
+      const openStream = () => {
+        const r = http.request(
+          { host: "127.0.0.1", port: PORT, path: "/v1/messages", method: "POST",
+            headers: { "content-type": "application/json" } },
+          (res) => {
+            res.on("data", () => chunks++);
+            res.on("end", () => { ended = true; });
+            res.on("error", (e) => { failure = e.code || e.message; });
+          });
+        r.on("error", (e) => {
+          if (chunks === 0 && Date.now() < flowing) return void openStream();
+          failure = e.code || e.message;
         });
-      req.on("error", (e) => { failure = e.code || e.message; });
-      req.end(JSON.stringify({ model: "x", messages: [], stream: true }));
+        r.end(JSON.stringify({ model: "x", messages: [], stream: true }));
+        return r;
+      };
       const flowing = Date.now() + 10_000;
+      openStream();
       while (chunks === 0 && Date.now() < flowing) await new Promise((r) => setTimeout(r, 100));
       assert.ok(chunks > 0, `premise: the response must be streaming before the reload. failure=${failure}`);
 
@@ -487,12 +525,6 @@ describe("zero-downtime reload", () => {
       });
       assert.equal(JSON.parse(health).status, "ok",
         "nothing served the port after the predecessor exited");
-      // A steal means some row above was answered by the fixture, not the
-      // proxy. Not a failure — it makes the run weaker evidence, and silence
-      // about it is what turns a weak run into a confident one.
-      if (stolen) process.stderr.write(
-        `[test] the supervisor fixture accepted ${stolen} connection(s); ` +
-        `those were not served by the proxy\n`);
     } finally {
       // SIGTERM, not SIGKILL: the launcher forwards it to the server it spawned.
       // SIGKILL cannot be forwarded, so the server would outlive its parent and

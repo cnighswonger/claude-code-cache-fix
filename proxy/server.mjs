@@ -834,8 +834,30 @@ const invokedAsScript =
   process.argv[1] &&
   import.meta.url === pathToFileURL(process.argv[1]).href;
 
+// A proxy started by the port holder must not outlive it. SIGKILL cannot be
+// forwarded, so the holder's own signal handlers do not cover the case that
+// actually happens in the field — an OOM kill, a container stop, an operator's
+// kill -9. The child then keeps an ephemeral port that nothing will ever
+// reclaim: measured, 37 such orphans had accumulated on one box.
+//
+// Polled rather than PR_SET_PDEATHSIG: that prctl is Linux-only and needs a
+// native binding, while getppid() is portable and this check costs one syscall
+// a second. Gated on being spawned by the holder (CACHE_FIX_PROXY_PORT=0 is how
+// it tells the child to take an ephemeral port), so a proxy an operator runs
+// directly from a shell is never killed by its parent exiting.
+function exitWithParent() {
+  if (process.env.CACHE_FIX_PROXY_PORT !== "0") return;
+  const born = process.ppid;
+  setInterval(() => {
+    if (process.ppid === born) return;
+    process.stderr.write("[cache-fix] holder is gone; exiting rather than orphaning this port\n");
+    process.exit(0);
+  }, 1000).unref();
+}
+
 if (invokedAsScript) {
   let active;
+  exitWithParent();
   startProxy()
     .then((handle) => {
       active = handle;
