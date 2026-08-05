@@ -502,7 +502,13 @@ test("27a. bytes_saved is bytes_original - bytes_after (can be negative on tiny 
 // PIPELINE ORDER (directive test 28)
 // =============================================================================
 
-test("28. read-dedupe loads at order 380 between image-retry-circuit-breaker (370) and cache-control-normalize (400)", async () => {
+test("28. read-dedupe loads at order 380, after image-retry-circuit-breaker (370) and before cache-control-normalize (400)", async () => {
+  // Asserts the ORDERING guarantee, not array adjacency. An earlier form
+  // pinned `reg[idx-1].name` and `reg[idx+1].name` directly, which held only
+  // while no extension existed in the (370, 400) gap and failed the moment
+  // one did — measured on #272, which registers insertion-normalization at
+  // 395. The `order` field is what other extensions can rely on; array
+  // neighbours are an incidental of what happens to be loaded alongside.
   const { loadExtensions } = await import("../proxy/pipeline.mjs");
   const extensionsDir = join(__dirname, "..", "proxy", "extensions");
   const configPath = join(__dirname, "..", "proxy", "extensions.json");
@@ -510,8 +516,12 @@ test("28. read-dedupe loads at order 380 between image-retry-circuit-breaker (37
   const idx = reg.findIndex((e) => e.name === "read-dedupe");
   assert.ok(idx >= 0, "read-dedupe not loaded");
   assert.equal(reg[idx].order, 380);
-  assert.equal(reg[idx - 1].name, "image-retry-circuit-breaker");
-  assert.equal(reg[idx + 1].name, "cache-control-normalize");
+  const irc = reg.findIndex((e) => e.name === "image-retry-circuit-breaker");
+  const ccn = reg.findIndex((e) => e.name === "cache-control-normalize");
+  assert.ok(irc >= 0, "image-retry-circuit-breaker not loaded");
+  assert.ok(ccn >= 0, "cache-control-normalize not loaded");
+  assert.ok(irc < idx, `read-dedupe (${idx}) must load AFTER image-retry-circuit-breaker (${irc})`);
+  assert.ok(idx < ccn, `read-dedupe (${idx}) must load BEFORE cache-control-normalize (${ccn})`);
 });
 
 // =============================================================================
