@@ -1,8 +1,9 @@
 import http from "node:http";
 import { createHash } from "node:crypto";
+import https from "node:https";
 import { pathToFileURL, URL } from "node:url";
 import config from "./config.mjs";
-import { forwardRequest, parseAbsoluteForm } from "./upstream.mjs";
+import { forwardRequest, parseAbsoluteForm, getAgent } from "./upstream.mjs";
 import { streamResponse, createTelemetryRecord } from "./stream.mjs";
 import { loadExtensions, snapshotRegistry, runOnRequest, runOnResponseStart, runOnResponse, getFailedExtensions } from "./pipeline.mjs";
 import { startWatcher } from "./watcher.mjs";
@@ -15,8 +16,9 @@ import { publishableGates } from "./gate-allowlist.mjs";
 // CACHE_FIX_DEBUG_LOG). Self-gated on CACHE_FIX_DEBUG=1; a no-op otherwise.
 // Env is read on every call so tests (and operators flipping the flag at
 // runtime) see live behavior — same pattern as image-strip's #98 gate.
-import { appendFileSync, mkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { appendFileSync, mkdirSync, readFileSync, readlinkSync, rmSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
+import { homedir } from "node:os";
 import util from "node:util";
 import { claudeHome } from "./claude-home.mjs";
 
@@ -771,6 +773,62 @@ export async function startProxy(options = {}) {
 // CLI entrypoint — preserves the v3.x behavior of `node proxy/server.mjs`
 // (used by `cache-fix-proxy server` and by `fork(SERVER_PATH)` in the
 // wrapper). When this module is imported as a library, none of this runs.
+// Claude Code's update poll writes .last-update-result.json when it fails and
+// NEVER rewrites it on a later success, so one transient miss pins
+// "Auto-update failed" on the status line for good. A restart of this proxy is
+// one such miss: the poll lands while the port is down and records it.
+//
+// We made it, so we clear it — but only when it is provably a fossil: the
+// record says failed AND the version on disk already equals the channel's
+// latest, i.e. there was nothing to install. A genuinely pending update, or a
+// channel we cannot reach, is left alone and still surfaces.
+//
+// Deferred, because the poll happens seconds AFTER we come up: sweeping at
+// startup would run before the failure it is meant to clear.
+function sweepUpdateFossil() {
+  if (process.env.CACHE_FIX_UPDATE_SWEEP === "off") return;
+  setTimeout(async () => {
+    const record = join(claudeHome(), ".last-update-result.json");
+    let body;
+    try { body = readFileSync(record, "utf8"); } catch { return; }
+    try { if (JSON.parse(body).outcome !== "failed") return; } catch { return; }
+
+    // The version on disk, from the launcher symlink Claude Code maintains.
+    let disk;
+    try { disk = basename(readlinkSync(join(homedir(), ".local", "bin", "claude"))); } catch { return; }
+    if (!disk) return;
+
+    // Through getAgent, the same egress the proxy forwards on: a bare fetch
+    // ignores HTTPS_PROXY and simply fails on a network that requires one,
+    // which would read as "channel unreachable" and sweep nothing. Never
+    // through OURSELVES — our MITM leaf is signed by a CA only the client
+    // trusts. The URL is overridable so a test can stand one up locally.
+    const url = new URL(process.env.CACHE_FIX_UPDATE_CHANNEL_URL ||
+      "https://downloads.claude.ai/claude-code-releases/latest");
+    const isHTTPS = url.protocol === "https:";
+    const latest = await new Promise((res) => {
+      const req = (isHTTPS ? https : http).get({
+        host: url.hostname,
+        port: url.port || undefined,
+        path: url.pathname + url.search,
+        agent: getAgent(isHTTPS, url.hostname),
+        timeout: 8_000,
+      }, (r) => {
+        if (r.statusCode !== 200) { r.resume(); return res(""); }
+        let b = ""; r.on("data", (d) => (b += d)); r.on("end", () => res(b.trim()));
+      });
+      req.on("error", () => res(""));
+      req.on("timeout", () => { req.destroy(); res(""); });
+    });
+    if (!latest || latest !== disk) return;   // unreachable or genuinely behind
+
+    try {
+      rmSync(record);
+      process.stderr.write(`[cache-fix] cleared a stale auto-update failure record (on ${disk})\n`);
+    } catch {}
+  }, Number(process.env.CACHE_FIX_UPDATE_SWEEP_DELAY_MS) || 25_000).unref();
+}
+
 const invokedAsScript =
   typeof process !== "undefined" &&
   process.argv[1] &&
@@ -782,6 +840,7 @@ if (invokedAsScript) {
     .then((handle) => {
       active = handle;
       process.stdout.write(`proxy listening on ${handle.address}:${handle.port}\n`);
+      sweepUpdateFossil();
     })
     .catch((err) => {
       process.stderr.write(`proxy failed to start: ${err.message}\n`);

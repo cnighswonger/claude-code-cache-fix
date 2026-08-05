@@ -34,6 +34,10 @@ function holdPort(rest) {
 
   return new Promise((resolveP) => {
     let child = null, childPort = 0, stopping = false, restart = null, failures = 0, served = false;
+    // `run-service` is idempotent: re-running it must not put a second proxy
+    // beside the first. Only the holder can answer that, because the bind is
+    // the only thing that knows whether the port is already taken.
+    const alreadyRunning = process.env.CACHE_FIX_EXIT_IF_RUNNING === "1";
     const settle = (code) => { stopping = true; resolveP(code ?? 0); };
     const forward = (sig) => {
       stopping = true;
@@ -126,7 +130,13 @@ function holdPort(rest) {
     // Only the BIND may fall back: another proxy owns the port, so run ours on
     // it directly and let the collision be reported the way it always has been.
     // A later server error must not start a second proxy beside the first.
-    const bindFailed = () => { holder.off("error", bindFailed); resolveP(runProxy(rest)); };
+    // Under run-service the collision is the ANSWER, not a fallback: something
+    // is already serving, which is all the caller asked for.
+    const bindFailed = () => {
+      holder.off("error", bindFailed);
+      if (alreadyRunning) return settle(0);
+      resolveP(runProxy(rest));
+    };
     holder.on("error", bindFailed);
     holder.listen({ port, host: bind }, () => { holder.off("error", bindFailed); start(); });
   });
@@ -174,6 +184,20 @@ async function dispatch() {
       return holdPort(args.slice(1));
     }
     return runProxy(args.slice(1));
+  }
+  // run-service — what install-service's unit does, without a service manager.
+  // The README tells you to run forward-proxy mode supervised; systemd and
+  // launchd are how, and neither exists in a container, in WSL, or for a
+  // non-root user on a shared host. This is the same guarantee from the
+  // process itself: it holds the port, restarts the proxy under it, and exits
+  // quietly when one is already serving.
+  //
+  // The mode comes from the environment, exactly as install-service takes it:
+  //   CACHE_FIX_FORWARD_PROXY=on cache-fix-proxy run-service
+  if (SUBCOMMAND === "run-service") {
+    process.env.CACHE_FIX_HOLD_PORT = "on";
+    process.env.CACHE_FIX_EXIT_IF_RUNNING = "1";
+    return holdPort(args.slice(1));
   }
   if (SUBCOMMAND === "install-service") {
     const force = args.includes("--force");

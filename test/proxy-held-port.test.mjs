@@ -39,11 +39,11 @@ it("holds the same default port the proxy would bind", () => {
 // A launcher holding a real port, its /health probe, and its reaper. The
 // held-port tests need all three; `get` answers "ERR:<code>" rather than
 // throwing so a caller can count failures instead of catching them.
-async function withHeldPort(fn) {
+async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
   const port = await freePort();          // a real number: the holder owns the ADVERTISED port
-  const env = { ...process.env, CACHE_FIX_HOLD_PORT: "on", CACHE_FIX_PROXY_PORT: String(port) };
+  const env = { ...process.env, CACHE_FIX_HOLD_PORT: "on", CACHE_FIX_PROXY_PORT: String(port), ...extraEnv };
   for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "LISTEN_FDS", "LISTEN_PID"]) delete env[k];
-  const launcher = spawn(process.execPath, [launcherPath, "server"], { env, stdio: ["ignore", "pipe", "pipe"] });
+  const launcher = spawn(process.execPath, [launcherPath, subcommand], { env, stdio: ["ignore", "pipe", "pipe"] });
   const exited = new Promise((r) => launcher.on("exit", () => r(true)));
   const get = () => new Promise((res) => {
     http.get({ host: "127.0.0.1", port, path: "/health", timeout: 8_000 }, (r) => {
@@ -221,4 +221,35 @@ it("stops when signalled between the proxy's death and its respawn", async () =>
     assert.ok(stopped, "the holder ignored SIGTERM and kept the port through a supervisor's stop");
   });
 });
+
+  describe("run-service", () => {
+    // The whole point of the subcommand: it gives an unsupervised host what a
+    // systemd unit gives a supervised one. Same holder, so the port survives a
+    // proxy death — asserted here on the SUBCOMMAND, because a caller who types
+    // `run-service` never sets CACHE_FIX_HOLD_PORT and must not have to.
+    it("holds the port across a proxy death without CACHE_FIX_HOLD_PORT", async () => {
+      await withHeldPort(async ({ get, killProxy }) => {
+        killProxy();
+        const deadline = Date.now() + 20_000;
+        let body = await get();
+        while (body.startsWith("ERR:") && Date.now() < deadline) body = await get();
+        assert.equal(JSON.parse(body).status, "ok", "the port did not come back under run-service");
+      }, { subcommand: "run-service", extraEnv: { CACHE_FIX_HOLD_PORT: "" } });
+    });
+
+    // Idempotent, so an rc line can run on every shell. Without this the second
+    // caller falls back to running its own proxy on a port someone else holds —
+    // two proxies, split cache.
+    it("exits 0 and starts nothing when a proxy is already serving", async () => {
+      await withHeldPort(async ({ get, port }) => {
+        const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port) };
+        for (const k of ["HTTPS_PROXY", "https_proxy", "LISTEN_FDS", "LISTEN_PID"]) delete env[k];
+        const second = spawn(process.execPath, [launcherPath, "run-service"], { env, stdio: ["ignore", "pipe", "pipe"] });
+        const code = await new Promise((r) => second.on("exit", (c) => r(c)));
+        assert.equal(code, 0, "a second run-service must exit 0 rather than fail or fork a rival proxy");
+        // The incumbent is still the one answering.
+        assert.equal(JSON.parse(await get()).status, "ok", "the second invocation disturbed the running proxy");
+      }, { subcommand: "run-service", extraEnv: { CACHE_FIX_HOLD_PORT: "" } });
+    });
+  });
 });
