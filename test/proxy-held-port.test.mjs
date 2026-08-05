@@ -5,7 +5,7 @@ import net from "node:net";
 import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { writeFile, rm } from "node:fs/promises";
-import { readdirSync, readFileSync, existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { readdirSync, readFileSync, existsSync, mkdtempSync, writeFileSync, cpSync, symlinkSync } from "node:fs";
 import { tmpdir, cpus } from "node:os";
 import { join, dirname } from "node:path";
 
@@ -637,6 +637,61 @@ it("stops when signalled between the proxy's death and its respawn", async () =>
             `(${[...new Set(cut)].join(", ")}); at most the connection the kernel ` +
             `resets as the socket's last owner dies is expected`);
         });
+    });
+
+    // AN UPGRADE MUST UPGRADE. A holder from an OLDER deploy is still "one of
+    // ours", so a rule that asks only that exits 0 and the new code never runs
+    // — the fix sits on disk while the old process keeps serving. Measured on
+    // the work Mac against 54 live sessions: rc=0, holder untouched, and a
+    // human had to retire the old process by hand before anything changed.
+    //
+    // cswap's pin had the mirror defect (an upgrade that ACTED and moved the
+    // port, stranding every session for 76 minutes). Both leave the outcome
+    // depending on somebody knowing to intervene at the right moment.
+    //
+    // Driven against a FAKE process tree rather than two real deploys. The rule
+    // is a pure function of what `ps` reports, and the real-deploy version of
+    // this case booted two more proxies — enough extra load to starve two
+    // timing-sensitive cases elsewhere in the suite (measured: they failed only
+    // when it ran beside them, and `concurrency: false` merely moved the
+    // starvation onto a third). A fixture that fakes the tree asks the same
+    // question and costs nothing.
+    it("takes the port from a holder running an older deploy", async () => {
+      const src = readFileSync(launcherPath, "utf8");
+      const rule = /function holderPidOn[\s\S]*?\n}/.exec(src)?.[0];
+      const helper = /function runningOurTree[\s\S]*?\n}/.exec(src)?.[0];
+      assert.ok(rule && helper,
+        "holderPidOn/runningOurTree are gone — the upgrade decision moved and this no longer tests it");
+
+      // Two trees, one live: whatever `ps` says the incumbent's proxy is.
+      const OURS = "/opt/new/proxy/server.mjs";
+      const OLD = "/opt/old/proxy/server.mjs";
+      const decide = (incumbentServerPath) => {
+        const fake = {
+          execFileSync: (cmd, args) => {
+            if (cmd === "lsof") return "4242\n";
+            if (cmd === "pgrep") return "4243\n";
+            if (cmd === "ps") {
+              const pid = args[args.indexOf("-p") + 1];
+              // 4242 is the listener (the proxy), 4241 its run-service holder.
+              if (pid === "4242") return `4241 node ${incumbentServerPath}\n`;
+              if (pid === "4241") return "node /usr/local/bin/cache-fix-proxy run-service\n";
+              return `node ${incumbentServerPath}\n`;
+            }
+            throw new Error("unexpected " + cmd);
+          },
+        };
+        // eslint-disable-next-line no-new-func
+        return Function("execFileSync", "SERVER_PATH",
+          `${helper}\n${rule}\nreturn holderPidOn(9901);`)(fake.execFileSync, OURS);
+      };
+
+      assert.equal(decide(OURS), "holder",
+        "a holder already running THIS deploy must be left alone — otherwise every " +
+        "`run-service` churns a healthy proxy");
+      assert.equal(decide(OLD), 4241,
+        "a holder running an OLDER deploy was read as \"one of ours\", so run-service " +
+        "exits and installing a fix changes nothing until a human intervenes");
     });
 
     it("exits 0 and starts nothing when a proxy is already serving", async () => {

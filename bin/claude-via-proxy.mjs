@@ -76,10 +76,47 @@ function holderPidOn(port) {
     try {
       const parent = execFileSync("ps", ["-p", String(ppid), "-o", "command="],
                                   { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
-      if (/\brun-service\b/.test(parent)) return "holder";
+      if (/\brun-service\b/.test(parent)) return runningOurTree(pid) ? "holder" : ppid;
     } catch { /* parent gone: fall through and treat the listener on its own */ }
   }
   return pid;
+}
+
+// Is the incumbent running the code THIS launcher would install?
+//
+// "Is it one of ours" is the wrong question, and asking it made every upgrade a
+// no-op: a holder from an older deploy is still ours, so run-service exits 0 and
+// the new code never starts. Measured on the work Mac against 54 live sessions —
+// rc=0, holder untouched, and the fix sat on disk doing nothing until a human
+// retired the old process by hand. cswap's pin had the mirror defect (an upgrade
+// that ACTED and moved the port); both leave the outcome depending on somebody
+// knowing to intervene.
+//
+// So compare TREES. A proxy's argv names its own server.mjs, which is the deploy
+// it came from; ours is SERVER_PATH. Same path means same code and there is
+// genuinely nothing to do. A different path means an older install is serving
+// and must be replaced.
+//
+// Unknown answers "yes": a listener we cannot read is one we must not signal,
+// and treating it as stale would make this the thing that kills an unrelated
+// process on the port.
+function runningOurTree(listenerPid) {
+  let kids = "";
+  try {
+    kids = execFileSync("pgrep", ["-P", String(listenerPid)],
+                        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+  } catch { /* no children: the listener IS the proxy on some builds */ }
+  const pids = [listenerPid, ...kids.trim().split("\n").map(Number).filter(Boolean)];
+  for (const p of pids) {
+    let argv = "";
+    try {
+      argv = execFileSync("ps", ["-p", String(p), "-o", "command="],
+                          { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    } catch { continue; }
+    const m = /(\S*proxy\/server\.mjs)/.exec(argv);
+    if (m) return m[1] === SERVER_PATH;
+  }
+  return true;
 }
 
 function holdPort(rest) {
