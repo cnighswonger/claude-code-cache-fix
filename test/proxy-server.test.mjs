@@ -518,13 +518,32 @@ describe("zero-downtime reload", () => {
         `so the handover was never exercised`);
 
       // The successor is serving, and it is the one still alive.
-      const health = await new Promise((res) => {
+      //
+      // RETRIED ON A RESET, the same rule the streaming request above follows
+      // and for the same reason: this fixture's listener shares the accept
+      // queue and RSTs whatever it takes (`resetAndDestroy`, ~40 lines up), so
+      // a single probe that happens to be stolen fails on the harness rather
+      // than on the proxy. The odds scale with how little CPU there is —
+      // measured, this passed 2 of 2 full-file runs on 48 cores and failed 3 of
+      // 3 pinned to 2 with `taskset -c 0,1`, which is CI's shape. The error was
+      // always ERR:ECONNRESET, never a bad body.
+      //
+      // A reset is the ONE answer a client can tell apart from a served
+      // response, which is what makes retrying sound here; a wrong body or a
+      // refusal still fails, because those are the proxy's answers, not the
+      // fixture's.
+      const probe = () => new Promise((res) => {
         http.get({ host: "127.0.0.1", port: PORT, path: "/health" }, (r) => {
           let b = ""; r.on("data", (d) => (b += d)); r.on("end", () => res(b));
         }).on("error", (e) => res(`ERR:${e.code}`));
       });
+      let health = await probe();
+      const settled = Date.now() + 10_000;
+      while (health === "ERR:ECONNRESET" && Date.now() < settled) health = await probe();
+      assert.ok(!health.startsWith("ERR:"),
+        `the port answered nothing after the predecessor exited: ${health}`);
       assert.equal(JSON.parse(health).status, "ok",
-        "nothing served the port after the predecessor exited");
+        `nothing served the port after the predecessor exited (got ${JSON.stringify(health.slice(0, 120))})`);
     } finally {
       // SIGTERM, not SIGKILL: the launcher forwards it to the server it spawned.
       // SIGKILL cannot be forwarded, so the server would outlive its parent and
