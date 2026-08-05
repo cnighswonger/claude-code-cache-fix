@@ -524,11 +524,24 @@ function holdPort(rest) {
     const watchMs = process.env.CACHE_FIX_SELF_HEAL === "off"
       ? 0
       : Number(process.env.CACHE_FIX_WATCH_DEPLOY_MS) || 0;
+    let warnedUnreadable = false;
     if (watchMs > 0) {
       const watcher = setInterval(() => {
         if (stopping || !child || !bootedHash) return;
         const onDisk = codeFingerprint(SERVER_PATH);
-        if (!onDisk || onDisk === bootedHash) return;   // unreadable: leave alone
+        // An UNREADABLE file and an UNCHANGED one are different facts, and
+        // folding them together hides the first: a watcher that can never read
+        // its own source looks exactly like one with nothing to do. Say it once
+        // — repeating it every tick would bury the log it belongs in.
+        if (!onDisk) {
+          if (!warnedUnreadable) {
+            warnedUnreadable = true;
+            process.stderr.write(
+              `[cache-fix] deploy watcher cannot read ${SERVER_PATH}; it will never fire\n`);
+          }
+          return;
+        }
+        if (onDisk === bootedHash) return;
         process.stderr.write(
           `[cache-fix] proxy source changed (${bootedHash.slice(0, 12)} -> ` +
           `${onDisk.slice(0, 12)}); restarting onto it\n`);

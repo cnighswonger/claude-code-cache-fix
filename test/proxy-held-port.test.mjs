@@ -904,7 +904,8 @@ describe("deploy watcher (CACHE_FIX_WATCH_DEPLOY_MS)", () => {
       // announces and does nothing; the pid alone counts any restart, including
       // ones this case is not about.
       assert.ok(await saidWithin(stderr, 10_000),
-        "the watcher never noticed a deploy that landed on disk");
+        "the watcher never noticed a deploy that landed on disk. Launcher stderr: " +
+        JSON.stringify(stderr().slice(-400)));
       const after = await settleFor(launcher, before, 8_000);
       assert.notEqual(after, before,
         "a deploy landed on disk and the running proxy kept serving the old bytes — " +
