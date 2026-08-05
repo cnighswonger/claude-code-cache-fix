@@ -69,7 +69,16 @@ function holdPort(rest) {
         if (childPort) return;
         line += chunk;
         const m = /listening on [\d.]+:(\d+)\n/.exec(line);
-        if (m) { childPort = Number(m[1]); served = true; failures = 0; line = ""; }
+        if (m) {
+          childPort = Number(m[1]); served = true; failures = 0; line = "";
+          // The proxy has generated its CA by the time it says this, so publish
+          // it now. A host wired by rc starts the proxy HERE and launches claude
+          // from the shell, so the --remote-control path that used to be the
+          // only publisher never runs — and every sibling then builds a merged
+          // bundle without us. Only in forward-proxy mode: reverse mode
+          // terminates no TLS, so it has no CA to offer.
+          if (process.env.CACHE_FIX_FORWARD_PROXY === "on") publishOurCA(ourCAPath());
+        }
         else if (line.length > 4096) line = line.slice(-256);
       });
       child.on("error", (err) => {
@@ -181,6 +190,121 @@ function runProxy(rest) {
 // Subcommand dispatch (must come before the wrapper-arg parser so subcommand
 // names don't get treated as claude args). Returns null when no subcommand
 // matched, signaling fall-through to wrapper mode below.
+// The proxy's CA, resolved from the SAME inputs as its config.caDir and in the
+// same order: CACHE_FIX_CA_DIR wins, else ${CLAUDE_CONFIG_DIR||~/.claude}/
+// cache-fix-ca. One function because two callers resolving it separately is how
+// a launcher comes to point at a different CA than the proxy generated.
+const ourCADir = () => process.env.CACHE_FIX_CA_DIR ||
+  join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"), "cache-fix-ca");
+const ourCAPath = () => join(ourCADir(), "ca.pem");
+
+const configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
+
+// The salvage scratch dir's name, in ONE place. Two matching string literals is
+// how the reaper below came to match `cache-fix-ca-prod` — an operator CA dir,
+// which README documents living under /tmp — and delete the private key the
+// running proxy signs with. A constant makes the mkdtemp and the glob provably
+// the same set.
+const SCRATCH_PREFIX = "cache-fix-ca-scratch-";
+
+const caTrustDir = join(configDir, "ca-trust.d");
+const PUBLISHED_CA_NAME = "ccf.pem";
+
+// Publish our MITM CA into the ca-trust.d rendezvous, and sweep our own
+// orphaned temps. Called from BOTH launch paths: --remote-control, which execs
+// claude itself, and run-service, which only supervises a proxy. It used to be
+// inline in the first, so a host wired by rc — proxy started by run-service,
+// claude launched by the shell — published nothing and every sibling built a
+// merged bundle without us. Measured on the work Mac: ca-trust.d held
+// cswap-pin.pem alone and the verifier said node loads no CA of ours from it.
+function publishOurCA(caPem) {
+
+  try {
+    mkdirSync(caTrustDir, { recursive: true });
+    const ours = readFileSync(caPem);
+    // Parse BEFORE publishing. Validating later (we do, at the own-CA step
+    // below) still handed a corrupt ca.pem to every OTHER component: "ccf" sorts
+    // first in the builder's sort(*.pem), so a bad entry lands in the same fatal
+    // leading position the torn-write guard above protects — measured, such a
+    // bundle loads 0 extra CAs and warns `bad base64 decode`. Atomicity
+    // guarantees whole bytes, never loadable ones. Throwing lands in the catch
+    // below, leaving any previous good ccf.pem in place for siblings to keep
+    // trusting.
+    new X509Certificate(ours);
+    // The published name and the orphan-sweep prefix, derived from one constant.
+    // Two matching literals is how SCRATCH_PREFIX came to delete an operator CA
+    // dir; this pair is the same hazard 50 lines earlier and was still two
+    // literals. Measured with the prefix shortened by one character: the sweep
+    // removed `ccf.pem` itself — the CA every other component reads.
+    const dst = join(caTrustDir, PUBLISHED_CA_NAME);
+    // Byte-compare skip so a bundle builder keying on mtime is not woken by a
+    // launch that changed nothing.
+    let same = false;
+    // ANY read failure means "write": absent, unreadable, EACCES, EISDIR, torn.
+    // Measured with dst at mode 0: same=false, and the branch republishes OURS.
+    // Safe because the only thing this branch can write is our own CA via
+    // temp+rename — the collapse cannot publish worse content than it could not
+    // read. That is a property of the WRITE, not of this catch; publish anything
+    // else here and an unreadable dst becomes indistinguishable from a stale one.
+    try { same = readFileSync(dst).equals(ours); } catch { /* see above */ }
+    if (!same) {
+      // Write a temp sibling and rename() over the target: rename is atomic on
+      // POSIX, so a builder reading the directory sees either the old complete
+      // file or the new one, never a half. A plain writeFileSync(dst) opens with
+      // O_TRUNC and leaves a torn pem visible for the duration of the write —
+      // and a torn pem does not merely lose OUR CA, it can void the ENTIRE merged
+      // bundle: Node's PEM reader aborts the whole extras load on an unterminated
+      // block. Measured on node v24 / openssl 3.5 with a leaf signed by this CA:
+      // torn entry AFTER a good one warns "bad end line" but still verifies;
+      // torn entry BEFORE it fails with UNABLE_TO_VERIFY_LEAF_SIGNATURE. The
+      // builder concatenates sort(*.pem) and "ccf.pem" sorts first, so a torn
+      // OURS lands in exactly the fatal position and takes every other component
+      // CA and corporate root down with it. Temp must be in the SAME directory —
+      // rename across filesystems is not atomic (and would EXDEV).
+      // pid alone is not unique: two launches in separate PID namespaces sharing
+      // a bind-mounted config dir can hold the same pid and collide on the temp
+      // path, so one publishes the other's bytes. uuid removes that.
+      const tmp = `${dst}.${process.pid}.${randomUUID()}`;
+      writeFileSync(tmp, ours);
+      renameSync(tmp, dst);
+    }
+  } catch (e) {
+    // Non-fatal: publishing is how OTHERS trust us. This session only needs its
+    // own CA, so a failure to publish must not stop it.
+    process.stderr.write(`cache-fix: could not publish CA to ${caTrustDir}: ${e.message}\n`);
+}
+// Reap temps orphaned by a kill between the write and the rename. They do not
+// match a *.pem glob so a builder ignores them, but nothing else would ever
+// remove them.
+//
+// Its OWN try, deliberately outside the publish one. Sharing that block made
+// reaping conditional on the rename succeeding, so exactly when publishing is
+// persistently broken — a root-owned ccf.pem, a read-only mount, ENOSPC — the
+// launcher abandoned one full-CA temp per launch and cleaned up none of them,
+// growing without bound in the directory a builder globs.
+//
+// Age-gated, because a temp is indistinguishable from an orphan by name: a
+// CONCURRENT launcher has its own ccf.pem.<pid>.<uuid> on disk in the window
+// between its writeFileSync and its renameSync, and deleting that makes its
+// rename throw a publish failure we caused. The window is one small write to
+// the same directory, microseconds; a minute is four orders of magnitude of
+// headroom and still collects the orphan on the next launch. Deleting late
+// costs nothing — nothing reads these — while deleting early breaks a peer.
+try {
+  const orphanAgeMs = 60_000;
+  for (const f of readdirSync(caTrustDir)) {
+    if (!f.startsWith(`${PUBLISHED_CA_NAME}.`)) continue;
+    const p = join(caTrustDir, f);
+    try { if (Date.now() - statSync(p).mtimeMs > orphanAgeMs) rmSync(p); }
+    // Raced, OR the delete was REFUSED — measured with the dir at mode 0500:
+    // removed=0, file still there. Tolerable because a survivor is disk, not
+    // trust: this name is `ccf.pem.<pid>.<uuid>` and does not end in `.pem`,
+    // so no builder globbing `*.pem` reads it.
+    catch { /* see above */ }
+  }
+} catch { /* unreadable dir: the publish warning above already said so */ }
+}
+
 async function dispatch() {
   if (SUBCOMMAND === "server") {
     if (process.env.CACHE_FIX_HOLD_PORT === "on" && !(Number(process.env.LISTEN_FDS) >= 1)) {
@@ -369,8 +493,7 @@ if (remoteControl) {
   // (Reading only CLAUDE_CONFIG_DIR here would ignore a CACHE_FIX_CA_DIR
   // override and point claude at the wrong — or absent — CA than the one the
   // spawned proxy actually generated.)
-  const caDir = process.env.CACHE_FIX_CA_DIR ||
-    join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"), "cache-fix-ca");
+  const caDir = ourCADir();
   const caPem = join(caDir, "ca.pem");
   if (!existsSync(caPem)) {
     process.stderr.write(
@@ -403,100 +526,7 @@ if (remoteControl) {
   // canonical bundle — dropping out of the contract while appearing to implement
   // it. Relocating the pair is what CLAUDE_CONFIG_DIR already does, and it moves
   // both sides together.
-  const configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
-  const caTrustDir = join(configDir, "ca-trust.d");
-  const PUBLISHED_CA_NAME = "ccf.pem";
-
-// The salvage scratch dir's name, in ONE place. Two matching string literals is
-// how the reaper below came to match `cache-fix-ca-prod` — an operator CA dir,
-// which README documents living under /tmp — and delete the private key the
-// running proxy signs with. A constant makes the mkdtemp and the glob provably
-// the same set.
-const SCRATCH_PREFIX = "cache-fix-ca-scratch-";
-  try {
-    mkdirSync(caTrustDir, { recursive: true });
-    const ours = readFileSync(caPem);
-    // Parse BEFORE publishing. Validating later (we do, at the own-CA step
-    // below) still handed a corrupt ca.pem to every OTHER component: "ccf" sorts
-    // first in the builder's sort(*.pem), so a bad entry lands in the same fatal
-    // leading position the torn-write guard above protects — measured, such a
-    // bundle loads 0 extra CAs and warns `bad base64 decode`. Atomicity
-    // guarantees whole bytes, never loadable ones. Throwing lands in the catch
-    // below, leaving any previous good ccf.pem in place for siblings to keep
-    // trusting.
-    new X509Certificate(ours);
-    // The published name and the orphan-sweep prefix, derived from one constant.
-    // Two matching literals is how SCRATCH_PREFIX came to delete an operator CA
-    // dir; this pair is the same hazard 50 lines earlier and was still two
-    // literals. Measured with the prefix shortened by one character: the sweep
-    // removed `ccf.pem` itself — the CA every other component reads.
-    const dst = join(caTrustDir, PUBLISHED_CA_NAME);
-    // Byte-compare skip so a bundle builder keying on mtime is not woken by a
-    // launch that changed nothing.
-    let same = false;
-    // ANY read failure means "write": absent, unreadable, EACCES, EISDIR, torn.
-    // Measured with dst at mode 0: same=false, and the branch republishes OURS.
-    // Safe because the only thing this branch can write is our own CA via
-    // temp+rename — the collapse cannot publish worse content than it could not
-    // read. That is a property of the WRITE, not of this catch; publish anything
-    // else here and an unreadable dst becomes indistinguishable from a stale one.
-    try { same = readFileSync(dst).equals(ours); } catch { /* see above */ }
-    if (!same) {
-      // Write a temp sibling and rename() over the target: rename is atomic on
-      // POSIX, so a builder reading the directory sees either the old complete
-      // file or the new one, never a half. A plain writeFileSync(dst) opens with
-      // O_TRUNC and leaves a torn pem visible for the duration of the write —
-      // and a torn pem does not merely lose OUR CA, it can void the ENTIRE merged
-      // bundle: Node's PEM reader aborts the whole extras load on an unterminated
-      // block. Measured on node v24 / openssl 3.5 with a leaf signed by this CA:
-      // torn entry AFTER a good one warns "bad end line" but still verifies;
-      // torn entry BEFORE it fails with UNABLE_TO_VERIFY_LEAF_SIGNATURE. The
-      // builder concatenates sort(*.pem) and "ccf.pem" sorts first, so a torn
-      // OURS lands in exactly the fatal position and takes every other component
-      // CA and corporate root down with it. Temp must be in the SAME directory —
-      // rename across filesystems is not atomic (and would EXDEV).
-      // pid alone is not unique: two launches in separate PID namespaces sharing
-      // a bind-mounted config dir can hold the same pid and collide on the temp
-      // path, so one publishes the other's bytes. uuid removes that.
-      const tmp = `${dst}.${process.pid}.${randomUUID()}`;
-      writeFileSync(tmp, ours);
-      renameSync(tmp, dst);
-    }
-  } catch (e) {
-    // Non-fatal: publishing is how OTHERS trust us. This session only needs its
-    // own CA, so a failure to publish must not stop it.
-    process.stderr.write(`cache-fix: could not publish CA to ${caTrustDir}: ${e.message}\n`);
-  }
-  // Reap temps orphaned by a kill between the write and the rename. They do not
-  // match a *.pem glob so a builder ignores them, but nothing else would ever
-  // remove them.
-  //
-  // Its OWN try, deliberately outside the publish one. Sharing that block made
-  // reaping conditional on the rename succeeding, so exactly when publishing is
-  // persistently broken — a root-owned ccf.pem, a read-only mount, ENOSPC — the
-  // launcher abandoned one full-CA temp per launch and cleaned up none of them,
-  // growing without bound in the directory a builder globs.
-  //
-  // Age-gated, because a temp is indistinguishable from an orphan by name: a
-  // CONCURRENT launcher has its own ccf.pem.<pid>.<uuid> on disk in the window
-  // between its writeFileSync and its renameSync, and deleting that makes its
-  // rename throw a publish failure we caused. The window is one small write to
-  // the same directory, microseconds; a minute is four orders of magnitude of
-  // headroom and still collects the orphan on the next launch. Deleting late
-  // costs nothing — nothing reads these — while deleting early breaks a peer.
-  try {
-    const orphanAgeMs = 60_000;
-    for (const f of readdirSync(caTrustDir)) {
-      if (!f.startsWith(`${PUBLISHED_CA_NAME}.`)) continue;
-      const p = join(caTrustDir, f);
-      try { if (Date.now() - statSync(p).mtimeMs > orphanAgeMs) rmSync(p); }
-      // Raced, OR the delete was REFUSED — measured with the dir at mode 0500:
-      // removed=0, file still there. Tolerable because a survivor is disk, not
-      // trust: this name is `ccf.pem.<pid>.<uuid>` and does not end in `.pem`,
-      // so no builder globbing `*.pem` reads it.
-      catch { /* see above */ }
-    }
-  } catch { /* unreadable dir: the publish warning above already said so */ }
+  publishOurCA(caPem);
   // Read the merged bundle if something built one, so a session trusts every
   // component's CA and not only ours.
   //

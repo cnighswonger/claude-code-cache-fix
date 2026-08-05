@@ -5,7 +5,7 @@ import net from "node:net";
 import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { writeFile, rm } from "node:fs/promises";
-import { readdirSync, readFileSync, existsSync } from "node:fs";
+import { readdirSync, readFileSync, existsSync, mkdtempSync } from "node:fs";
 import { tmpdir, cpus } from "node:os";
 import { join, dirname } from "node:path";
 
@@ -262,6 +262,30 @@ it("stops when signalled between the proxy's death and its respawn", async () =>
         while (body.startsWith("ERR:") && Date.now() < deadline) body = await get();
         assert.equal(JSON.parse(body).status, "ok", "the port did not come back under run-service");
       }, { subcommand: "run-service", extraEnv: { CACHE_FIX_HOLD_PORT: "" } });
+    });
+
+    // A supervisor that only ever runs `run-service` must still publish our CA,
+    // or every sibling component builds a merged bundle without it and the
+    // sessions those components wire cannot verify this proxy. Publishing was
+    // reachable ONLY from --remote-control, the path that execs claude itself —
+    // measured on the work Mac: ca-trust.d held cswap-pin.pem alone and the
+    // bundle verifier answered "node loads no CA of ours from it".
+    it("publishes its CA to ca-trust.d/ccf.pem", async () => {
+      const cfg = mkdtempSync(join(tmpdir(), "ccf-runsvc-"));
+      await withHeldPort(async () => {
+        const published = join(cfg, "ca-trust.d", "ccf.pem");
+        const deadline = Date.now() + 15_000;
+        while (!existsSync(published) && Date.now() < deadline)
+          await new Promise((r) => setTimeout(r, 100));
+        assert.ok(existsSync(published),
+          `run-service served without publishing ${published}, so no sibling can trust it`);
+        // A path is not a certificate: an empty or torn file satisfies existsSync
+        // and takes the whole merged bundle down when it sorts first.
+        assert.match(readFileSync(published, "utf8"), /BEGIN CERTIFICATE/,
+          "published a file that is not a PEM certificate");
+      }, { subcommand: "run-service",
+           extraEnv: { CACHE_FIX_HOLD_PORT: "", CLAUDE_CONFIG_DIR: cfg,
+                       CACHE_FIX_FORWARD_PROXY: "on" } });
     });
 
     // Discoverable. An rc line must be able to ask whether this build has the
