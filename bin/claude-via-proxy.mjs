@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { fork, spawn } from "node:child_process";
+import { execFileSync, fork, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
 import { homedir, tmpdir } from "node:os";
@@ -26,6 +26,35 @@ const SUBCOMMAND = args[0];
 //
 // Opt-in: it only pays where something restarts this command, and systemd
 // socket activation already gives the same guarantee.
+// Who owns <port>, and is it one of ours already holding it?
+//
+// `lsof` rather than /proc: this has to work on macOS too, and a namespace the
+// caller cannot see is exactly the case where guessing is worse than declining.
+// Returns "holder" when the owner is a holder of ours (nothing to do), a pid
+// when it is something else we may ask to stop, or null when we cannot tell —
+// and NULL MEANS LEAVE IT ALONE. Signalling a pid we did not identify is how a
+// deploy comes to kill an unrelated service that happened to be on the port.
+function holderPidOn(port) {
+  let out = "";
+  try {
+    out = execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN"],
+                       { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+  } catch { return null; }
+  const pid = Number(out.trim().split("\n")[0]);
+  if (!Number.isInteger(pid) || pid <= 1) return null;
+  // A holder of ours runs the launcher, not the server: the server it supervises
+  // sits on an ephemeral port. Read the command rather than a pidfile — a
+  // pidfile outlives the process that wrote it, and this decision is about who
+  // holds the socket RIGHT NOW.
+  let cmd = "";
+  try {
+    cmd = execFileSync("ps", ["-p", String(pid), "-o", "command="],
+                       { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+  } catch { return pid; }
+  if (/claude-via-proxy|cache-fix-proxy/.test(cmd) && !/server\.mjs/.test(cmd)) return "holder";
+  return pid;
+}
+
 function holdPort(rest) {
   // The proxy's own default: holding a different port than the proxy would have
   // served leaves nothing at the documented address.
@@ -146,11 +175,53 @@ function holdPort(rest) {
     // is already serving, which is all the caller asked for.
     const bindFailed = () => {
       holder.off("error", bindFailed);
-      if (alreadyRunning) return settle(0);
+      if (alreadyRunning) return takeOver();
       resolveP(runProxy(rest));
     };
     holder.on("error", bindFailed);
-    holder.listen({ port, host: bind }, () => { holder.off("error", bindFailed); start(); });
+    const listen = () =>
+      holder.listen({ port, host: bind }, () => { holder.off("error", bindFailed); start(); });
+
+    // Somebody else owns the port. Under run-service that is a DEPLOY, not an
+    // error: the caller wants this code serving that address, and the incumbent
+    // is usually a proxy an older rc started — commonly a plain `server` that
+    // bound the port itself, with nothing under it to hand the socket down.
+    //
+    // So: ask it to stop, then take the port. SIGTERM, never SIGKILL — the
+    // proxy's own handler drains in-flight requests first and FINs whatever is
+    // left (measured in proxy/server.mjs: closeAllConnections() sends RST and a
+    // client that had every byte still threw the data away). The window between
+    // its exit and our bind is the only unowned moment, measured at 0.06s, and
+    // it is paid ONCE: everything after this restarts under the holder with no
+    // window at all.
+    //
+    // Idempotence is preserved by what we stop: an incumbent that is ALREADY a
+    // holder of ours answers nothing here and keeps its port, because we only
+    // reach this path when our own bind lost — and we identify the incumbent
+    // before signalling, so a second run-service against a healthy holder exits
+    // 0 rather than churning it.
+    const takeOver = () => {
+      const incumbent = holderPidOn(port);
+      if (incumbent === "holder") return settle(0);   // ours already; nothing to do
+      if (!incumbent) return settle(0);               // cannot identify it: leave it alone
+      try { process.kill(incumbent, "SIGTERM"); } catch { return settle(0); }
+      // Retry the bind until it lands. The incumbent drains first, so this is
+      // not a fixed wait — a busy proxy takes longer and we simply keep asking.
+      const deadline = Date.now() + 20_000;
+      const retry = () => {
+        if (stopping) return;
+        if (Date.now() > deadline) {
+          process.stderr.write(
+            `[cache-fix] could not take port ${port} from pid ${incumbent} within 20s\n`);
+          return settle(1);
+        }
+        const again = () => { holder.off("error", again); setTimeout(retry, 50); };
+        holder.on("error", again);
+        holder.listen({ port, host: bind }, () => { holder.off("error", again); start(); });
+      };
+      retry();
+    };
+    listen();
   });
 }
 
