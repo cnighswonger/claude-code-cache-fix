@@ -12,6 +12,17 @@ import { join, dirname } from "node:path";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
+// Whoever is LISTENING on a port, by port rather than by parentage. The
+// self-heal spawns a DETACHED successor, so it is nobody's child and `pgrep -P`
+// cannot see it — the only durable handle on it is the address it took.
+function listeners(port) {
+  try {
+    return execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN"],
+                        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
+      .trim().split("\n").filter(Boolean);
+  } catch { return []; }
+}
+
 async function freePort() {
   const s = net.createServer();
   await new Promise((r) => s.listen(0, "127.0.0.1", r));
@@ -406,6 +417,42 @@ it("stops when signalled between the proxy's death and its respawn", async () =>
       } finally {
         try { holder.kill("SIGKILL"); } catch {}
         if (kid > 1) { try { process.kill(kid, "SIGKILL"); } catch {} }
+        // THE SUCCESSOR THIS CASE CAUSED. A child whose holder dies does not
+        // simply exit — it spawns a DETACHED replacement on the advertised port,
+        // which is the whole point of the self-heal. That successor is nobody's
+        // child, so nothing above reaps it: measured, this file left one holder
+        // and one proxy behind on every run, and on a CI runner a leftover
+        // process holds the job's stdout pipe and the job never finishes.
+        //
+        // THE SUCCESSOR THIS CASE CAUSES, and the ones IT causes. A child whose
+        // holder dies spawns a DETACHED replacement on the advertised port —
+        // the point of the self-heal — and that replacement is a full
+        // run-service that will do the same again when killed. Nobody's child
+        // (ppid 1), so nothing above reaps it.
+        //
+        // Measured: one holder and one proxy left behind per run. A 4 s watch
+        // was too short, and a 20 s one still lost — the pair left behind was
+        // 37 s and 17 s old, i.e. born DURING the sweep and again after it. On a
+        // CI runner a leftover process holds the job's stdout pipe and the job
+        // never finishes.
+        //
+        // So kill the holder FIRST and only then the listener: with the holder
+        // gone there is nothing left to spawn another, and the sweep converges.
+        for (let i = 0; i < 60; i++) {
+          const live = listeners(port);
+          if (!live.length) { if (i > 10) break; }
+          for (const pid of live) {
+            // The holder is the listener's parent when there is one; killing it
+            // first stops the ladder that would replace what we are about to
+            // kill.
+            let parent = 0;
+            try { parent = Number(execFileSync("ps", ["-p", pid, "-o", "ppid="],
+                    { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim()); } catch {}
+            if (parent > 1) { try { process.kill(parent, "SIGKILL"); } catch {} }
+            try { process.kill(Number(pid), "SIGKILL"); } catch {}
+          }
+          await new Promise((r) => setTimeout(r, 200));
+        }
       }
     });
 
