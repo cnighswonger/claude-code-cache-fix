@@ -48,7 +48,13 @@ it("holds the same default port the proxy would bind", () => {
 // throwing so a caller can count failures instead of catching them.
 async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
   const port = await freePort();          // a real number: the holder owns the ADVERTISED port
-  const env = { ...process.env, CACHE_FIX_HOLD_PORT: "on", CACHE_FIX_PROXY_PORT: String(port), ...extraEnv };
+  // Self-heal OFF by default. A proxy whose holder was SIGKILLed spawns a
+  // REPLACEMENT holder about a second later, and nothing in a test tracks that
+  // grandchild — measured, three leaked per run of this file, reparented to
+  // init, accumulating until the box stalls. The cases that MEASURE self-heal
+  // turn it back on through extraEnv, so the behaviour is still covered.
+  const env = { ...process.env, CACHE_FIX_HOLD_PORT: "on", CACHE_FIX_PROXY_PORT: String(port),
+                CACHE_FIX_SELF_HEAL: "off", ...extraEnv };
   for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "LISTEN_FDS", "LISTEN_PID"]) delete env[k];
   const launcher = spawn(process.execPath, [launcherPath, subcommand], { env, stdio: ["ignore", "pipe", "pipe"] });
   const exited = new Promise((r) => launcher.on("exit", () => r(true)));
@@ -76,7 +82,7 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
     let body = await get();
     while (body.startsWith("ERR:") && Date.now() < up) body = await get();
     assert.equal(JSON.parse(body).status, "ok", "the held port never came up");
-    await fn({ get, killProxy, launcher, exited, port });
+    await fn({ get, killProxy, proxyPid, launcher, exited, port });
   } finally {
     // SIGTERM first: SIGKILL cannot be forwarded, so the proxy would outlive
     // its parent and keep this file's event loop alive on its pipes.
@@ -192,7 +198,7 @@ async function withFakeProxy(serverSrc, fn) {
   // seam shrinks the RUNGS, not the count, so the shape under assertion (does
   // it back off? does it give up after 5?) is the shipped one.
   const env = { ...process.env, CACHE_FIX_HOLD_PORT: "on", CACHE_FIX_PROXY_PORT: String(port),
-                CACHE_FIX_RESTART_BASE_MS: "25" };
+                CACHE_FIX_RESTART_BASE_MS: "25", CACHE_FIX_SELF_HEAL: "off" };
   // An ambient LISTEN_FDS sends the launcher down the socket-activation path
   // instead of the holder, and an ambient proxy var routes its own requests
   // through a proxy that is not there.
@@ -208,6 +214,17 @@ async function withFakeProxy(serverSrc, fn) {
   try {
     await fn({ launcher, port, bound, stderr: () => err });
   } finally {
+    // SIGTERM FIRST, and wait for it. SIGKILL cannot be forwarded, so a killed
+    // launcher leaves its proxy running — and that grandchild holds the pipes
+    // this runner is waiting on. Measured: every case here exited in about a
+    // second while the FILE took 300s and then failed with "Promise resolution
+    // is still pending but the event loop has already resolved". On the
+    // personal Mac the same leak sat 29 minutes with holders still alive.
+    launcher.kill("SIGTERM");
+    await Promise.race([
+      new Promise((r) => launcher.on("close", r)),
+      new Promise((r) => setTimeout(r, 5_000)),
+    ]);
     try { launcher.kill("SIGKILL"); } catch {}
     await rm(failing, { force: true });
     await rm(copy, { force: true });
@@ -409,8 +426,36 @@ it("stops when signalled between the proxy's death and its respawn", async () =>
           "to that address is stranded, which is the outage this guards");
       } finally {
         try { first.kill("SIGKILL"); } catch {}
-        try { execFileSync("pkill", ["-f", `CACHE_FIX_HELD_PORT=${port}`], { stdio: "ignore" }); } catch {}
-        try { execFileSync("pkill", ["-f", `CACHE_FIX_PROXY_PORT=${port}`], { stdio: "ignore" }); } catch {}
+        // Reap the HEALED holder, the one this test asked to be born.
+        //
+        // NOT by `pkill -f CACHE_FIX_PROXY_PORT=<port>`: that pattern matches
+        // ARGV, and the port lives in the ENVIRONMENT — the healed holder's
+        // command line is a bare `claude-via-proxy.mjs run-service` with no
+        // port in it, so the sweep matched nothing and every run leaked two
+        // holders that reparented to init. Verified on /proc/<pid>/cmdline.
+        //
+        // Find it by the port it OWNS instead, after the self-heal poll (~1s)
+        // has had time to create it.
+        await new Promise((r) => setTimeout(r, 2_000));
+        for (let i = 0; i < 3; i++) {
+          let owners = [];
+          try {
+            owners = execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN"],
+                                  { encoding: "utf8" }).trim().split("\n").filter(Boolean);
+          } catch { break; }                       // nobody owns it: done
+          for (const o of owners) {
+            const pid = Number(o);
+            if (!Number.isInteger(pid) || pid <= 1) continue;
+            // The holder ABOVE the listener, so killing the listener cannot
+            // trigger another heal; the listener itself when it has no holder.
+            let target = pid;
+            try { target = Number(execFileSync("ps", ["-o", "ppid=", "-p", String(pid)],
+                                               { encoding: "utf8" }).trim()) || pid; } catch {}
+            if (target <= 1) target = pid;
+            try { process.kill(target, "SIGTERM"); } catch {}
+          }
+          await new Promise((r) => setTimeout(r, 800));
+        }
       }
     });
 
@@ -446,7 +491,8 @@ it("stops when signalled between the proxy's death and its respawn", async () =>
     // a MaxListenersExceededWarning as the only clue.
     it("supervises exactly one proxy after taking the port over", async () => {
       const port = await freePort();
-      const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port), CACHE_FIX_FORWARD_PROXY: "on" };
+      const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port), CACHE_FIX_FORWARD_PROXY: "on",
+                    CACHE_FIX_SELF_HEAL: "off" };
       for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
                        "ALL_PROXY", "all_proxy", "LISTEN_FDS", "LISTEN_PID",
                        "CACHE_FIX_HOLD_PORT"]) delete env[k];
@@ -474,9 +520,47 @@ it("stops when signalled between the proxy's death and its respawn", async () =>
         assert.ok(!/MaxListenersExceeded/.test(warned),
           "listen() is still being handed a callback per attempt");
       } finally {
+        // SIGTERM AND WAIT, before any SIGKILL. SIGKILL cannot be forwarded, so
+        // a killed launcher strands its proxy — and that grandchild holds the
+        // runner's pipes: measured, this one case alone took the file from 20s
+        // to a 120s timeout, reported as "Promise resolution is still pending
+        // but the event loop has already resolved".
+        for (const p of [old, taker]) { try { p.kill("SIGTERM"); } catch {} }
+        await Promise.all([old, taker].map((p) => Promise.race([
+          new Promise((r) => p.on("close", r)),
+          new Promise((r) => setTimeout(r, 5_000)),
+        ])));
         for (const p of [old, taker]) { try { p.kill("SIGKILL"); } catch {} }
-        try { execFileSync("pkill", ["-f", `CACHE_FIX_HELD_PORT=${port}`], { stdio: "ignore" }); } catch {}
-        try { execFileSync("pkill", ["-f", `CACHE_FIX_PROXY_PORT=${port}`], { stdio: "ignore" }); } catch {}
+        // Reap the HEALED holder, the one this test asked to be born.
+        //
+        // NOT by `pkill -f CACHE_FIX_PROXY_PORT=<port>`: that pattern matches
+        // ARGV, and the port lives in the ENVIRONMENT — the healed holder's
+        // command line is a bare `claude-via-proxy.mjs run-service` with no
+        // port in it, so the sweep matched nothing and every run leaked two
+        // holders that reparented to init. Verified on /proc/<pid>/cmdline.
+        //
+        // Find it by the port it OWNS instead, after the self-heal poll (~1s)
+        // has had time to create it.
+        await new Promise((r) => setTimeout(r, 2_000));
+        for (let i = 0; i < 3; i++) {
+          let owners = [];
+          try {
+            owners = execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN"],
+                                  { encoding: "utf8" }).trim().split("\n").filter(Boolean);
+          } catch { break; }                       // nobody owns it: done
+          for (const o of owners) {
+            const pid = Number(o);
+            if (!Number.isInteger(pid) || pid <= 1) continue;
+            // The holder ABOVE the listener, so killing the listener cannot
+            // trigger another heal; the listener itself when it has no holder.
+            let target = pid;
+            try { target = Number(execFileSync("ps", ["-o", "ppid=", "-p", String(pid)],
+                                               { encoding: "utf8" }).trim()) || pid; } catch {}
+            if (target <= 1) target = pid;
+            try { process.kill(target, "SIGTERM"); } catch {}
+          }
+          await new Promise((r) => setTimeout(r, 800));
+        }
       }
     });
 
@@ -530,14 +614,34 @@ it("stops when signalled between the proxy's death and its respawn", async () =>
     });
 
     it("exits 0 and starts nothing when a proxy is already serving", async () => {
-      await withHeldPort(async ({ get, port }) => {
+      await withHeldPort(async ({ get, port, proxyPid }) => {
         const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port) };
         for (const k of ["HTTPS_PROXY", "https_proxy", "LISTEN_FDS", "LISTEN_PID"]) delete env[k];
+        const incumbentPid = proxyPid();
+        assert.ok(incumbentPid, "premise: the first run-service must have a proxy to protect");
         const second = spawn(process.execPath, [launcherPath, "run-service"], { env, stdio: ["ignore", "pipe", "pipe"] });
-        const code = await new Promise((r) => second.on("exit", (c) => r(c)));
-        assert.equal(code, 0, "a second run-service must exit 0 rather than fail or fork a rival proxy");
-        // The incumbent is still the one answering.
+        // BOUNDED. Awaiting `exit` alone turns "it never exits" into an
+        // infinite wait, and the runner reports nothing at all: measured, the
+        // suite sat 29 minutes on this case while the defect it exists to catch
+        // was live, with a childless holder and a rival proxy on another port.
+        // A hang must FAIL, and fail with the timing named.
+        const code = await Promise.race([
+          new Promise((r) => second.on("exit", (c) => r(c))),
+          new Promise((r) => setTimeout(() => r("HUNG"), 20_000)),
+        ]);
+        try { second.kill("SIGKILL"); } catch {}
+        assert.equal(code, 0, "a second run-service must exit 0 rather than fail, hang, or fork a rival proxy");
+        // The incumbent is still the one answering — and is the SAME process.
+        //
+        // Identity, not just health: the holder hands its socket down and stops
+        // accepting, so the process holding the port is the proxy CHILD, whose
+        // command line names server.mjs and never `run-service`. A takeover that
+        // identifies the incumbent by the listener alone reads our own healthy
+        // proxy as a stranger, SIGTERMs it, and takes the port. `status: ok`
+        // passes right through that, because the replacement answers too.
         assert.equal(JSON.parse(await get()).status, "ok", "the second invocation disturbed the running proxy");
+        assert.equal(proxyPid(), incumbentPid,
+          "the second run-service replaced the running proxy instead of leaving it alone");
       }, { subcommand: "run-service", extraEnv: { CACHE_FIX_HOLD_PORT: "" } });
     });
   });

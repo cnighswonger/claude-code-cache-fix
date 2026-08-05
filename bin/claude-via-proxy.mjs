@@ -57,12 +57,28 @@ function holderPidOn(port) {
   //
   // Read from `ps` rather than a pidfile: a pidfile outlives the process that
   // wrote it, and this decision is about who holds the socket RIGHT NOW.
+  //
+  // Ask about the PARENT too. Since the holder hands its socket down and stops
+  // accepting, the process actually LISTENING is the proxy child, whose command
+  // line is `.../proxy/server.mjs` — no `run-service` anywhere. Reading only the
+  // listener therefore called our own healthy proxy a stranger: measured on
+  // both machines, a second `run-service` SIGTERMed the running proxy, took the
+  // port, and never exited 0. That is the "already running, nothing to do" case
+  // turning into an outage plus a rival holder on a different port.
   let cmd = "";
   try {
-    cmd = execFileSync("ps", ["-p", String(pid), "-o", "command="],
+    cmd = execFileSync("ps", ["-p", String(pid), "-o", "ppid=,command="],
                        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
   } catch { return pid; }
   if (/\brun-service\b/.test(cmd)) return "holder";
+  const ppid = Number(cmd.trim().split(/\s+/)[0]);
+  if (Number.isInteger(ppid) && ppid > 1) {
+    try {
+      const parent = execFileSync("ps", ["-p", String(ppid), "-o", "command="],
+                                  { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+      if (/\brun-service\b/.test(parent)) return "holder";
+    } catch { /* parent gone: fall through and treat the listener on its own */ }
+  }
   return pid;
 }
 
@@ -134,6 +150,12 @@ function holdPort(rest) {
     // served by the successor.
     const spawnWhenReady = () => {
       if (stopping || child || !bound) return;
+      // A pending restart timer OWNS the next spawn. Without this the bind that
+      // reclaim() lands fires `listening` -> spawnWhenReady -> start(), which
+      // skips the ladder entirely: measured, a proxy that could not start was
+      // respawned 51 times in 1.2s. The ladder exists so a proxy broken for
+      // hours costs one attempt every few seconds, not forty a second.
+      if (restart) return;
       start();
     };
 
@@ -216,6 +238,13 @@ function holdPort(rest) {
           retired = true;
           if (child === me) child = null;
           reclaim();
+          // AND ask for the successor. reclaim() only starts one if its bind
+          // lands after this point; when the port is already ours — a proxy
+          // that released before we ever gave it up — `bound` is still true and
+          // no `listening` event will fire, so nothing else would spawn one.
+          // Measured on the personal Mac: a holder sat 26 minutes with no child
+          // and no listening socket, and the suite hung behind it.
+          spawnWhenReady();
         }
         if (childPort) return;
         line += chunk;
@@ -241,7 +270,13 @@ function holdPort(rest) {
         // already back and a successor is already running, so its exit is
         // bookkeeping, not an event. Respawning here would put a second proxy
         // beside the one that replaced it.
-        if (retired) return;
+        //
+        // But a retiring proxy is STILL what a shutdown is waiting on when the
+        // holder was signalled while it drained. Returning unconditionally left
+        // `settle()` uncalled, so the holder never resolved and never exited —
+        // measured on the personal Mac: the suite hung for 25 minutes with five
+        // run-service holders alive after their SIGTERM.
+        if (retired) return stopping ? settle(code) : undefined;
         childPort = 0;
         if (child === me) child = null;
         // A crash releases the socket without ever having handed it back, so the
@@ -278,7 +313,10 @@ function holdPort(rest) {
         // Through the gate, not straight to start(): the port may not be back
         // yet (reclaim() is still polling), and spawning a child that cannot
         // inherit a bound socket gives it nothing to accept on.
-        restart = setTimeout(spawnWhenReady, firstAfterServing
+        // Cleared as it FIRES, not after: spawnWhenReady refuses while a
+        // restart is pending, so a timer that stayed set would block the very
+        // spawn it was scheduled for — and every one after it.
+        restart = setTimeout(() => { restart = null; spawnWhenReady(); }, firstAfterServing
           ? 0
           : Math.min(base * 2 ** Math.min(failures, 5), base * 20));
       });
