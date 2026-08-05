@@ -95,3 +95,33 @@ test("no test awaits a child's exit without a deadline", () => {
     `hangs the whole run instead of failing: ${bare.join(" | ")}. ` +
     `Use exitWithin()/withDeadline() from ./child-deadline.mjs.`);
 });
+
+// A TEST THAT KILLS A HOLDER MUST REAP WHAT THE SELF-HEAL PUTS BACK.
+//
+// The product's whole point is that a proxy whose holder dies spawns a DETACHED
+// replacement on the advertised port. That replacement is ppid 1, so `pgrep -P`
+// cannot see it, and a reaper written the obvious way is blind to exactly the
+// process it must kill. Measured: the suite leaked a holder+proxy pair on every
+// run, rc=0 the whole time, and on a CI runner the leftover holds the job's
+// stdout pipe — run 31040510248 froze at updated_at 19:40:46 for 30 minutes
+// while other branches went green.
+//
+// Killing by port alone loses the race: the survivors after a 20 s sweep were
+// 37 s and 17 s old, i.e. born during the sweep and again after it, because a
+// holder whose listener dies simply starts another. The HOLDER has to go first.
+//
+// Static, because the reaper is cleanup code — nothing fails when it is deleted,
+// which is how it would come back. cswap's pin had the same two halves as
+// comments that could not fail, and pinned them as assertions for this reason.
+test("a test that SIGKILLs a holder reaps the successor, holder first", () => {
+  const src = readFileSync(join(testDir, "proxy-held-port.test.mjs"), "utf8");
+  const orphan = /it\("leaves no orphan when the holder is killed outright"[\s\S]*?\n    \}\);/.exec(src)?.[0];
+  assert.ok(orphan, "the orphan case moved — this no longer guards anything");
+
+  assert.match(orphan, /listeners\(port\)/,
+    "the successor is reaped by parentage, but it is detached (ppid 1) and " +
+    "`pgrep -P` cannot see it — only the port it took is a durable handle");
+  assert.match(orphan, /"ppid="/,
+    "nothing looks up the listener's parent, so the reaper kills a listener " +
+    "that a live holder immediately replaces");
+});
