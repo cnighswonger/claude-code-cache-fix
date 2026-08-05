@@ -599,6 +599,30 @@ function inheritedFd() {
   return 3;
 }
 
+// The upstream address, when it names this very proxy; "" otherwise.
+//
+// Compared by PORT, and by host only loosely: the loop is created by the port,
+// and `localhost`, `127.0.0.1` and `0.0.0.0` all reach us on it. A hostname we
+// cannot resolve here is left alone — refusing on a guess would block a
+// legitimate upstream that merely looks local.
+export function upstreamPointsAtSelf(upstream, port, bind) {
+  if (!upstream) return "";
+  let u;
+  try { u = new URL(upstream); } catch { return ""; }
+  const theirPort = Number(u.port) || (u.protocol === "https:" ? 443 : 80);
+  if (theirPort !== Number(port)) return "";
+  const local = new Set(["127.0.0.1", "::1", "localhost", "0.0.0.0", ""]);
+  const host = u.hostname.replace(/^\[|\]$/g, "");
+  if (!local.has(host)) return "";
+  // Bound to one interface, and they name a different local alias for it: still
+  // us. Bound to 0.0.0.0 we answer on every alias, so any local host matches.
+  if (bind && !local.has(bind) && host !== bind) return "";
+  // Credentials in the address are wiring, not evidence — strip them so the
+  // error we print cannot leak a token into a log.
+  u.username = ""; u.password = "";
+  return u.toString();
+}
+
 export async function startProxy(options = {}) {
   const port = options.port ?? config.port;
   const bind = options.bind ?? config.bind;
@@ -656,6 +680,39 @@ export async function startProxy(options = {}) {
   } else {
     process.stderr.write(
       "[cache-fix] hot-reload: off (set CACHE_FIX_HOT_RELOAD=on to enable). Extension changes require a supervisor-level proxy restart.\n",
+    );
+  }
+
+  // REFUSE TO BE OUR OWN UPSTREAM.
+  //
+  // The upstream is read from HTTPS_PROXY, so it is decided by whatever shell
+  // launched us. Start `run-service` from a shell that already exports the
+  // chain and we adopt a hop that points back here: 9901 -> 36301 -> 9901,
+  // which never reaches privoxy and hangs every CONNECT.
+  //
+  // Measured twice on <linux-host> in one day. Both times every health field was
+  // green — `status: ok`, `forward_proxy: true`, port bound — because they
+  // report what is CONFIGURED, not what works. The only field that showed it
+  // was the VALUE of https_proxy.
+  //
+  // Refuse rather than silently drop the variable: a proxy that quietly picks a
+  // different upstream than it was told is the same class of bug one layer
+  // down. The operator's own recovery command is the fix (`env -u HTTPS_PROXY
+  // … cache-fix-proxy run-service`), so the message names it.
+  // BOTH variables, because both can become the upstream: selectProxyUrl falls
+  // through to httpProxy when httpsProxy is empty, so HTTP_PROXY alone is
+  // enough to build the loop. The polluted process measured on <linux-host> had
+  // exactly that split — HTTPS_PROXY/ALL_PROXY on the pin, HTTP_PROXY on 9901
+  // itself — so a guard reading only https would have passed it.
+  const selfUpstream = upstreamPointsAtSelf(config.httpsProxy, port, bind)
+                    || upstreamPointsAtSelf(config.httpProxy, port, bind);
+  if (selfUpstream) {
+    throw new Error(
+      `refusing to start: upstream proxy ${selfUpstream} is this proxy's own ` +
+      `address (${bind}:${port}) — requests would loop instead of reaching the ` +
+      `internet. Clear the inherited wiring, e.g. ` +
+      `env -u HTTPS_PROXY -u https_proxy -u ALL_PROXY -u all_proxy ` +
+      `HTTPS_PROXY=<the hop BELOW this one> cache-fix-proxy run-service`,
     );
   }
 
@@ -888,6 +945,25 @@ function exitWithParent() {
 if (invokedAsScript) {
   let active;
   exitWithParent();
+  // Signals FIRST, before the await. `startProxy()` is async — it loads
+  // extensions, merges the CA bundle and binds — and until it settles there is
+  // no handler, so a SIGTERM in that window gets node's DEFAULT action and the
+  // process dies by signal instead of running `shutdown`.
+  //
+  // `shutdown` already handles the not-yet-listening case (`if (!active)` ->
+  // exit 0), so the intent was there; only the registration was late, and the
+  // code could never be reached. Measured on this box: SIGTERM at +0/+5/+20/+50
+  // ms gave exit=null (killed), +150 ms onwards gave exit=0. Boot here is ~100
+  // ms, so the window is invisible locally and opens wide on a loaded CI runner
+  // — which is why `shuts down cleanly on SIGTERM` asserts code 0 and failed
+  // there, not here: 3 of 5 node-20 runs, always in a file that forks a proxy.
+  //
+  // Registering before the boot also means the SIGKILL-forcing watchdog below
+  // is armed for the whole life of the process rather than only after it is
+  // serving.
+  const onSignal = () => shutdown();
+  process.on("SIGTERM", onSignal);
+  process.on("SIGINT", onSignal);
   startProxy()
     .then((handle) => {
       active = handle;
@@ -958,6 +1034,4 @@ if (invokedAsScript) {
       }
     }, 5000).unref();
   };
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
 }

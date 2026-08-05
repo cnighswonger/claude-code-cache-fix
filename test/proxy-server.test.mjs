@@ -8,7 +8,7 @@ import { mkdir, writeFile, rm } from "node:fs/promises";
 import { readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { startProxy } from "../proxy/server.mjs";
+import { startProxy, upstreamPointsAtSelf } from "../proxy/server.mjs";
 import { startWatcher } from "../proxy/watcher.mjs";
 import { loadExtensions, getRegistry } from "../proxy/pipeline.mjs";
 
@@ -596,5 +596,71 @@ describe("zero-downtime reload", () => {
       }
     });
   }
+
+  // The upstream comes from HTTPS_PROXY, so it is chosen by whichever shell
+  // launched us. Started from a shell that already exports the chain, this proxy
+  // adopts a hop pointing back at itself and every request loops instead of
+  // reaching the internet.
+  //
+  // Happened twice on one box in one day. Both times /health was fully green —
+  // status ok, forward_proxy true, port bound — because those fields report what
+  // is CONFIGURED. Only the VALUE of https_proxy showed it, which is why this
+  // asserts a refusal to START rather than a health field.
+  describe("upstream self-reference", () => {
+    const self = (u, port = 9901, bind = "127.0.0.1") => upstreamPointsAtSelf(u, port, bind);
+
+    it("refuses an upstream that is this proxy's own address", () => {
+      // The incident verbatim: pin credentials, our own port.
+      assert.ok(self("http://cswap:tok@127.0.0.1:9901"), "the measured loop was allowed");
+      assert.ok(self("http://127.0.0.1:9901"), "bare self-reference was allowed");
+      assert.ok(self("http://localhost:9901"), "a local alias of ourselves was allowed");
+    });
+
+    it("allows the hop below, and any remote host", () => {
+      assert.equal(self("http://127.0.0.1:8118"), "",
+        "refused the CORRECT next hop — this would break every healthy start");
+      assert.equal(self("http://proxy.corp:9901"), "",
+        "refused a remote upstream that merely shares our port number");
+      assert.equal(self(""), "", "refused when there is no upstream at all");
+    });
+
+    it("does not echo credentials into the error", () => {
+      assert.ok(!self("http://cswap:SECRET@127.0.0.1:9901").includes("SECRET"),
+        "the refusal message would leak a token into every log that captures it");
+    });
+
+    it("startProxy actually refuses, not just the predicate", async () => {
+      const saved = process.env.HTTPS_PROXY;
+      process.env.HTTPS_PROXY = "http://127.0.0.1:19893";
+      try {
+        await assert.rejects(
+          () => startProxy({ port: 19893, bind: "127.0.0.1", watch: false }),
+          /refusing to start/,
+          "the predicate is right but nothing calls it — a looping proxy still boots");
+      } finally {
+        if (saved === undefined) delete process.env.HTTPS_PROXY;
+        else process.env.HTTPS_PROXY = saved;
+      }
+    });
+
+    // The polluted process had HTTPS_PROXY on the pin and HTTP_PROXY on itself.
+    // selectProxyUrl falls through to httpProxy when httpsProxy is empty, so
+    // that half alone still builds the loop.
+    it("refuses when only HTTP_PROXY names us", async () => {
+      const saved = { s: process.env.HTTPS_PROXY, p: process.env.HTTP_PROXY };
+      delete process.env.HTTPS_PROXY;
+      process.env.HTTP_PROXY = "http://127.0.0.1:19894";
+      try {
+        await assert.rejects(
+          () => startProxy({ port: 19894, bind: "127.0.0.1", watch: false }),
+          /refusing to start/,
+          "HTTP_PROXY pointing at us was allowed — the loop forms through the fallthrough");
+      } finally {
+        for (const [k, v] of [["HTTPS_PROXY", saved.s], ["HTTP_PROXY", saved.p]]) {
+          if (v === undefined) delete process.env[k]; else process.env[k] = v;
+        }
+      }
+    });
+  });
 
 });
