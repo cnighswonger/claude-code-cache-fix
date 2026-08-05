@@ -5,7 +5,7 @@ import net from "node:net";
 import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { writeFile, rm } from "node:fs/promises";
-import { readdirSync, readFileSync, existsSync, mkdtempSync } from "node:fs";
+import { readdirSync, readFileSync, existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir, cpus } from "node:os";
 import { join, dirname } from "node:path";
 
@@ -380,6 +380,30 @@ it("stops when signalled between the proxy's death and its respawn", async () =>
         try { execFileSync("pkill", ["-f", `CACHE_FIX_HELD_PORT=${port}`], { stdio: "ignore" }); } catch {}
         try { execFileSync("pkill", ["-f", `CACHE_FIX_PROXY_PORT=${port}`], { stdio: "ignore" }); } catch {}
       }
+    });
+
+    // The rule that decides "is this incumbent one of ours". Asserted on the
+    // REAL argv rather than by spawning a lookalike: the incumbent a deploy
+    // meets is launched through the npm-global symlink, so `ps` reports
+    //
+    //     node /opt/homebrew/bin/cache-fix-proxy server
+    //
+    // and no fixture on this box reproduces that string — spawning a shim let
+    // node rewrite argv[1] to server.mjs, which is the case that already worked.
+    // Measured against the live process on the work Mac (pid 15060): the old
+    // rule answered "holder, skip" and `cc-update --apply --force` therefore
+    // relaunched six sessions onto a proxy carrying none of the deployed code.
+    it("does not read a plain `cache-fix-proxy server` as one of its own holders", () => {
+      const src = readFileSync(launcherPath, "utf8");
+      const fn = src.slice(src.indexOf("function holderPidOn"));
+      const rule = fn.slice(0, fn.indexOf('return "holder"'));
+      // The distinguishing fact is the SUBCOMMAND. `cache-fix-proxy` is our own
+      // bin name, so matching it identifies the package, not the role.
+      assert.match(rule, /run-service/,
+        "holder detection does not key on the run-service subcommand, so a plain " +
+        "`cache-fix-proxy server` reads as a holder and a deploy silently skips it");
+      assert.ok(!/cache-fix-proxy\b(?!.*run-service)/.test(rule.replace(/\/\/[^\n]*/g, "")),
+        "detection still matches the bin name alone — that is what misread pid 15060");
     });
 
     it("exits 0 and starts nothing when a proxy is already serving", async () => {

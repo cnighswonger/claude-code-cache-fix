@@ -42,16 +42,27 @@ function holderPidOn(port) {
   } catch { return null; }
   const pid = Number(out.trim().split("\n")[0]);
   if (!Number.isInteger(pid) || pid <= 1) return null;
-  // A holder of ours runs the launcher, not the server: the server it supervises
-  // sits on an ephemeral port. Read the command rather than a pidfile — a
-  // pidfile outlives the process that wrote it, and this decision is about who
-  // holds the socket RIGHT NOW.
+  // A holder of ours is running the `run-service` SUBCOMMAND. Nothing weaker
+  // works: the rule was "names our launcher and is not server.mjs", and the
+  // incumbent a real deploy meets is
+  //
+  //     node /opt/homebrew/bin/cache-fix-proxy server
+  //
+  // which satisfies both — `cache-fix-proxy` IS our launcher's bin name, and the
+  // script path never appears when it is invoked through the shim. Measured on
+  // the work Mac: `cc-update --apply --force` relaunched six sessions onto 9901
+  // and left the pre-deploy proxy (pid 15060) serving, because the takeover read
+  // it as one of ours and skipped it. A deploy that silently does nothing is
+  // worse than one that fails.
+  //
+  // Read from `ps` rather than a pidfile: a pidfile outlives the process that
+  // wrote it, and this decision is about who holds the socket RIGHT NOW.
   let cmd = "";
   try {
     cmd = execFileSync("ps", ["-p", String(pid), "-o", "command="],
                        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
   } catch { return pid; }
-  if (/claude-via-proxy|cache-fix-proxy/.test(cmd) && !/server\.mjs/.test(cmd)) return "holder";
+  if (/\brun-service\b/.test(cmd)) return "holder";
   return pid;
 }
 
