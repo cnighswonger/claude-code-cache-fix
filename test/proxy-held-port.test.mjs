@@ -111,6 +111,38 @@ it("cuts nothing on the held port while the proxy restarts", async () => {
   });
 });
 
+// NOTHING IS KILLED HERE. The holder and the proxy hold the SAME listening
+// socket, and the kernel gives each connection to exactly one of them — so a
+// holder that stays open eats a share of ordinary traffic, and a net.Server
+// with no connection handler accepts and then hangs until the client's own
+// timeout. There is no way to hold a bound socket without accepting: measured,
+// net.Server has no pause(), maxConnections=0 accepts then RSTs 19 of 20, and
+// nulling _handle.onconnection still hung 66 of 300.
+//
+// CONCURRENT, which is the whole point: one request at a time is always served
+// by whichever process wins, so a serial probe reads 100% healthy against a
+// holder losing a fifth of everything. Measured before the fix, 200 concurrent
+// requests: hung=36 acceptedByHolder=36, exactly 1:1.
+it("serves every concurrent request while nothing restarts", async () => {
+  await withHeldPort(async ({ port }) => {
+    const one = () => new Promise((res) => {
+      const r = http.get({ host: "127.0.0.1", port, path: "/health", agent: false }, (q) => {
+        q.resume();
+        q.on("end", () => res("ok"));
+      });
+      // Well under the 8s a hung accept would cost, and far above a served
+      // request on loopback: the failure this catches is unbounded, not slow.
+      r.setTimeout(3_000, () => { r.destroy(); res("HUNG"); });
+      r.on("error", (e) => res(e.code || "ERR"));
+    });
+    const out = await Promise.all(Array.from({ length: 200 }, one));
+    const bad = out.filter((r) => r !== "ok");
+    assert.equal(bad.length, 0,
+      `${bad.length} of 200 concurrent requests were not served: ` +
+      `${[...new Set(bad)].join(", ")} — the holder is accepting connections it cannot answer`);
+  });
+});
+
 // A client that aborts mid-request (Ctrl-C, a cancelled tool call) sends RST,
 // and pipe() does not propagate destroy — so the upstream half would stay
 // open. A holder that runs out of descriptors stops accepting on the very
@@ -404,6 +436,97 @@ it("stops when signalled between the proxy's death and its respawn", async () =>
         "`cache-fix-proxy server` reads as a holder and a deploy silently skips it");
       assert.ok(!/cache-fix-proxy\b(?!.*run-service)/.test(rule.replace(/\/\/[^\n]*/g, "")),
         "detection still matches the bin name alone — that is what misread pid 15060");
+    });
+
+    // A takeover must leave ONE proxy, not one per bind attempt. Passing the
+    // callback to listen() adds a `listening` listener per call and node fires
+    // all of them on the bind that finally lands — measured standalone, 21
+    // callbacks from a single success. On the work Mac one takeover left the
+    // holder supervising 100 proxies, 72 of them holding ephemeral ports, with
+    // a MaxListenersExceededWarning as the only clue.
+    it("supervises exactly one proxy after taking the port over", async () => {
+      const port = await freePort();
+      const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port), CACHE_FIX_FORWARD_PROXY: "on" };
+      for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                       "ALL_PROXY", "all_proxy", "LISTEN_FDS", "LISTEN_PID",
+                       "CACHE_FIX_HOLD_PORT"]) delete env[k];
+      const get = () => new Promise((res) => {
+        http.get({ host: "127.0.0.1", port, path: "/health", timeout: 3_000 }, (r) => {
+          let b = ""; r.on("data", (d) => (b += d)); r.on("end", () => res(b));
+        }).on("error", (e) => res(`ERR:${e.code}`));
+      });
+      const old = spawn(process.execPath, [launcherPath, "server"], { env, stdio: ["ignore", "pipe", "pipe"] });
+      const taker = spawn(process.execPath, [launcherPath, "run-service"], { env, stdio: ["ignore", "pipe", "pipe"] });
+      let warned = "";
+      taker.stderr.on("data", (d) => { warned += d.toString(); });
+      try {
+        const up = Date.now() + 15_000;
+        let body = await get();
+        while (body.startsWith("ERR:") && Date.now() < up) body = await get();
+        assert.equal(JSON.parse(body).status, "ok", "nothing served the port");
+        // Past the retry ladder, so a per-attempt spawn would have happened.
+        await new Promise((r) => setTimeout(r, 3_000));
+        let kids = [];
+        try { kids = execFileSync("pgrep", ["-P", String(taker.pid)], { encoding: "utf8" })
+                       .trim().split("\n").filter(Boolean); } catch {}
+        assert.equal(kids.length, 1,
+          `the holder supervises ${kids.length} proxies; a bind retry spawned one per attempt`);
+        assert.ok(!/MaxListenersExceeded/.test(warned),
+          "listen() is still being handed a callback per attempt");
+      } finally {
+        for (const p of [old, taker]) { try { p.kill("SIGKILL"); } catch {} }
+        try { execFileSync("pkill", ["-f", `CACHE_FIX_HELD_PORT=${port}`], { stdio: "ignore" }); } catch {}
+        try { execFileSync("pkill", ["-f", `CACHE_FIX_PROXY_PORT=${port}`], { stdio: "ignore" }); } catch {}
+      }
+    });
+
+    // ZERO cut requests when the proxy under the holder dies. Not "one in
+    // forty" — a session must not see "Connection closed mid-response" for a
+    // restart the held port exists to hide.
+    //
+    // The relay is what made that impossible: it holds a client-side socket
+    // that outlives the upstream one, and once bytes have reached the client a
+    // request cannot be replayed (measured — retrying the dial made it WORSE,
+    // 80 of 80 failed). The fix is to have no relay: the child accepts on the
+    // holder's own listening socket, handed over the IPC channel, so the
+    // connection the client made IS the connection the proxy serves.
+    it("cuts nothing when the proxy under it dies", async () => {
+      await withFakeProxy(
+        // Serves the INHERITED fd, the way the real proxy does under a holder.
+        'import net from "node:net";\n' +
+        'const s = net.createServer((c) => { c.on("error", () => {});\n' +
+        '  c.end("HTTP/1.1 200 OK\\r\\ncontent-length:2\\r\\nconnection:close\\r\\n\\r\\nok"); });\n' +
+        'const fd = Number(process.env.LISTEN_FDS) >= 1 ? 3 : null;\n' +
+        'if (fd === null) { process.stderr.write("no LISTEN_FDS\\n"); process.exit(1); }\n' +
+        's.listen({ fd }, () => process.stdout.write("proxy listening on 127.0.0.1:0\\n"));\n',
+        async ({ launcher, port }) => {
+          const get = () => new Promise((res) => {
+            http.get({ host: "127.0.0.1", port, path: "/health", timeout: 3_000 }, (r) => {
+              r.resume(); r.on("end", () => res(r.statusCode));
+            }).on("error", (e) => res(e.code));
+          });
+          const up = Date.now() + 10_000;
+          while (Date.now() < up && (await get()) !== 200) await new Promise((r) => setTimeout(r, 50));
+          assert.equal(await get(), 200, "the stand-in never came up behind the holder");
+
+          const seen = [];
+          const hammer = (async () => {
+            for (let i = 0; i < 40; i++) { seen.push(await get()); await new Promise((r) => setTimeout(r, 25)); }
+          })();
+          setTimeout(() => {
+            let kid = 0;
+            try { kid = Number(execFileSync("pgrep", ["-P", String(launcher.pid)], { encoding: "utf8" })
+                                .trim().split("\n")[0]); } catch {}
+            if (kid > 1) { try { process.kill(kid, "SIGKILL"); } catch {} }
+          }, 250);
+          await hammer;
+
+          const cut = seen.filter((c) => c !== 200);
+          assert.equal(cut.length, 0,
+            `${cut.length} of 40 requests were cut when the proxy restarted ` +
+            `(${[...new Set(cut)].join(", ")}) — a session sees each as ` +
+            `"Connection closed mid-response"`);
+        });
     });
 
     it("exits 0 and starts nothing when a proxy is already serving", async () => {

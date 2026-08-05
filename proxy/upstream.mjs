@@ -1,5 +1,6 @@
 import https from "node:https";
 import http from "node:http";
+import { connect as netConnect } from "node:net";
 import { URL } from "node:url";
 import { readFileSync } from "node:fs";
 import { HttpProxyAgent, HttpsProxyAgent } from "hpagent";
@@ -129,6 +130,97 @@ export function selectProxyUrl(isHTTPS) {
   return config.httpProxy || "";
 }
 
+// The hops BELOW the one we normally dial, nearest first, so a hop that is off
+// can be routed around instead of answering 502.
+//
+// A session bakes HTTPS_PROXY at exec and never re-reads it, so it cannot fail
+// over itself: when the hop it names goes away the session is stranded for its
+// whole life. We are the one process in the chain that CAN re-decide, because
+// `config.httpsProxy` is a getter read per request.
+//
+// Configured, never guessed: CACHE_FIX_FALLBACK_PROXIES is a comma-separated
+// list of proxy URLs. Empty (the default) keeps the old behaviour exactly —
+// one hop, 502 when it is down — so nothing changes for anyone who has not
+// asked for this.
+export function fallbackProxyUrls() {
+  // OUR OWN ADDRESS IS NEVER A FALLBACK. A request routed there comes straight
+  // back to us, and with both hops in this chain carrying a list (the agreed
+  // symmetric design) that is how a request ping-pongs until the socket dies.
+  // The pin guards the same shape in its _ambient_proxy, which skips a value
+  // pointing at its own daemon.
+  // config.port, not the raw env: the env may be unset (the default applies) or
+  // "0" (the OS picked one), and a self-address we fail to compute is a self-
+  // address we fail to exclude.
+  const mine = new Set();
+  for (const p of [config.port, process.env.CACHE_FIX_PROXY_PORT].filter(Boolean))
+    for (const h of ["127.0.0.1", "localhost", "[::1]"]) mine.add(`${h}:${p}`);
+  return (process.env.CACHE_FIX_FALLBACK_PROXIES || "")
+    .split(",").map((s) => s.trim()).filter(Boolean)
+    .filter((u) => { try { return !mine.has(new URL(u).host); } catch { return false; } });
+}
+
+// The chain grace, matched to the pin's _CHAIN_HEAL_GRACE_S / _CHAIN_HEAL_POLL_S
+// rather than chosen independently. One window for one chain: two components
+// each waiting their own amount is how a request gets abandoned by one while
+// the other is still hopeful. Both numbers were measured against the same
+// event — a hop killed and restarted is back in ~1s and REFUSES throughout.
+const CHAIN_GRACE_MS = Number(process.env.CACHE_FIX_CHAIN_GRACE_MS) || 2500;
+const CHAIN_POLL_MS = Number(process.env.CACHE_FIX_CHAIN_POLL_MS) || 200;
+
+// The hop to dial for this request: the configured one when it answers, else
+// the first fallback that does, else "" (a direct dial). Retries the WHOLE list
+// for the grace window before giving up on it — a hop that is restarting is
+// back within it, and waiting beats routing around a hop that never left.
+//
+// Logged per episode, not per request, and in the string the pin also emits so
+// one probe greps both: `hop <addr> unusable`.
+let _lastHopReport = "";
+export async function resolveHop(isHTTPS) {
+  const primary = selectProxyUrl(isHTTPS);
+  const chain = [primary, ...fallbackProxyUrls()].filter(Boolean);
+  if (!chain.length) return "";
+  const deadline = Date.now() + CHAIN_GRACE_MS;
+  for (;;) {
+    for (const hop of chain) {
+      if (await hopAlive(hop)) {
+        if (hop !== primary) {
+          const note = `hop ${addrOf(primary)} unusable — routing via ${addrOf(hop)}`;
+          if (note !== _lastHopReport) { _lastHopReport = note; process.stderr.write(`[upstream] ${note}\n`); }
+        } else if (_lastHopReport) {
+          _lastHopReport = "";
+          process.stderr.write(`[upstream] hop ${addrOf(primary)} is back\n`);
+        }
+        return hop;
+      }
+    }
+    if (Date.now() >= deadline) break;
+    await new Promise((r) => setTimeout(r, CHAIN_POLL_MS));
+  }
+  // Nothing in the chain answered. A direct dial is the pin's fail-open stance
+  // too ("egress DIRECT — no chain hop reachable"), and it beats 502: the
+  // request goes out unpinned rather than not at all.
+  const note = `hop ${addrOf(primary)} unusable — no chain hop reachable, dialling direct`;
+  if (note !== _lastHopReport) { _lastHopReport = note; process.stderr.write(`[upstream] ${note}\n`); }
+  return "";
+}
+
+const addrOf = (u) => { try { return new URL(u).host; } catch { return u || "direct"; } };
+
+// Is a hop answering right now? A refused dial is the cheap, immediate signal —
+// measured across a holder restart, a hop that is down REFUSES rather than
+// accepting and hanging, so this costs a syscall and never a timeout.
+export function hopAlive(proxyUrl, timeoutMs = 700) {
+  return new Promise((res) => {
+    let u;
+    try { u = new URL(proxyUrl); } catch { return res(false); }
+    const sock = netConnect({ host: u.hostname, port: Number(u.port) || 80 });
+    const done = (ok) => { sock.destroy(); res(ok); };
+    sock.on("connect", () => done(true));
+    sock.on("error", () => done(false));
+    sock.setTimeout(timeoutMs, () => done(false));
+  });
+}
+
 function buildAgent(isHTTPS, proxyUrl) {
   const ca = loadCa();
   if (proxyUrl) {
@@ -159,7 +251,7 @@ function buildAgent(isHTTPS, proxyUrl) {
 // Exported so other egress paths (e.g. the forward-proxy's download rewrite to
 // storage.googleapis.com) reuse the SAME proxy/NO_PROXY/CA/TLS policy instead of
 // reimplementing a subset of it.
-export function getAgent(isHTTPS, hostname) {
+export function getAgent(isHTTPS, hostname, hop) {
   if (!_warnedTlsDisabled && !config.rejectUnauthorized) {
     _warnedTlsDisabled = true;
     process.stderr.write(
@@ -168,7 +260,10 @@ export function getAgent(isHTTPS, hostname) {
   }
 
   const bypass = shouldBypassProxy(hostname);
-  const proxyUrl = bypass ? "" : selectProxyUrl(isHTTPS);
+  // `hop` is the address resolveHop() picked for THIS request. Absent (every
+  // caller that has not opted in) it falls back to the configured one, so the
+  // signature change is invisible to them.
+  const proxyUrl = bypass ? "" : (hop !== undefined ? hop : selectProxyUrl(isHTTPS));
   const cacheKey = `${isHTTPS ? "https" : "http"}|${proxyUrl}|${config.caFile}|${config.rejectUnauthorized}`;
 
   let agent = _agents.get(cacheKey);
@@ -218,9 +313,17 @@ export function buildUpstreamUrl(base, clientUrl) {
   return new URL(trimmedBase + relative);
 }
 
-export function forwardRequest(clientReq, body, signal) {
+export async function forwardRequest(clientReq, body, signal) {
+  const upstreamUrl0 = buildUpstreamUrl(config.upstream, clientReq.url);
+  // Resolve the hop BEFORE building the request: a hop that is off gets routed
+  // around here, so a session wired to this proxy never sees the outage. With
+  // no fallbacks configured this returns the configured hop unchanged and costs
+  // one loopback dial.
+  const hop = fallbackProxyUrls().length && !shouldBypassProxy(upstreamUrl0.hostname)
+    ? await resolveHop(upstreamUrl0.protocol === "https:")
+    : undefined;
   return new Promise((resolve, reject) => {
-    const upstreamUrl = buildUpstreamUrl(config.upstream, clientReq.url);
+    const upstreamUrl = upstreamUrl0;
 
     const headers = buildUpstreamHeaders(clientReq.headers, upstreamUrl.hostname);
     if (body) {
@@ -238,7 +341,7 @@ export function forwardRequest(clientReq, body, signal) {
       method: clientReq.method,
       headers,
       timeout: config.timeout,
-      agent: getAgent(isHTTPS, upstreamUrl.hostname),
+      agent: getAgent(isHTTPS, upstreamUrl.hostname, hop),
     };
 
     let upstreamConnectionId = null;

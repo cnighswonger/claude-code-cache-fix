@@ -74,6 +74,12 @@ function holdPort(rest) {
 
   return new Promise((resolveP) => {
     let child = null, childPort = 0, stopping = false, restart = null, failures = 0, served = false;
+    // Which process currently owns the listening socket, and whether a successor
+    // is already on its way. Both the reclaim poll and the child's exit can be
+    // the second of the two events that must happen before a successor starts —
+    // the port has to be ours again AND the old proxy has to be gone — so each
+    // fires the same guarded spawn and only the later one gets through.
+    let bound = false, reclaiming = null;
     // `run-service` is idempotent: re-running it must not put a second proxy
     // beside the first. Only the holder can answer that, because the bind is
     // the only thing that knows whether the port is already taken.
@@ -90,26 +96,127 @@ function holdPort(rest) {
     process.on("SIGTERM", () => forward("SIGTERM"));
     process.on("SIGINT", () => forward("SIGINT"));
 
+    // Take the port back as soon as the child stops owning it. Polled rather
+    // than event-driven: nothing tells a parent "your child just called
+    // close()", and the child releases the socket well before it exits.
+    //
+    // Retried at 1ms, because this IS the outage: every request arriving while
+    // nothing owns the port is refused, and a refusal is instant.
+    //
+    // The interval is not what closes the window, and measuring said so: 1ms
+    // and 20ms both leave 5-6 refused per restart, as does closing before
+    // announcing. The window is the RE-ACQUIRE itself — this holder gives the
+    // socket up and has to win it back, and nothing owns the port in between.
+    // A holder that never lets go (keeps the listening fd, hands each child a
+    // dup) has nothing to re-acquire and measures 0; that is the next change,
+    // not a smaller number here.
+    //
+    // Backs off after 100 tries (~0.1s) so a port taken by something else costs
+    // one attempt per 20ms rather than a thousand a second.
+    let tries = 0;
+    const reclaim = () => {
+      if (stopping || bound) return;
+      clearTimeout(reclaiming);
+      const again = () => {
+        holder.off("error", again);
+        reclaiming = setTimeout(reclaim, ++tries < 100 ? 1 : 20);
+      };
+      holder.on("error", again);
+      holder.listen({ port, host: bind });
+    };
+
+    // A successor may start as soon as the port is ours again. It does NOT wait
+    // for the old proxy to exit: a proxy that has released its listening socket
+    // is draining connections it already accepted, and needs nothing further
+    // from the port. Waiting for its exit instead left the holder bound and
+    // accepting, with no handler, for the whole 5s drain — measured, requests
+    // arriving there hung until the client's own timeout rather than being
+    // served by the successor.
+    const spawnWhenReady = () => {
+      if (stopping || child || !bound) return;
+      start();
+    };
+
     const start = () => {
       if (stopping) return;
       childPort = 0;
       // Piped only to read the ephemeral port back; every byte is written on.
       // The child binds loopback on its own ephemeral port; we advertise $bind.
       // Pinning it here keeps the dial address below correct whatever $bind is.
+      // fork, not spawn: fork opens an IPC channel, and the channel is how the
+      // LISTENING SOCKET reaches the child. The child then accepts on it
+      // directly, so the connection a client made IS the connection the proxy
+      // serves — there is no second socket, and a proxy that dies has nothing
+      // half-delivered to strand.
+      //
+      // This replaces a relay. The relay held a client-side socket that outlived
+      // the upstream one, which cost one cut request in forty on every restart
+      // (measured), and could not be fixed by retrying: once bytes have reached
+      // the client a request is unrepeatable, and a retry sends it twice —
+      // measured at 80 of 80 failing.
+      // The listening socket goes down as FD 3 with LISTEN_FDS=1 — the systemd
+      // socket-activation convention, not a private protocol. Anything that
+      // speaks it can drive this proxy, and this holder can drive anything that
+      // speaks it. `stdio` index 3 IS the child's fd 3, so no IPC is involved.
+      //
+      // The child accepts on that socket directly, which is what removes the
+      // relay. A relay holds a client-side socket outliving the upstream one, so
+      // a proxy that died mid-request cut it — one in forty on every restart,
+      // measured — and retrying could not fix it: once bytes have reached the
+      // client the request is unrepeatable, and a retry sent it twice (80 of 80
+      // failed).
       child = spawn(process.execPath, [SERVER_PATH, ...rest], {
-        stdio: ["inherit", "pipe", "inherit"],
-        // CACHE_FIX_HELD_PORT: the ADVERTISED port, passed down so the child can
-        // put a new holder back on it if we die. Without it the child can only
-        // exit, and the address stays unowned until a human opens a shell.
+        stdio: ["inherit", "pipe", "inherit", holder._handle.fd],
+        // CACHE_FIX_HELD_PORT: the ADVERTISED port, so a child whose holder dies
+        // can put a new holder back on it rather than exiting quietly.
+        // LISTEN_PID is deliberately unset — the child's pid is unknown before
+        // the spawn, and the receiver reads an absent one as "addressed to me".
         env: { ...process.env, CACHE_FIX_PROXY_PORT: "0", CACHE_FIX_PROXY_BIND: "127.0.0.1",
-               CACHE_FIX_HELD_PORT: String(port) },
+               CACHE_FIX_HELD_PORT: String(port), LISTEN_FDS: "1" },
       });
+      // Hand the socket over NOW, not when the child reports "listening".
+      //
+      // `spawn` dup'd the fd into the child at exec, so the port is already
+      // held there and closing our copy cannot unbind it. Waiting for the
+      // child's first line instead leaves US the only acceptor for the whole
+      // boot — ~80ms — and a net.Server with no connection handler accepts and
+      // then hangs forever. Measured across one SIGTERM: 4 requests arriving in
+      // that window hung until the client's own 8s timeout.
+      //
+      // With nobody accepting, those connections wait in the KERNEL BACKLOG and
+      // the child accepts them when it comes up. A queued connection costs
+      // latency; an accepted-and-hung one costs the request.
+      //
+      // `me`: this spawn's own child, captured so the handlers below can tell
+      // whether the shared `child` still refers to them. A retiring proxy and
+      // its successor overlap, so `child` may already be the next one.
+      const me = child;
+      let retired = false;
+      // The same defect in steady state: both processes hold one listening
+      // socket, the kernel gives each connection to exactly ONE of them, and
+      // there is no way to hold the fd without accepting (net.Server has no
+      // pause(); maxConnections=0 accepts then RSTs, 19 of 20 measured). A
+      // holder that stayed open therefore ate a share of ALL traffic, not just
+      // traffic during a restart — measured standalone at 200 concurrent
+      // requests, hung=36 acceptedByHolder=36, exactly 1:1.
+      holder.close();
+      bound = false;
       // Buffered until a newline: the port arrives on stdout, and a chunk
       // boundary inside that line would otherwise lose it silently — every
       // connection would then wait out the relay's deadline.
       let line = "";
-      child.stdout.on("data", (chunk) => {
+      me.stdout.on("data", (chunk) => {
         process.stdout.write(chunk);
+        // The proxy announces the release before it drains, so the port comes
+        // back to us at the START of its shutdown rather than at its exit.
+        // Retire it here: it is no longer the proxy this holder supervises, so
+        // the successor can boot while it finishes its in-flight work, and its
+        // eventual exit must not be read as a death needing a respawn.
+        if (!retired && String(chunk).includes("releasing the listening socket")) {
+          retired = true;
+          if (child === me) child = null;
+          reclaim();
+        }
         if (childPort) return;
         line += chunk;
         const m = /listening on [\d.]+:(\d+)\n/.exec(line);
@@ -125,12 +232,21 @@ function holdPort(rest) {
         }
         else if (line.length > 4096) line = line.slice(-256);
       });
-      child.on("error", (err) => {
+      me.on("error", (err) => {
         process.stderr.write(`Failed to start proxy server: ${err.message}\n`);
         settle(1);
       });
-      child.on("close", (code, sig) => {
+      me.on("close", (code, sig) => {
+        // A proxy that announced its release was retired then: the port is
+        // already back and a successor is already running, so its exit is
+        // bookkeeping, not an event. Respawning here would put a second proxy
+        // beside the one that replaced it.
+        if (retired) return;
         childPort = 0;
+        if (child === me) child = null;
+        // A crash releases the socket without ever having handed it back, so the
+        // reclaim poll may not be running. Idempotent when it already is.
+        reclaim();
         // Only OUR being signalled ends this. The proxy exiting is what the held
         // port exists to survive — including the clean exit 0 a reload produces.
         if (stopping) return settle(code);
@@ -149,40 +265,38 @@ function holdPort(rest) {
         // broken for hours costs one attempt every 5s, not four a second.
         // Test seam: the ladder's base. Proving the backoff exists means
         // sleeping through several rungs of it.
-        if (served) failures++;
+        // A proxy that HAD served and died once is not a failing proxy — it is a
+        // restart, and the backoff is for a proxy that cannot start. Waiting out
+        // a rung there costs the requests sitting in the kernel accept queue:
+        // measured, one request in forty timed out across a 500ms first rung,
+        // and zero across an immediate respawn.
+        //
+        // The ladder still applies to REPEATED deaths, which is what it is for.
         const base = Number(process.env.CACHE_FIX_RESTART_BASE_MS) || 250;
-        restart = setTimeout(start, Math.min(base * 2 ** Math.min(failures, 5), base * 20));
+        const firstAfterServing = served && failures === 0;
+        if (served) failures++;
+        // Through the gate, not straight to start(): the port may not be back
+        // yet (reclaim() is still polling), and spawning a child that cannot
+        // inherit a bound socket gives it nothing to accept on.
+        restart = setTimeout(spawnWhenReady, firstAfterServing
+          ? 0
+          : Math.min(base * 2 ** Math.min(failures, 5), base * 20));
       });
     };
 
     // Wait for the proxy rather than refusing: to a client that baked
     // HTTPS_PROXY at exec, a refusal is as fatal as an unbound port.
-    const relay = (sock) => {
-      const deadline = Date.now() + 15000;
-      let up = null;
-      sock.on("error", () => {});
-      // pipe() forwards end-of-stream but not destroy, so an aborted client
-      // would leave its upstream open forever — a long-lived holder then runs
-      // out of descriptors and stops accepting on the port it exists to keep.
-      // Registered once: dial() may retry, and a handler per attempt leaks too.
-      sock.on("close", () => up?.destroy());
-      const dial = () => {
-        if (sock.destroyed) return;
-        if (Date.now() > deadline) return sock.destroy();
-        if (!childPort) return setTimeout(dial, 25);
-        up = net.connect(childPort, "127.0.0.1");
-        const mine = up;
-        let piped = false;
-        // Before the pipe the proxy is still coming up, so retry; after it, the
-        // connection is genuinely broken.
-        mine.on("error", () => (piped ? sock.destroy() : setTimeout(dial, 25)));
-        mine.on("close", () => { if (piped) sock.destroy(); });
-        mine.on("connect", () => { piped = true; sock.pipe(mine); mine.pipe(sock); });
-      };
-      dial();
-    };
-
-    const holder = net.createServer(relay);
+    // No relay. The child accepts on the socket we bound (handed down as fd 3,
+    // LISTEN_FDS=1), so the connection a client makes IS the connection the
+    // proxy serves. Requests that arrive while a proxy is restarting wait in the
+    // KERNEL accept queue and are served by the successor — which is why the
+    // port never has to answer anything itself.
+    //
+    // Measured across three SIGKILLs of the proxy: with a relay in the path,
+    // requests were cut (ECONNRESET) because it held a client-side socket that
+    // outlived the upstream one; retrying could not fix it, since a request
+    // whose bytes have started cannot be replayed.
+    const holder = net.createServer();
     // Only the BIND may fall back: another proxy owns the port, so run ours on
     // it directly and let the collision be reported the way it always has been.
     // A later server error must not start a second proxy beside the first.
@@ -194,8 +308,21 @@ function holdPort(rest) {
       resolveP(runProxy(rest));
     };
     holder.on("error", bindFailed);
-    const listen = () =>
-      holder.listen({ port, host: bind }, () => { holder.off("error", bindFailed); start(); });
+    // ONE success handler for every bind attempt, first or retried. Passing the
+    // callback to listen() adds a `listening` listener PER CALL and node fires
+    // all of them on the bind that finally lands — measured standalone, 21
+    // callbacks from one success; on the work Mac a single takeover left the
+    // holder supervising 100 proxies, 72 of them holding ephemeral ports.
+    // `on`, not `once`: the holder rebinds on every restart, and a one-shot
+    // listener would leave every bind after the first unobserved.
+    holder.on("listening", () => {
+      holder.off("error", bindFailed);
+      bound = true;
+      tries = 0;
+      clearTimeout(reclaiming);
+      spawnWhenReady();
+    });
+    const listen = () => holder.listen({ port, host: bind });
 
     // Somebody else owns the port. Under run-service that is a DEPLOY, not an
     // error: the caller wants this code serving that address, and the incumbent
@@ -232,7 +359,7 @@ function holdPort(rest) {
         }
         const again = () => { holder.off("error", again); setTimeout(retry, 50); };
         holder.on("error", again);
-        holder.listen({ port, host: bind }, () => { holder.off("error", again); start(); });
+        holder.listen({ port, host: bind });
       };
       retry();
     };

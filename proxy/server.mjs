@@ -849,6 +849,10 @@ const invokedAsScript =
 // it tells the child to take an ephemeral port), so a proxy an operator runs
 // directly from a shell is never killed by its parent exiting.
 function exitWithParent() {
+  // An operator debugging a holder needs to be able to kill it and have it STAY
+  // dead. Off also disables the respawn below, since the two are one mechanism:
+  // the child noticing its parent is what puts a new holder on the port.
+  if (process.env.CACHE_FIX_SELF_HEAL === "off") return;
   if (process.env.CACHE_FIX_PROXY_PORT !== "0") return;
   const born = process.ppid;
   // The advertised port, which the holder passed down so we can put a new
@@ -908,6 +912,26 @@ if (invokedAsScript) {
       process.exit(0);
       return;
     }
+    // Stop listening FIRST, then say so. server.close() unbinds at once and
+    // only then drains in-flight requests — up to the 5s below — so a
+    // supervisor that waits for our EXIT sees the port unowned for the whole
+    // drain (measured: 43 ECONNREFUSED across 3 SIGTERMs with 4 concurrent
+    // clients). Announcing lets it take the port back immediately instead.
+    //
+    // Closing first is ordering hygiene, NOT the cure: announcing while we
+    // still hold the socket makes the supervisor race a bind it must lose.
+    // Measured, it does not close the window on its own — 5-6 requests are
+    // still refused per restart, the same as before the reorder and the same at
+    // 1ms and 20ms supervisor retries.
+    //
+    // That residue is structural and lives in the supervisor, not here: a
+    // holder that CLOSES has to re-acquire, and nothing owns the port in
+    // between. The shape without it keeps the listening fd forever and hands
+    // each child a dup, so there is nothing to re-acquire (cswap's pin does
+    // this and measures 0 refused). Until the holder is rebuilt that way, a
+    // planned restart costs ~5-9 refused per 3 restarts of ~38,000.
+    active.server.close?.();
+    process.stdout.write("proxy releasing the listening socket\n");
     active.close().finally(() => process.exit(0));
     // The 5 s grace is DELIBERATELY UNCHANGED. A supervised stop is SERIAL
     // (stop, wait for exit, start), so a longer grace only extends the outage:
