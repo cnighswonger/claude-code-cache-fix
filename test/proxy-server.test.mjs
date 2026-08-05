@@ -387,10 +387,17 @@ describe("zero-downtime reload", () => {
     // parent is a node server, which does — and the kernel shares accepts with
     // the proxy, so one it takes would go unanswered and read as a dropped
     // request. Measured on a probe of this shape: misses tracked steals 1:1.
+    //
+    // A steal must be KEPT, not just answered: `close()` waits on every open
+    // connection and `c.end()` only half-closes. Measured — one steal, close()
+    // silent at 3s; destroying it first returns at once.
     const listener = net.createServer();
     let stolen = 0;
+    const stolenSockets = new Set();
     listener.on("connection", (c) => {
       stolen++;
+      stolenSockets.add(c);
+      c.on("close", () => stolenSockets.delete(c));
       c.end("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n" +
             "content-length: 15\r\n\r\n{\"status\":\"ok\"}");
     });
@@ -489,6 +496,7 @@ describe("zero-downtime reload", () => {
         k.on("exit", () => { clearTimeout(t); r(); });
       })));
       await new Promise((r) => upstream.close(r));
+      for (const c of stolenSockets) c.destroy();
       await new Promise((r) => listener.close(r));
     }
   });

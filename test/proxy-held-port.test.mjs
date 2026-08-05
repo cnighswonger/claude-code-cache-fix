@@ -5,7 +5,7 @@ import net from "node:net";
 import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { writeFile, rm } from "node:fs/promises";
-import { readdirSync, readFileSync } from "node:fs";
+import { readdirSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 
@@ -22,7 +22,10 @@ async function freePort() {
 // Its own file: every case here drives a REAL launcher holding a REAL port, so
 // a mis-signalled pid or a stuck child aborts the whole runner process. Node
 // runs each test file in its own process, which keeps that blast radius here.
-describe("held port (CACHE_FIX_HOLD_PORT)", () => {
+// Concurrent: every case takes its own free port and spawns its own launcher,
+// so they share nothing but the clock. Serial, the file pays the sum of the
+// waits instead of the longest one.
+describe("held port (CACHE_FIX_HOLD_PORT)", { concurrency: true }, () => {
 // The default is declared in proxy/config.mjs and repeated in the launcher.
 // If they drift, an unset CACHE_FIX_PROXY_PORT binds one port while callers
 // dial the other.
@@ -122,8 +125,13 @@ it("leaks no descriptor when a client aborts", async () => {
         setTimeout(() => { s.resetAndDestroy?.() ?? s.destroy(); done(); }, 5);
       });
     });
-    for (let i = 0; i < 60; i++) await abort(port);
-    await new Promise((r) => setTimeout(r, 1_500));
+    // Concurrent, and settled by POLLING rather than by a fixed grace: 60
+    // serial round-trips plus a 1.5s wait is 2s of the file's runtime, and a
+    // leak that is real never falls back under the ceiling, so the first
+    // reading at-or-under it is the final answer.
+    await Promise.all(Array.from({ length: 60 }, () => abort(port)));
+    const settle = Date.now() + 5_000;
+    while (fds() > before + 5 && Date.now() < settle) await new Promise((r) => setTimeout(r, 50));
     assert.ok(fds() <= before + 5, `descriptors grew ${before} -> ${fds()} over 60 aborted clients`);
     assert.equal(JSON.parse(await get()).status, "ok", "the holder stopped serving after the aborts");
   });
@@ -132,14 +140,23 @@ it("leaks no descriptor when a client aborts", async () => {
 // A launcher whose proxy is a stand-in script, so a start failure can be
 // driven on demand. The copy sits beside the real launcher for its relative
 // imports; both files are removed again.
+// Named per call, not per file: two cases running at once on one fixed name
+// would each write the other's stand-in and delete it in their own cleanup.
+let fakeSeq = 0;
 async function withFakeProxy(serverSrc, fn) {
-  const failing = join(dirname(launcherPath), ".test-fake-server.mjs");
-  const copy = join(dirname(launcherPath), ".test-launcher.mjs");
+  const tag = `${process.pid}-${++fakeSeq}`;
+  const failing = join(dirname(launcherPath), `.test-fake-server-${tag}.mjs`);
+  const copy = join(dirname(launcherPath), `.test-launcher-${tag}.mjs`);
   await writeFile(failing, serverSrc);
   await writeFile(copy, readFileSync(launcherPath, "utf8").replace(
     /const SERVER_PATH = .*/, `const SERVER_PATH = ${JSON.stringify(failing)};`));
   const port = await freePort();
-  const env = { ...process.env, CACHE_FIX_HOLD_PORT: "on", CACHE_FIX_PROXY_PORT: String(port) };
+  // The backoff ladder is what these cases measure, and at its 250ms default
+  // they measure it by sleeping through it — 22s of the file's runtime. The
+  // seam shrinks the RUNGS, not the count, so the shape under assertion (does
+  // it back off? does it give up after 5?) is the shipped one.
+  const env = { ...process.env, CACHE_FIX_HOLD_PORT: "on", CACHE_FIX_PROXY_PORT: String(port),
+                CACHE_FIX_RESTART_BASE_MS: "25" };
   // An ambient LISTEN_FDS sends the launcher down the socket-activation path
   // instead of the holder, and an ambient proxy var routes its own requests
   // through a proxy that is not there.
@@ -169,7 +186,7 @@ it("gives the port up when the proxy never starts", async () => {
     async ({ launcher, bound, stderr }) => {
       const exited = await Promise.race([
         new Promise((r) => launcher.on("exit", () => r(true))),
-        new Promise((r) => setTimeout(() => r(false), 15_000)),
+        new Promise((r) => setTimeout(() => r(false), 8_000)),
       ]);
       assert.ok(exited, "the launcher respawned a hopeless proxy forever, holding the port");
       assert.match(stderr(), /releasing the port/);
@@ -181,7 +198,7 @@ it("gives the port up when the proxy never starts", async () => {
 // them for good — so a proxy that breaks on a later restart must keep the
 // port and keep retrying, backed off rather than spinning.
 it("keeps the port and backs off when a proxy that had served stops starting", async () => {
-  const flag = join(tmpdir(), `ccf-flip-${process.pid}`);
+  const flag = join(tmpdir(), `ccf-flip-${process.pid}-${++fakeSeq}`);
   await rm(flag, { force: true });
   await withFakeProxy(
     `import fs from "node:fs"; import net from "node:net";\n` +
@@ -190,20 +207,26 @@ it("keeps the port and backs off when a proxy that had served stops starting", a
     `const s = net.createServer((c) => c.end("HTTP/1.1 200 OK\\r\\ncontent-length:2\\r\\n\\r\\nok"));\n` +
     `s.listen(0, "127.0.0.1", () => process.stdout.write("proxy listening on 127.0.0.1:" + s.address().port + "\\n"));\n`,
     async ({ launcher, bound, stderr }) => {
-      // Let the one good generation come up, then kill it: every restart now fails.
-      await new Promise((r) => setTimeout(r, 2_500));
+      // Let the one good generation come up, then kill it: every restart now
+      // fails. Waited on the FLAG the fake proxy writes, not on a duration —
+      // a fixed sleep has to cover the slowest box and still races on it.
+      const started = Date.now() + 15_000;
+      while (!existsSync(flag) && Date.now() < started) await new Promise((r) => setTimeout(r, 20));
       let out = "";
       try { out = execFileSync("pgrep", ["-P", String(launcher.pid)]).toString(); } catch {}
       const kid = Number(out.trim().split("\n")[0]);
       assert.ok(Number.isInteger(kid) && kid > 1, "the fake proxy never started, so this measures nothing");
       process.kill(kid, "SIGKILL");
-      await new Promise((r) => setTimeout(r, 12_000));
+      // Long enough for an UNBACKED-OFF loop to blow the ceiling: at the 25ms
+      // base the ladder tops out at 500ms, so ~1.2s admits at most a handful of
+      // tries and a spinner would land dozens. Measured both ways below.
+      await new Promise((r) => setTimeout(r, 1_200));
 
       assert.equal(launcher.exitCode, null, "the launcher gave the port up, stranding every wired session");
       assert.equal(await bound(), true, "the port was released while sessions were still wired to it");
       // Backed off: an unbounded loop reaches ~40 in this window.
       const tries = (stderr().match(/cannot start/g) || []).length;
-      assert.ok(tries <= 10, `respawned ${tries} times in 12s — the backoff is not applied`);
+      assert.ok(tries <= 10, `respawned ${tries} times in 1.2s — the backoff is not applied`);
     });
   await rm(flag, { force: true });
 });

@@ -124,6 +124,18 @@ const NODE = process.execPath;
 // exits. Two ca-trust tests below run the wrapper TWICE against one config dir
 // (first launch publishes our CA, second reads the bundle built from it), which
 // is what makes a named helper worth it over the inline fork the older tests use.
+// `close`, not `exit`: exit fires when the process is gone, close when its
+// stdio has also been drained. Measured under the concurrency this file now
+// runs at — an exit-resolved run came back with bytesRead=0 and
+// readableEnded=false while the child had provably run and written, so the
+// assertion read an empty string the child had in fact produced. One helper
+// because that judgement was previously repeated at fifteen call sites, which
+// is why correcting it had to touch all fifteen.
+const waitClose = (p) => new Promise((res) => {
+  const t = setTimeout(() => { p.kill("SIGTERM"); res(null); }, 15_000);
+  p.on("close", (c) => { clearTimeout(t); res(c); });
+});
+
 async function runWrapper(script, overrides) {
   const p = fork(WRAPPER_PATH, ["--remote-control", "--proxy-port", "0"], {
     stdio: ["ignore", "pipe", "pipe", "ipc"],
@@ -132,14 +144,13 @@ async function runWrapper(script, overrides) {
   let out = "", err = "";
   p.stdout.on("data", (c) => { out += c.toString(); });
   p.stderr.on("data", (c) => { err += c.toString(); });
-  const code = await new Promise((res) => {
-    p.on("exit", res);
-    setTimeout(() => { p.kill("SIGTERM"); res(null); }, 15000);
-  });
-  return { code, out, err };
+  return { code: await waitClose(p), out, err };
 }
 
-describe("launch wrapper (claude-via-proxy)", () => {
+// Concurrent: every case forks its own wrapper on `--proxy-port 0`, and
+// cleanEnv() hands each invocation its own CLAUDE_CONFIG_DIR by default, so
+// nothing is shared but the clock.
+describe("launch wrapper (claude-via-proxy)", { concurrency: true }, () => {
   it("exits with error when claude command is not found", async () => {
     const wrapperProc = fork(WRAPPER_PATH, ["--proxy-port", "0"], {
       stdio: ["ignore", "pipe", "pipe", "ipc"],
@@ -149,10 +160,7 @@ describe("launch wrapper (claude-via-proxy)", () => {
     let stderr = "";
     wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
 
-    const code = await new Promise((resolve) => {
-      wrapperProc.on("exit", (c) => resolve(c));
-      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
-    });
+    const code = await waitClose(wrapperProc);
 
     assert.ok(code !== 0, `Wrapper should exit non-zero. stderr: ${stderr}`);
   });
@@ -167,10 +175,7 @@ describe("launch wrapper (claude-via-proxy)", () => {
     let stdout = "";
     wrapperProc.stdout.on("data", (c) => { stdout += c.toString(); });
 
-    const code = await new Promise((resolve) => {
-      wrapperProc.on("exit", (c) => resolve(c));
-      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
-    });
+    const code = await waitClose(wrapperProc);
 
     assert.ok(stdout.includes("BASE_URL=http://127.0.0.1:"), `Expected BASE_URL in output, got: ${stdout}`);
     assert.equal(code, 0);
@@ -185,10 +190,7 @@ describe("launch wrapper (claude-via-proxy)", () => {
     let stderr = "";
     wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
 
-    const code = await new Promise((resolve) => {
-      wrapperProc.on("exit", (c) => resolve(c));
-      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
-    });
+    const code = await waitClose(wrapperProc);
 
     assert.equal(code, 42, `Expected exit 42, got ${code}. stderr: ${stderr}`);
   });
@@ -218,10 +220,7 @@ describe("launch wrapper (claude-via-proxy)", () => {
     wrapperProc.stdout.on("data", (c) => { stdout += c.toString(); });
     wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
 
-    const code = await new Promise((resolve) => {
-      wrapperProc.on("exit", (c) => resolve(c));
-      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
-    });
+    const code = await waitClose(wrapperProc);
 
     assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
     assert.ok(stdout.includes("BASE=UNSET"), `ANTHROPIC_BASE_URL should be unset in forward mode, got: ${stdout}`);
@@ -249,10 +248,7 @@ describe("launch wrapper (claude-via-proxy)", () => {
     wrapperProc.stdout.on("data", (c) => { stdout += c.toString(); });
     wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
 
-    const code = await new Promise((resolve) => {
-      wrapperProc.on("exit", (c) => resolve(c));
-      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
-    });
+    const code = await waitClose(wrapperProc);
 
     assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
     // The CA must be the override path exactly, not the default ~/.claude one.
@@ -288,10 +284,7 @@ describe("launch wrapper (claude-via-proxy)", () => {
     wrapperProc.stdout.on("data", (c) => { stdout += c.toString(); });
     wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
 
-    const code = await new Promise((resolve) => {
-      wrapperProc.on("exit", (c) => resolve(c));
-      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
-    });
+    const code = await waitClose(wrapperProc);
 
     assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
     // The child already ran and exited, so anything on disk now was written
@@ -346,10 +339,7 @@ describe("launch wrapper (claude-via-proxy)", () => {
     let stderr = "";
     wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
 
-    const code = await new Promise((resolve) => {
-      wrapperProc.on("exit", (c) => resolve(c));
-      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
-    });
+    const code = await waitClose(wrapperProc);
 
     assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
     assert.equal(readFileSync(sibling, "utf8"), SIBLING_BYTES, "sibling component's pem must be untouched");
@@ -457,10 +447,7 @@ describe("launch wrapper (claude-via-proxy)", () => {
     wrapperProc.stdout.on("data", (c) => { stdout += c.toString(); });
     wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
 
-    const code = await new Promise((resolve) => {
-      wrapperProc.on("exit", (c) => resolve(c));
-      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
-    });
+    const code = await waitClose(wrapperProc);
 
     assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
     assert.ok(
@@ -540,10 +527,7 @@ describe("launch wrapper (claude-via-proxy)", () => {
     let stderr = "";
     wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
 
-    const code = await new Promise((resolve) => {
-      wrapperProc.on("exit", (c) => resolve(c));
-      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
-    });
+    const code = await waitClose(wrapperProc);
 
     clearInterval(sampler);
     assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
@@ -803,10 +787,7 @@ describe("launch wrapper (claude-via-proxy)", () => {
     wrapperProc.stdout.on("data", (c) => { stdout += c.toString(); });
     wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
 
-    const code = await new Promise((resolve) => {
-      wrapperProc.on("exit", (c) => resolve(c));
-      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
-    });
+    const code = await waitClose(wrapperProc);
 
     assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
     const handed = (stdout.match(/CA=(.*)/) || [])[1];
@@ -927,10 +908,7 @@ describe("launch wrapper (claude-via-proxy)", () => {
     wrapperProc.stdout.on("data", (c) => { stdout += c.toString(); });
     wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
 
-    const code = await new Promise((resolve) => {
-      wrapperProc.on("exit", (c) => resolve(c));
-      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
-    });
+    const code = await waitClose(wrapperProc);
 
     assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
     // Both NO_PROXY and no_proxy must cover localhost.
@@ -953,10 +931,7 @@ describe("launch wrapper (claude-via-proxy)", () => {
     wrapperProc.stdout.on("data", (c) => { stdout += c.toString(); });
     wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
 
-    const code = await new Promise((resolve) => {
-      wrapperProc.on("exit", (c) => resolve(c));
-      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
-    });
+    const code = await waitClose(wrapperProc);
 
     assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
     assert.ok(stdout.includes("example.com"), `existing NO_PROXY entry should be preserved, got: ${stdout}`);
@@ -977,10 +952,7 @@ describe("launch wrapper (claude-via-proxy)", () => {
     wrapperProc.stdout.on("data", (c) => { stdout += c.toString(); });
     wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
 
-    const code = await new Promise((resolve) => {
-      wrapperProc.on("exit", (c) => resolve(c));
-      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
-    });
+    const code = await waitClose(wrapperProc);
 
     assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
     assert.ok(stdout.includes("corp.internal"), `lowercase no_proxy entry should be preserved, got: ${stdout}`);
@@ -999,10 +971,7 @@ describe("launch wrapper (claude-via-proxy)", () => {
     wrapperProc.stdout.on("data", (c) => { stdout += c.toString(); });
     wrapperProc.stderr.on("data", (c) => { stderr += c.toString(); });
 
-    const code = await new Promise((resolve) => {
-      wrapperProc.on("exit", (c) => resolve(c));
-      setTimeout(() => { wrapperProc.kill("SIGTERM"); resolve(null); }, 15000);
-    });
+    const code = await waitClose(wrapperProc);
 
     assert.equal(code, 0, `Expected exit 0, got ${code}. stderr: ${stderr}`);
     // 127.0.0.1 must appear exactly once, not duplicated, and localhost still added.

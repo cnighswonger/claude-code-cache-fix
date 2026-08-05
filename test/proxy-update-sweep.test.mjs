@@ -19,6 +19,7 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 
 const serverPath = join(dirname(fileURLToPath(import.meta.url)), "..", "proxy", "server.mjs");
+const DELAY_MS = 300;
 
 const freePort = () => new Promise((res) => {
   const s = net.createServer();
@@ -52,7 +53,7 @@ async function sweepLeaves({ record, diskVersion, channelVersion, sweep }) {
       HOME: home,
       CLAUDE_CONFIG_DIR: cfg,
       CACHE_FIX_PROXY_PORT: String(await freePort()),
-      CACHE_FIX_UPDATE_SWEEP_DELAY_MS: "300",
+      CACHE_FIX_UPDATE_SWEEP_DELAY_MS: String(DELAY_MS),
       // Point the channel probe at the stand-in. It goes through the proxy's
       // own egress agent, so an http upstream is what an https URL would be.
       CACHE_FIX_UPDATE_CHANNEL_URL: `http://127.0.0.1:${channelPort}/latest`,
@@ -61,7 +62,15 @@ async function sweepLeaves({ record, diskVersion, channelVersion, sweep }) {
     for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "LISTEN_FDS"]) delete env[k];
     const proc = spawn(process.execPath, [serverPath], { env, stdio: ["ignore", "pipe", "pipe"] });
     try {
-      await new Promise((r) => setTimeout(r, 4_000));
+      // Gate on the proxy SAYING it is up, because the sweep timer is armed
+      // right after that line — a blind sleep from spawn has to cover boot as
+      // well, and pays for the slowest box on every run.
+      await new Promise((res, rej) => {
+        const to = setTimeout(() => rej(new Error("proxy never reported listening")), 15_000);
+        proc.stdout.on("data", (d) => { if (/listening/.test(String(d))) { clearTimeout(to); res(); } });
+        proc.on("exit", (c) => rej(new Error(`proxy exited ${c} before listening`)));
+      });
+      await new Promise((r) => setTimeout(r, DELAY_MS + 700));
       return existsSync(result);
     } finally {
       proc.kill("SIGKILL");
@@ -70,7 +79,9 @@ async function sweepLeaves({ record, diskVersion, channelVersion, sweep }) {
   });
 }
 
-describe("auto-update fossil sweep", () => {
+// Concurrent: each case owns its own HOME, config dir, port and channel, so
+// they share nothing. Serial, the four fixed waits add up instead of overlap.
+describe("auto-update fossil sweep", { concurrency: true }, () => {
   // The case the sweep exists for: the record says failed, and the version on
   // disk already equals the channel's, so there was nothing to install.
   it("clears a record whose failure had nothing to install", async () => {

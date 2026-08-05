@@ -94,8 +94,11 @@ function holdPort(rest) {
         // strands them for good, so keep holding and keep retrying — a later
         // deploy is picked up by the next respawn. Back off so a proxy that is
         // broken for hours costs one attempt every 5s, not four a second.
+        // Test seam: the ladder's base. Proving the backoff exists means
+        // sleeping through several rungs of it.
         if (served) failures++;
-        restart = setTimeout(start, Math.min(250 * 2 ** Math.min(failures, 5), 5000));
+        const base = Number(process.env.CACHE_FIX_RESTART_BASE_MS) || 250;
+        restart = setTimeout(start, Math.min(base * 2 ** Math.min(failures, 5), base * 20));
       });
     };
 
