@@ -181,6 +181,37 @@ function holdPort(rest) {
     process.on("SIGTERM", () => forward("SIGTERM"));
     process.on("SIGINT", () => forward("SIGINT"));
 
+    // STOP WHEN NOBODY IS LEFT TO STOP US.
+    //
+    // A holder is deliberately hard to kill: its whole job is to put the proxy
+    // back. That is right while someone owns it and catastrophic once nobody
+    // does — a SIGKILLed parent runs no cleanup (a `finally` never executes),
+    // so the pair reparents to init and holds its port, its memory and the
+    // runner's pipes forever. Measured on this box: 151 orphaned holder/proxy
+    // processes, oldest 6.8 hours, 9.17 GiB resident, from test runs whose
+    // node --test runner had been killed. Nothing on the machine would ever
+    // have collected them, because the only name they answer to carries the
+    // dead runner's pid.
+    //
+    // Linux has PR_SET_PDEATHSIG for exactly this and node cannot call prctl,
+    // so poll: cheap (one getppid-equivalent every 5s), portable to macOS, and
+    // it cannot fire early — reparenting to init is irreversible, so ppid 1 is
+    // a fact rather than a race. Skipped when we were STARTED detached (ppid
+    // already 1), which is the supported "outlive my shell" launch and must
+    // keep working.
+    //
+    // Not gated on being under a test: a holder orphaned in production is the
+    // same leak with a longer fuse.
+    if (process.ppid > 1) {
+      const orphanCheck = setInterval(() => {
+        if (stopping || process.ppid > 1) return;
+        process.stderr.write("[cache-fix] parent gone; releasing the port and stopping\n");
+        clearInterval(orphanCheck);
+        forward("SIGTERM");
+      }, 5_000);
+      orphanCheck.unref();
+    }
+
     // Take the port back as soon as the child stops owning it. Polled rather
     // than event-driven: nothing tells a parent "your child just called
     // close()", and the child releases the socket well before it exits.
