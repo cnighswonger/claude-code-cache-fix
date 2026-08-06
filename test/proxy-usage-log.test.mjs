@@ -888,3 +888,248 @@ test("agent_id e2e: gate-off + ctx.meta._workflowAgentId present → row omits f
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+// --- ttl_tier + duration_ms fields (directive: cache-fix#297, meter#42) ---
+//
+// Schema (both optional):
+//   ttl_tier?: z.enum(["5m","1h"])
+//   duration_ms?: z.number().int().min(0)
+// Gated on CACHE_FIX_USAGE_LOG_EXTENDED=on. Mirrors the agent_id rollout
+// pattern. Cross-repo: claude-code-meter must have the meter#42 schema
+// change published in a release the operator has installed — the env-var IS
+// the operator's attestation of that. Older meter installs reject rows
+// carrying these keys (MeterRowSchema is a z.strictObject; safeParse fails
+// silently at writer.mjs:68-70 and jsonl-tailer.mjs:143-153).
+
+function withExtendedGate(value, fn) {
+  const prior = process.env.CACHE_FIX_USAGE_LOG_EXTENDED;
+  if (value === undefined) delete process.env.CACHE_FIX_USAGE_LOG_EXTENDED;
+  else process.env.CACHE_FIX_USAGE_LOG_EXTENDED = value;
+  try {
+    return fn();
+  } finally {
+    if (prior === undefined) delete process.env.CACHE_FIX_USAGE_LOG_EXTENDED;
+    else process.env.CACHE_FIX_USAGE_LOG_EXTENDED = prior;
+  }
+}
+
+test("extended gate-off (env unset) + valid ttlTier + durationMs → fields OMITTED", () => {
+  withExtendedGate(undefined, () => {
+    const start = extractMessageStartFields(mkMessageStart());
+    const quota = parseQuotaHeaders(mkHeaders());
+    const record = assembleRecord({
+      start, delta: { output_tokens: 5 }, quota, sid: "abcdef01",
+      ttlTier: "1h", durationMs: 123,
+    });
+    assert.ok(!("ttl_tier" in record));
+    assert.ok(!("duration_ms" in record));
+  });
+});
+
+test("extended gate-on + ttlTier=1h + durationMs=123 → both fields PRESENT", () => {
+  withExtendedGate("on", () => {
+    const start = extractMessageStartFields(mkMessageStart());
+    const quota = parseQuotaHeaders(mkHeaders());
+    const record = assembleRecord({
+      start, delta: { output_tokens: 5 }, quota, sid: "abcdef01",
+      ttlTier: "1h", durationMs: 123,
+    });
+    assert.equal(record.ttl_tier, "1h");
+    assert.equal(record.duration_ms, 123);
+  });
+});
+
+test("extended gate-on + ttlTier=5m → field PRESENT (other enum member)", () => {
+  withExtendedGate("on", () => {
+    const start = extractMessageStartFields(mkMessageStart());
+    const quota = parseQuotaHeaders(mkHeaders());
+    const record = assembleRecord({
+      start, delta: { output_tokens: 5 }, quota, sid: "abcdef01",
+      ttlTier: "5m",
+    });
+    assert.equal(record.ttl_tier, "5m");
+  });
+});
+
+test("extended gate-on + ttlTier is bogus string → field OMITTED (enum tripwire)", () => {
+  withExtendedGate("on", () => {
+    const start = extractMessageStartFields(mkMessageStart());
+    const quota = parseQuotaHeaders(mkHeaders());
+    const record = assembleRecord({
+      start, delta: { output_tokens: 5 }, quota, sid: "abcdef01",
+      ttlTier: "1d",
+    });
+    assert.ok(!("ttl_tier" in record));
+  });
+});
+
+test("extended gate-on + ttlTier undefined → field OMITTED (source unset)", () => {
+  withExtendedGate("on", () => {
+    const start = extractMessageStartFields(mkMessageStart());
+    const quota = parseQuotaHeaders(mkHeaders());
+    const record = assembleRecord({
+      start, delta: { output_tokens: 5 }, quota, sid: "abcdef01",
+      // ttlTier intentionally omitted
+    });
+    assert.ok(!("ttl_tier" in record));
+  });
+});
+
+test("extended gate-on + durationMs negative → field OMITTED (min(0) tripwire)", () => {
+  withExtendedGate("on", () => {
+    const start = extractMessageStartFields(mkMessageStart());
+    const quota = parseQuotaHeaders(mkHeaders());
+    const record = assembleRecord({
+      start, delta: { output_tokens: 5 }, quota, sid: "abcdef01",
+      durationMs: -1,
+    });
+    assert.ok(!("duration_ms" in record));
+  });
+});
+
+test("extended gate-on + durationMs non-integer → field OMITTED (int() tripwire)", () => {
+  withExtendedGate("on", () => {
+    const start = extractMessageStartFields(mkMessageStart());
+    const quota = parseQuotaHeaders(mkHeaders());
+    const record = assembleRecord({
+      start, delta: { output_tokens: 5 }, quota, sid: "abcdef01",
+      durationMs: 1.5,
+    });
+    assert.ok(!("duration_ms" in record));
+  });
+});
+
+test("extended gate-on + durationMs is a string → field OMITTED (defensive type check)", () => {
+  withExtendedGate("on", () => {
+    const start = extractMessageStartFields(mkMessageStart());
+    const quota = parseQuotaHeaders(mkHeaders());
+    const record = assembleRecord({
+      start, delta: { output_tokens: 5 }, quota, sid: "abcdef01",
+      durationMs: "123",
+    });
+    assert.ok(!("duration_ms" in record));
+  });
+});
+
+test("extended gate-on + durationMs=0 → field PRESENT (min(0) admits zero)", () => {
+  withExtendedGate("on", () => {
+    const start = extractMessageStartFields(mkMessageStart());
+    const quota = parseQuotaHeaders(mkHeaders());
+    const record = assembleRecord({
+      start, delta: { output_tokens: 5 }, quota, sid: "abcdef01",
+      durationMs: 0,
+    });
+    assert.equal(record.duration_ms, 0);
+  });
+});
+
+test("extended gate-on + ttlTier valid but durationMs invalid → mixed emit (independent gates)", () => {
+  withExtendedGate("on", () => {
+    const start = extractMessageStartFields(mkMessageStart());
+    const quota = parseQuotaHeaders(mkHeaders());
+    const record = assembleRecord({
+      start, delta: { output_tokens: 5 }, quota, sid: "abcdef01",
+      ttlTier: "1h", durationMs: -5,
+    });
+    assert.equal(record.ttl_tier, "1h");
+    assert.ok(!("duration_ms" in record));
+  });
+});
+
+test("extended e2e: gate-on + ctx.meta._ttlTier + onRequest/onResponseStart timing → row carries fields", async () => {
+  const mod = await freshExt();
+  const dir = await newTmp();
+  const path = join(dir, "usage.jsonl");
+  process.env.CACHE_FIX_USAGE_LOG = path;
+  process.env.CACHE_FIX_USAGE_LOG_EXTENDED = "on";
+  try {
+    const ctx = {
+      meta: { _ttlTier: "1h" },
+      body: {},
+      event: mkMessageStart(),
+      telemetry: {},
+      responseHeaders: mkHeaders(),
+    };
+    // Simulate the lifecycle: onRequest → onResponseStart → message_start → message_delta.
+    await mod.default.onRequest(ctx);
+    // Force a small measurable gap so durationMs is > 0 without being flaky.
+    await new Promise((r) => setTimeout(r, 5));
+    await mod.default.onResponseStart(ctx);
+    await mod.default.onStreamEvent(ctx);
+    ctx.event = { type: "message_delta", usage: { output_tokens: 100 } };
+    await mod.default.onStreamEvent(ctx);
+
+    const lines = (await readFile(path, "utf8")).split("\n").filter(Boolean);
+    assert.equal(lines.length, 1);
+    const row = JSON.parse(lines[0]);
+    assert.equal(row.ttl_tier, "1h");
+    assert.equal(typeof row.duration_ms, "number");
+    assert.ok(row.duration_ms >= 0, `duration_ms should be >= 0, got ${row.duration_ms}`);
+    assert.ok(Number.isInteger(row.duration_ms), "duration_ms must be an integer");
+  } finally {
+    delete process.env.CACHE_FIX_USAGE_LOG;
+    delete process.env.CACHE_FIX_USAGE_LOG_EXTENDED;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("extended e2e: gate-off + ctx.meta._ttlTier present → row omits fields (back-compat default-off)", async () => {
+  const mod = await freshExt();
+  const dir = await newTmp();
+  const path = join(dir, "usage.jsonl");
+  process.env.CACHE_FIX_USAGE_LOG = path;
+  // CACHE_FIX_USAGE_LOG_EXTENDED intentionally unset
+  try {
+    const ctx = {
+      meta: { _ttlTier: "1h" },
+      body: {},
+      event: mkMessageStart(),
+      telemetry: {},
+      responseHeaders: mkHeaders(),
+    };
+    await mod.default.onRequest(ctx);
+    await mod.default.onResponseStart(ctx);
+    await mod.default.onStreamEvent(ctx);
+    ctx.event = { type: "message_delta", usage: { output_tokens: 100 } };
+    await mod.default.onStreamEvent(ctx);
+
+    const lines = (await readFile(path, "utf8")).split("\n").filter(Boolean);
+    assert.equal(lines.length, 1);
+    const row = JSON.parse(lines[0]);
+    assert.ok(!("ttl_tier" in row));
+    assert.ok(!("duration_ms" in row));
+  } finally {
+    delete process.env.CACHE_FIX_USAGE_LOG;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("extended gate-on + onResponseStart never fired → duration_ms OMITTED (honest missing timing)", async () => {
+  const mod = await freshExt();
+  const dir = await newTmp();
+  const path = join(dir, "usage.jsonl");
+  process.env.CACHE_FIX_USAGE_LOG = path;
+  process.env.CACHE_FIX_USAGE_LOG_EXTENDED = "on";
+  try {
+    const ctx = {
+      meta: { _ttlTier: "1h" },
+      body: {},
+      event: mkMessageStart(),
+      telemetry: {},
+      responseHeaders: mkHeaders(),
+    };
+    // Deliberately skip onRequest and onResponseStart — timing is unavailable.
+    await mod.default.onStreamEvent(ctx);
+    ctx.event = { type: "message_delta", usage: { output_tokens: 100 } };
+    await mod.default.onStreamEvent(ctx);
+
+    const lines = (await readFile(path, "utf8")).split("\n").filter(Boolean);
+    const row = JSON.parse(lines[0]);
+    assert.equal(row.ttl_tier, "1h", "ttl_tier still emits — its source is present");
+    assert.ok(!("duration_ms" in row), "duration_ms omitted when timing hooks didn't fire");
+  } finally {
+    delete process.env.CACHE_FIX_USAGE_LOG;
+    delete process.env.CACHE_FIX_USAGE_LOG_EXTENDED;
+    await rm(dir, { recursive: true, force: true });
+  }
+});

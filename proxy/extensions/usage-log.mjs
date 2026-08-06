@@ -163,7 +163,7 @@ export function computeDelta(current, previous) {
   return current - previous;
 }
 
-export function assembleRecord({ start, delta, quota, requestedModel, sid, prevQ5h, prevQ7d, requestId, workflowAgent, now = new Date() }) {
+export function assembleRecord({ start, delta, quota, requestedModel, sid, prevQ5h, prevQ7d, requestId, workflowAgent, ttlTier, durationMs, now = new Date() }) {
   const s = start || {};
   const d = delta || {};
   const q = quota || {};
@@ -270,6 +270,28 @@ export function assembleRecord({ start, delta, quota, requestedModel, sid, prevQ
     record.agent_id_source = workflowAgent.source;
   }
 
+  // Optional: emit ttl_tier + duration_ms when CACHE_FIX_USAGE_LOG_EXTENDED=on.
+  // Cross-repo contract: claude-code-meter must accept these fields on
+  // MeterRowSchema before we emit them (meter #42 landed the schema change;
+  // publishing that release is the operator-visible prerequisite for flipping
+  // this gate). MeterRowSchema is a z.strictObject — an older meter install
+  // rejects any row carrying an unknown key, and rejection is silent at both
+  // chokepoints (writer.mjs:68-70 safeParse→null; jsonl-tailer.mjs:143-153
+  // parse→skip). The env-var IS the operator's attestation of a compatible
+  // meter — there is no runtime version probe.
+  //
+  // Same belt-and-braces pattern as agent_id: re-enforce the schema's
+  // constraints here so a future refactor to ttl-tier-detect or the timing
+  // hooks can't emit a row the meter's strict-object validation would reject.
+  if (process.env.CACHE_FIX_USAGE_LOG_EXTENDED === "on") {
+    if (ttlTier === "5m" || ttlTier === "1h") {
+      record.ttl_tier = ttlTier;
+    }
+    if (typeof durationMs === "number" && Number.isInteger(durationMs) && durationMs >= 0) {
+      record.duration_ms = durationMs;
+    }
+  }
+
   return record;
 }
 
@@ -303,6 +325,23 @@ export default {
   enabled: false,
   order: 650,
 
+  // Timing capture for duration_ms (emitted when CACHE_FIX_USAGE_LOG_EXTENDED=on).
+  // Kept self-contained rather than reading from request-log.mjs's stashes,
+  // because request-log is enabled:false in extensions.json — an implementation
+  // that depended on it would produce no duration on the default extension
+  // graph. Definition: time-to-response-start, not to completion. That is the
+  // value we can produce without buffering.
+  async onRequest(ctx) {
+    if (!ctx) return;
+    ctx.meta = ctx.meta || {};
+    ctx.meta._usageLogRequestStart = Date.now();
+  },
+
+  async onResponseStart(ctx) {
+    if (!ctx || !ctx.meta) return;
+    ctx.meta._usageLogResponseStart = Date.now();
+  },
+
   async onStreamEvent(ctx) {
     if (!ctx || !ctx.event) return;
 
@@ -328,6 +367,17 @@ export default {
       const requestedModel = ctx.telemetry?.requestedModel || undefined;
       const requestId = extractRequestId(ctx.responseHeaders || {});
       const workflowAgent = ctx.meta?._workflowAgentId || undefined;
+      // ttl_tier source: ttl-tier-detect.mjs (order 75) sets _ttlTier on every
+      // request. It runs before usage-log (order 650), so the value is present
+      // by the time we assemble. assembleRecord re-validates the shape.
+      const ttlTier = ctx.meta?._ttlTier;
+      // duration_ms source: our own onRequest+onResponseStart hooks above.
+      // Falls back to undefined if either timing didn't fire (health-checks,
+      // non-streaming request paths); assembleRecord omits the key rather than
+      // emitting a null.
+      const rs = ctx.meta?._usageLogRequestStart;
+      const ss = ctx.meta?._usageLogResponseStart;
+      const durationMs = typeof rs === "number" && typeof ss === "number" && ss >= rs ? ss - rs : undefined;
 
       const record = assembleRecord({
         start,
@@ -339,6 +389,8 @@ export default {
         prevQ7d: _lastQ7d,
         requestId,
         workflowAgent,
+        ttlTier,
+        durationMs,
         now: new Date(),
       });
 
