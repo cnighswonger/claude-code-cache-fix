@@ -115,6 +115,37 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
     await Promise.race([exited, new Promise((r) => setTimeout(r, 8_000))]);
     try { launcher.kill("SIGKILL"); } catch {}
     await Promise.race([exited, new Promise((r) => setTimeout(r, 2_000))]);
+    // A handover successor is DETACHED and deliberately ignores exit-with-parent
+    // — that guard is what makes a redeploy free — so nothing above reaps it. It
+    // outlives the launcher still holding this runner's stdio, and the file then
+    // finishes every case and never exits. Measured: 25 cases green in 10s, then
+    // 8 minutes hung on one survivor, one leaked per run.
+    //
+    // SIGHUP, not SIGTERM: SIGTERM is the signal that means "hand the socket on",
+    // so it would breed the next successor and this loop would never drain.
+    for (let i = 0; i < 5 && !process.env.CCF_TEST_NO_REAP; i++) {
+      const owners = listeners(port);
+      if (!owners.length) break;
+      let signalled = 0;
+      for (const o of owners) {
+        const pid = Number(o);
+        if (!Number.isInteger(pid) || pid <= 1) continue;
+        // ONLY an orphan. freePort() hands the same number out again once the
+        // OS recycles it, so "whoever listens on my port" can be a NEIGHBOUR's
+        // live launcher — measured: reaping by port alone killed the holder in
+        // "gives the port up when the proxy never starts" mid-run, and it went
+        // red having spawned 4 of the 5 proxies it counts. A leaked successor is
+        // detached and always reparented to init; every live fixture's process
+        // still has the test runner above it.
+        let ppid = 0;
+        try { ppid = Number(execFileSync("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8" }).trim()); }
+        catch { continue; }
+        if (ppid !== 1) continue;
+        try { process.kill(pid, "SIGHUP"); signalled++; } catch {}
+      }
+      if (!signalled) break;
+      await new Promise((r) => setTimeout(r, 300));
+    }
   }
 }
 
@@ -271,9 +302,22 @@ async function withFakeProxy(serverSrc, fn, { watchMs, selfHeal = "" } = {}) {
 it("gives the port up when the proxy never starts", async () => {
   await withFakeProxy('process.stderr.write("simulated\\n"); process.exit(1);\n',
     async ({ launcher, bound, stderr }) => {
+      // 30s, and the number is the cost of FIVE NODE STARTUPS — not of the
+      // backoff, which the fixture already shrinks to 25ms rungs. Measured:
+      // 5,943ms alone, 8,053ms inside the file, against a cap that was 8,000 —
+      // so this went red on how many neighbours happened to be running, having
+      // spawned 4 of the 5 it counts. The cap still has to exist, because the
+      // defect it catches is "respawns forever"; it just must not be reachable
+      // by load.
+      // "close", NOT "exit". exit fires when the process ends, close when its
+      // stdio has drained — and this case reads the LAST line the launcher
+      // writes. Measured: exitCode=1, signal=null, stderr holding only the 4
+      // "simulated" lines, with "releasing the port" still in the pipe. Alone it
+      // drained in time and passed; in the full file it did not. The repo
+      // already moved 15 forks off "exit" for exactly this; this one was missed.
       const exited = await Promise.race([
-        new Promise((r) => launcher.on("exit", () => r(true))),
-        new Promise((r) => setTimeout(() => r(false), 8_000)),
+        new Promise((r) => launcher.on("close", () => r(true))),
+        new Promise((r) => setTimeout(() => r(false), 30_000)),
       ]);
       assert.ok(exited, "the launcher respawned a hopeless proxy forever, holding the port");
       assert.match(stderr(), /releasing the port/);
@@ -329,6 +373,27 @@ it("stops when signalled between the proxy's death and its respawn", async () =>
     launcher.kill("SIGTERM");
     const stopped = await Promise.race([exited, new Promise((r) => setTimeout(() => r(false), 10_000))]);
     assert.ok(stopped, "the holder ignored SIGTERM and kept the port through a supervisor's stop");
+  });
+});
+
+// SIGHUP means RELEASE, and a takeover is what depends on it. Node's default
+// action for SIGHUP also ends the holder, so "did it exit" cannot tell the two
+// apart — only the PORT can. A holder that goes without telling its child
+// leaves the child holding the socket, and the claimant then waits out its
+// deadline against a port that never frees.
+it("frees the port when signalled SIGHUP, so a claimant can take it", async () => {
+  await withHeldPort(async ({ launcher, exited, port }) => {
+    launcher.kill("SIGHUP");
+    // Wait for the holder to be GONE, then look once. A poll loop here would
+    // call lsof over and over, and execFileSync BLOCKS this runner's event loop
+    // for every one of them — the file already documents what that starvation
+    // does to its neighbours. Measured: with the loop, "keeps the port and backs
+    // off" went red in 2 of 5 whole-file runs on a check its own logic passes.
+    await Promise.race([exited, new Promise((r) => setTimeout(r, 15_000))]);
+    const free = !listeners(port).length;
+    assert.ok(free,
+      "SIGHUP left something still listening — the holder went without releasing, " +
+      "so whoever claims this port waits out its deadline against an orphan");
   });
 });
 
@@ -583,6 +648,38 @@ it("stops when signalled between the proxy's death and its respawn", async () =>
         assert.ok(back,
           "the port stayed unowned after its holder was killed — every session wired " +
           "to that address is stranded, which is the outage this guards");
+
+        // SERVED IS NOT SUPERVISED, and only the second one survives the NEXT
+        // kill. The orphaned proxy keeps the port by itself, so a health probe
+        // passes with nothing left to restart it. Measured on the personal Mac:
+        // 9901 answering 200 for 16h with its whole lineage reparented to init,
+        // and every run-service since unable to take it back — the port looked
+        // healthy the entire time.
+        const ancestry = () => {
+          let pid = 0;
+          try {
+            pid = Number(execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN"],
+                                      { encoding: "utf8" }).trim().split("\n").filter(Boolean)[0]);
+          } catch { return false; }
+          for (let hop = 0; Number.isInteger(pid) && pid > 1 && hop < 4; hop++) {
+            let line = "";
+            try { line = execFileSync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8" }); }
+            catch { return false; }
+            if (line.includes("run-service")) return true;
+            try { pid = Number(execFileSync("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8" }).trim()); }
+            catch { return false; }
+          }
+          return false;
+        };
+        const byWhen = Date.now() + 25_000;
+        let supervised = false;
+        while (!supervised && Date.now() < byWhen) {
+          await new Promise((r) => setTimeout(r, 300));
+          supervised = ancestry();
+        }
+        assert.ok(supervised,
+          "the port is served but no run-service supervises the listener — the heal " +
+          "restored the ADDRESS and not the supervision, so the next crash is an outage");
       } finally {
         try { first.kill("SIGKILL"); } catch {}
         // Reap the HEALED holder, the one this test asked to be born.

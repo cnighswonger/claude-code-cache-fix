@@ -324,6 +324,11 @@ function holdPort(rest) {
     };
     process.on("SIGTERM", () => forward("SIGTERM"));
     process.on("SIGINT", () => forward("SIGINT"));
+    // SIGHUP is the word for "release the port" everywhere else in this file, so
+    // a holder must answer it too. Without a handler node's default killed the
+    // holder outright, leaving its child holding the socket — the takeover below
+    // then had nobody to ask and waited out its deadline.
+    process.on("SIGHUP", () => forward("SIGHUP"));
 
     // STOP WHEN NOBODY IS LEFT TO STOP US.
     //
@@ -695,13 +700,16 @@ function holdPort(rest) {
     // is usually a proxy an older rc started — commonly a plain `server` that
     // bound the port itself, with nothing under it to hand the socket down.
     //
-    // So: ask it to stop, then take the port. SIGTERM, never SIGKILL — the
-    // proxy's own handler drains in-flight requests first and FINs whatever is
-    // left (measured in proxy/server.mjs: closeAllConnections() sends RST and a
-    // client that had every byte still threw the data away). The window between
-    // its exit and our bind is the only unowned moment, measured at 0.06s, and
-    // it is paid ONCE: everything after this restarts under the holder with no
-    // window at all.
+    // So: ask it to RELEASE, then take the port. SIGHUP, not SIGTERM — SIGTERM
+    // is the signal that makes a redeploy free, so our own proxy answers it by
+    // handing the listening socket to a successor and the port never frees at
+    // all. Measured on the personal Mac: pid 78405 handed down to 83219, this
+    // path printed "could not take port within 20s", the holder exited, and the
+    // lineage stayed unsupervised — a livelock, not a slow takeover. SIGHUP
+    // means "go, and do not replace yourself"; both roles honour it and both
+    // drain in-flight requests first. The window between the release and our
+    // bind is the only unowned moment, measured at 0.06s, and it is paid ONCE:
+    // everything after this restarts under the holder with no window at all.
     //
     // Idempotence is preserved by what we stop: an incumbent that is ALREADY a
     // holder of ours answers nothing here and keeps its port, because we only
@@ -712,7 +720,7 @@ function holdPort(rest) {
       const incumbent = holderPidOn(port);
       if (incumbent === "holder") return settle(0);   // ours already; nothing to do
       if (!incumbent) return settle(0);               // cannot identify it: leave it alone
-      try { process.kill(incumbent, "SIGTERM"); } catch { return settle(0); }
+      try { process.kill(incumbent, "SIGHUP"); } catch { return settle(0); }
       // Retry the bind until it lands. The incumbent drains first, so this is
       // not a fixed wait — a busy proxy takes longer and we simply keep asking.
       const deadline = Date.now() + 20_000;
