@@ -271,16 +271,12 @@ export function assembleRecord({ start, delta, quota, requestedModel, sid, prevQ
   }
 
   // Optional: emit ttl_tier + duration_ms when CACHE_FIX_USAGE_LOG_EXTENDED=on.
-  // Cross-repo contract: claude-code-meter must accept these fields on
-  // MeterRowSchema before we emit them. Meter #42 merged the DIRECTIVE
-  // (`docs/directives/usage-row-extended-fields.md`) but not the schema
-  // change itself; a follow-up impl PR to `src/log/schema.mjs` must land
-  // and ship in a tagged meter release BEFORE this gate is safe to flip.
-  // MeterRowSchema is a z.strictObject — an older meter install rejects
-  // any row carrying an unknown key, and rejection is silent at both
-  // chokepoints (writer.mjs:68-70 safeParse→null; jsonl-tailer.mjs:143-153
-  // parse→skip). The env-var IS the operator's attestation of a compatible
-  // meter — there is no runtime version probe.
+  // Cross-repo contract: claude-code-meter v0.9.0+ accepts these fields on
+  // MeterRowSchema. Older meter installs reject any row carrying an unknown
+  // key, and rejection is silent at both chokepoints (writer.mjs:68-70
+  // safeParse→null; jsonl-tailer.mjs:143-153 parse→skip). The env-var IS
+  // the operator's attestation of a compatible meter — there is no runtime
+  // version probe.
   //
   // Same belt-and-braces pattern as agent_id: re-enforce the schema's
   // constraints here so a future refactor to ttl-tier-detect or the timing
