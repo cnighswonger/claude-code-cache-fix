@@ -561,6 +561,48 @@ describe("zero-downtime reload", () => {
       await new Promise((r) => upstream.close(r));
       for (const c of stolenSockets) c.destroy();
       await new Promise((r) => listener.close(r));
+      // REAP THE SUCCESSOR. SIGTERM above is the signal that means "hand the
+      // socket on", so each stop above BREEDS a detached proxy that ignores
+      // exit-with-parent by design — that guard is what makes a redeploy free.
+      // Nothing here was reaping them: measured, 3 left per run, all
+      // FROM_HANDOVER=1 at ppid 1, one of them on 9801. They hold this runner's
+      // stdio, so the file finished its cases and then never exited, and with
+      // it the whole `npm test` — 1,108 cases in and no exit code.
+      //
+      // SIGHUP, never SIGTERM: SIGTERM would breed the next one and this loop
+      // would never drain.
+      // BOTH PORTS. Some cases here make the handed-down fd deliberately
+      // unusable, and the server then falls back to binding the DEFAULT — so a
+      // successor bred from one of those sits on 9801, not on this fixture's
+      // port. Reaping only the fixture's port left exactly one behind, measured,
+      // and one is enough to hold the runner open.
+      const defaultPort = Number(
+        /envInt\("CACHE_FIX_PROXY_PORT",\s*(\d+)\)/.exec(
+          readFileSync(new URL("../proxy/config.mjs", import.meta.url), "utf8"))?.[1]) || 0;
+      for (let i = 0; i < 5; i++) {
+        let owners = [];
+        for (const port of [PORT, defaultPort].filter(Boolean)) {
+          try {
+            owners = owners.concat(
+              execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN"],
+                           { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
+                .trim().split("\n").filter(Boolean));
+          } catch { /* nobody on that one */ }
+        }
+        if (!owners.length) break;
+        let signalled = 0;
+        for (const o of owners) {
+          const pid = Number(o);
+          if (!Number.isInteger(pid) || pid <= 1) continue;
+          let ppid = 0;
+          try { ppid = Number(execFileSync("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8" }).trim()); }
+          catch { continue; }
+          if (ppid !== 1) continue;          // only an orphan; never a neighbour's live fixture
+          try { process.kill(pid, "SIGHUP"); signalled++; } catch {}
+        }
+        if (!signalled) break;
+        await new Promise((r) => setTimeout(r, 300));
+      }
     }
   });
 
