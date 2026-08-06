@@ -115,4 +115,80 @@ describe("holder handover (SIGUSR2)", () => {
       }
     }
   });
+  // A HANDOVER SUCCESSOR MUST STILL PUT A HOLDER BACK. This is the state two of
+  // our three machines sat in for 30 and 48 days: serving 200, holder long gone,
+  // nothing left to restart the proxy if it ever stopped. The lineage reaches it
+  // the first time anything redeploys, because a successor used to skip the
+  // self-heal outright — and a successor is what every proxy becomes.
+  //
+  // The guard it skipped on was not wrong: a successor's ppid changes on EVERY
+  // handover (the predecessor exits right after), so "ppid changed" fires on a
+  // healthy one and starts a RIVAL holder — measured at 1,970 then 6,528
+  // requests lost, port down twice. The answer is to ask whether anyone is
+  // SUPERVISING the port, which is a fact, rather than whether our parent
+  // changed, which is a heuristic that cannot tell the two apart.
+  it("puts a holder back when a handover successor outlives its holder", async () => {
+    const port = await freePort();
+    const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port),
+                  CACHE_FIX_FORWARD_PROXY: "on" };
+    for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                     "ALL_PROXY", "all_proxy", "LISTEN_FDS", "LISTEN_PID",
+                     "CACHE_FIX_HOLD_PORT", "CACHE_FIX_WATCH_DEPLOY_MS",
+                     "CACHE_FIX_SELF_HEAL"]) delete env[k];
+    const holder = spawn(process.execPath, [launcherPath, "run-service"],
+                         { env, stdio: ["ignore", "pipe", "pipe"] });
+    const supervised = () => listeners(port).some((p) => {
+      let pid = Number(p);
+      for (let hop = 0; Number.isInteger(pid) && pid > 1 && hop < 4; hop++) {
+        let line = "";
+        try { line = execFileSync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8" }); }
+        catch { return false; }
+        if (line.includes("run-service")) return true;
+        try { pid = Number(execFileSync("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8" }).trim()); }
+        catch { return false; }
+      }
+      return false;
+    });
+    try {
+      const up = Date.now() + 25_000;
+      let body = await probe(port);
+      while (body.startsWith("ERR:") && Date.now() < up) body = await probe(port);
+      assert.equal(body, "ok", "the holder never came up, so nothing was measured");
+
+      // Force a HANDOVER, so the process on the port carries FROM_HANDOVER: the
+      // child hands its socket to a successor it spawns itself.
+      const kids = execFileSync("pgrep", ["-P", String(holder.pid)], { encoding: "utf8" })
+        .trim().split("\n").filter(Boolean).map(Number);
+      assert.ok(kids.length, "premise: the holder must have a child to hand over");
+      process.kill(kids[0], "SIGTERM");
+      const swapped = Date.now() + 20_000;
+      while (Date.now() < swapped && listeners(port).includes(String(kids[0])))
+        await new Promise((r) => setTimeout(r, 100));
+
+      assert.ok(supervised(), "premise: the port must be supervised before we take the holder away");
+      holder.kill("SIGKILL");
+
+      const back = Date.now() + 45_000;
+      let ok = false;
+      while (!ok && Date.now() < back) {
+        await new Promise((r) => setTimeout(r, 500));
+        ok = supervised();
+      }
+      assert.ok(ok,
+        "the port is served but nothing supervises it — a handover successor skipped the " +
+        "self-heal, so this lineage can never put a holder back and the next crash is an outage");
+      assert.equal(await probe(port), "ok", "the port did not survive losing its holder");
+    } finally {
+      try { holder.kill("SIGKILL"); } catch { }
+      for (let i = 0; i < 6; i++) {
+        const held = listeners(port);
+        if (!held.length) break;
+        for (const p of held) {
+          const pid = Number(p);
+          if (Number.isInteger(pid) && pid > 1) { try { process.kill(pid, "SIGHUP"); } catch { } }
+        }
+        await new Promise((r) => setTimeout(r, 300));
+      }
+    }
+  });
 });

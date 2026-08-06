@@ -565,8 +565,17 @@ function holdPort(rest) {
         // can put a new holder back on it rather than exiting quietly.
         // LISTEN_PID is deliberately unset — the child's pid is unknown before
         // the spawn, and the receiver reads an absent one as "addressed to me".
+        // CACHE_FIX_HELD_BY names US, and only a holder ever sets it. The child
+        // can then tell "a holder is alive above me" from "my predecessor handed
+        // me this on its way out" with two free facts and no probe: the marker
+        // outlives us because it is the child's own environment, while its ppid
+        // moves to 1 the instant we die. The two disagreeing IS the orphaning.
+        // cswap's pin answers the same question this way; we had been answering
+        // it with "did my ppid change", which is true on every handover too and
+        // therefore cost a rival holder — 1,970 then 6,528 requests.
         env: { ...process.env, CACHE_FIX_PROXY_PORT: "0", CACHE_FIX_PROXY_BIND: "127.0.0.1",
-               CACHE_FIX_HELD_PORT: String(port), LISTEN_FDS: "1" },
+               CACHE_FIX_HELD_PORT: String(port), CACHE_FIX_HELD_BY: String(process.pid),
+               LISTEN_FDS: "1" },
       });
       // Hand the socket over NOW, not when the child reports "listening".
       //

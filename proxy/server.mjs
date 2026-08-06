@@ -996,7 +996,6 @@ function exitWithParent() {
   // old, holding the test runner's stdout pipe and stalling the whole suite at
   // 568 cases until they were reaped by hand.
   if (process.env.CACHE_FIX_PROXY_PORT !== "0") return;
-  const born = process.ppid;
   // The advertised port, which the holder passed down so we can put a new
   // holder back on it. Without it we can only exit, and the port stays dead
   // until a human opens a shell — which is exactly the outage this exists for.
@@ -1025,10 +1024,27 @@ function exitWithParent() {
   // (0 "holder died" events across 4 runs), so it exercised a path the
   // condition cannot reach there. A mutation that cannot trip the guard proves
   // nothing about the guard — "no difference" was "no measurement".
-  if (process.env.CACHE_FIX_FROM_HANDOVER === "1") return;
+  // NO BLANKET EXEMPTION ANY MORE. This used to return outright for a handover
+  // successor, and a successor is what every proxy becomes the first time
+  // anything redeploys — so the whole lineage permanently lost the ability to
+  // put a holder back. Measured on the fleet: <linux-host> orphaned 30 days, the
+  // personal Mac 48, both serving 200 the entire time with nobody above the
+  // listener.
+  //
+  // What replaces it is the marker, not the ppid. CACHE_FIX_HELD_BY is set by a
+  // HOLDER ONLY, naming itself; a predecessor handing over clears it. So a
+  // successor is not "held" and can never be "orphaned", which is what the
+  // blanket return was protecting against — a rival holder started off a ppid
+  // that legitimately changes on every handover.
+  const heldBy = process.env.CACHE_FIX_HELD_BY;
   const advertised = process.env.CACHE_FIX_HELD_PORT;
   setInterval(() => {
-    if (process.ppid === born) return;
+    // Two facts, both free, and no probe: the marker outlives the holder
+    // because it is our own environment, while our ppid moves to 1 the instant
+    // the holder dies. The two disagreeing IS the orphaning. `born` is no
+    // longer consulted — it could not tell a dead holder from a predecessor
+    // that exited on purpose.
+    if (!heldBy || heldBy === String(process.ppid)) return;
     // The holder is gone and every session on this box has HTTPS_PROXY baked at
     // exec — they cannot be re-pointed, so the address must get an owner back.
     // Measured on <linux-host>: the holder died, nothing revived it, and every session
@@ -1174,12 +1190,31 @@ if (invokedAsScript) {
     // that still owns the socket — the pre-detach case, and cswap's pin —
     // reads as "put a successor on this socket". The two paths must not
     // disagree about what our exit means.
-    const askForSuccessor = active.inheritedSocket && !releasing;
+    // UNDER A LIVE HOLDER THERE IS NOTHING TO HAND OVER. The holder still owns
+    // the socket, so it survives our exit on its own — measured: parent binds,
+    // child listens, child SIGKILLed, the port still ACCEPTED/QUEUED. Spawning
+    // our own successor there produces a proxy the holder did not place and does
+    // not supervise, which is the process that then cannot self-heal. cswap's
+    // pin measured the same shape from the other side: a successor that could
+    // not take the port served UNHELD on another one for 76 minutes while every
+    // health signal stayed green. Exit instead, and let the holder place the
+    // next child on the descriptor it never let go of.
+    const heldByLiveHolder = !!process.env.CACHE_FIX_HELD_BY
+      && process.env.CACHE_FIX_HELD_BY === String(process.ppid);
+    const askForSuccessor = active.inheritedSocket && !releasing && !heldByLiveHolder;
     if (askForSuccessor) {
       try {
         spawn(process.execPath, [fileURLToPath(import.meta.url), ...process.argv.slice(2)], {
           stdio: ["ignore", "inherit", "inherit", 3],
-          env: { ...process.env, LISTEN_FDS: "1", CACHE_FIX_FROM_HANDOVER: "1" },
+          // HELD_BY is CLEARED, and that single fact is what stops a successor
+          // self-healing into a rival. Only a live holder names itself; a
+          // predecessor handing over on its way out does not. So a successor is
+          // not "held", therefore can never be "orphaned from its holder", and
+          // the self-heal below needs no blanket exemption for the whole
+          // lineage — which is what left two of three machines unable to put a
+          // holder back for 30 and 48 days.
+          env: { ...process.env, LISTEN_FDS: "1", CACHE_FIX_FROM_HANDOVER: "1",
+                 CACHE_FIX_HELD_BY: undefined },
           detached: true,
         }).unref();
       } catch (err) {
