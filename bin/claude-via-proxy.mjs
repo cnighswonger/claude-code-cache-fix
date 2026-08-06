@@ -17,6 +17,7 @@ const SERVER_PATH = resolve(__dirname, "../proxy/server.mjs");
 // DISK rather than from the bytes it booted with — which is the only reason
 // anyone asks it to hand the port on.
 const LAUNCHER_PATH = fileURLToPath(import.meta.url);
+const GAP_RELAY_PATH = resolve(__dirname, "gap-relay.mjs");
 // AT MODULE LOAD, not on first use. This value is an IDENTITY — "the bytes this
 // process is running" — and the only moment it is certainly true is next to the
 // exec that loaded them. Hashing lazily instead reads DISK at whatever later
@@ -193,63 +194,26 @@ class HolderSocket extends EventEmitter {
   // implementation of the thing we are relaying to.
   openGap() {
     if (this._gap || !this._handle) return;
-    const hop = (process.env.CACHE_FIX_FALLBACK_PROXIES || "").split(",")[0].trim();
-    const m = /^(?:https?:\/\/)?(?:[^@/]*@)?([^:/]+):(\d+)/.exec(hop);
-    const live = new Set();
-    // WHEN THERE IS NO HOP EITHER, GO DIRECT. "Everything off" is a real
-    // operating state on these machines — privoxy, this proxy and the pin can
-    // all be stopped — and a session whose HTTPS_PROXY is this address cannot be
-    // re-pointed, so the address itself has to complete the request. CONNECT is
-    // the whole of what matters here: every call this proxy exists for is HTTPS.
-    // Plain absolute-form is deliberately not handled — it would be a second
-    // implementation of the proxy this is standing in for, and it is not what
-    // gets used.
-    const splice = (client, up) => {
-      live.add(up);
-      up.on("close", () => live.delete(up));
-      const bail = () => { up.destroy(); client.destroy(); };
-      up.on("error", bail);
-      client.on("error", bail);
-      return bail;
-    };
-    const srv = net.createServer((client) => {
-      live.add(client);
-      client.on("close", () => live.delete(client));
-      if (m) {                                        // a hop exists: splice to it
-        const up = net.connect(Number(m[2]), m[1]);
-        splice(client, up);
-        up.on("connect", () => { client.pipe(up); up.pipe(client); });
-        return;
-      }
-      client.once("data", (first) => {
-        const line = String(first).split("\r\n")[0];
-        const c = /^CONNECT\s+([^\s:]+):(\d+)/i.exec(line);
-        if (!c) { client.destroy(); return; }          // not CONNECT: not ours to answer
-        const up = net.connect(Number(c[2]), c[1]);
-        splice(client, up);
-        up.on("connect", () => {
-          client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-          client.pipe(up); up.pipe(client);
-        });
+    const fd = this._handle.fd;
+    if (typeof fd !== "number" || fd < 0) return;
+    try {
+      this._gap = spawn(process.execPath, [GAP_RELAY_PATH], {
+        stdio: ["ignore", "ignore", "inherit", fd],
+        env: { ...process.env, CACHE_FIX_HOLDER_TREE: undefined, CACHE_FIX_HELD_BY: undefined },
       });
-    });
-    srv.on("error", () => { try { srv.close(); } catch { } if (this._gap === srv) this._gap = null; });
-    srv.listen({ port: this._port, host: this._host });
-    this._gapSockets = live;
-    this._gap = srv;
+      this._gap.on("exit", () => { this._gap = null; });
+    } catch {
+      this._gap = null;
+    }
   }
-  // Before spawning: the child cannot listen on the fd while we are listening
-  // on the same port.
+  // Before a real proxy starts, and on every release: the gap is a PROCESS
+  // holding this socket, so a stop that only ends the child leaves it accepting.
+  // Two acceptors on one descriptor take turns — measured, a gap left open
+  // across a handover reset 60 of 125 requests, and one left open past a release
+  // kept the port answering with nobody supervising it.
   closeGap() {
     if (!this._gap) return;
-    try { this._gap.close(); } catch { }
-    // AND DESTROY WHAT IT WAS RELAYING. close() stops accepting but waits on
-    // open sockets, and the child cannot listen until this one lets go — so a
-    // relay still in flight would hold the port against the very process that
-    // is meant to take over. The relay only exists while nothing better is
-    // serving; a child arriving IS the better thing.
-    for (const s of this._gapSockets || []) { try { s.destroy(); } catch { } }
-    this._gapSockets = null;
+    try { this._gap.kill("SIGKILL"); } catch { }
     this._gap = null;
   }
   close() {
@@ -422,7 +386,12 @@ function holdPort(rest) {
     // beside the first. Only the holder can answer that, because the bind is
     // the only thing that knows whether the port is already taken.
     const alreadyRunning = process.env.CACHE_FIX_EXIT_IF_RUNNING === "1";
-    const settle = (code) => { stopping = true; resolveP(code ?? 0); };
+    // RELEASING MEANS THE GAP GOES TOO. It is a separate process holding this
+    // socket, so a stop that only ends the child leaves it accepting — and the
+    // port then "answers" with nobody supervising it, which is exactly the
+    // orphan a claimant would wait out. Measured before this line existed: the
+    // lifecycle log showed open -> close -> exit -> OPEN, and nothing after.
+    const settle = (code) => { stopping = true; try { holder.closeGap(); } catch { } resolveP(code ?? 0); };
     const forward = (sig) => {
       stopping = true;
       // SIGHUP, not the signal we were sent: the proxy spawns its own successor
@@ -773,7 +742,6 @@ function holdPort(rest) {
         // strands a session whose HTTPS_PROXY was baked at exec. Idempotent, and
         // a no-op when a successor already took the port (its bind wins, ours
         // fails and is discarded).
-        holder.openGap();
         // A proxy that announced its release was retired then: the port is
         // already back and a successor is already running, so its exit is
         // bookkeeping, not an event. Respawning here would put a second proxy
@@ -815,6 +783,13 @@ function holdPort(rest) {
         // and zero across an immediate respawn.
         //
         // The ladder still applies to REPEATED deaths, which is what it is for.
+        // ONLY NOW. Opening the gap the moment a child closes puts a second
+        // acceptor on the socket during a HANDOVER, where a successor is already
+        // serving — measured, the gap lived 352 ms across one restart and reset
+        // 60 of 125 requests. Every path that returns above this point is a case
+        // where somebody else has the port; what is left here is the one case
+        // where nobody does and we are about to start a child ourselves.
+        holder.openGap();
         const base = Number(process.env.CACHE_FIX_RESTART_BASE_MS) || 250;
         const firstAfterServing = served && failures === 0;
         if (served) failures++;
