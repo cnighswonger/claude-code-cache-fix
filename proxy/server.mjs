@@ -983,10 +983,19 @@ function exitWithParent() {
   //   [cache-fix] holder died; started a new one on 9901   <- rival, 1s later
   // and the churn cost 1,970 then 6,528 requests, twice taking the port down.
   //
-  // I removed this guard once, because mutating it out changed nothing. That
-  // mutation ran on an isolated port where "holder died" never fired at all —
-  // 0 events across 4 runs — so it measured a path the condition cannot reach.
-  // A mutation that cannot trip the guard proves nothing about the guard.
+  // REACHABILITY, measured rather than argued, because I got this wrong twice.
+  // The successor is spawned with detached:true, and I assumed that meant born
+  // with ppid 1 — in which case `born === process.ppid` holds forever and this
+  // branch could never run for it. It does not: detached creates a new SESSION,
+  // not an orphan. Measured — successor born ppid=4094730, then 4094730 -> 1
+  // the moment the predecessor exited, which it always does right after handing
+  // over. So the branch IS reached, on every single handover.
+  //
+  // I also removed this guard once because mutating it out changed nothing.
+  // That mutation ran on an isolated port where the branch never fired at all
+  // (0 "holder died" events across 4 runs), so it exercised a path the
+  // condition cannot reach there. A mutation that cannot trip the guard proves
+  // nothing about the guard — "no difference" was "no measurement".
   if (process.env.CACHE_FIX_FROM_HANDOVER === "1") return;
   const advertised = process.env.CACHE_FIX_HELD_PORT;
   setInterval(() => {
