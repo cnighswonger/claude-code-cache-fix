@@ -75,7 +75,26 @@ const srv = net.createServer((client) => {
   // — normal, and legitimately long — is never touched by it.
   const mute = setTimeout(() => client.destroy(), 30_000);
   let up = null;
-  client.on("error", () => { up?.destroy(); client.destroy(); });
+  const bail = () => { up?.destroy(); client.destroy(); };
+  client.on("error", bail);
+  // CLOSE, not just error, on both sides. `pipe()` does not end a destination
+  // whose source was DESTROYED rather than ended, and between a CONNECT 200 and
+  // the first TLS byte neither side is writing, so nothing errors either — the
+  // shape where an upstream can be left behind. forward-proxy.mjs guards the
+  // same hazard for the same reason ("dialling for a dead socket leaks the
+  // upstream connection").
+  //
+  // A review reported 20 leaked descriptors from 20 aborted tunnels here. I
+  // could NOT reproduce it, at this commit or with these two lines removed: the
+  // relay's own fd table stayed at one socket, its listener. So these are a
+  // guard against a shape that is real in principle, not the fix for a leak
+  // measured in this code — and there is no case below that kills them.
+  //
+  // It is worth the three lines anyway: this process exits(1) on an accept
+  // error, so at an EMFILE ceiling the standby would drop the last descriptor on
+  // the socket and the ADDRESS would die, from the one process meant to be the
+  // last line of defence.
+  client.on("close", () => up?.destroy());
   client.once("data", (first) => {
     // PAUSE, or every byte after this chunk is lost. Removing the last `data`
     // listener does NOT stop a flowing stream, so whatever arrives between here
@@ -114,7 +133,8 @@ const srv = net.createServer((client) => {
       const c = /^CONNECT\s+([^\s:]+):(\d+)/i.exec(line);
       if (!c) return void client.destroy();
       up = net.connect(Number(c[2]), c[1]);
-      up.on("error", () => { up.destroy(); client.destroy(); });
+      up.on("error", bail);
+      up.on("close", () => client.destroy());
       up.on("connect", () => {
         client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
         client.pipe(up); up.pipe(client);
@@ -146,6 +166,7 @@ const srv = net.createServer((client) => {
     // it. Same 2s the standby's own probe uses.
     hopSock.setTimeout(2_000, () => { if (!carried) hopSock.destroy(new Error("hop dial timed out")); });
     hopSock.on("error", () => { hopSock.destroy(); if (carried) client.destroy(); else direct(); });
+    hopSock.on("close", () => { if (carried) client.destroy(); });
     hopSock.on("connect", () => {
       carried = true;
       hopSock.setTimeout(0);          // an established tunnel is allowed to idle
@@ -215,7 +236,13 @@ else {
   let silent = 0;
   const tick = async () => {
     if (process.ppid === bornOf) { silent = 0; return void setTimeout(tick, 250); }
-    silent = (await answered()) ? 0 : silent + 1;
+    // ORPHANED BUT ANSWERED is a steady state, not a transient: it is where every
+    // machine sits once a holder has died and the lineage self-healed. Polling
+    // it four times a second for ever costs the live proxy a connection every
+    // 250ms and buys nothing — back off, and come back to 250ms the moment the
+    // answer stops.
+    if (await answered()) { silent = 0; return void setTimeout(tick, 2_000); }
+    silent += 1;
     if (silent < 2) return void setTimeout(tick, 250);
     carry();
   };

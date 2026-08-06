@@ -432,8 +432,14 @@ describe("holder handover (SIGUSR2)", () => {
                      "CACHE_FIX_FALLBACK_PROXIES"]) delete env[k];
     // A port nobody listens on, which is what a stopped privoxy leaves behind.
     if (deadHop) env.CACHE_FIX_FALLBACK_PROXIES = `http://127.0.0.1:${await freePort()}`;
+    // STDERR KEPT. The launcher writes "standby relay gone (…)" precisely for
+    // this case, and discarding it made "the standby never spawned" and "the
+    // standby never armed" produce the same message — one flake here was
+    // undiagnosable for exactly that reason.
+    let err = "";
     const holder = spawn(process.execPath, [launcherPath, "run-service"],
-                         { env, stdio: ["ignore", "ignore", "ignore"] });
+                         { env, stdio: ["ignore", "ignore", "pipe"] });
+    holder.stderr.on("data", (d) => { err += d; });
     const carries = () => new Promise((res) => {
       const req = http.request({ host: "127.0.0.1", port, method: "CONNECT",
                                  path: `127.0.0.1:${originPort}` });
@@ -463,6 +469,11 @@ describe("holder handover (SIGUSR2)", () => {
       const doomed = listeners(port).filter((p) => /\brun-service\b|server\.mjs/.test(cmdOf(p)));
       assert.equal(doomed.length, 2,
         `premise: a holder and a child must both be on the port, found ${doomed.length}`);
+      // AND THE THING THAT HAS TO SURVIVE THEM IS ALREADY THERE. Without this
+      // the case cannot tell "it never armed" from "it was never spawned".
+      assert.ok(listeners(port).some((p) => /gap-relay/.test(cmdOf(p))),
+        `no standby relay is on the port before the kill, so nothing could survive it. ` +
+        `Launcher stderr: ${JSON.stringify(err.slice(-300))}`);
       for (const p of doomed) { try { process.kill(Number(p), "SIGKILL"); } catch { } }
 
       // The standby polls before it arms, so give it the window it asks for.
@@ -471,7 +482,8 @@ describe("holder handover (SIGUSR2)", () => {
       while (got !== "pong" && Date.now() < by) got = await carries();
       assert.equal(got, "pong",
         "with the holder and the proxy both dead the address stopped carrying — a live " +
-        "session whose HTTPS_PROXY points here has nowhere else to go");
+        `session whose HTTPS_PROXY points here has nowhere else to go. Launcher stderr: ` +
+        JSON.stringify(err.slice(-300)));
     } finally {
       try { holder.kill("SIGKILL"); } catch { }
       for (const p of listeners(port)) { try { process.kill(Number(p), "SIGHUP"); } catch { } }

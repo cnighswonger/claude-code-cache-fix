@@ -572,6 +572,11 @@ function holdPort(rest) {
         // one back. Without it a failed handover leaves the holder live and
         // permanently unprotected, and says nothing about it.
         stopping = false;
+        // AND THE LADDER BACK. clearTimeout above stops the pending restart but
+        // leaves the handle non-null, and spawnWhenReady() returns early on a
+        // non-null `restart` — so a holder that survives a failed handover could
+        // never start another proxy again, while looking healthy.
+        restart = null;
         holder.openStandby();
         return;
       }
