@@ -1059,7 +1059,15 @@ function exitWithParent() {
       try {
         spawn(process.execPath, [join(__dirname, "..", "bin", "claude-via-proxy.mjs"), "run-service"], {
           detached: true, stdio: "ignore",
-          env: { ...process.env, CACHE_FIX_PROXY_PORT: advertised, CACHE_FIX_HELD_PORT: undefined },
+          // HELD_BY is cleared with HELD_PORT. It named OUR holder, which is the
+          // one that just died; carrying it into the replacement makes a live
+          // holder look "held" by a pid that is not its parent. Nothing acts on
+          // it there today — the holder overwrites it for its own child — but a
+          // stale marker riding along is the exact shape that cost us the
+          // successor's inherited EXIT_WITH_PARENT and the rival holder before
+          // it. Clear it where it stops being true.
+          env: { ...process.env, CACHE_FIX_PROXY_PORT: advertised,
+                 CACHE_FIX_HELD_PORT: undefined, CACHE_FIX_HELD_BY: undefined },
         }).unref();
         process.stderr.write(`[cache-fix] holder died; started a new one on ${advertised}\n`);
         // KEEP SERVING UNTIL THE SUCCESSOR IS UP. Exiting the instant we have
