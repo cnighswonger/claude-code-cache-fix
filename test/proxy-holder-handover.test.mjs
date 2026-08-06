@@ -242,14 +242,19 @@ describe("holder handover (SIGUSR2)", () => {
       }
     }
   });
-  // THIS CASE DOES NOT KILL ITS MUTATION, and that is stated here rather than
-  // discovered later. Removing the releasingPort guard leaves it green: on the
-  // SIGHUP path the child drains and exits faster than the self-heal's 1s poll,
-  // so the race never opens here. It opened on the work Mac, where nine proxies
-  // were serving and drained slowly enough to poll once with their holder
-  // already gone. The case is kept because it pins the CONTRACT and would catch
-  // a gross regression; it is not evidence the guard works, and the evidence
-  // that it does is the fleet measurement in the commit, not this file.
+  // DETERMINISTIC NOW, and it was not. This case used to pass with the guard
+  // REMOVED: on the SIGHUP path the child drains and exits faster than the
+  // self-heal's one-second poll, so the tick that would resurrect a holder
+  // never happened here. It happened on the work Mac, where nine proxies were
+  // serving and drained slowly enough to be polled with their holder already
+  // gone — a real failure the harness could not reproduce.
+  //
+  // Fixed by making the race deterministic rather than hoping for it:
+  // CACHE_FIX_SELF_HEAL_MS shortens the poll so a tick lands INSIDE the
+  // release, and the holder is SIGKILLed first so the self-heal is armed
+  // (marker set, ppid now 1) before the child is asked to let go. Mutation-
+  // checked both ways — with the guard the port stays gone, without it a
+  // replacement holder appears.
   //
   // RELEASE MUST MEAN THE LINEAGE STOPS. A holder asked to let go forwards that
   // to its child, and the child's self-heal used to notice its holder was gone
@@ -265,6 +270,7 @@ describe("holder handover (SIGUSR2)", () => {
                      "ALL_PROXY", "all_proxy", "LISTEN_FDS", "LISTEN_PID",
                      "CACHE_FIX_HOLD_PORT", "CACHE_FIX_WATCH_DEPLOY_MS",
                      "CACHE_FIX_SELF_HEAL"]) delete env[k];
+    env.CACHE_FIX_SELF_HEAL_MS = "50";
     const holder = spawn(process.execPath, [launcherPath, "run-service"],
                          { env, stdio: ["ignore", "pipe", "pipe"] });
     try {
@@ -273,10 +279,24 @@ describe("holder handover (SIGUSR2)", () => {
       while (body.startsWith("ERR:") && Date.now() < up) body = await probe(port);
       assert.equal(body, "ok", "the holder never came up, so nothing was measured");
 
-      holder.kill("SIGHUP");
-      // Long enough for the self-heal to have fired: it polls every second, and
-      // the resurrection this guards against was observed within 23s.
-      await new Promise((r) => setTimeout(r, 25_000));
+      // ARM the self-heal first: kill the holder, so the child's marker no
+      // longer matches its ppid. Then ask the CHILD to release. With the poll
+      // at 50ms a tick is guaranteed to land while it is releasing.
+      const kid = Number(execFileSync("pgrep", ["-P", String(holder.pid)], { encoding: "utf8" })
+        .trim().split("\n")[0]);
+      assert.ok(Number.isInteger(kid) && kid > 1, "premise: the holder must have a child");
+      // AN ACCEPTED, IDLE CONNECTION, so the release cannot finish inside one
+      // tick. server.close() waits on connections the proxy has ACCEPTED, and
+      // without one the drain completes in under 50ms and the poll that would
+      // resurrect a holder never runs — measured, the mutation survived twice
+      // before this line existed.
+      const held = net.connect({ host: "127.0.0.1", port });
+      await new Promise((r) => held.on("connect", r));
+      holder.kill("SIGKILL");
+      try { process.kill(kid, "SIGHUP"); } catch { }
+      await new Promise((r) => setTimeout(r, 6_000));
+      held.destroy();
+      await new Promise((r) => setTimeout(r, 2_000));
       assert.deepEqual(listeners(port), [],
         "the port came back after being released — the lineage resurrected itself, " +
         "so no port can ever be retired and every stray one is permanent");

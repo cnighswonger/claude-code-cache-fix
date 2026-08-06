@@ -1141,7 +1141,13 @@ function exitWithParent() {
       }
     }
     process.exit(0);
-  }, 1000).unref();
+    // Test seam: the poll interval. The guard above is only reachable when a
+    // release is still in flight AT a tick, and at one second a fast release
+    // finishes between ticks — so the case that pins it passed with the guard
+    // REMOVED. Same seam style as CACHE_FIX_RESTART_BASE_MS and
+    // CACHE_FIX_WATCH_DEPLOY_MS, and it makes a timing race deterministic
+    // rather than hoping for it, which is what cswap's pin did with tgkill.
+  }, Number(process.env.CACHE_FIX_SELF_HEAL_MS) || 1000).unref();
 }
 
 if (invokedAsScript) {
