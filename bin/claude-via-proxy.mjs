@@ -423,6 +423,34 @@ function holderPidOn(port) {
   return pid;
 }
 
+// Another `run-service` that already holds this address, older than us.
+//
+// Deliberately NOT holderPidOn(): that one answers "is the incumbent ours",
+// which is true of every copy of us and is exactly why they piled up. This asks
+// "is one of us already doing this job", which has one right answer.
+function otherHolderOn(port) {
+  let pids = [];
+  try {
+    pids = execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN"],
+                        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
+      .trim().split("\n").map(Number).filter((n) => Number.isInteger(n) && n > 1 && n !== process.pid);
+  } catch { return 0; }
+  for (const p of pids) {
+    let line = "";
+    try {
+      line = execFileSync("ps", ["-p", String(p), "-o", "etimes=,command="],
+                          { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    } catch { continue; }
+    if (!/\brun-service\b/.test(line)) continue;
+    // etimes is SECONDS ALIVE, so larger means older. Ours is whatever this
+    // process has been up; a tie goes to the incumbent, which is the safe way
+    // round — the surplus one leaving is free, two holders is not.
+    const theirs = Number(line.split(/\s+/)[0]);
+    if (Number.isFinite(theirs) && theirs >= Math.floor(process.uptime())) return p;
+  }
+  return 0;
+}
+
 // Is the incumbent running the code THIS launcher would install?
 //
 // "Is it one of ours" is the wrong question, and asking it made every upgrade a
@@ -1003,11 +1031,40 @@ function holdPort(rest) {
     // listener would leave every bind after the first unobserved.
     holder.on("listening", () => {
       holder.off("error", bindFailed);
+      // ONE HOLDER PER ADDRESS, and a successful bind does not establish that.
+      // Binding a port another process merely BOUND succeeds — that is what makes
+      // the gap listener possible — and the listen() ownership test only settles
+      // it while somebody is LISTENING. With no child serving, every arriving
+      // run-service passes the same test and believes it is the holder. Measured
+      // on <linux-host>: 27 alive, ZERO listening, one per shell launched in that
+      // window, none able to take the port and none willing to leave.
+      //
+      // So ask the question the test cannot: is an OLDER run-service already
+      // holding this address? If so we are the surplus one and the correct move
+      // is to go, not to compete. Older by pid start time, not by pid number,
+      // which wraps.
       bound = true;
       tries = 0;
       clearTimeout(reclaiming);
       spawnWhenReady();
     });
+    // ONCE, BEFORE THE FIRST BIND — not on every `listening`, which fires again
+    // on every rebind and on a handover adopt, where an older holder is present
+    // legitimately. Measured when this ran there: a sole holder exited as
+    // "surplus" and 200 of 200 concurrent requests hung.
+    //
+    // A successful bind does not establish ownership: binding a port another
+    // process merely BOUND succeeds, and the listen() test only settles it while
+    // somebody is LISTENING. With no child serving, every arriving run-service
+    // passes that test and believes it is the holder — measured on <linux-host>, 27
+    // alive and ZERO listening, one per shell. So ask the question the test
+    // cannot answer: is one of us already doing this job.
+    const surplus = process.env.CACHE_FIX_HOLDER_HANDOVER === "1" ? 0 : otherHolderOn(port);
+    if (surplus) {
+      process.stderr.write(
+        `[cache-fix] ${port} is already held by run-service pid ${surplus}; this one is surplus\n`);
+      return settle(0);
+    }
     const listen = () => holder.listen({ port, host: bind });
 
     // Somebody else owns the port. Under run-service that is a DEPLOY, not an

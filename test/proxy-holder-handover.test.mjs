@@ -283,12 +283,23 @@ describe("holder handover (SIGUSR2)", () => {
       while (body.startsWith("ERR:") && Date.now() < up) body = await probe(port);
       assert.equal(body, "ok", "the holder never came up, so nothing was measured");
 
-      const health = await new Promise((res) => {
+      // RETRIED TO 200. A restart can put the relay in front between the probe
+      // above and this read, and the relay answers 503 on purpose — under full
+      // suite load that turned into "no holder_tree" and a failure about the
+      // wrong thing. The question here is what the HOLDER publishes, so wait
+      // until a holder is the one answering.
+      const readHealth = () => new Promise((res) => {
         http.get({ host: "127.0.0.1", port, path: "/health", agent: false, timeout: 8_000 },
                  (r) => { let b = ""; r.on("data", (d) => (b += d));
                           r.on("end", () => res(r.statusCode === 200 ? b : "{}")); })
           .on("error", () => res("{}"));
       });
+      let health = await readHealth();
+      const by = Date.now() + 15_000;
+      while (health === "{}" && Date.now() < by) {
+        await new Promise((r) => setTimeout(r, 250));
+        health = await readHealth();
+      }
       const reported = JSON.parse(health).holder_tree;
       // THE WHOLE DIRECTORY, not a list of files. Naming them was wrong twice —
       // first gap-relay.mjs, then ca-trust.mjs which the launcher imports — and
