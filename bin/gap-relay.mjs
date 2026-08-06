@@ -204,11 +204,19 @@ const carry = () => srv.listen({ fd: 3 }, () => process.stderr.write("[cache-fix
 // same wall from the other side and wrote it down: a refused-versus-not probe
 // cannot separate "served" from "accepted and queued behind nobody".
 //
-// TWICE, because arming is a one-way door and a proxy is allowed to be slow. A
-// boot takes ~1.2s here and a loaded box stretches it, so a single silent
-// window races a child that is still coming up. The second window costs a
-// caller nothing it was not already paying: its connection is queued in the
-// backlog either way and is served the moment somebody accepts.
+// THREE SHORT WINDOWS, not two long ones, and the difference is what a waiting
+// caller feels. Arming is a one-way door, so it needs evidence; but the evidence
+// is "nothing answered", and a live proxy answers /health in about a millisecond
+// — the seconds were slack for a stalled event loop, not measurement. Three
+// silences at 250ms cost more samples and less waiting than two at 2s: the
+// user-visible stall for a request that arrives in the gap went from ~4.6s to
+// under a second, measured, while the number of independent observations went up.
+//
+// The queue would have been better still — a socket whose acceptor is gone piles
+// connections up, and that is the symptom itself rather than a proxy for it — but
+// darwin reports Recv-Q as 0 for a listening socket, and two of three machines
+// are macs. Measured before choosing this: linux /proc/net/tcp exposes it,
+// `netstat -an` on the mac does not.
 if (process.env.CACHE_FIX_STANDBY !== "1") carry();
 else {
   const port = Number(process.env.CACHE_FIX_HELD_PORT);
@@ -227,7 +235,7 @@ else {
     const end = (v) => { if (done) return; done = true; clearTimeout(t); s.destroy(); res(v); };
     // A hang IS the symptom: listening with nobody accepting reads exactly like
     // this, and it is the state we exist to end.
-    const t = setTimeout(() => end(false), 2_000);
+    const t = setTimeout(() => end(false), 250);
     s.on("connect", () => s.write(`GET /health HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\n\r\n`));
     s.on("data", () => end(true));
     s.on("error", () => end(false));
@@ -243,7 +251,7 @@ else {
     // answer stops.
     if (await answered()) { silent = 0; return void setTimeout(tick, 2_000); }
     silent += 1;
-    if (silent < 2) return void setTimeout(tick, 250);
+    if (silent < 3) return void setTimeout(tick, 150);
     carry();
   };
   setTimeout(tick, 250);
