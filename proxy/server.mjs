@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import https from "node:https";
 import { pathToFileURL, URL } from "node:url";
 import config from "./config.mjs";
-import { forwardRequest, parseAbsoluteForm, getAgent } from "./upstream.mjs";
+import { forwardRequest, parseAbsoluteForm, getAgent, fallbackProxyUrls } from "./upstream.mjs";
 import { streamResponse, createTelemetryRecord } from "./stream.mjs";
 import { loadExtensions, snapshotRegistry, runOnRequest, runOnResponseStart, runOnResponse, getFailedExtensions } from "./pipeline.mjs";
 import { startWatcher } from "./watcher.mjs";
@@ -376,18 +376,29 @@ function handleHealth(_req, res) {
     return;
   }
   res.writeHead(200, { "content-type": "application/json" });
-  // Surface the outbound proxy the forward-proxy blind-tunnels CONNECTs through
-  // (config.httpsProxy, from HTTPS_PROXY/https_proxy). A supervisor/health probe
-  // can then tell a proxy that came up WITH the expected corp proxy from one that
-  // came up WITHOUT it — a stale instance started without HTTPS_PROXY still
-  // answers forward_proxy:true but silently dials non-MITM hosts directly, which
-  // fails behind a corp firewall. Only meaningful in forward-proxy mode; null
-  // when no outbound proxy is configured.
+  // Surface the outbound proxy the forward-proxy blind-tunnels CONNECTs through.
+  // A supervisor/health probe can then tell a proxy that came up WITH the
+  // expected corp proxy from one that came up WITHOUT it — a stale instance
+  // started without one still answers forward_proxy:true but silently dials
+  // direct, which fails behind a corp firewall.
+  //
+  // THE FALLBACK COUNTS, and reading only config.httpsProxy is why this field
+  // was a lie on every machine we run: the shipped wiring configures
+  // CACHE_FIX_FALLBACK_PROXIES and nothing else, so the getter is empty and this
+  // published null while CONNECTs left through :8118 all day. cswap's pin reads
+  // exactly this field to confirm the next hop in the chain and treats null as
+  // "cannot confirm", so its confirmation had been dead for weeks and it was
+  // running on a preserved historical value — a hop that moved would not have
+  // been noticed by anything.
+  //
+  // Address only, never the credentials. A hop URL may carry them (the pin
+  // publishes its own as cswap:<token>@127.0.0.1:53749) and this field is
+  // readable by anything that can reach /health.
   res.end(JSON.stringify({
     status: "ok",
     version: config.version,
     forward_proxy: _forwardActive > 0,
-    https_proxy: (_forwardActive > 0 && config.httpsProxy) || null,
+    https_proxy: (_forwardActive > 0 && hopAddress(config.httpsProxy || fallbackProxyUrls()[0])) || null,
     // Content fingerprint of the source this process LOADED. Hot-reload is
     // off, so after an edit without a restart this stays at the old value
     // while the working tree moves on — which is precisely the drift an
@@ -969,6 +980,18 @@ const invokedAsScript =
 // Is a DIFFERENT process serving the advertised port? Used only while handing
 // over to a replacement holder: we still hold the socket, so "is the port up"
 // would answer yes about ourselves. Ownership by pid is the question.
+// scheme://host:port of a hop URL, with any credentials dropped. Empty for
+// anything unparseable, so a malformed value publishes nothing rather than
+// itself — and empty for anything that is not http(s), because `URL` reads
+// `user:pass@host:port` as the scheme `user:` and would otherwise publish the
+// username back out as `user://`.
+function hopAddress(u) {
+  try {
+    const x = new URL(u);
+    return x.protocol === "http:" || x.protocol === "https:" ? `${x.protocol}//${x.host}` : "";
+  } catch { return ""; }
+}
+
 export function successorServing(port) {
   // The /proc attempt is skippable so the lsof path below can be exercised on a
   // machine that HAS /proc. Without it the fallback is only reachable by running
