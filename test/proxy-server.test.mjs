@@ -15,11 +15,21 @@ import { loadExtensions, getRegistry } from "../proxy/pipeline.mjs";
 const serverPath = join(dirname(fileURLToPath(import.meta.url)), "..", "proxy", "server.mjs");
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
+function listeners(port) {
+  try {
+    return execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN"],
+                        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
+      .trim().split("\n").filter(Boolean);
+  } catch { return []; }
+}
+
+const usedPorts = [];
 async function freePort() {
   const s = net.createServer();
   await new Promise((r) => s.listen(0, "127.0.0.1", r));
   const p = s.address().port;
   await new Promise((r) => s.close(r));
+  usedPorts.push(p);
   return p;
 }
 
@@ -791,4 +801,23 @@ describe("zero-downtime reload", () => {
     });
   });
 
+});
+
+// ONE SWEEP FOR THE FILE, over the ports it handed out and nobody else's. A
+// standby relay outlives a holder that was killed rather than released — that
+// is the point of it — and while it has not armed yet it holds a socket nobody
+// listened on, so a case's own cleanup cannot see it. Reaping by process name
+// instead would reach into a neighbouring file's live fixture, since node runs
+// test files concurrently in their own processes.
+after(async () => {
+  for (let i = 0; i < 6; i++) {
+    let any = false;
+    for (const port of usedPorts) {
+      for (const q of listeners(port)) {
+        try { process.kill(Number(q), "SIGHUP"); any = true; } catch { }
+      }
+    }
+    if (!any && i) break;
+    await new Promise((r) => setTimeout(r, 700));
+  }
 });

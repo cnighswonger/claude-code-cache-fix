@@ -1,4 +1,4 @@
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import net from "node:net";
@@ -23,11 +23,21 @@ function listeners(port) {
   } catch { return []; }
 }
 
+// The command line of a pid, or "" if it is gone. Every case here has to tell
+// a holder from a proxy from a standby relay, and they are only distinguishable
+// by what they are running.
+const cmdOf = (pid) => {
+  try { return execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" }); }
+  catch { return ""; }
+};
+
+const usedPorts = [];
 async function freePort() {
   const s = net.createServer();
   await new Promise((r) => s.listen(0, "127.0.0.1", r));
   const p = s.address().port;
   await new Promise((r) => s.close(r));
+  usedPorts.push(p);
   return p;
 }
 
@@ -83,18 +93,27 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
                        CACHE_FIX_EXIT_WITH_PARENT: "1", ...extraEnv });
   const launcher = spawn(process.execPath, [launcherPath, subcommand], { env, stdio: ["ignore", "pipe", "pipe"] });
   const exited = new Promise((r) => launcher.on("exit", () => r(true)));
+  // 200 OR IT IS NOT THE PROXY. The gap relay answers /health too, with a 503
+  // and a JSON body of its own, so a readiness loop that took any body finished
+  // against the relay that covers a cold start — measured, six cases in this
+  // file went red on `JSON.parse(body).status` being undefined, and which ones
+  // depended on the race.
   const get = () => new Promise((res) => {
     http.get({ host: "127.0.0.1", port, path: "/health", timeout: 8_000 }, (r) => {
-      let b = ""; r.on("data", (d) => (b += d)); r.on("end", () => res(b));
+      let b = ""; r.on("data", (d) => (b += d));
+      r.on("end", () => res(r.statusCode === 200 ? b : `ERR:${r.statusCode}`));
     }).on("error", (e) => res(`ERR:${e.code}`));
   });
   // pgrep, never a pid arithmetic shortcut: `process.kill(0, ...)` signals the
   // caller's whole process group — the test runner included — and Number("")
   // and Number(undefined) are both 0.
+  // THE PROXY child. A holder also parents a standby relay, so the first pid is
+  // not reliably the one a case means to kill.
   const proxyPid = () => {
     let out = "";
     try { out = execFileSync("pgrep", ["-P", String(launcher.pid)]).toString(); } catch { return 0; }
-    const pid = Number(out.trim().split("\n")[0]);
+    const pid = Number(out.trim().split("\n").filter(Boolean)
+      .find((q) => /server\.mjs/.test(cmdOf(q))));
     return Number.isInteger(pid) && pid > 1 ? pid : 0;
   };
   const killProxy = () => {
@@ -190,7 +209,7 @@ it("serves every concurrent request while nothing restarts", async () => {
     const one = () => new Promise((res) => {
       const r = http.get({ host: "127.0.0.1", port, path: "/health", agent: false }, (q) => {
         q.resume();
-        q.on("end", () => res("ok"));
+        q.on("end", () => res(q.statusCode === 200 ? "ok" : `ERR:${q.statusCode}`));
       });
       // Well under the 8s a hung accept would cost, and far above a served
       // request on loopback: the failure this catches is unbounded, not slow.
@@ -291,17 +310,34 @@ async function withFakeProxy(serverSrc, fn, { watchMs, selfHeal = "" } = {}) {
       new Promise((r) => setTimeout(r, 5_000)),
     ]);
     try { launcher.kill("SIGKILL"); } catch {}
+    // AND THE STANDBY. It is detached and outlives a launcher that exited on
+    // its own, which is the point of it — but a case that leaks one leaves an
+    // ephemeral port held for the rest of the run. SIGHUP is the word it
+    // answers; the fixture is the one place that knows every case is over.
+    //
+    // RETRIED, because a standby that has not armed yet holds a socket nobody
+    // ever listened on, and `lsof -sTCP:LISTEN` cannot see it. It becomes
+    // visible when it arms, which takes its poll plus its silence window —
+    // measured, a single immediate pass left 14 of them alive across one run.
+    for (let i = 0; i < 6; i++) {
+      const held = listeners(port);
+      if (i && !held.length) break;
+      for (const q of held) { try { process.kill(Number(q), "SIGHUP"); } catch { } }
+      await new Promise((r) => setTimeout(r, 600));
+    }
     await rm(failing, { force: true });
     await rm(copy, { force: true });
   }
 }
 
-// Never served: no session is wired to the port, so holding it in front of a
-// proxy that cannot start only makes callers wait out the relay deadline
-// instead of failing over at once.
+// Never served: no session is wired to this port, so nothing is stranded by
+// letting it go — and a lineage that respawns a hopeless proxy forever is the
+// defect. The ADDRESS is a separate question from the SUPERVISOR: a standby
+// relay keeps the socket alive and carries, so what must end here is the
+// respawning, and the port must still be takeable by anything that asks.
 it("gives the port up when the proxy never starts", async () => {
   await withFakeProxy('process.stderr.write("simulated\\n"); process.exit(1);\n',
-    async ({ launcher, bound, stderr }) => {
+    async ({ launcher, port, bound, stderr }) => {
       // 30s, and the number is the cost of FIVE NODE STARTUPS — not of the
       // backoff, which the fixture already shrinks to 25ms rungs. Measured:
       // 5,943ms alone, 8,053ms inside the file, against a cap that was 8,000 —
@@ -321,7 +357,16 @@ it("gives the port up when the proxy never starts", async () => {
       ]);
       assert.ok(exited, "the launcher respawned a hopeless proxy forever, holding the port");
       assert.match(stderr(), /releasing the port/);
-      assert.equal(await bound(), false, "the port was still bound after the launcher gave up");
+      const lineage = listeners(port).filter((q) => /test-launcher-|test-fake-server-/.test(cmdOf(q)));
+      assert.deepEqual(lineage, [],
+        "the launcher gave up but its lineage is still on the port, so it never really let go");
+      // AND THE ADDRESS STILL RETIRES, which is the other half of the same
+      // harm: a standby that ignored the release word would hold every port a
+      // failed launcher ever touched, forever.
+      for (const q of listeners(port)) { try { process.kill(Number(q), "SIGHUP"); } catch { } }
+      const gone = Date.now() + 5_000;
+      while (await bound() && Date.now() < gone) await new Promise((r) => setTimeout(r, 100));
+      assert.equal(await bound(), false, "the port survived SIGHUP, so it can never be reclaimed");
     });
 });
 
@@ -345,7 +390,11 @@ it("keeps the port and backs off when a proxy that had served stops starting", a
       while (!existsSync(flag) && Date.now() < started) await new Promise((r) => setTimeout(r, 20));
       let out = "";
       try { out = execFileSync("pgrep", ["-P", String(launcher.pid)]).toString(); } catch {}
-      const kid = Number(out.trim().split("\n")[0]);
+      // THE PROXY child. A holder also parents a standby relay, and taking the
+      // first pid killed that instead — the fake proxy went on serving and the
+      // case measured a backoff that never happened.
+      const kid = Number(out.trim().split("\n").filter(Boolean)
+        .find((q) => /test-fake-server-/.test(cmdOf(q))));
       assert.ok(Number.isInteger(kid) && kid > 1, "the fake proxy never started, so this measures nothing");
       process.kill(kid, "SIGKILL");
       // Long enough for an UNBACKED-OFF loop to blow the ceiling: at the 25ms
@@ -459,7 +508,10 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         const refused = [];
         const once = () => new Promise((res) => {
           http.get({ host: "127.0.0.1", port, path: "/health", agent: false, timeout: 8_000 },
-                   (r) => { r.resume(); r.on("end", () => res("ok")); })
+                   // 200, not merely a reply: a standby relay carrying this
+                   // address answers 503, and counting that as served would
+                   // hide exactly the loss this sampler exists to count.
+                   (r) => { r.resume(); r.on("end", () => res(r.statusCode === 200 ? "ok" : `ERR:${r.statusCode}`)); })
             .on("error", (e) => res(`ERR:${e.code}`));
         });
         // A pause between requests, and it is NOT politeness. This describe
@@ -638,9 +690,14 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port), CACHE_FIX_FORWARD_PROXY: "on" };
       for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
                        "ALL_PROXY", "all_proxy", "LISTEN_FDS", "LISTEN_PID"]) delete env[k];
+      // 200 OR IT IS NOT THE PROXY. A standby relay carrying this address answers
+      // /health with a 503 and a JSON body of its own, and a helper that returned
+      // any body let a readiness loop finish on it — measured, `JSON.parse(body)
+      // .status` came back undefined against a relay that was working perfectly.
       const get = () => new Promise((res) => {
         http.get({ host: "127.0.0.1", port, path: "/health", timeout: 3_000 }, (r) => {
-          let b = ""; r.on("data", (d) => (b += d)); r.on("end", () => res(b));
+          let b = ""; r.on("data", (d) => (b += d));
+          r.on("end", () => res(r.statusCode === 200 ? b : `ERR:${r.statusCode}`));
         }).on("error", (e) => res(`ERR:${e.code}`));
       });
       const first = spawn(process.execPath, [launcherPath, "run-service"], { env, stdio: ["ignore", "pipe", "pipe"] });
@@ -765,9 +822,14 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
                        "ALL_PROXY", "all_proxy", "LISTEN_FDS", "LISTEN_PID",
                        "CACHE_FIX_HOLD_PORT"]) delete env[k];
+      // 200 OR IT IS NOT THE PROXY. A standby relay carrying this address answers
+      // /health with a 503 and a JSON body of its own, and a helper that returned
+      // any body let a readiness loop finish on it — measured, `JSON.parse(body)
+      // .status` came back undefined against a relay that was working perfectly.
       const get = () => new Promise((res) => {
         http.get({ host: "127.0.0.1", port, path: "/health", timeout: 3_000 }, (r) => {
-          let b = ""; r.on("data", (d) => (b += d)); r.on("end", () => res(b));
+          let b = ""; r.on("data", (d) => (b += d));
+          r.on("end", () => res(r.statusCode === 200 ? b : `ERR:${r.statusCode}`));
         }).on("error", (e) => res(`ERR:${e.code}`));
       });
       const old = spawn(process.execPath, [launcherPath, "server"], { env, stdio: ["ignore", "pipe", "pipe"] });
@@ -788,7 +850,10 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         const refused = [];
         const once = () => new Promise((res) => {
           http.get({ host: "127.0.0.1", port, path: "/health", agent: false, timeout: 8_000 },
-                   (r) => { r.resume(); r.on("end", () => res("ok")); })
+                   // 200, not merely a reply: a standby relay carrying this
+                   // address answers 503, and counting that as served would
+                   // hide exactly the loss this sampler exists to count.
+                   (r) => { r.resume(); r.on("end", () => res(r.statusCode === 200 ? "ok" : `ERR:${r.statusCode}`)); })
             .on("error", (e) => res(`ERR:${e.code}`));
         });
         const pump = (async () => {
@@ -833,9 +898,12 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
           `takeover did not complete, it stranded the address`);
         assert.equal((await get()).startsWith("ERR:"), false,
           "the port never came back after the takeover");
+        // PROXIES, which is what the sentence says. A holder also parents one
+        // standby relay, so counting children counts something else.
         let kids = [];
         try { kids = execFileSync("pgrep", ["-P", String(taker.pid)], { encoding: "utf8" })
-                       .trim().split("\n").filter(Boolean); } catch {}
+                       .trim().split("\n").filter(Boolean)
+                       .filter((q) => /server\.mjs/.test(cmdOf(q))); } catch {}
         assert.equal(kids.length, 1,
           `the holder supervises ${kids.length} proxies; a bind retry spawned one per attempt`);
         assert.ok(!/MaxListenersExceeded/.test(warned),
@@ -1117,10 +1185,14 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
 describe("deploy watcher (CACHE_FIX_WATCH_DEPLOY_MS)", () => {
   const serving = 'process.stdout.write(`proxy listening on 127.0.0.1:${process.env.CACHE_FIX_PROXY_PORT}\\n`); setInterval(() => {}, 1e9);\n';
 
+  // THE PROXY child. A holder also parents a standby relay whose pid never
+  // changes, and taking the first one made every restart look like no restart:
+  // `settleFor` waited out its whole window for a pid that cannot move.
   const pidOn = (launcher) => {
     try {
       const out = execFileSync("pgrep", ["-P", String(launcher.pid)], { encoding: "utf8" });
-      const p = Number(out.trim().split("\n")[0]);
+      const p = Number(out.trim().split("\n").filter(Boolean)
+        .find((q) => /test-fake-server-/.test(cmdOf(q))));
       return Number.isInteger(p) && p > 1 ? p : 0;
     } catch { return 0; }
   };
@@ -1213,4 +1285,23 @@ describe("deploy watcher (CACHE_FIX_WATCH_DEPLOY_MS)", () => {
     }, { selfHeal: "on" });
   });
 });
+});
+
+// ONE SWEEP FOR THE FILE, over the ports it handed out and nobody else's. A
+// standby relay outlives a holder that was killed rather than released — that
+// is the point of it — and while it has not armed yet it holds a socket nobody
+// listened on, so a case's own cleanup cannot see it. Reaping by process name
+// instead would reach into a neighbouring file's live fixture, since node runs
+// test files concurrently in their own processes.
+after(async () => {
+  for (let i = 0; i < 6; i++) {
+    let any = false;
+    for (const port of usedPorts) {
+      for (const q of listeners(port)) {
+        try { process.kill(Number(q), "SIGHUP"); any = true; } catch { }
+      }
+    }
+    if (!any && i) break;
+    await new Promise((r) => setTimeout(r, 700));
+  }
 });

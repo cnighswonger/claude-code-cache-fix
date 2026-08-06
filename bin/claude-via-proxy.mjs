@@ -74,6 +74,7 @@ class HolderSocket extends EventEmitter {
     super();
     this._handle = null;
     this._gap = null;
+    this._standby = null;
   }
   listen({ port, host }) {
     // A fresh handle per attempt: a TCP handle that failed to bind cannot be
@@ -107,6 +108,11 @@ class HolderSocket extends EventEmitter {
         adopted.getsockname(got);
         this._port = got.port || port;
         this._adopted = true;
+        // AND A STANDBY, because the predecessor took its own with it on the way
+        // out. Without this the protection only ever reached a machine that cold
+        // started: every deploy hands the port on, and a successor that skipped
+        // it left the address with nothing behind the proxy again.
+        this.openStandby();
         queueMicrotask(() => this.emit("listening"));
         return this;
       }
@@ -166,6 +172,7 @@ class HolderSocket extends EventEmitter {
     // session dialling before the first proxy binds gets ECONNREFUSED, and
     // HTTPS_PROXY is baked at exec — so that session is stranded for life.
     this.openGap();
+    this.openStandby();
     queueMicrotask(() => this.emit("listening"));
     return this;
   }
@@ -215,6 +222,60 @@ class HolderSocket extends EventEmitter {
     if (!this._gap) return;
     try { this._gap.kill("SIGKILL"); } catch { }
     this._gap = null;
+  }
+  // The gap is the holder's to open and close. This one is nobody's: it is
+  // detached, it holds this socket, and it outlives us on purpose.
+  //
+  // What it covers is the holder dying WITH its child — an operator turning CCF
+  // off, an OOM kill, a `kill -9` on both. Measured with neither alive: no
+  // descriptor left, no listener, ECONNREFUSED. Nothing inside the holder can
+  // cover that, because the thing that would serve is the thing that died.
+  //
+  // EXACTLY ONE PER SOCKET, kept that way by the handover rather than by a
+  // guard here: the predecessor ends its standby as it hands the port on, and
+  // the successor places a fresh one. Two of them would both arm when the
+  // lineage dies, and two acceptors on one descriptor is the failure the gap
+  // already taught us (60 of 125 reset).
+  openStandby() {
+    if (this._standby || !this._handle) return;
+    const fd = this._handle.fd;
+    if (typeof fd !== "number" || fd < 0) return;
+    try {
+      this._standby = spawn(process.execPath, [GAP_RELAY_PATH], {
+        detached: true,
+        // EVERY STREAM IGNORED, stderr included. The gap inherits ours because
+        // it dies with us; this one outlives us, and an inherited pipe it never
+        // closes is a pipe our own parent waits on forever — measured, the
+        // launcher exited and its `close` never fired for 30s because a detached
+        // standby still held the write end. What it would have said is on
+        // /health anyway, where a checker can actually reach it.
+        stdio: ["ignore", "ignore", "ignore", fd],
+        env: { ...process.env, CACHE_FIX_STANDBY: "1", CACHE_FIX_HELD_PORT: String(this._port),
+               CACHE_FIX_HELD_HOST: this._host || "127.0.0.1" },
+      });
+      // NOT SILENTLY. A standby that dies is never replaced — nothing calls
+      // this again — so the holder would run on believing it is protected.
+      // The `error` listener matters twice over: an async spawn failure
+      // (EAGAIN under fork pressure) is emitted, not thrown, and an unhandled
+      // one on a ChildProcess takes the holder down with it.
+      const lost = (why) => {
+        this._standby = null;
+        process.stderr.write(`[cache-fix] standby relay gone (${why}); the port will not survive this holder\n`);
+      };
+      this._standby.on("exit", () => { if (this._standby) lost("exited"); });
+      this._standby.on("error", (e) => lost(e?.code || e?.message || "spawn failed"));
+      this._standby.unref();
+    } catch {
+      this._standby = null;
+    }
+  }
+  // Only a RELEASE ends it. The address is being handed to another install, and
+  // a standby still holding this socket keeps it listening — so the claimant's
+  // listen fails, it asks us to release again, and neither side ever wins.
+  closeStandby() {
+    if (!this._standby) return;
+    try { this._standby.kill("SIGKILL"); } catch { }
+    this._standby = null;
   }
   close() {
     // Deliberately a NO-OP on the socket. The holder's entire job is that this
@@ -394,6 +455,17 @@ function holdPort(rest) {
     const settle = (code) => { stopping = true; try { holder.closeGap(); } catch { } resolveP(code ?? 0); };
     const forward = (sig) => {
       stopping = true;
+      // ONLY SIGHUP ENDS THE STANDBY, and the distinction is the whole point of
+      // it. SIGHUP gives the ADDRESS away: left alive the standby keeps the
+      // socket listening, and the claimant's listen — the only real test of
+      // ownership — fails forever against a process deliberately not answering.
+      //
+      // SIGTERM and SIGINT are a STOP. `systemctl stop`, Ctrl-C and a plain
+      // `kill` all arrive here, and taking the address down with them is
+      // exactly the stranding this standby exists to prevent — measured on an
+      // earlier draft: SIGTERM left ECONNREFUSED while `kill -9` on the same
+      // pair carried, so the graceful path was the destructive one.
+      if (sig === "SIGHUP") { try { holder.closeStandby(); } catch { } }
       // SIGHUP, not the signal we were sent: the proxy spawns its own successor
       // on SIGTERM (that is what makes a redeploy free), and a successor here
       // would keep this holder supervising forever — measured, the case that
@@ -431,6 +503,11 @@ function holdPort(rest) {
       if (stopping || !holder?._handle) return settle(0);
       stopping = true;
       clearTimeout(restart);
+      // OUR STANDBY GOES WITH US. The successor adopts this socket and places
+      // its own; leaving ours would put two standbys on one descriptor, both
+      // waiting to arm. The socket is never at risk in between — we and our
+      // child are still holding it.
+      try { holder.closeStandby(); } catch { }
       try {
         spawn(process.execPath, [LAUNCHER_PATH, "run-service"], {
           detached: true,
@@ -447,7 +524,11 @@ function holdPort(rest) {
         }).unref();
       } catch (e) {
         process.stderr.write(`[cache-fix] could not hand the port on: ${e.message}\n`);
+        // We killed our standby on the way into this and we are staying, so put
+        // one back. Without it a failed handover leaves the holder live and
+        // permanently unprotected, and says nothing about it.
         stopping = false;
+        holder.openStandby();
         return;
       }
       // The child under us keeps serving until IT is replaced by the successor's

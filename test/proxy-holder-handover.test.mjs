@@ -1,4 +1,4 @@
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import net from "node:net";
@@ -23,17 +23,36 @@ function listeners(port) {
   } catch { return []; }
 }
 
+// Every port this file hands out, so the sweep at the bottom knows where to
+// look. A standby that has not armed yet holds a socket nobody ever listened
+// on, so `lsof -sTCP:LISTEN` cannot see it while a case is finishing — it
+// becomes visible a couple of seconds later, by which time the case's own
+// cleanup has run and moved on.
+const usedPorts = [];
 async function freePort() {
   const s = net.createServer();
   await new Promise((r) => s.listen(0, "127.0.0.1", r));
   const p = s.address().port;
   await new Promise((r) => s.close(r));
+  usedPorts.push(p);
   return p;
 }
 
+// The command line of a pid, or "" if it is gone. Every case here has to tell
+// a holder from a proxy from a standby relay, and they are only distinguishable
+// by what they are running.
+const cmdOf = (pid) => {
+  try { return execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" }); }
+  catch { return ""; }
+};
+
 const probe = (port) => new Promise((res) => {
   const r = http.get({ host: "127.0.0.1", port, path: "/health", agent: false, timeout: 8_000 },
-                     (s) => { s.resume(); s.on("end", () => res("ok")); });
+                     // THE STATUS, not merely a reply. A standby relay carrying
+                     // this address answers 503 on purpose, and a fixture that
+                     // took any response for "the proxy is up" started measuring
+                     // 1.3s before one existed.
+                     (s) => { s.resume(); s.on("end", () => res(s.statusCode === 200 ? "ok" : `ERR:${s.statusCode}`)); });
   r.on("error", (e) => res(`ERR:${e.code}`));
   // The timeout must RESOLVE, not merely fire: an unhandled one leaves the
   // request hanging and the sampler stalls on it forever.
@@ -53,6 +72,21 @@ const probe = (port) => new Promise((res) => {
 // successor that adopts rather than binds, which makes the replacement
 // same-tree instead of cross-tree.
 describe("holder handover (SIGUSR2)", () => {
+  // ONE SWEEP FOR THE FILE, over the ports it used and nobody else's. Reaping
+  // by process name would reach into a neighbouring file's live fixture, since
+  // node runs test files concurrently in their own processes.
+  after(async () => {
+    for (let i = 0; i < 6; i++) {
+      let any = false;
+      for (const port of usedPorts) {
+        for (const q of listeners(port)) {
+          try { process.kill(Number(q), "SIGHUP"); any = true; } catch { }
+        }
+      }
+      if (!any && i) break;
+      await new Promise((r) => setTimeout(r, 700));
+    }
+  });
   it("hands the port to a successor without refusing a request", async () => {
     const port = await freePort();
     const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port),
@@ -221,7 +255,8 @@ describe("holder handover (SIGUSR2)", () => {
 
       const health = await new Promise((res) => {
         http.get({ host: "127.0.0.1", port, path: "/health", agent: false, timeout: 8_000 },
-                 (r) => { let b = ""; r.on("data", (d) => (b += d)); r.on("end", () => res(b)); })
+                 (r) => { let b = ""; r.on("data", (d) => (b += d));
+                          r.on("end", () => res(r.statusCode === 200 ? b : "{}")); })
           .on("error", () => res("{}"));
       });
       const reported = JSON.parse(health).holder_tree;
@@ -282,9 +317,13 @@ describe("holder handover (SIGUSR2)", () => {
       // ARM the self-heal first: kill the holder, so the child's marker no
       // longer matches its ppid. Then ask the CHILD to release. With the poll
       // at 50ms a tick is guaranteed to land while it is releasing.
+      // THE PROXY child, not the first one. A holder also parents a standby
+      // relay, and `| head -1` picked that instead — the release then went to a
+      // process that has no release, the proxy never heard it, and the case
+      // failed reporting a resurrection that had not happened.
       const kid = Number(execFileSync("pgrep", ["-P", String(holder.pid)], { encoding: "utf8" })
-        .trim().split("\n")[0]);
-      assert.ok(Number.isInteger(kid) && kid > 1, "premise: the holder must have a child");
+        .trim().split("\n").find((p) => /server\.mjs/.test(cmdOf(p))));
+      assert.ok(Number.isInteger(kid) && kid > 1, "premise: the holder must have a proxy child");
       // AN ACCEPTED, IDLE CONNECTION, so the release cannot finish inside one
       // tick. server.close() waits on connections the proxy has ACCEPTED, and
       // without one the drain completes in under 50ms and the poll that would
@@ -297,9 +336,22 @@ describe("holder handover (SIGUSR2)", () => {
       await new Promise((r) => setTimeout(r, 6_000));
       held.destroy();
       await new Promise((r) => setTimeout(r, 2_000));
+      // NO LINEAGE, rather than no listener. The standby is a descriptor holder
+      // that outlives a killed holder on purpose, so it is expected here; what
+      // must not come back is a supervisor. Asserting on the command line keeps
+      // the mutation this case exists for — a self-heal that resurrects a holder
+      // shows up as `run-service` or `server.mjs` and fails right here.
+      const lineage = listeners(port).filter((p) => /\brun-service\b|server\.mjs/.test(cmdOf(p)));
+      assert.deepEqual(lineage, [],
+        "a supervisor came back after the port was released — the lineage resurrected " +
+        "itself, so no port can ever be retired and every stray one is permanent");
+      // AND THE ADDRESS STILL RETIRES. That is the other half of the same harm:
+      // a standby that ignored the release word would make every stray port
+      // permanent by a different route.
+      for (const p of listeners(port)) { try { process.kill(Number(p), "SIGHUP"); } catch { } }
+      await new Promise((r) => setTimeout(r, 1_500));
       assert.deepEqual(listeners(port), [],
-        "the port came back after being released — the lineage resurrected itself, " +
-        "so no port can ever be retired and every stray one is permanent");
+        "the address survived SIGHUP, so a released port cannot be retired at all");
     } finally {
       try { holder.kill("SIGKILL"); } catch { }
       for (let i = 0; i < 5; i++) {
@@ -323,6 +375,185 @@ describe("holder handover (SIGUSR2)", () => {
   // unreadable on purpose, so the case exercises the fallback on Linux too —
   // simulating the platform we do not run on beats skipping it, which is
   // cswap's pin's framing and the reason this is a case at all.
+  // TURNING CCF OFF MUST NOT TAKE THE ADDRESS WITH IT. A session's HTTPS_PROXY
+  // is fixed at exec and cannot be re-pointed, so "the proxy is gone" still has
+  // to mean "the address carries". Measured before the standby existed, with the
+  // holder and its child killed together: no descriptor left, no listener, and
+  // ECONNREFUSED — every live session on that port stranded for good.
+  // TWO HOP STATES, ONE BODY. "Everything off" reaches this address in both
+  // shapes: no fallback configured at all, and one configured but DOWN because
+  // privoxy was stopped too. The second is the one that used to reset every
+  // request — the hop is read once at startup, so a relay pointed at a dead
+  // port stayed pointed at it.
+  for (const [what, deadHop] of [["no hop is configured", false],
+                                 ["the configured hop is down", true]]) {
+  it(`carries the address when the holder and its child are both killed and ${what}`, async () => {
+    // A real origin, because ANSWERING IS NOT CARRYING. A relay that accepted
+    // and then sat there would pass a health probe and fail every request.
+    const origin = net.createServer((s) => s.on("data", () => s.end("pong")));
+    await new Promise((r) => origin.listen(0, "127.0.0.1", r));
+    const originPort = origin.address().port;
+    const port = await freePort();
+    const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port),
+                  CACHE_FIX_FORWARD_PROXY: "on" };
+    for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                     "ALL_PROXY", "all_proxy", "LISTEN_FDS", "LISTEN_PID",
+                     "CACHE_FIX_HOLD_PORT", "CACHE_FIX_WATCH_DEPLOY_MS",
+                     "CACHE_FIX_FALLBACK_PROXIES"]) delete env[k];
+    // A port nobody listens on, which is what a stopped privoxy leaves behind.
+    if (deadHop) env.CACHE_FIX_FALLBACK_PROXIES = `http://127.0.0.1:${await freePort()}`;
+    const holder = spawn(process.execPath, [launcherPath, "run-service"],
+                         { env, stdio: ["ignore", "ignore", "ignore"] });
+    const carries = () => new Promise((res) => {
+      const req = http.request({ host: "127.0.0.1", port, method: "CONNECT",
+                                 path: `127.0.0.1:${originPort}` });
+      let done = false;
+      const end = (v, s) => { if (done) return; done = true; clearTimeout(t);
+                              try { s?.destroy(); req.destroy(); } catch { } res(v); };
+      const t = setTimeout(() => end("HANG"), 10_000);
+      req.on("error", (e) => end(e.code));
+      req.on("connect", (r, socket) => {
+        if (r.statusCode !== 200) return end("connect:" + r.statusCode, socket);
+        socket.write("ping");
+        socket.on("data", (d) => end(String(d), socket));
+        socket.on("error", (e) => end(e.code, socket));
+      });
+      req.end();
+    });
+    try {
+      const up = Date.now() + 25_000;
+      let body = await probe(port);
+      while (body.startsWith("ERR:") && Date.now() < up) body = await probe(port);
+      assert.equal(body, "ok", "the holder never came up, so nothing was measured");
+      assert.equal(await carries(), "pong", "premise: the live proxy must carry a CONNECT");
+
+      // Kill the supervisor AND the proxy, and nothing else. Killing the standby
+      // too would be killing the only thing that can survive this, which is not
+      // the case under test.
+      const doomed = listeners(port).filter((p) => /\brun-service\b|server\.mjs/.test(cmdOf(p)));
+      assert.equal(doomed.length, 2,
+        `premise: a holder and a child must both be on the port, found ${doomed.length}`);
+      for (const p of doomed) { try { process.kill(Number(p), "SIGKILL"); } catch { } }
+
+      // The standby polls before it arms, so give it the window it asks for.
+      const by = Date.now() + 15_000;
+      let got = await carries();
+      while (got !== "pong" && Date.now() < by) got = await carries();
+      assert.equal(got, "pong",
+        "with the holder and the proxy both dead the address stopped carrying — a live " +
+        "session whose HTTPS_PROXY points here has nowhere else to go");
+    } finally {
+      try { holder.kill("SIGKILL"); } catch { }
+      for (const p of listeners(port)) { try { process.kill(Number(p), "SIGHUP"); } catch { } }
+      await new Promise((r) => setTimeout(r, 300));
+      for (const p of listeners(port)) { try { process.kill(Number(p), "SIGKILL"); } catch { } }
+      await new Promise((r) => origin.close(r));
+    }
+  });
+  }
+  // A STOP MUST NOT TAKE THE ADDRESS WITH IT. `systemctl stop`, Ctrl-C and a
+  // plain `kill` all arrive as SIGTERM, and an earlier draft ended the standby
+  // there — measured, SIGTERM left ECONNREFUSED while `kill -9` on the same pair
+  // carried, so the graceful path was the destructive one. Only SIGHUP, the word
+  // for "give the address away", may end it.
+  //
+  // Driven through a LIVE hop and with the request SPLIT across two writes,
+  // because that route reads the first chunk before it dials: removing a `data`
+  // listener does not pause a flowing stream, so everything after that chunk
+  // went to nobody and the hop waited out a Content-Length that never arrived.
+  it("carries a split request through the hop after the holder is stopped", async () => {
+    // A BIG body, written in the same breath as the headers. The window between
+    // the relay reading its first chunk and piping the rest is one loop turn, so
+    // a small body sent a beat later arrives after the pipe is up and proves
+    // nothing — measured, that shape passed with the pause removed. A megabyte
+    // spans many reads inside that one turn, so any of it that is emitted to
+    // nobody shows up as a short count here.
+    const BODY = 1 << 20;
+    let head = "", bytes = 0;
+    const hop = net.createServer((s) => {
+      s.on("data", (d) => {
+        if (head.length < 200) head += d.subarray(0, 200);
+        bytes += d.length;
+        if (bytes >= BODY) s.end("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+      });
+    });
+    await new Promise((r) => hop.listen(0, "127.0.0.1", r));
+    const hopAddr = `http://127.0.0.1:${hop.address().port}`;
+    const port = await freePort();
+    const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port),
+                  CACHE_FIX_FORWARD_PROXY: "on", CACHE_FIX_FALLBACK_PROXIES: hopAddr };
+    for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                     "ALL_PROXY", "all_proxy", "LISTEN_FDS", "LISTEN_PID",
+                     "CACHE_FIX_HOLD_PORT", "CACHE_FIX_WATCH_DEPLOY_MS"]) delete env[k];
+    const holder = spawn(process.execPath, [launcherPath, "run-service"],
+                         { env, stdio: ["ignore", "ignore", "ignore"] });
+    const raw = (send) => new Promise((res) => {
+      const c = net.connect(port, "127.0.0.1");
+      let b = "";
+      const done = (v) => { c.destroy(); res(v); };
+      const t = setTimeout(() => done(`TIMEOUT:${b}`), 8_000);
+      c.on("connect", () => send(c));
+      c.on("data", (d) => { b += d; });
+      c.on("close", () => { clearTimeout(t); res(b); });
+      c.on("error", (e) => { clearTimeout(t); done(`ERR:${e.code}`); });
+    });
+    try {
+      const up = Date.now() + 25_000;
+      let body = await probe(port);
+      while (body.startsWith("ERR:") && Date.now() < up) body = await probe(port);
+      assert.equal(body, "ok", "the holder never came up, so nothing was measured");
+
+      // THE GRACEFUL STOP, and nothing else. No SIGKILL anywhere in this case:
+      // what is under test is that the polite signal is not the destructive one.
+      holder.kill("SIGTERM");
+      const stopped = Date.now() + 20_000;
+      let left = listeners(port);
+      while (Date.now() < stopped
+             && left.some((q) => /\brun-service\b|server\.mjs/.test(cmdOf(q)))) {
+        await new Promise((r) => setTimeout(r, 200));
+        left = listeners(port);
+      }
+      assert.deepEqual(left.filter((q) => /\brun-service\b|server\.mjs/.test(cmdOf(q))), [],
+        "the holder and its proxy never went, so the stop was not measured");
+      assert.ok(left.length, "SIGTERM took the address down — every live session on it is stranded");
+
+      // FIRED BEFORE THE RELAY ARMS, on purpose. The connection lands in the
+      // backlog of a socket nobody is accepting yet — which is what a request
+      // arriving during the gap actually does — so by the time the relay reads,
+      // the whole body is already buffered and comes out in one flow loop.
+      // That is what makes the loss deterministic: measured in isolation,
+      // 983,051 of 1,048,587 bytes went to nobody without the pause, while the
+      // same request sent to an already-armed relay lost nothing at all.
+      const posted = raw((c) => {
+        c.write("POST http://example.invalid/ HTTP/1.1\r\nHost: example.invalid\r\n" +
+                `Content-Length: ${BODY}\r\n\r\n`);
+        c.write(Buffer.alloc(BODY, 0x62));
+      });
+
+      // The relay names itself and names the hop, at a status that cannot be
+      // mistaken for a healthy proxy by anything that gates on one.
+      const health = await raw((c) =>
+        c.write("GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"));
+      assert.match(health, /^HTTP\/1\.1 503 /, `a carrying relay must not report healthy: ${health}`);
+      const json = JSON.parse(health.slice(health.indexOf("{")));
+      assert.equal(json.carrying, "gap-relay");
+      assert.equal(json.https_proxy, hopAddr,
+        "the chain cannot be confirmed through an address that will not name its own next hop");
+
+      const reply = await posted;
+      assert.match(head, /^POST http:\/\/example\.invalid\//,
+        `the hop never saw the request line: ${JSON.stringify(head.slice(0, 80))}`);
+      assert.ok(bytes >= BODY,
+        `the hop got ${bytes} of ${BODY} body bytes — the relay dropped what arrived while it dialled`);
+      assert.match(reply, /^HTTP\/1\.1 200 /, `the hop's answer never came back: ${reply}`);
+    } finally {
+      try { holder.kill("SIGKILL"); } catch { }
+      for (const q of listeners(port)) { try { process.kill(Number(q), "SIGHUP"); } catch { } }
+      await new Promise((r) => setTimeout(r, 300));
+      for (const q of listeners(port)) { try { process.kill(Number(q), "SIGKILL"); } catch { } }
+      await new Promise((r) => hop.close(r));
+    }
+  });
   it("recognises a successor without /proc", async () => {
     const { successorServing } = await import("../proxy/server.mjs");
     if (typeof successorServing !== "function") {

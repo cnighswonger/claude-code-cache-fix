@@ -15,34 +15,157 @@
 // one, and straight to the origin by terminating CONNECT when there is not.
 // "Everything off" is a real state on these machines, and a session's
 // HTTPS_PROXY is fixed at exec — so this address has to finish the request.
-// CONNECT only: every call this stands in for is HTTPS.
 import net from "node:net";
 
-const hop = (process.env.CACHE_FIX_FALLBACK_PROXIES || "").split(",")[0].trim();
-const m = /^(?:https?:\/\/)?(?:[^@/]*@)?([^:/]+):(\d+)/.exec(hop);
-
-const join = (client, up, onReady) => {
-  const bail = () => { up.destroy(); client.destroy(); };
-  up.on("error", bail);
-  client.on("error", bail);
-  up.on("connect", onReady);
-};
+// The hop, parsed the way the proxy parses its own fallback list: a value
+// `new URL` rejects is not a hop over there either, so accepting a looser shape
+// here would make the two disagree about whether this machine has one. The
+// protocol check is what keeps `user:pass@host:port` — which URL reads as the
+// scheme `user:` — from becoming a hop, and from reaching /health below.
+const hopUrl = (() => {
+  try {
+    const u = new URL((process.env.CACHE_FIX_FALLBACK_PROXIES || "").split(",")[0].trim());
+    return u.protocol === "http:" || u.protocol === "https:" ? u : null;
+  } catch { return null; }
+})();
+const hopPort = hopUrl ? Number(hopUrl.port) || (hopUrl.protocol === "https:" ? 443 : 80) : 0;
+// Address only, never the credentials: a hop URL may carry them (cswap's pin
+// publishes its own as cswap:<token>@127.0.0.1:53749) and this goes into a
+// /health body that anything able to reach the port can read.
+const hopAddress = hopUrl ? `${hopUrl.protocol}//${hopUrl.host}` : null;
 
 const srv = net.createServer((client) => {
-  if (m) {
-    const up = net.connect(Number(m[2]), m[1]);
-    join(client, up, () => { client.pipe(up); up.pipe(client); });
-    return;
-  }
+  // A client that connects and never speaks would hold a descriptor for as long
+  // as this process lives. Cleared on the first byte, so an idle CONNECT tunnel
+  // — normal, and legitimately long — is never touched by it.
+  const mute = setTimeout(() => client.destroy(), 30_000);
+  let up = null;
+  client.on("error", () => { up?.destroy(); client.destroy(); });
   client.once("data", (first) => {
-    const c = /^CONNECT\s+([^\s:]+):(\d+)/i.exec(String(first).split("\r\n")[0]);
-    if (!c) { client.destroy(); return; }
-    const up = net.connect(Number(c[2]), c[1]);
-    join(client, up, () => {
-      client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-      client.pipe(up); up.pipe(client);
+    clearTimeout(mute);
+    // PAUSE, or every byte after this chunk is lost. Removing the last `data`
+    // listener does NOT stop a flowing stream, so whatever arrives between here
+    // and the pipe below is emitted to nobody. Measured on this exact shape: a
+    // request whose body followed its headers reached the hop with an empty
+    // body and hung waiting for a Content-Length that never came. pipe()
+    // resumes, so the buffered bytes go out in order.
+    client.pause();
+    const line = String(first).split("\r\n")[0];
+    // /health, answered 503, and both halves are load-bearing.
+    //
+    // /health because the standby below has to ask a question a real proxy also
+    // answers — a private path would be silence from a live proxy, and silence
+    // is its cue to start accepting beside one. Measured: the proxy closes on an
+    // unknown path without a byte.
+    //
+    // 503 because THIS ADDRESS IS NOT WELL, and every readiness check in the
+    // tree reads /health. Answering 200 made a fixture take a relay for a proxy
+    // and run 1.3s before one existed. `curl -sf` fails on 503, so the checks
+    // that gate a deploy keep saying no, which is the truth: traffic is moving
+    // and nothing is caching it.
+    if (/^GET\s+\/health\b/.test(line)) {
+      client.end("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n"
+                 + JSON.stringify({ carrying: "gap-relay", https_proxy: hopAddress }));
+      return;
+    }
+    // Straight to the origin, terminating CONNECT ourselves: the route when no
+    // hop is configured, and the route when the configured one is gone.
+    const direct = () => {
+      const c = /^CONNECT\s+([^\s:]+):(\d+)/i.exec(line);
+      if (!c) return void client.destroy();
+      up = net.connect(Number(c[2]), c[1]);
+      up.on("error", () => { up.destroy(); client.destroy(); });
+      up.on("connect", () => {
+        client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+        client.pipe(up); up.pipe(client);
+      });
+    };
+    if (!hopUrl) return void direct();
+
+    // A CONFIGURED HOP THAT IS DOWN IS NOT THE END OF THE LINE. The hop is read
+    // once at startup, so "privoxy is off too" leaves this pointing at a port
+    // that refuses — and refusing every request is the state we exist to
+    // prevent. Measured before this fell through: CCF off and the hop stopped
+    // gave ECONNRESET on every request, at 1ms, forever.
+    //
+    // Only BEFORE the tunnel opens. Once bytes are flowing the client is inside
+    // an established tunnel and there is nothing to re-dial — a second attempt
+    // would replay a request the hop may already have acted on.
+    //
+    // A hop speaks the same protocol we were handed, so CONNECT and
+    // absolute-form both pass through untouched, including the chunk we had to
+    // read to get here.
+    const hopSock = net.connect(hopPort, hopUrl.hostname);
+    up = hopSock;
+    let carried = false;
+    hopSock.on("error", () => { hopSock.destroy(); if (carried) client.destroy(); else direct(); });
+    hopSock.on("connect", () => {
+      carried = true;
+      hopSock.write(first);
+      client.pipe(hopSock); hopSock.pipe(client);
     });
   });
 });
 srv.on("error", (e) => { process.stderr.write(`[cache-fix] gap-relay: ${e.code}\n`); process.exit(1); });
-srv.listen({ fd: 3 }, () => process.stderr.write("[cache-fix] gap-relay carrying\n"));
+
+const carry = () => srv.listen({ fd: 3 }, () => process.stderr.write("[cache-fix] gap-relay carrying\n"));
+
+// STANDBY — the same relay, spawned once by the holder and then left alone,
+// accepting NOTHING until the holder is gone.
+//
+// A socket outlives every process that served it for as long as any descriptor
+// remains. Measured: killing the holder and its child together left no
+// descriptor at all and the address answered ECONNREFUSED, and a session's
+// HTTPS_PROXY is fixed at exec, so that session is stranded for life. Holding
+// the descriptor is what keeps the address alive; arming is what makes it work.
+//
+// Orphanhood says the holder that would respawn a proxy is gone, so nothing is
+// coming back to compete. Against the parent we were BORN with, not against pid
+// 1: an orphan is only reparented to init where nothing else claims it, and a
+// host running a child-subreaper (systemd --user sets one) would leave this
+// waiting for a 1 that never comes — and a standby that never arms still holds
+// the descriptor, so the address would ACCEPT and hang, which is worse than the
+// refusal it replaced.
+//
+// Silence says nothing is serving RIGHT NOW — which no descriptor scan can tell
+// you, because the holder, the child and this process all hold the same socket
+// and all read as LISTEN. Two acceptors on one descriptor take turns and drop
+// connections (measured: 60 of 125 reset), so the guard has to ask whether
+// anything ANSWERS rather than whether anything is attached. cswap's pin hit the
+// same wall from the other side and wrote it down: a refused-versus-not probe
+// cannot separate "served" from "accepted and queued behind nobody".
+//
+// TWICE, because arming is a one-way door and a proxy is allowed to be slow. A
+// boot takes ~1.2s here and a loaded box stretches it, so a single silent
+// window races a child that is still coming up. The second window costs a
+// caller nothing it was not already paying: its connection is queued in the
+// backlog either way and is served the moment somebody accepts.
+if (process.env.CACHE_FIX_STANDBY !== "1") carry();
+else {
+  const port = Number(process.env.CACHE_FIX_HELD_PORT);
+  // The host the socket is BOUND to, not loopback by assumption: a holder on a
+  // non-loopback bind would refuse every probe, leaving orphanhood as the only
+  // guard and arming this beside a live proxy.
+  const host = process.env.CACHE_FIX_HELD_HOST || "127.0.0.1";
+  const bornOf = process.ppid;
+  const answered = () => new Promise((res) => {
+    const s = net.connect(port, host);
+    let done = false;
+    const end = (v) => { if (done) return; done = true; clearTimeout(t); s.destroy(); res(v); };
+    // A hang IS the symptom: listening with nobody accepting reads exactly like
+    // this, and it is the state we exist to end.
+    const t = setTimeout(() => end(false), 2_000);
+    s.on("connect", () => s.write(`GET /health HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\n\r\n`));
+    s.on("data", () => end(true));
+    s.on("error", () => end(false));
+    s.on("close", () => end(false));
+  });
+  let silent = 0;
+  const tick = async () => {
+    if (process.ppid === bornOf) { silent = 0; return void setTimeout(tick, 250); }
+    silent = (await answered()) ? 0 : silent + 1;
+    if (silent < 2) return void setTimeout(tick, 250);
+    carry();
+  };
+  setTimeout(tick, 250);
+}
