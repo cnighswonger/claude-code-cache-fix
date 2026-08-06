@@ -19,4 +19,4 @@ Precedent that produced this convention: [#318](https://github.com/cnighswonger/
 
 - [`AGENTS.md`](../../AGENTS.md) — review lens and anti-bloat rules that apply to the underlying PRs.
 - [`CLAUDE.md`](../../CLAUDE.md#public-repo-information-hygiene) — the origin-IP hygiene rule that the UUID convention here parallels. Same reasoning (public history is immutable), different identifier class.
-- [`tools/absence-scan.mjs`](../../tools/absence-scan.mjs) — pre-push guard once #276 lands. Would have caught this class at authoring time.
+- `tools/absence-scan.mjs` — pre-push guard once [#276](https://github.com/cnighswonger/claude-code-cache-fix/pull/276) lands (the file isn't on `main` yet; the link resolves after that PR merges). Would have caught this class at authoring time.
