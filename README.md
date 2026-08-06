@@ -1435,6 +1435,18 @@ Backout: gate off + proxy restart → clients self-manage exactly as today (they
 
 ## Limitations
 
+### When NOT to run this
+
+Cases where the honest answer is "this proxy isn't the right tool for your setup." These are the questions to answer before you decide to adopt, not after.
+
+- **You already operate a caching gateway or proxy in the request path.** Composition here is *chaining*, not layering — you'd point your existing gateway's upstream at `cache-fix-proxy` (or vice versa via `CACHE_FIX_PROXY_UPSTREAM`), which adds a hop, a second failure mode, and a decision about which layer terminates TLS and which owns the cache-control markers. For many setups this is a net negative compared to a single well-instrumented gateway you already run. If you're evaluating whether to add this on top of an existing layer, weigh the marginal signal it gives you against the operational cost of one more process in the path.
+- **You need crash-to-supervisor semantics.** In forward-proxy mode (`--remote-control` / `CACHE_FIX_FORWARD_PROXY=on`), the proxy installs process-wide `uncaughtException` / `unhandledRejection` handlers that log and keep serving instead of crashing. On a shared / multi-tenant proxy this is a feature (one bad request doesn't take the whole process down); on a setup where you rely on a supervisor to restart on fatal errors, it means a fatal bug is swallowed rather than surfaced to the supervisor. See [Crash semantics on a shared proxy](#forward-proxy-mode-keeps-remote-control-working) for the full discussion — the constraint predates this section and applies regardless of when you find it.
+- **Your sessions are short and cold.** The proxy's value concentrates on resumed and long-running sessions where a stable prefix would otherwise be re-billed. On a pattern of many short fresh sessions, there is little cached prefix to protect, and the proxy carries overhead against a small ceiling of improvement. See [`docs/benchmarking.md`](docs/benchmarking.md) for the full "what this doesn't improve" discussion; this is the same argument stated at the adoption decision instead of the measurement one.
+
+### After adoption
+
+Constraints that assume you've already decided to run this:
+
 - **Proxy requires a running process** — The proxy must be started before Claude Code. If it's not running and `ANTHROPIC_BASE_URL` points to it, CC will fail to connect. We recommend running it as a systemd service or with a health-checking wrapper script.
 - **Overage TTL downgrade** — Exceeding 100% of the 5-hour quota triggers a server-enforced TTL downgrade from 1h to 5m. This is server-side and cannot be fixed client-side. The proxy/interceptor prevents the cache instability that can push you into overage in the first place.
 - **Microcompact is not preventable** — The monitoring features detect context degradation but cannot prevent it. Microcompact and budget enforcement are server-controlled via GrowthBook flags with no client-side disable option.
