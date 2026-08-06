@@ -569,9 +569,24 @@ function holdPort(rest) {
       // measured — and retrying could not fix it: once bytes have reached the
       // client the request is unrepeatable, and a retry sent it twice (80 of 80
       // failed).
-      // Publish BEFORE the spawn: the record must never claim a newer build
-      // than the process actually serving. Written on every spawn, so a restart
-      // that picks up a redeployed file republishes without anyone asking.
+      // Publish BEFORE the spawn, and the reason is the OPPOSITE of what this
+      // comment used to claim. It said the record must never name a newer build
+      // than the process serving — but publishing early is exactly what makes it
+      // do that, for the child's whole boot.
+      //
+      // What the order actually buys: a concurrent run-service reads this record
+      // through runningOurCode() to decide whether to take the port. Publish
+      // after the child reports listening and the record names the OLD build for
+      // ~1.2s, so a deploy landing in that window reads an already-upgrading
+      // holder as stale and churns it. Publish first and it reads "same bytes as
+      // mine, leave it alone", which is the right answer while an upgrade is in
+      // flight. The cost is the mirror case — a spawn that fails leaves the
+      // record naming a build nothing serves — and that one self-corrects,
+      // because the restart ladder republishes on every attempt and a port with
+      // no listener never reaches this comparison at all.
+      //
+      // Written on every spawn, so a restart that picks up a redeployed file
+      // republishes without anyone asking.
       publishFingerprint(port);
       bootedHash = codeFingerprint(SERVER_PATH);
       // The gap listener must let go before the child can listen on the
