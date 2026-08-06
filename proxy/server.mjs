@@ -955,6 +955,20 @@ function successorServing(port) {
   return false;
 }
 
+// stdout/stderr belong to the SUPERVISOR, and it can die first.
+//
+// When the holder is SIGKILLed its pipe goes with it, and the next write throws
+// EPIPE. That is not cosmetic: the throw happened mid-shutdown, so the drain
+// never ran and the process died with a connection still open — the client saw
+// RST. Measured, holder SIGKILLed under load: "self-heal: uncaughtException
+// swallowed: Error: write EPIPE ... at proxy/server.mjs:1079" and exactly 1
+// request lost, every run.
+//
+// A log line must never be able to end the process it is describing.
+function say(stream, text) {
+  try { stream.write(text); } catch { /* supervisor's pipe is gone; keep serving */ }
+}
+
 function exitWithParent() {
   // TWO BEHAVIOURS, AND ONLY ONE IS OPTIONAL. Noticing the parent is gone and
   // EXITING must always happen; putting a new holder back on the port is what
@@ -1076,7 +1090,7 @@ if (invokedAsScript) {
   startProxy()
     .then((handle) => {
       active = handle;
-      process.stdout.write(`proxy listening on ${handle.address}:${handle.port}\n`);
+      say(process.stdout, `proxy listening on ${handle.address}:${handle.port}\n`);
       sweepUpdateFossil();
     })
     .catch((err) => {
@@ -1164,8 +1178,8 @@ if (invokedAsScript) {
     // port and spawn", so a proxy that already spawned must say so or the two
     // of us put two proxies on one socket — measured, one extra per deploy:
     // PEAK CONCURRENT 4 and 3 still alive after 4 deploys.
-    process.stdout.write(
-      `proxy releasing the listening socket${askForSuccessor ? " (handed off)" : ""}\n`);
+    say(process.stdout,
+        `proxy releasing the listening socket${askForSuccessor ? " (handed off)" : ""}\n`);
     active.close().finally(() => process.exit(askForSuccessor ? 75 : 0));
     // The 5 s grace is DELIBERATELY UNCHANGED. A supervised stop is SERIAL
     // (stop, wait for exit, start), so a longer grace only extends the outage:
