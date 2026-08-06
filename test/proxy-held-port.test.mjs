@@ -758,16 +758,68 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         }).on("error", (e) => res(`ERR:${e.code}`));
       });
       const old = spawn(process.execPath, [launcherPath, "server"], { env, stdio: ["ignore", "pipe", "pipe"] });
-      const taker = spawn(process.execPath, [launcherPath, "run-service"], { env, stdio: ["ignore", "pipe", "pipe"] });
       let warned = "";
-      taker.stderr.on("data", (d) => { warned += d.toString(); });
+      let taker = null;
       try {
         const up = Date.now() + 15_000;
         let body = await get();
         while (body.startsWith("ERR:") && Date.now() < up) body = await get();
         assert.equal(JSON.parse(body).status, "ok", "nothing served the port");
+
+        // TRAFFIC ACROSS THE TAKEOVER, started before the taker exists — the
+        // whole window is between the incumbent letting go and the new child
+        // listening, so a probe that begins afterwards measures nothing.
+        // agent:false, a fresh connection each time: what is under test is
+        // whether the ADDRESS ever refuses, and a pooled socket would not ask.
+        let stop = false, served = 0;
+        const refused = [];
+        const once = () => new Promise((res) => {
+          http.get({ host: "127.0.0.1", port, path: "/health", agent: false, timeout: 8_000 },
+                   (r) => { r.resume(); r.on("end", () => res("ok")); })
+            .on("error", (e) => res(`ERR:${e.code}`));
+        });
+        const pump = (async () => {
+          while (!stop) {
+            const b = await once();
+            if (b.startsWith("ERR:")) refused.push({ code: b, at: Date.now() }); else served++;
+            await new Promise((r) => setTimeout(r, 2));   // yield to neighbours
+          }
+        })();
+
+        taker = spawn(process.execPath, [launcherPath, "run-service"], { env, stdio: ["ignore", "pipe", "pipe"] });
+        taker.stderr.on("data", (d) => { warned += d.toString(); });
         // Past the retry ladder, so a per-attempt spawn would have happened.
         await new Promise((r) => setTimeout(r, 3_000));
+        stop = true; await pump;
+
+        assert.ok(served > 0, "no request succeeded at all — the probe measured nothing");
+
+        // A CROSS-TREE TAKEOVER CANNOT BE FREE IN NODE, so this bounds the
+        // outage rather than forbidding it — and the bound is what catches a
+        // regression that turns a blip into an outage.
+        //
+        // Why zero is unreachable here. The socket survives its listener's
+        // death (measured: parent binds, child listens, child SIGKILLed, port
+        // still ACCEPTED/QUEUED) — so nothing is lost when a CHILD goes. What
+        // costs is a NEW HOLDER: it cannot inherit the incumbent's fd across
+        // process trees (node exposes no SCM_RIGHTS), so it must bind its own,
+        // and cswap's pin measured on both platforms that it cannot:
+        //   linux 6.8   incumbent LISTENING   -> second bind EADDRINUSE 98
+        //   darwin 15.7 incumbent BOUND ONLY  -> second bind EADDRINUSE 48
+        // So "spawn our child first and let it retry" is not available: the
+        // incumbent must let go BEFORE we can bind at all, and the port is
+        // unowned until our child boots. The zero-loss paths are the ones that
+        // never change process tree — the holder restarting its own child, and
+        // the proxy handing its socket to its own successor.
+        const outage = refused.length
+          ? refused[refused.length - 1].at - refused[0].at
+          : 0;
+        assert.ok(outage < 4_000,
+          `the port was refusing for ${outage}ms across a takeover (${refused.length} of ` +
+          `${served + refused.length} requests) — that is past a child's boot, so the ` +
+          `takeover did not complete, it stranded the address`);
+        assert.equal((await get()).startsWith("ERR:"), false,
+          "the port never came back after the takeover");
         let kids = [];
         try { kids = execFileSync("pgrep", ["-P", String(taker.pid)], { encoding: "utf8" })
                        .trim().split("\n").filter(Boolean); } catch {}

@@ -603,14 +603,29 @@ function removeSelfHeal() {
 // convention (LISTEN_FDS, first fd is 3). We never bind and never close it, so
 // the port stays bound across a restart.
 //
-// The env reaches every descendant, so the claim is checked against our pid and
-// cleared once taken — otherwise a child listens on whatever its own fd 3 is.
+// The env reaches every descendant, so it is read and CLEARED here, at module
+// load, before anything can spawn. The clearing is what stops a grandchild
+// serving on whatever its own fd 3 happens to be — not the pid check below.
+//
+// At load rather than inside startProxy(): a guard that works because "nobody
+// has spawned yet" is state, and state has an ordering. Clearing it before any
+// of our code runs leaves no window with code in it to spawn from. cswap's pin
+// named this, from the other side of the same problem — their guard is a FACT
+// checked at use time (does this variable name my actual parent), which needs
+// no ordering at all.
+const HANDED_DOWN = {
+  fds: Number(process.env.LISTEN_FDS),
+  // Set by systemd, never by us: our holder cannot know the child's pid before
+  // the child exists. So on our own launch path this is undefined and the check
+  // below never fires — it is here for the convention, not for our protection.
+  pid: process.env.LISTEN_PID,
+};
+delete process.env.LISTEN_FDS;
+delete process.env.LISTEN_PID;
+
 function inheritedFd() {
-  if (!(Number(process.env.LISTEN_FDS) >= 1)) return null;
-  const pid = process.env.LISTEN_PID;
-  if (pid && Number(pid) !== process.pid) return null;
-  delete process.env.LISTEN_FDS;
-  delete process.env.LISTEN_PID;
+  if (!(HANDED_DOWN.fds >= 1)) return null;
+  if (HANDED_DOWN.pid && Number(HANDED_DOWN.pid) !== process.pid) return null;
   return 3;
 }
 
