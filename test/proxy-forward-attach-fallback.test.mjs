@@ -14,6 +14,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import net from "node:net";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,6 +24,7 @@ import { startProxy } from "../proxy/server.mjs";
 const ENV_KEYS = [
   "CACHE_FIX_FORWARD_PROXY", "CACHE_FIX_CA_DIR", "CACHE_FIX_PROXY_UPSTREAM",
   "CACHE_FIX_HTTPS_PROXY", "HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy",
+  "CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_FALLBACK_PROXIES",
   "PATH",
 ];
 
@@ -149,6 +151,84 @@ test("attach failure: non-core paths 404 (not passthrough), no self-heal install
     restoreEnv(saved);
     if (handle) await handle.close();
     upstream.close();
+    try { rmSync(caDir, { recursive: true, force: true }); } catch {}
+  }
+});
+
+// A CONNECT MUST TRAVERSE THE FALLBACK CHAIN, NOT DIAL DIRECT.
+//
+// Live outage on the work Mac, found by cswap's pin: every `/login` failed with
+// UNABLE_TO_GET_ISSUER_CERT while plain HTTP was fine. The cause is one call
+// away from the fix — resolveHop() consults fallbackProxyUrls(), and its ONLY
+// caller was forwardRequest() (plain HTTP). Both CONNECT paths read
+// config.httpsProxy directly, which is fed by CACHE_FIX_UPSTREAM_PROXY /
+// HTTPS_PROXY and NEVER by CACHE_FIX_FALLBACK_PROXIES. With only the fallback
+// configured — the shipped wiring — that value is "" and CONNECT dialled
+// direct, straight into the corporate MITM.
+//
+// It hid for as long as it did because the host everyone probes is the one CCF
+// MITMs: api.anthropic.com goes down the relay path, comes back re-signed by
+// our own CA, and reads authorized=true. Only the hosts CCF does NOT MITM take
+// the blind tunnel, and those are exactly the login hosts. Measured on the work
+// Mac, same box, same minute:
+//   claude.ai / console.anthropic.com via 9901 -> UNABLE_TO_GET_ISSUER_CERT
+//   the same two              via 8118 -> authorized=true, Let's Encrypt
+//
+// A stand-in CONNECT proxy rather than a real hop: the assertion is WHICH
+// SOCKET the tunnel is opened on, and a listener that records the CONNECT line
+// answers that without TLS, a CA, or the network.
+test("CONNECT traverses the fallback chain when only a fallback is configured", async () => {
+  const saved = saveEnv();
+  const caDir = mkdtempSync(join(tmpdir(), "ccf-connect-fallback-"));
+  const seen = [];
+  // The fallback hop. Speaks just enough CONNECT to be chosen and to record it.
+  const hop = net.createServer((sock) => {
+    sock.once("data", (d) => {
+      seen.push(String(d).split("\r\n")[0]);
+      sock.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      sock.end();
+    });
+    sock.on("error", () => {});
+  });
+  const hopPort = await listen(hop);
+  // Where a DIRECT dial would land. Nothing may reach it.
+  const direct = net.createServer((sock) => { seen.push("DIRECT"); sock.destroy(); });
+  const directPort = await listen(direct);
+
+  let handle;
+  try {
+    process.env.CACHE_FIX_FORWARD_PROXY = "on";
+    process.env.CACHE_FIX_CA_DIR = caDir;
+    // The shipped shape: a fallback and NOTHING else. Every variable that feeds
+    // config.httpsProxy is cleared, because inheriting one here would let the
+    // old code pass for the wrong reason.
+    process.env.CACHE_FIX_FALLBACK_PROXIES = `http://127.0.0.1:${hopPort}`;
+    for (const k of ["CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_HTTPS_PROXY",
+                     "HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"]) delete process.env[k];
+
+    handle = await startProxy({ port: 0, watch: false });
+
+    // A host CCF does not MITM, so this is the blind tunnel — the failing path.
+    const target = `127.0.0.1:${directPort}`;
+    await new Promise((resolve) => {
+      const req = http.request({ host: "127.0.0.1", port: handle.port, method: "CONNECT",
+                                 path: target, headers: { host: target } });
+      req.on("connect", (_res, socket) => { socket.destroy(); resolve(); });
+      req.on("error", () => resolve());
+      req.setTimeout(4_000, () => { req.destroy(); resolve(); });
+      req.end();
+    });
+    await new Promise((r) => setTimeout(r, 150));   // let the hop record it
+
+    assert.ok(!seen.includes("DIRECT"),
+      "CONNECT dialled the target directly, bypassing the configured fallback — " +
+      "this is the work-Mac outage: every non-MITM'd host lands on the corporate proxy");
+    assert.deepEqual(seen, [`CONNECT ${target} HTTP/1.1`],
+      `CONNECT did not go through the fallback hop; saw ${JSON.stringify(seen)}`);
+  } finally {
+    restoreEnv(saved);
+    if (handle) await handle.close();
+    hop.close(); direct.close();
     try { rmSync(caDir, { recursive: true, force: true }); } catch {}
   }
 });
