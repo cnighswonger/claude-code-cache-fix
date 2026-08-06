@@ -971,6 +971,23 @@ function exitWithParent() {
   // The advertised port, which the holder passed down so we can put a new
   // holder back on it. Without it we can only exit, and the port stays dead
   // until a human opens a shell — which is exactly the outage this exists for.
+  // A SUCCESSOR IS NOT THE HOLDER'S CHILD. During a handover the OUTGOING
+  // proxy spawns us, so our ppid is its pid — never the holder's. "ppid
+  // changed" therefore says nothing about the holder here, and acting on it
+  // starts a RIVAL holder on a port that already has one.
+  //
+  // Measured on <linux-host>, live 9901, in this exact order:
+  //   proxy listening on 127.0.0.1:9901
+  //   proxy releasing the listening socket (handed off)
+  //   proxy listening on 127.0.0.1:9901      <- successor is up and serving
+  //   [cache-fix] holder died; started a new one on 9901   <- rival, 1s later
+  // and the churn cost 1,970 then 6,528 requests, twice taking the port down.
+  //
+  // I removed this guard once, because mutating it out changed nothing. That
+  // mutation ran on an isolated port where "holder died" never fired at all —
+  // 0 events across 4 runs — so it measured a path the condition cannot reach.
+  // A mutation that cannot trip the guard proves nothing about the guard.
+  if (process.env.CACHE_FIX_FROM_HANDOVER === "1") return;
   const advertised = process.env.CACHE_FIX_HELD_PORT;
   setInterval(() => {
     if (process.ppid === born) return;
@@ -1124,7 +1141,7 @@ if (invokedAsScript) {
       try {
         spawn(process.execPath, [fileURLToPath(import.meta.url), ...process.argv.slice(2)], {
           stdio: ["ignore", "inherit", "inherit", 3],
-          env: { ...process.env, LISTEN_FDS: "1" },
+          env: { ...process.env, LISTEN_FDS: "1", CACHE_FIX_FROM_HANDOVER: "1" },
           detached: true,
         }).unref();
       } catch (err) {
