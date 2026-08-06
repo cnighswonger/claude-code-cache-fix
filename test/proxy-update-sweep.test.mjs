@@ -15,7 +15,7 @@ import http from "node:http";
 import net from "node:net";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { mkdtempSync, writeFileSync, existsSync, mkdirSync, symlinkSync } from "node:fs";
+import { mkdtempSync, writeFileSync, existsSync, mkdirSync, symlinkSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 
@@ -48,7 +48,13 @@ async function sweepLeaves({ record, diskVersion, channelVersion, sweep }) {
   mkdirSync(join(home, ".local", "bin"), { recursive: true });
   symlinkSync(`/nonexistent/versions/${diskVersion}`, join(home, ".local", "bin", "claude"));
 
-  return withChannel(channelVersion, async (channelPort) => {
+  // BOTH DIRS GO, always. mkdtemp NEVER cleans up after itself, and this
+  // fixture makes two per call — measured on this box: 950 of them from one
+  // afternoon's runs and 831 from earlier sessions, 1,781 directories in a
+  // shared /tmp. Small on disk, but it is exactly the "test leftovers" class
+  // this repo has been bitten by, and nothing was ever going to remove them.
+  try {
+  return await withChannel(channelVersion, async (channelPort) => {
     const env = {
       ...process.env,
       HOME: home,
@@ -78,6 +84,9 @@ async function sweepLeaves({ record, diskVersion, channelVersion, sweep }) {
       await exitWithin(proc, 20_000, "the proxy never exited after SIGKILL");
     }
   });
+  } finally {
+    for (const d of [cfg, home]) { try { rmSync(d, { recursive: true, force: true }); } catch { } }
+  }
 }
 
 // Concurrent: each case owns its own HOME, config dir, port and channel, so
