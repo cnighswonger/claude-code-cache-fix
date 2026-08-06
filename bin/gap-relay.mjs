@@ -17,16 +17,40 @@
 // HTTPS_PROXY is fixed at exec — so this address has to finish the request.
 import net from "node:net";
 
-// The hop, parsed the way the proxy parses its own fallback list: a value
-// `new URL` rejects is not a hop over there either, so accepting a looser shape
-// here would make the two disagree about whether this machine has one. The
-// protocol check is what keeps `user:pass@host:port` — which URL reads as the
-// scheme `user:` — from becoming a hop, and from reaching /health below.
+// OUR OWN ADDRESS IS NEVER A HOP. `fallbackProxyUrls()` drops it for a reason
+// the fallback suite pins — a request routed there comes straight back — and the
+// shipped list can legitimately BEGIN with self. Taking `[0]` raw meant an armed
+// relay forwarded to itself: measured on one CONNECT, the relay's descriptor
+// count went 22 -> 8,195 -> 22,733 -> 29,814 and kept climbing, so the address
+// is destroyed rather than degraded, in the one state where nothing else is left
+// to serve it.
+const mine = new Set();
+for (const h of ["127.0.0.1", "localhost", "[::1]"])
+  if (process.env.CACHE_FIX_HELD_PORT) mine.add(`${h}:${process.env.CACHE_FIX_HELD_PORT}`);
+// Same precedence the proxy uses — config.httpsProxy first, then the fallback
+// list — because a host wired with only CACHE_FIX_UPSTREAM_PROXY has a hop this
+// would otherwise not see, and would dial origins direct, straight into a
+// corporate MITM, while /health on that same host named the corp proxy.
+//
+// `new URL` and http(s) only, matching upstream.mjs: a value it rejects is not a
+// hop there either, and the protocol check is what keeps `user:pass@host:port` —
+// which URL reads as the scheme `user:` — from becoming one, or from reaching
+// /health below.
 const hopUrl = (() => {
-  try {
-    const u = new URL((process.env.CACHE_FIX_FALLBACK_PROXIES || "").split(",")[0].trim());
-    return u.protocol === "http:" || u.protocol === "https:" ? u : null;
-  } catch { return null; }
+  const candidates = [process.env.CACHE_FIX_UPSTREAM_PROXY,
+                      process.env.HTTPS_PROXY, process.env.https_proxy,
+                      ...(process.env.CACHE_FIX_FALLBACK_PROXIES || "").split(",")];
+  for (const raw of candidates) {
+    const v = (raw || "").trim();
+    if (!v) continue;
+    try {
+      const u = new URL(v);
+      if (u.protocol !== "http:" && u.protocol !== "https:") continue;
+      if (mine.has(u.host)) continue;
+      return u;
+    } catch { /* not a hop; try the next */ }
+  }
+  return null;
 })();
 const hopPort = hopUrl ? Number(hopUrl.port) || (hopUrl.protocol === "https:" ? 443 : 80) : 0;
 // Address only, never the credentials: a hop URL may carry them (cswap's pin
@@ -42,7 +66,6 @@ const srv = net.createServer((client) => {
   let up = null;
   client.on("error", () => { up?.destroy(); client.destroy(); });
   client.once("data", (first) => {
-    clearTimeout(mute);
     // PAUSE, or every byte after this chunk is lost. Removing the last `data`
     // listener does NOT stop a flowing stream, so whatever arrives between here
     // and the pipe below is emitted to nobody. Measured on this exact shape: a
@@ -64,12 +87,18 @@ const srv = net.createServer((client) => {
     // that gate a deploy keep saying no, which is the truth: traffic is moving
     // and nothing is caching it.
     if (/^GET\s+\/health\b/.test(line)) {
+      // The timer is deliberately NOT cleared on this path: `end()` half-closes,
+      // and a peer that never closes back would hold this descriptor for the
+      // life of the process — one per probe, and the standby probes forever.
       client.end("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n"
                  + JSON.stringify({ carrying: "gap-relay", https_proxy: hopAddress }));
       return;
     }
+    clearTimeout(mute);
     // Straight to the origin, terminating CONNECT ourselves: the route when no
-    // hop is configured, and the route when the configured one is gone.
+    // hop is configured, and the route when the configured one is gone. CONNECT
+    // ONLY — with no hop there is nothing to hand an absolute-form request to,
+    // and every call this stands in for is HTTPS.
     const direct = () => {
       const c = /^CONNECT\s+([^\s:]+):(\d+)/i.exec(line);
       if (!c) return void client.destroy();

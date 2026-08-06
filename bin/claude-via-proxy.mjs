@@ -166,7 +166,12 @@ class HolderSocket extends EventEmitter {
     // and storing the 0 made the gap listener bind a different, useless port
     // — measured, the held port still answered ECONNREFUSED with gap=true.
     const bound = {};
-    h.getsockname(bound);
+    // h2, not h: h was closed above, and getsockname on a closed handle returns
+    // -9 and fills in nothing — measured. With an explicit port that was
+    // harmless because the fallback is the requested one, but with
+    // CACHE_FIX_PROXY_PORT=0 it handed the standby a held port of 0, whose every
+    // probe fails instantly and which would arm it beside a live proxy.
+    this._handle.getsockname(bound);
     this._port = bound.port || port;
     // Answer from this instant, even though no child is up yet. Without it a
     // session dialling before the first proxy binds gets ECONNREFUSED, and
@@ -206,7 +211,11 @@ class HolderSocket extends EventEmitter {
     try {
       this._gap = spawn(process.execPath, [GAP_RELAY_PATH], {
         stdio: ["ignore", "ignore", "inherit", fd],
-        env: { ...process.env, CACHE_FIX_HOLDER_TREE: undefined, CACHE_FIX_HELD_BY: undefined },
+        // HELD_PORT so it can exclude THIS address from its own hop list. The
+        // shipped fallback list may begin with self, and a relay that forwards
+        // to itself recurses until it runs out of descriptors.
+        env: { ...process.env, CACHE_FIX_HELD_PORT: String(this._port),
+               CACHE_FIX_HOLDER_TREE: undefined, CACHE_FIX_HELD_BY: undefined },
       });
       this._gap.on("exit", () => { this._gap = null; });
     } catch {
@@ -251,20 +260,33 @@ class HolderSocket extends EventEmitter {
         // /health anyway, where a checker can actually reach it.
         stdio: ["ignore", "ignore", "ignore", fd],
         env: { ...process.env, CACHE_FIX_STANDBY: "1", CACHE_FIX_HELD_PORT: String(this._port),
-               CACHE_FIX_HELD_HOST: this._host || "127.0.0.1" },
+               CACHE_FIX_HELD_HOST: this._host || "127.0.0.1",
+               // Same scrub the gap gets, and it matters more here: this one is
+               // detached and long-lived, so anything reading its environment
+               // would go on seeing it as part of a holder tree that is gone.
+               CACHE_FIX_HOLDER_TREE: undefined, CACHE_FIX_HELD_BY: undefined },
       });
       // NOT SILENTLY. A standby that dies is never replaced — nothing calls
       // this again — so the holder would run on believing it is protected.
       // The `error` listener matters twice over: an async spawn failure
       // (EAGAIN under fork pressure) is emitted, not thrown, and an unhandled
       // one on a ChildProcess takes the holder down with it.
+      const proc = this._standby;
+      // IDENTITY, not state. "Is there a standby" answers yes about a SUCCESSOR:
+      // a failed handover kills A, spawns B, and A's late exit would then null
+      // out B — leaving a live standby the holder can no longer close, so a
+      // release cannot end it and the next failed handover puts a second one
+      // beside it. Both would arm.
       const lost = (why) => {
+        if (this._standby !== proc) return;
         this._standby = null;
         process.stderr.write(`[cache-fix] standby relay gone (${why}); the port will not survive this holder\n`);
       };
-      this._standby.on("exit", () => { if (this._standby) lost("exited"); });
-      this._standby.on("error", (e) => lost(e?.code || e?.message || "spawn failed"));
-      this._standby.unref();
+      proc.on("exit", () => lost("exited"));
+      // An async spawn failure (EAGAIN under fork pressure) is EMITTED, not
+      // thrown, and an unhandled one on a ChildProcess takes the holder with it.
+      proc.on("error", (e) => lost(e?.code || e?.message || "spawn failed"));
+      proc.unref();
     } catch {
       this._standby = null;
     }
@@ -319,7 +341,21 @@ function holderPidOn(port) {
       if (/\brun-service\b/.test(c)) return "holder";
     } catch { /* gone between lsof and ps */ }
   }
-  const pid = pids[0];
+  // NOT THE STANDBY, unless it is all there is. lsof returns ascending pid order
+  // and the standby is spawned at bind — before the first proxy child — so it is
+  // always pids[0]. Measured consequence: a holder SIGKILLed while its child
+  // lived sent the child's self-heal here, this named the standby, release()
+  // SIGHUP'd it, and the retry loop then bind-failed for its whole 20s against
+  // the child that actually held the port. The one process whose job is to
+  // survive a dead holder was destroyed by the recovery path. A LONE armed
+  // standby must still be releasable, so it stays eligible when nothing else is.
+  const real = pids.filter((p) => {
+    try {
+      return !/gap-relay/.test(execFileSync("ps", ["-p", String(p), "-o", "command="],
+                                            { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }));
+    } catch { return false; }
+  });
+  const pid = (real.length ? real : pids)[0];
   // A holder of ours is running the `run-service` SUBCOMMAND. Nothing weaker
   // works: the rule was "names our launcher and is not server.mjs", and the
   // incumbent a real deploy meets is

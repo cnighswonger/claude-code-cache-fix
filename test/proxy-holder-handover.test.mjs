@@ -80,6 +80,11 @@ describe("holder handover (SIGUSR2)", () => {
       let any = false;
       for (const port of usedPorts) {
         for (const q of listeners(port)) {
+          // OURS ONLY. freePort() releases the port before handing it over, so by
+          // sweep time the OS may have given it to something unrelated — and
+          // signalling a stranger is exactly what holderPidOn's own comment
+          // refuses to do.
+          if (!/claude-via-proxy|gap-relay|server\.mjs|test-launcher-|test-fake-server-/.test(cmdOf(q))) continue;
           try { process.kill(Number(q), "SIGHUP"); any = true; } catch { }
         }
       }
@@ -135,6 +140,31 @@ describe("holder handover (SIGUSR2)", () => {
         `(${[...new Set(refused)].join(", ")}); a successor that BINDS instead of adopting ` +
         `cannot do better, which is why it has to be handed the descriptor`);
       assert.equal(await probe(port), "ok", "the port did not survive the handover");
+
+      // AND THE HANDOVER CARRIED THE PROTECTION FORWARD. Every deploy comes
+      // through here, so a successor that placed no standby of its own would
+      // leave the fleet with the code and without the cover — and a predecessor
+      // that kept its own would leave two of them, both waiting to arm.
+      const relays = listeners(port).filter((p) => /gap-relay/.test(cmdOf(p)));
+      assert.equal(relays.length, 1,
+        `${relays.length} standby relays hold the port after a handover; one is the contract, ` +
+        `two both arm when the lineage dies and take turns dropping connections`);
+      for (const p of listeners(port).filter((q) => /\brun-service\b|server\.mjs/.test(cmdOf(q)))) {
+        try { process.kill(Number(p), "SIGKILL"); } catch { }
+      }
+      const by = Date.now() + 15_000;
+      let after = await probe(port);
+      while (after === "ok" && Date.now() < by) {          // the proxy's own 200 first
+        await new Promise((r) => setTimeout(r, 200));
+        after = await probe(port);
+      }
+      while (after !== "ERR:503" && Date.now() < by) {     // then the relay's 503
+        await new Promise((r) => setTimeout(r, 200));
+        after = await probe(port);
+      }
+      assert.equal(after, "ERR:503",
+        "the successor's lineage was killed and the address went with it — a deploy left the " +
+        "port with no standby behind it");
     } finally {
       try { holder.kill("SIGKILL"); } catch { }
       // The successor is detached and deliberately outlives its predecessor —
@@ -478,10 +508,15 @@ describe("holder handover (SIGUSR2)", () => {
       });
     });
     await new Promise((r) => hop.listen(0, "127.0.0.1", r));
+    // CREDENTIALS ON THE HOP, so the equality below is a stripping assertion and
+    // not just a plumbing one. /health is readable by anything that can reach
+    // the port, and a hop URL can carry them — cswap's pin publishes its own as
+    // cswap:<token>@127.0.0.1:53749.
     const hopAddr = `http://127.0.0.1:${hop.address().port}`;
+    const hopWithCreds = `http://ccfuser:ccfsecret@127.0.0.1:${hop.address().port}`;
     const port = await freePort();
     const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port),
-                  CACHE_FIX_FORWARD_PROXY: "on", CACHE_FIX_FALLBACK_PROXIES: hopAddr };
+                  CACHE_FIX_FORWARD_PROXY: "on", CACHE_FIX_FALLBACK_PROXIES: hopWithCreds };
     for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
                      "ALL_PROXY", "all_proxy", "LISTEN_FDS", "LISTEN_PID",
                      "CACHE_FIX_HOLD_PORT", "CACHE_FIX_WATCH_DEPLOY_MS"]) delete env[k];
@@ -502,6 +537,17 @@ describe("holder handover (SIGUSR2)", () => {
       let body = await probe(port);
       while (body.startsWith("ERR:") && Date.now() < up) body = await probe(port);
       assert.equal(body, "ok", "the holder never came up, so nothing was measured");
+
+      // The proxy's own answer first: same field, same stripping, different
+      // implementation. Both sides publish the hop and neither may publish what
+      // is in front of it.
+      const alive = await raw((c) =>
+        c.write("GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"));
+      const aliveJson = alive.slice(alive.indexOf("{"), alive.lastIndexOf("}") + 1);
+      assert.equal(JSON.parse(aliveJson).https_proxy, hopAddr,
+        "the live proxy does not name the hop its CONNECTs leave through");
+      assert.ok(!/ccfuser|ccfsecret/.test(alive),
+        "the proxy published the hop's credentials on /health");
 
       // THE GRACEFUL STOP, and nothing else. No SIGKILL anywhere in this case:
       // what is under test is that the polite signal is not the destructive one.
@@ -535,10 +581,12 @@ describe("holder handover (SIGUSR2)", () => {
       const health = await raw((c) =>
         c.write("GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"));
       assert.match(health, /^HTTP\/1\.1 503 /, `a carrying relay must not report healthy: ${health}`);
-      const json = JSON.parse(health.slice(health.indexOf("{")));
+      const json = JSON.parse(health.slice(health.indexOf("{"), health.lastIndexOf("}") + 1));
       assert.equal(json.carrying, "gap-relay");
       assert.equal(json.https_proxy, hopAddr,
         "the chain cannot be confirmed through an address that will not name its own next hop");
+      assert.ok(!/ccfuser|ccfsecret/.test(health),
+        "the carrying relay published the hop's credentials on /health");
 
       const reply = await posted;
       assert.match(head, /^POST http:\/\/example\.invalid\//,

@@ -1298,6 +1298,11 @@ after(async () => {
     let any = false;
     for (const port of usedPorts) {
       for (const q of listeners(port)) {
+        // OURS ONLY. freePort() releases the port before handing it over, so by
+        // sweep time the OS may have given it to something unrelated — and
+        // signalling a stranger is exactly what holderPidOn's own comment
+        // refuses to do.
+        if (!/claude-via-proxy|gap-relay|server\.mjs|test-launcher-|test-fake-server-/.test(cmdOf(q))) continue;
         try { process.kill(Number(q), "SIGHUP"); any = true; } catch { }
       }
     }
