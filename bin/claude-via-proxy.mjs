@@ -13,6 +13,10 @@ import { bundleUsable, carriesOurCA, salvageBundle } from "./ca-trust.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SERVER_PATH = resolve(__dirname, "../proxy/server.mjs");
+// Our own path, so a holder can spawn its successor from the file AS IT IS ON
+// DISK rather than from the bytes it booted with — which is the only reason
+// anyone asks it to hand the port on.
+const LAUNCHER_PATH = fileURLToPath(import.meta.url);
 
 const args = process.argv.slice(2);
 const SUBCOMMAND = args[0];
@@ -54,6 +58,42 @@ class HolderSocket extends EventEmitter {
     // A fresh handle per attempt: a TCP handle that failed to bind cannot be
     // rebound, and reusing it turns every retry into the same error.
     const { TCP, constants } = process.binding("tcp_wrap");
+
+    // A SUCCESSOR HOLDER ADOPTS, IT DOES NOT BIND. This is the whole escape
+    // from a lossy handover: the outgoing holder spawns us with its socket on
+    // fd 3 and only then goes away, so the socket never loses its last fd and
+    // we never race anyone for the address. Binding here instead is what cost
+    // 63 of 1,281 requests, because the incumbent has to let go BEFORE a second
+    // bind can succeed at all — EADDRINUSE 98 on linux against a LISTENING
+    // socket, and 48 on darwin against a merely bound one (both measured by
+    // cswap's pin, who hit this failure first and fixed it the same way).
+    //
+    // HANDED_DOWN_HOLDER, not LISTEN_FDS alone: "my holder is alive above me
+    // and will replace me" and "my predecessor gave me this on its way out"
+    // look identical in the fd variables and mean opposite things when we are
+    // signalled. The proxy already distinguishes them with CACHE_FIX_HELD_PORT
+    // against CACHE_FIX_FROM_HANDOVER; this is the same distinction one layer up.
+    if (process.env.CACHE_FIX_HOLDER_HANDOVER === "1" && Number(process.env.LISTEN_FDS) >= 1) {
+      delete process.env.CACHE_FIX_HOLDER_HANDOVER;
+      delete process.env.LISTEN_FDS;
+      const adopted = new TCP(constants.SOCKET);
+      // Wrap the descriptor we were handed; it is already bound AND listening,
+      // so there is nothing to do to it but hold it.
+      if (adopted.open(3) === 0) {
+        this._handle = adopted;
+        this._host = host;
+        const got = {};
+        adopted.getsockname(got);
+        this._port = got.port || port;
+        this._adopted = true;
+        queueMicrotask(() => this.emit("listening"));
+        return this;
+      }
+      try { adopted.close(); } catch { }
+      // Fall through and bind: a handover we could not take is not a reason to
+      // leave the port unheld, it is a reason to take it the ordinary way.
+    }
+
     const h = new TCP(constants.SOCKET);
     const err = h.bind(host, port);
     if (err) {
@@ -329,6 +369,49 @@ function holdPort(rest) {
     // holder outright, leaving its child holding the socket — the takeover below
     // then had nobody to ask and waited out its deadline.
     process.on("SIGHUP", () => forward("SIGHUP"));
+
+    // SIGUSR2 — "replace yourself, and keep the socket alive while you do it".
+    //
+    // The difference from SIGHUP is who ends up holding the address. SIGHUP
+    // means let go, which leaves the port unowned until whoever asked can bind
+    // it, and a bind cannot even be attempted until we have let go. Here WE
+    // spawn the successor, hand it this socket on fd 3, and only then leave, so
+    // the socket never loses its last descriptor and the successor never binds
+    // anything. Same-tree by construction; cross-tree was the choice that made
+    // the handover lossy, not a constraint of the platform.
+    //
+    // The successor runs the launcher AS IT IS ON DISK, which is the point: a
+    // caller asks for this because the file changed under us.
+    process.on("SIGUSR2", () => {
+      if (stopping || !holder?._handle) return settle(0);
+      stopping = true;
+      clearTimeout(restart);
+      try {
+        spawn(process.execPath, [LAUNCHER_PATH, "run-service"], {
+          detached: true,
+          stdio: ["ignore", "inherit", "inherit", holder._handle.fd],
+          // EXIT_WITH_PARENT is dropped, and this is the distinction cswap's
+          // pin warned about before we hit it: "my parent is alive and watching
+          // me" and "my predecessor handed me its socket on the way out" look
+          // identical in the environment and mean opposite things. We are about
+          // to exit BY DESIGN, so a successor that inherited the orphan guard
+          // reads our death as its own cue and takes the port down with it —
+          // measured, every request in the sampling window refused.
+          env: { ...process.env, CACHE_FIX_HOLDER_HANDOVER: "1", LISTEN_FDS: "1",
+                 CACHE_FIX_EXIT_WITH_PARENT: "0" },
+        }).unref();
+      } catch (e) {
+        process.stderr.write(`[cache-fix] could not hand the port on: ${e.message}\n`);
+        stopping = false;
+        return;
+      }
+      // The child under us keeps serving until IT is replaced by the successor's
+      // own child; nothing here interrupts the accept path.
+      if (child && child.exitCode === null && !child.signalCode) {
+        try { child.kill("SIGHUP"); } catch { }
+      }
+      settle(0);
+    });
 
     // STOP WHEN NOBODY IS LEFT TO STOP US.
     //
@@ -720,6 +803,44 @@ function holdPort(rest) {
       const incumbent = holderPidOn(port);
       if (incumbent === "holder") return settle(0);   // ours already; nothing to do
       if (!incumbent) return settle(0);               // cannot identify it: leave it alone
+      // ASK A HOLDER TO HAND THE PORT ON RATHER THAN DROP IT.
+      //
+      // A holder can spawn our replacement itself and pass it this very socket,
+      // so the address never goes unowned and nothing has to bind. Releasing
+      // costs the incoming child's whole boot, because a second bind is refused
+      // while the incumbent still holds the port — that is the 63-of-1,281 this
+      // avoids. Only a holder can do it; a bare proxy has no successor-holder to
+      // spawn, so that case still goes the release route below.
+      let argv = "";
+      try {
+        argv = execFileSync("ps", ["-o", "command=", "-p", String(incumbent)],
+                            { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+      } catch { }
+      if (argv.includes("run-service")) {
+        try { process.kill(incumbent, "SIGUSR2"); } catch { return settle(0); }
+        // Confirm it actually happened. An incumbent too old to know SIGUSR2
+        // takes node's default and dies outright, which leaves its child on the
+        // socket and nobody supervising — so a handover we cannot SEE must fall
+        // back rather than be assumed.
+        const until = Date.now() + 10_000;
+        const settled = () => {
+          if (holderPidOn(port) === "holder") return settle(0);
+          if (Date.now() < until) return void setTimeout(settled, 100);
+          process.stderr.write(
+            `[cache-fix] pid ${incumbent} did not hand the port on; taking it the slow way\n`);
+          release();
+        };
+        return void settled();
+      }
+      release();
+    };
+
+    // The older route: ask the incumbent to let go, then bind what it drops.
+    // Whatever arrives here cannot hand a socket on, so the port is unowned for
+    // as long as our child takes to boot.
+    const release = () => {
+      const incumbent = holderPidOn(port);
+      if (incumbent === "holder" || !incumbent) return settle(0);
       try { process.kill(incumbent, "SIGHUP"); } catch { return settle(0); }
       // Retry the bind until it lands. The incumbent drains first, so this is
       // not a fixed wait — a busy proxy takes longer and we simply keep asking.

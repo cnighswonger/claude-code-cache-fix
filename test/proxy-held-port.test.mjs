@@ -354,7 +354,20 @@ it("keeps the port and backs off when a proxy that had served stops starting", a
       await new Promise((r) => setTimeout(r, 1_200));
 
       assert.equal(launcher.exitCode, null, "the launcher gave the port up, stranding every wired session");
-      assert.equal(await bound(), true, "the port was released while sessions were still wired to it");
+      // RELEASED means gone for good, not "not listening at the instant I
+      // looked". Only ONE handle may listen on a port, so the gap listener has
+      // to close before each respawn and the address genuinely does not accept
+      // while the next child boots. A single sample lands in that window often
+      // enough to matter — measured, 2 of 5 whole-file runs went red here on a
+      // holder that had not released anything. Retried, so what fails is a port
+      // that never comes back.
+      const backUp = Date.now() + 8_000;
+      let held = await bound();
+      while (!held && Date.now() < backUp) {
+        await new Promise((r) => setTimeout(r, 100));
+        held = await bound();
+      }
+      assert.equal(held, true, "the port was released while sessions were still wired to it");
       // Backed off: an unbounded loop reaches ~40 in this window.
       const tries = (stderr().match(/cannot start/g) || []).length;
       assert.ok(tries <= 10, `respawned ${tries} times in 1.2s — the backoff is not applied`);
