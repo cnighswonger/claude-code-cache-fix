@@ -18,7 +18,7 @@ import { publishableGates } from "./gate-allowlist.mjs";
 // runtime) see live behavior — same pattern as image-strip's #98 gate.
 import { appendFileSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 import { homedir } from "node:os";
@@ -969,8 +969,14 @@ const invokedAsScript =
 // Is a DIFFERENT process serving the advertised port? Used only while handing
 // over to a replacement holder: we still hold the socket, so "is the port up"
 // would answer yes about ourselves. Ownership by pid is the question.
-function successorServing(port) {
+export function successorServing(port) {
+  // The /proc attempt is skippable so the lsof path below can be exercised on a
+  // machine that HAS /proc. Without it the fallback is only reachable by running
+  // the suite on a mac, which is exactly the "skip the platform we do not run
+  // on" that left it untested in the first place — cswap's pin simulates Darwin
+  // rather than skipping it, and this is the seam that lets us do the same.
   try {
+    if (process.env.CACHE_FIX_NO_PROC === "1") throw new Error("proc disabled");
     const hex = Number(port).toString(16).toUpperCase().padStart(4, "0");
     const inodes = new Set();
     for (const line of readFileSync("/proc/net/tcp", "utf8").split("\n").slice(1)) {
@@ -989,7 +995,23 @@ function successorServing(port) {
         if (m && inodes.has(m[1])) return true;
       }
     }
-  } catch { /* /proc unavailable (macOS): fall through to the timeout */ }
+  } catch { /* no /proc: ask lsof below instead of waiting out the ceiling */ }
+  // MACS HAVE NO /proc, and this is the self-heal's exit condition — without an
+  // answer it returns false forever and the outgoing proxy waits out its whole
+  // 30s ceiling instead of leaving as soon as the successor serves. Two of our
+  // three machines are macs, so the Linux-only path was the exception rather
+  // than the rule. The launcher already reaches for lsof one file over, for
+  // exactly this reason and with that reason written down.
+  //
+  // Same question, different instrument: is any OTHER pid listening here.
+  try {
+    const out = execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN"],
+                             { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    for (const line of out.trim().split("\n")) {
+      const pid = Number(line);
+      if (Number.isInteger(pid) && pid > 1 && pid !== process.pid) return true;
+    }
+  } catch { /* lsof absent or nobody listening: the ceiling is the fallback */ }
   return false;
 }
 

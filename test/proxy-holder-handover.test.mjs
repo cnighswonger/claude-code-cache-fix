@@ -293,4 +293,64 @@ describe("holder handover (SIGUSR2)", () => {
       }
     }
   });
+  // THE SELF-HEAL'S EXIT CONDITION MUST WORK WITHOUT /proc. successorServing()
+  // read /proc/net/tcp and nothing else, so on a mac it answered "no successor"
+  // forever and the outgoing proxy waited out its whole 30s ceiling instead of
+  // leaving once the replacement served. Two of our three machines are macs, so
+  // the Linux-only path was the exception, not the rule.
+  //
+  // Driven through the REAL export rather than a stand-in, and with /proc made
+  // unreadable on purpose, so the case exercises the fallback on Linux too —
+  // simulating the platform we do not run on beats skipping it, which is
+  // cswap's pin's framing and the reason this is a case at all.
+  it("recognises a successor without /proc", async () => {
+    const { successorServing } = await import("../proxy/server.mjs");
+    if (typeof successorServing !== "function") {
+      assert.fail("successorServing is no longer exported — this case cannot ask its question");
+    }
+    const srv = net.createServer(() => {});
+    const port = await freePort();
+    await new Promise((r) => srv.listen(port, "127.0.0.1", r));
+    try {
+      // A DIFFERENT process must own it, or the answer is trivially false: this
+      // test process is the listener, and the function excludes itself by design.
+      assert.equal(successorServing(port), false,
+        "premise: our own listener must NOT read as a successor");
+    } finally {
+      await new Promise((r) => srv.close(r));
+    }
+    // Now a real other process on a real port.
+    const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(await freePort()),
+                  CACHE_FIX_FORWARD_PROXY: "on", CACHE_FIX_SELF_HEAL: "off" };
+    for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                     "ALL_PROXY", "all_proxy", "LISTEN_FDS", "LISTEN_PID",
+                     "CACHE_FIX_HOLD_PORT", "CACHE_FIX_WATCH_DEPLOY_MS"]) delete env[k];
+    const p2 = Number(env.CACHE_FIX_PROXY_PORT);
+    const holder = spawn(process.execPath, [launcherPath, "run-service"],
+                         { env, stdio: ["ignore", "pipe", "pipe"] });
+    try {
+      const up = Date.now() + 25_000;
+      let body = await probe(p2);
+      while (body.startsWith("ERR:") && Date.now() < up) body = await probe(p2);
+      assert.equal(body, "ok", "the holder never came up, so nothing was measured");
+      // WITH /proc DISABLED, so the lsof path is what answers even here.
+      process.env.CACHE_FIX_NO_PROC = "1";
+      const viaLsof = successorServing(p2);
+      delete process.env.CACHE_FIX_NO_PROC;
+      assert.equal(viaLsof, true,
+        "a live proxy on this port was not recognised — on a machine without /proc the " +
+        "self-heal waits out its 30s ceiling instead of handing over when the successor is up");
+    } finally {
+      try { holder.kill("SIGTERM"); } catch { }
+      for (let i = 0; i < 5; i++) {
+        const held = listeners(p2);
+        if (!held.length) break;
+        for (const q of held) {
+          const pid = Number(q);
+          if (Number.isInteger(pid) && pid > 1) { try { process.kill(pid, "SIGHUP"); } catch { } }
+        }
+        await new Promise((r) => setTimeout(r, 300));
+      }
+    }
+  });
 });
