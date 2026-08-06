@@ -5,6 +5,8 @@ import net from "node:net";
 import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
@@ -181,6 +183,55 @@ describe("holder handover (SIGUSR2)", () => {
     } finally {
       try { holder.kill("SIGKILL"); } catch { }
       for (let i = 0; i < 6; i++) {
+        const held = listeners(port);
+        if (!held.length) break;
+        for (const p of held) {
+          const pid = Number(p);
+          if (Number.isInteger(pid) && pid > 1) { try { process.kill(pid, "SIGHUP"); } catch { } }
+        }
+        await new Promise((r) => setTimeout(r, 300));
+      }
+    }
+  });
+  // A STALE HOLDER IS INVISIBLE FROM THE PROXY. It execs the launcher from
+  // DISK, so it spawns a perfectly current proxy while carrying none of the
+  // holder-side code itself — and proxy_tree therefore says nothing about the
+  // layer above it. Presence of a marker proves a GENERATION, not a commit:
+  // measured, our own fleet reported "current" on a marker check ten minutes
+  // after a holder-side commit it was not running.
+  //
+  // cswap's pin hit the same blind spot from the other side and worse: they
+  // diffed what shipped TODAY instead of what their PROCESSES lacked, and their
+  // holders turned out to be twelve releases behind with the adopt branch
+  // missing entirely.
+  it("publishes the holder's own bytes, so a stale holder is visible", async () => {
+    const port = await freePort();
+    const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port),
+                  CACHE_FIX_FORWARD_PROXY: "on", CACHE_FIX_SELF_HEAL: "off" };
+    for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                     "ALL_PROXY", "all_proxy", "LISTEN_FDS", "LISTEN_PID",
+                     "CACHE_FIX_HOLD_PORT", "CACHE_FIX_WATCH_DEPLOY_MS"]) delete env[k];
+    const holder = spawn(process.execPath, [launcherPath, "run-service"],
+                         { env, stdio: ["ignore", "pipe", "pipe"] });
+    try {
+      const up = Date.now() + 25_000;
+      let body = await probe(port);
+      while (body.startsWith("ERR:") && Date.now() < up) body = await probe(port);
+      assert.equal(body, "ok", "the holder never came up, so nothing was measured");
+
+      const health = await new Promise((res) => {
+        http.get({ host: "127.0.0.1", port, path: "/health", agent: false, timeout: 8_000 },
+                 (r) => { let b = ""; r.on("data", (d) => (b += d)); r.on("end", () => res(b)); })
+          .on("error", () => res("{}"));
+      });
+      const reported = JSON.parse(health).holder_tree;
+      const onDisk = createHash("sha256").update(readFileSync(launcherPath)).digest("hex").slice(0, 12);
+      assert.equal(reported, onDisk,
+        "health does not report the bytes the HOLDER is running, so a holder left behind by a " +
+        "deploy is indistinguishable from a current one — it spawns a current proxy either way");
+    } finally {
+      try { holder.kill("SIGKILL"); } catch { }
+      for (let i = 0; i < 5; i++) {
         const held = listeners(port);
         if (!held.length) break;
         for (const p of held) {

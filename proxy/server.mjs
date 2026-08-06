@@ -394,6 +394,10 @@ function handleHealth(_req, res) {
     // external checker needs to see, and cannot infer from mtimes without
     // false-firing on every touch that changes no bytes.
     proxy_tree: _sourceTree,
+    // The layer ABOVE, published by the holder that spawned us. Empty when
+    // nothing is holding this port, which is itself the answer to "is anyone
+    // supervising" for an external checker.
+    holder_tree: process.env.CACHE_FIX_HOLDER_TREE || "",
     // The gate set this process is ACTUALLY running, snapshotted at startup.
     //
     // Same argument as proxy_tree, one layer over: checking the unit file

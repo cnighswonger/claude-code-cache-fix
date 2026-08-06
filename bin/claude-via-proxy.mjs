@@ -17,6 +17,17 @@ const SERVER_PATH = resolve(__dirname, "../proxy/server.mjs");
 // DISK rather than from the bytes it booted with — which is the only reason
 // anyone asks it to hand the port on.
 const LAUNCHER_PATH = fileURLToPath(import.meta.url);
+// Hashed once, lazily: the bytes cannot change under a running process, and a
+// holder that never spawns never needs it.
+let _holderTree = null;
+function holderTree() {
+  if (_holderTree === null) {
+    try {
+      _holderTree = createHash("sha256").update(readFileSync(LAUNCHER_PATH)).digest("hex").slice(0, 12);
+    } catch { _holderTree = ""; }
+  }
+  return _holderTree;
+}
 
 const args = process.argv.slice(2);
 const SUBCOMMAND = args[0];
@@ -575,6 +586,14 @@ function holdPort(rest) {
         // therefore cost a rival holder — 1,970 then 6,528 requests.
         env: { ...process.env, CACHE_FIX_PROXY_PORT: "0", CACHE_FIX_PROXY_BIND: "127.0.0.1",
                CACHE_FIX_HELD_PORT: String(port), CACHE_FIX_HELD_BY: String(process.pid),
+               // OUR OWN BYTES, so the holder's version is observable instead of
+               // inferred. The proxy already publishes proxy_tree and a checker
+               // can compare it with disk; there was no equivalent for the layer
+               // ABOVE it, and a stale holder execs the launcher from disk — so
+               // it can spawn a perfectly current proxy while carrying none of
+               // the holder-side code itself. Presence of a marker proves a
+               // GENERATION, not a commit; this proves the commit.
+               CACHE_FIX_HOLDER_TREE: holderTree(),
                LISTEN_FDS: "1" },
       });
       // Hand the socket over NOW, not when the child reports "listening".
