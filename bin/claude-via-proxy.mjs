@@ -181,28 +181,50 @@ class HolderSocket extends EventEmitter {
   // that way, so we split it across two. A second bind+listen on a port the
   // first handle merely BOUND succeeds (measured), and it is closed the moment
   // a child takes over, so it never competes for traffic.
+  // AND IT RELAYS, because answering is not the same as working. Accepting with
+  // nobody behind it turns ECONNREFUSED into a HANG: measured, a request through
+  // a held port whose proxy was gone took 10,012 ms and then failed. A session
+  // whose HTTPS_PROXY was baked at exec cannot be re-pointed, so "CCF is off"
+  // has to mean "the address still carries", not "the address still accepts".
+  //
+  // A dumb TCP splice is enough and is the only thing that is correct here: the
+  // fallback is another HTTP proxy speaking the same protocol, so CONNECT and
+  // absolute-form both pass through untouched. Parsing them would add a second
+  // implementation of the thing we are relaying to.
   openGap() {
     if (this._gap || !this._handle) return;
-    const { TCP, constants } = process.binding("tcp_wrap");
-    const g = new TCP(constants.SOCKET);
-    if (g.bind(this._host, this._port)) { try { g.close(); } catch { } return; }
-    // THE LISTEN CAN FAIL, and ignoring it kept a handle that answers nothing.
-    // Measured: a second handle binds this port either way, but listen() returns
-    // -98 once the socket is already LISTENING — which it is from the moment the
-    // first child listens on the inherited fd, and stays even after that child
-    // dies, because the holder still holds a descriptor to it. So this device is
-    // a COLD-START one: it covers the window between our bind and the first
-    // child, and every later call is the kernel telling us the port already
-    // answers. Retaining the failed handle made closeGap() think it had
-    // something to close and hid that fact.
-    if (g.listen(511) !== 0) { try { g.close(); } catch { } return; }
-    this._gap = g;
+    const hop = (process.env.CACHE_FIX_FALLBACK_PROXIES || "").split(",")[0].trim();
+    const m = /^(?:https?:\/\/)?(?:[^@/]*@)?([^:/]+):(\d+)/.exec(hop);
+    const live = new Set();
+    const srv = net.createServer((client) => {
+      live.add(client);
+      client.on("close", () => live.delete(client));
+      if (!m) { client.destroy(); return; }          // nothing to relay to
+      const up = net.connect(Number(m[2]), m[1]);
+      live.add(up);
+      up.on("close", () => live.delete(up));
+      const bail = () => { up.destroy(); client.destroy(); };
+      up.on("error", bail);
+      client.on("error", bail);
+      up.on("connect", () => { client.pipe(up); up.pipe(client); });
+    });
+    srv.on("error", () => { try { srv.close(); } catch { } if (this._gap === srv) this._gap = null; });
+    srv.listen({ port: this._port, host: this._host });
+    this._gapSockets = live;
+    this._gap = srv;
   }
   // Before spawning: the child cannot listen on the fd while we are listening
   // on the same port.
   closeGap() {
     if (!this._gap) return;
     try { this._gap.close(); } catch { }
+    // AND DESTROY WHAT IT WAS RELAYING. close() stops accepting but waits on
+    // open sockets, and the child cannot listen until this one lets go — so a
+    // relay still in flight would hold the port against the very process that
+    // is meant to take over. The relay only exists while nothing better is
+    // serving; a child arriving IS the better thing.
+    for (const s of this._gapSockets || []) { try { s.destroy(); } catch { } }
+    this._gapSockets = null;
     this._gap = null;
   }
   close() {
