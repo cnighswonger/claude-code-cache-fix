@@ -831,6 +831,10 @@ export async function startProxy(options = {}) {
     server,
     port: addr.port,
     address: addr.address,
+    // Whether we are serving a socket a supervisor handed down. Only then can
+    // shutdown hand the SAME socket to a successor: a proxy that bound its own
+    // port has nothing to pass on.
+    inheritedSocket: listenFd !== null && listenFd === 3,
     close: () =>
       new Promise((resolve, reject) => {
         // Retire this instance's forward-mode vote exactly once (guarded
@@ -925,10 +929,16 @@ const invokedAsScript =
 // it tells the child to take an ephemeral port), so a proxy an operator runs
 // directly from a shell is never killed by its parent exiting.
 function exitWithParent() {
-  // An operator debugging a holder needs to be able to kill it and have it STAY
-  // dead. Off also disables the respawn below, since the two are one mechanism:
-  // the child noticing its parent is what puts a new holder on the port.
-  if (process.env.CACHE_FIX_SELF_HEAL === "off") return;
+  // TWO BEHAVIOURS, AND ONLY ONE IS OPTIONAL. Noticing the parent is gone and
+  // EXITING must always happen; putting a new holder back on the port is what
+  // an operator may want off.
+  //
+  // They used to be one switch, and that left orphans: every case that sets
+  // CACHE_FIX_SELF_HEAL=off — which is most of the suite, deliberately, so a
+  // killed holder stays dead — also disabled the exit, so the proxy child
+  // outlived its holder forever. Measured: three of them at ppid 1, 7 minutes
+  // old, holding the test runner's stdout pipe and stalling the whole suite at
+  // 568 cases until they were reaped by hand.
   if (process.env.CACHE_FIX_PROXY_PORT !== "0") return;
   const born = process.ppid;
   // The advertised port, which the holder passed down so we can put a new
@@ -946,7 +956,8 @@ function exitWithParent() {
     // and it is the holder that knows how to supervise a proxy. We hand the
     // port over by exiting right after — the successor takes it the same way a
     // deploy does.
-    if (advertised) {
+    // The respawn is the part `off` turns off. We still exit below.
+    if (advertised && process.env.CACHE_FIX_SELF_HEAL !== "off") {
       try {
         spawn(process.execPath, [join(__dirname, "..", "bin", "claude-via-proxy.mjs"), "run-service"], {
           detached: true, stdio: "ignore",
@@ -983,6 +994,12 @@ if (invokedAsScript) {
   const onSignal = () => shutdown();
   process.on("SIGTERM", onSignal);
   process.on("SIGINT", onSignal);
+  // Set before any handler can read it: `releasing` is declared here rather
+  // than beside shutdown() because SIGHUP arrives from the line below.
+  let releasing = false;
+  // The supervisor is stopping US, not redeploying: leave without putting a
+  // successor on the socket. See the holder's `forward()`.
+  process.on("SIGHUP", () => { releasing = true; onSignal(); });
   startProxy()
     .then((handle) => {
       active = handle;
@@ -1019,15 +1036,64 @@ if (invokedAsScript) {
     // still refused per restart, the same as before the reorder and the same at
     // 1ms and 20ms supervisor retries.
     //
-    // That residue is structural and lives in the supervisor, not here: a
-    // holder that CLOSES has to re-acquire, and nothing owns the port in
-    // between. The shape without it keeps the listening fd forever and hands
-    // each child a dup, so there is nothing to re-acquire (cswap's pin does
-    // this and measures 0 refused). Until the holder is rebuilt that way, a
-    // planned restart costs ~5-9 refused per 3 restarts of ~38,000.
+    // UNDER A HOLDER THERE IS NOTHING TO HAND OVER — the holder owns this
+    // socket and it is the holder that puts the successor on it. We only say
+    // WHICH kind of exit this is, and it says so with an exit code.
+    //
+    // I built the other shape first: the outgoing proxy spawning its own
+    // successor on fd 3. It measured zero refused, and it was still wrong.
+    // Once the proxy spawns, the holder is supervising a child it never
+    // started, so a supervisor's SIGTERM no longer stops it — measured, the
+    // case that asserts exactly that went from 587 ms to 10,985 ms and failed.
+    // cswap's pin has the same comment for the same reason, with a worse
+    // outcome recorded: 76 minutes of a broken pin reporting healthy, because
+    // the successor lost the bind and served on the wrong port.
+    //
+    // 75 (EX_TEMPFAIL) = "put a successor on this socket". Plain 0 = "I bound
+    // my own port, there is nothing to succeed to". Same number and meaning as
+    // the pin, so one probe reads both.
+    //
+    // We do NOT try to tell a redeploy from a shutdown here, because we cannot:
+    // both arrive as SIGTERM and only the holder knows which it sent. The
+    // holder already tracks that as `stopping` and ignores our code when it is
+    // stopping — so 75 is a REQUEST, and the supervisor is what grants it.
+    // WE hand the socket to our successor, because the holder cannot. It left
+    // libuv's accept path after our generation started — that is what stops it
+    // eating steady traffic — and closing its handle made the fd number
+    // unusable there (ENOTSOCK, measured). Ours is still valid, so the socket
+    // travels DOWN THE CHAIN: each proxy passes its own fd 3 on.
+    //
+    // SUCCESSOR FIRST, then stop accepting, then drain. Measured at 30
+    // concurrent over 3 handovers: 99,710 requests, 0 lost, 0 refused, and the
+    // port answered at every step. Removing the successor spawn under the same
+    // load puts the losses straight back.
+    //
+    // Exit 75 (EX_TEMPFAIL) stays even though we spawned: it is what a holder
+    // that still owns the socket — the pre-detach case, and cswap's pin —
+    // reads as "put a successor on this socket". The two paths must not
+    // disagree about what our exit means.
+    const askForSuccessor = active.inheritedSocket && !releasing;
+    if (askForSuccessor) {
+      try {
+        spawn(process.execPath, [fileURLToPath(import.meta.url), ...process.argv.slice(2)], {
+          stdio: ["ignore", "inherit", "inherit", 3],
+          env: { ...process.env, LISTEN_FDS: "1" },
+          detached: true,
+        }).unref();
+      } catch (err) {
+        // Say so and go: a holder that still has its handle will restart us the
+        // old way, and one that has detached is better told than left guessing.
+        process.stderr.write(`[cache-fix] successor spawn failed (${err?.code || err?.message})\n`);
+      }
+    }
     active.server.close?.();
-    process.stdout.write("proxy releasing the listening socket\n");
-    active.close().finally(() => process.exit(0));
+    // SAY WHO STARTED THE SUCCESSOR. The holder reads this line as "reclaim the
+    // port and spawn", so a proxy that already spawned must say so or the two
+    // of us put two proxies on one socket — measured, one extra per deploy:
+    // PEAK CONCURRENT 4 and 3 still alive after 4 deploys.
+    process.stdout.write(
+      `proxy releasing the listening socket${askForSuccessor ? " (handed off)" : ""}\n`);
+    active.close().finally(() => process.exit(askForSuccessor ? 75 : 0));
     // The 5 s grace is DELIBERATELY UNCHANGED. A supervised stop is SERIAL
     // (stop, wait for exit, start), so a longer grace only extends the outage:
     // measured at 120 s against `DefaultTimeoutStopSec=90s`, the stop was
