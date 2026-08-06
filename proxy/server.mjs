@@ -627,6 +627,15 @@ const HANDED_DOWN = {
 delete process.env.LISTEN_FDS;
 delete process.env.LISTEN_PID;
 
+// RELEASING IS A LINEAGE-WIDE FACT, so it cannot live inside the shutdown
+// closure. The self-heal below runs on its own timer and could not see it:
+// measured on wmac, nine holders were told to release and nine were back on the
+// same ports within 23 seconds, because each dying proxy noticed its holder was
+// gone and put a replacement there — correct behaviour for a holder that DIED,
+// wrong for one that was asked to let go. "Release" has to mean the lineage
+// stops, not that it respawns one level up.
+let releasingPort = false;
+
 function inheritedFd() {
   if (!(HANDED_DOWN.fds >= 1)) return null;
   if (HANDED_DOWN.pid && Number(HANDED_DOWN.pid) !== process.pid) return null;
@@ -1048,6 +1057,7 @@ function exitWithParent() {
     // the holder dies. The two disagreeing IS the orphaning. `born` is no
     // longer consulted — it could not tell a dead holder from a predecessor
     // that exited on purpose.
+    if (releasingPort) return;          // asked to let go: do not resurrect the lineage
     if (!heldBy || heldBy === String(process.ppid)) return;
     // The holder is gone and every session on this box has HTTPS_PROXY baked at
     // exec — they cannot be re-pointed, so the address must get an owner back.
@@ -1129,7 +1139,7 @@ if (invokedAsScript) {
   let releasing = false;
   // The supervisor is stopping US, not redeploying: leave without putting a
   // successor on the socket. See the holder's `forward()`.
-  process.on("SIGHUP", () => { releasing = true; onSignal(); });
+  process.on("SIGHUP", () => { releasing = true; releasingPort = true; onSignal(); });
   startProxy()
     .then((handle) => {
       active = handle;

@@ -242,4 +242,55 @@ describe("holder handover (SIGUSR2)", () => {
       }
     }
   });
+  // THIS CASE DOES NOT KILL ITS MUTATION, and that is stated here rather than
+  // discovered later. Removing the releasingPort guard leaves it green: on the
+  // SIGHUP path the child drains and exits faster than the self-heal's 1s poll,
+  // so the race never opens here. It opened on the work Mac, where nine proxies
+  // were serving and drained slowly enough to poll once with their holder
+  // already gone. The case is kept because it pins the CONTRACT and would catch
+  // a gross regression; it is not evidence the guard works, and the evidence
+  // that it does is the fleet measurement in the commit, not this file.
+  //
+  // RELEASE MUST MEAN THE LINEAGE STOPS. A holder asked to let go forwards that
+  // to its child, and the child's self-heal used to notice its holder was gone
+  // and put a replacement there — correct for a holder that DIED, wrong for one
+  // that was asked to release. Measured on the work Mac before this was fixed:
+  // nine holders released, nine back on the same ports within 23 seconds, so a
+  // port could not be retired at all.
+  it("stays gone when released, instead of resurrecting a holder", async () => {
+    const port = await freePort();
+    const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port),
+                  CACHE_FIX_FORWARD_PROXY: "on" };
+    for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                     "ALL_PROXY", "all_proxy", "LISTEN_FDS", "LISTEN_PID",
+                     "CACHE_FIX_HOLD_PORT", "CACHE_FIX_WATCH_DEPLOY_MS",
+                     "CACHE_FIX_SELF_HEAL"]) delete env[k];
+    const holder = spawn(process.execPath, [launcherPath, "run-service"],
+                         { env, stdio: ["ignore", "pipe", "pipe"] });
+    try {
+      const up = Date.now() + 25_000;
+      let body = await probe(port);
+      while (body.startsWith("ERR:") && Date.now() < up) body = await probe(port);
+      assert.equal(body, "ok", "the holder never came up, so nothing was measured");
+
+      holder.kill("SIGHUP");
+      // Long enough for the self-heal to have fired: it polls every second, and
+      // the resurrection this guards against was observed within 23s.
+      await new Promise((r) => setTimeout(r, 25_000));
+      assert.deepEqual(listeners(port), [],
+        "the port came back after being released — the lineage resurrected itself, " +
+        "so no port can ever be retired and every stray one is permanent");
+    } finally {
+      try { holder.kill("SIGKILL"); } catch { }
+      for (let i = 0; i < 5; i++) {
+        const held = listeners(port);
+        if (!held.length) break;
+        for (const p of held) {
+          const pid = Number(p);
+          if (Number.isInteger(pid) && pid > 1) { try { process.kill(pid, "SIGHUP"); } catch { } }
+        }
+        await new Promise((r) => setTimeout(r, 300));
+      }
+    }
+  });
 });
