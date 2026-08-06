@@ -17,17 +17,26 @@ const SERVER_PATH = resolve(__dirname, "../proxy/server.mjs");
 // DISK rather than from the bytes it booted with — which is the only reason
 // anyone asks it to hand the port on.
 const LAUNCHER_PATH = fileURLToPath(import.meta.url);
-// Hashed once, lazily: the bytes cannot change under a running process, and a
-// holder that never spawns never needs it.
-let _holderTree = null;
-function holderTree() {
-  if (_holderTree === null) {
-    try {
-      _holderTree = createHash("sha256").update(readFileSync(LAUNCHER_PATH)).digest("hex").slice(0, 12);
-    } catch { _holderTree = ""; }
-  }
-  return _holderTree;
-}
+// AT MODULE LOAD, not on first use. This value is an IDENTITY — "the bytes this
+// process is running" — and the only moment it is certainly true is next to the
+// exec that loaded them. Hashing lazily instead reads DISK at whatever later
+// moment the first child is spawned, and a source replaced in between would be
+// reported as ours: a stale holder publishing the current hash, which is
+// precisely the case the field exists to catch.
+//
+// Measured before hoisting it, on the lazy version: source changed under a
+// running holder, child respawned, holder_tree still reported the old hash — so
+// memoisation was already covering the common case. The window it did NOT cover
+// is boot to first spawn, ~260ms wide. cswap's pin flagged it while deciding
+// whether to copy the field, and named the distinction exactly: their
+// daemon_fingerprint() re-reads the file on every call, which is RIGHT for a
+// watchdog asking "does disk still match what I loaded" and wrong for an
+// identity handed down. Same function, opposite requirement.
+const HOLDER_TREE = (() => {
+  try {
+    return createHash("sha256").update(readFileSync(LAUNCHER_PATH)).digest("hex").slice(0, 12);
+  } catch { return ""; }
+})();
 
 const args = process.argv.slice(2);
 const SUBCOMMAND = args[0];
@@ -593,7 +602,7 @@ function holdPort(rest) {
                // it can spawn a perfectly current proxy while carrying none of
                // the holder-side code itself. Presence of a marker proves a
                // GENERATION, not a commit; this proves the commit.
-               CACHE_FIX_HOLDER_TREE: holderTree(),
+               CACHE_FIX_HOLDER_TREE: HOLDER_TREE,
                LISTEN_FDS: "1" },
       });
       // Hand the socket over NOW, not when the child reports "listening".
