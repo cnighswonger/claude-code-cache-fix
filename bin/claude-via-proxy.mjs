@@ -33,9 +33,18 @@ const GAP_RELAY_PATH = resolve(__dirname, "gap-relay.mjs");
 // daemon_fingerprint() re-reads the file on every call, which is RIGHT for a
 // watchdog asking "does disk still match what I loaded" and wrong for an
 // identity handed down. Same function, opposite requirement.
+//
+// BOTH FILES OF THIS LAYER. The relay is not covered by proxy_tree — it is not
+// under proxy/ — and it was not covered here either, so a change to it was
+// invisible to everything: the deploy printed "live proxy already on this code"
+// and verify agreed, on three machines running the OLD relay. That is the same
+// blind spot that made proxy_tree alone insufficient, one layer further down,
+// and it is why this hashes the layer rather than the file.
 const HOLDER_TREE = (() => {
   try {
-    return createHash("sha256").update(readFileSync(LAUNCHER_PATH)).digest("hex").slice(0, 12);
+    const h = createHash("sha256");
+    for (const f of [LAUNCHER_PATH, GAP_RELAY_PATH]) h.update(readFileSync(f));
+    return h.digest("hex").slice(0, 12);
   } catch { return ""; }
 })();
 

@@ -290,7 +290,15 @@ describe("holder handover (SIGUSR2)", () => {
           .on("error", () => res("{}"));
       });
       const reported = JSON.parse(health).holder_tree;
-      const onDisk = createHash("sha256").update(readFileSync(launcherPath)).digest("hex").slice(0, 12);
+      // THE WHOLE LAYER, not the one file. The relay lives in bin/ beside the
+      // launcher and is covered by no other fingerprint, so a relay-only change
+      // used to read as "already on this code" everywhere — deploy and verify
+      // both said OK on three machines running the old one.
+      const layer = createHash("sha256");
+      for (const f of [launcherPath, join(dirname(launcherPath), "gap-relay.mjs")]) {
+        layer.update(readFileSync(f));
+      }
+      const onDisk = layer.digest("hex").slice(0, 12);
       assert.equal(reported, onDisk,
         "health does not report the bytes the HOLDER is running, so a holder left behind by a " +
         "deploy is indistinguishable from a current one — it spawns a current proxy either way");
