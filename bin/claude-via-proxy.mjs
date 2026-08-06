@@ -196,17 +196,42 @@ class HolderSocket extends EventEmitter {
     const hop = (process.env.CACHE_FIX_FALLBACK_PROXIES || "").split(",")[0].trim();
     const m = /^(?:https?:\/\/)?(?:[^@/]*@)?([^:/]+):(\d+)/.exec(hop);
     const live = new Set();
-    const srv = net.createServer((client) => {
-      live.add(client);
-      client.on("close", () => live.delete(client));
-      if (!m) { client.destroy(); return; }          // nothing to relay to
-      const up = net.connect(Number(m[2]), m[1]);
+    // WHEN THERE IS NO HOP EITHER, GO DIRECT. "Everything off" is a real
+    // operating state on these machines — privoxy, this proxy and the pin can
+    // all be stopped — and a session whose HTTPS_PROXY is this address cannot be
+    // re-pointed, so the address itself has to complete the request. CONNECT is
+    // the whole of what matters here: every call this proxy exists for is HTTPS.
+    // Plain absolute-form is deliberately not handled — it would be a second
+    // implementation of the proxy this is standing in for, and it is not what
+    // gets used.
+    const splice = (client, up) => {
       live.add(up);
       up.on("close", () => live.delete(up));
       const bail = () => { up.destroy(); client.destroy(); };
       up.on("error", bail);
       client.on("error", bail);
-      up.on("connect", () => { client.pipe(up); up.pipe(client); });
+      return bail;
+    };
+    const srv = net.createServer((client) => {
+      live.add(client);
+      client.on("close", () => live.delete(client));
+      if (m) {                                        // a hop exists: splice to it
+        const up = net.connect(Number(m[2]), m[1]);
+        splice(client, up);
+        up.on("connect", () => { client.pipe(up); up.pipe(client); });
+        return;
+      }
+      client.once("data", (first) => {
+        const line = String(first).split("\r\n")[0];
+        const c = /^CONNECT\s+([^\s:]+):(\d+)/i.exec(line);
+        if (!c) { client.destroy(); return; }          // not CONNECT: not ours to answer
+        const up = net.connect(Number(c[2]), c[1]);
+        splice(client, up);
+        up.on("connect", () => {
+          client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+          client.pipe(up); up.pipe(client);
+        });
+      });
     });
     srv.on("error", () => { try { srv.close(); } catch { } if (this._gap === srv) this._gap = null; });
     srv.listen({ port: this._port, host: this._host });
