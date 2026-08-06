@@ -152,7 +152,13 @@ export function fallbackProxyUrls() {
   // "0" (the OS picked one), and a self-address we fail to compute is a self-
   // address we fail to exclude.
   const mine = new Set();
-  for (const p of [config.port, process.env.CACHE_FIX_PROXY_PORT].filter(Boolean))
+  // CACHE_FIX_HELD_PORT too, and it is the one that matters: the holder tells
+  // its child CACHE_FIX_PROXY_PORT=0 (take the descriptor, do not bind), so the
+  // two names above exclude 127.0.0.1:0 while the address the child actually
+  // serves stays in the list. A fallback list that begins with self then routes
+  // the child into itself.
+  for (const p of [config.port, process.env.CACHE_FIX_PROXY_PORT,
+                   process.env.CACHE_FIX_HELD_PORT].filter(Boolean))
     for (const h of ["127.0.0.1", "localhost", "[::1]"]) mine.add(`${h}:${p}`);
   return (process.env.CACHE_FIX_FALLBACK_PROXIES || "")
     .split(",").map((s) => s.trim()).filter(Boolean)

@@ -348,7 +348,7 @@ it("gives the port up when the proxy never starts", async () => {
       // "close", NOT "exit". exit fires when the process ends, close when its
       // stdio has drained — and this case reads the LAST line the launcher
       // writes. Measured: exitCode=1, signal=null, stderr holding only the 4
-      // "simulated" lines, with "releasing the port" still in the pipe. Alone it
+      // "simulated" lines, with the give-up line still in the pipe. Alone it
       // drained in time and passed; in the full file it did not. The repo
       // already moved 15 forks off "exit" for exactly this; this one was missed.
       const exited = await Promise.race([
@@ -356,7 +356,11 @@ it("gives the port up when the proxy never starts", async () => {
         new Promise((r) => setTimeout(() => r(false), 30_000)),
       ]);
       assert.ok(exited, "the launcher respawned a hopeless proxy forever, holding the port");
-      assert.match(stderr(), /releasing the port/);
+      // ANCHORED ON THE FACT, not on the old wording. The launcher used to say
+      // "releasing the port" here and it was not true once a standby stayed
+      // behind carrying the address — the line a human reads while diagnosing
+      // must not promise a free port that is still bound.
+      assert.match(stderr(), /failed to start 5 times; stopping/);
       const lineage = listeners(port).filter((q) => /test-launcher-|test-fake-server-/.test(cmdOf(q)));
       assert.deepEqual(lineage, [],
         "the launcher gave up but its lineage is still on the port, so it never really let go");

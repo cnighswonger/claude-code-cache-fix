@@ -261,6 +261,14 @@ class HolderSocket extends EventEmitter {
         stdio: ["ignore", "ignore", "ignore", fd],
         env: { ...process.env, CACHE_FIX_STANDBY: "1", CACHE_FIX_HELD_PORT: String(this._port),
                CACHE_FIX_HELD_HOST: this._host || "127.0.0.1",
+               // OUR PID, because it cannot read its own parent in time. It gets
+               // to `process.ppid` tens of milliseconds after being spawned, and
+               // a holder that dies inside that window has already been replaced
+               // by init — so the standby would compare 1 against 1 forever,
+               // never arm, and go on holding a listening socket. That is an
+               // address that ACCEPTS AND HANGS, which is worse than the refusal
+               // this whole mechanism replaced.
+               CACHE_FIX_STANDBY_PARENT: String(process.pid),
                // Same scrub the gap gets, and it matters more here: this one is
                // detached and long-lived, so anything reading its environment
                // would go on seeing it as part of a holder tree that is gone.
@@ -602,7 +610,7 @@ function holdPort(rest) {
     // Treating that as "our parent died" made this holder release the port and
     // stop — measured on this box, 9901 went down twice under a live session
     // and had to be restarted by hand, with the log saying exactly
-    // "[cache-fix] parent gone; releasing the port and stopping".
+    // "[cache-fix] parent gone; stopping. The standby keeps the address carrying (503 on /health)".
     //
     // So the guard exists for the case it was written for — a TEST RUNNER that
     // is SIGKILLed, leaving a holder nothing will ever collect (151 of them,
@@ -611,7 +619,7 @@ function holdPort(rest) {
     if (process.env.CACHE_FIX_EXIT_WITH_PARENT === "1" && process.ppid > 1) {
       const orphanCheck = setInterval(() => {
         if (stopping || process.ppid > 1) return;
-        process.stderr.write("[cache-fix] parent gone; releasing the port and stopping\n");
+        process.stderr.write("[cache-fix] parent gone; stopping. The standby keeps the address carrying (503 on /health)\n");
         clearInterval(orphanCheck);
         forward("SIGTERM");
       }, 5_000);
@@ -884,7 +892,7 @@ function holdPort(rest) {
         // front of a proxy that cannot start only makes callers wait out the
         // relay deadline instead of failing over. Give it up.
         if (!served && ++failures >= 5) {
-          process.stderr.write("[cache-fix] proxy failed to start 5 times; releasing the port\n");
+          process.stderr.write("[cache-fix] proxy failed to start 5 times; stopping. The standby keeps the address carrying (503 on /health), so a session wired here still reaches its next hop\n");
           return settle(code || 1);
         }
         // Served before: sessions ARE wired to this port and releasing it
@@ -1044,9 +1052,23 @@ function holdPort(rest) {
       try { process.kill(incumbent, "SIGHUP"); } catch { return settle(0); }
       // Retry the bind until it lands. The incumbent drains first, so this is
       // not a fixed wait — a busy proxy takes longer and we simply keep asking.
+      //
+      // AND KEEP ASKING WHOEVER IS STILL THERE. One nomination cannot free a
+      // port that two of our processes hold: releasing the proxy child leaves
+      // the standby's descriptor, and a socket stays LISTENING — and refuses a
+      // second bind — for as long as ANY descriptor to it remains. Measured:
+      // signalling once released the child, then bind-failed for the whole 20s
+      // against a standby nobody had asked to go, and the deploy exited 1 with
+      // no proxy on the address at all.
       const deadline = Date.now() + 20_000;
+      let asked = Date.now();
       const retry = () => {
         if (stopping) return;
+        if (Date.now() - asked > 500) {
+          asked = Date.now();
+          const still = holderPidOn(port);
+          if (still && still !== "holder") { try { process.kill(still, "SIGHUP"); } catch { } }
+        }
         if (Date.now() > deadline) {
           process.stderr.write(
             `[cache-fix] could not take port ${port} from pid ${incumbent} within 20s\n`);

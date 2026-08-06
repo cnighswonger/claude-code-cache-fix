@@ -25,8 +25,19 @@ import net from "node:net";
 // is destroyed rather than degraded, in the one state where nothing else is left
 // to serve it.
 const mine = new Set();
-for (const h of ["127.0.0.1", "localhost", "[::1]"])
-  if (process.env.CACHE_FIX_HELD_PORT) mine.add(`${h}:${process.env.CACHE_FIX_HELD_PORT}`);
+{
+  const held = process.env.CACHE_FIX_HELD_PORT;
+  // The host we are BOUND to as well as loopback: a non-loopback bind plus a
+  // fallback naming this box's own address is the same self-forward by another
+  // name. And the bare host for 80/443, because `new URL` drops a default port
+  // from `.host` and the comparison would never match.
+  if (held) {
+    for (const h of ["127.0.0.1", "localhost", "[::1]", process.env.CACHE_FIX_HELD_HOST].filter(Boolean)) {
+      mine.add(`${h}:${held}`);
+      if (held === "80" || held === "443") mine.add(h);
+    }
+  }
+}
 // Same precedence the proxy uses — config.httpsProxy first, then the fallback
 // list — because a host wired with only CACHE_FIX_UPSTREAM_PROXY has a hop this
 // would otherwise not see, and would dial origins direct, straight into a
@@ -127,9 +138,17 @@ const srv = net.createServer((client) => {
     const hopSock = net.connect(hopPort, hopUrl.hostname);
     up = hopSock;
     let carried = false;
+    // A DEADLINE ON THE DIAL. The measured fall-through case was a hop that
+    // REFUSED, which is instant; a hop that DROPS — VPN down, a firewalled corp
+    // proxy — costs the kernel's own connect timeout instead, ~130s on linux and
+    // ~75s on darwin. Waiting that out before falling through is the "worse than
+    // a refusal" outcome this path exists to prevent, on the path that prevents
+    // it. Same 2s the standby's own probe uses.
+    hopSock.setTimeout(2_000, () => { if (!carried) hopSock.destroy(new Error("hop dial timed out")); });
     hopSock.on("error", () => { hopSock.destroy(); if (carried) client.destroy(); else direct(); });
     hopSock.on("connect", () => {
       carried = true;
+      hopSock.setTimeout(0);          // an established tunnel is allowed to idle
       hopSock.write(first);
       client.pipe(hopSock); hopSock.pipe(client);
     });
@@ -176,7 +195,11 @@ else {
   // non-loopback bind would refuse every probe, leaving orphanhood as the only
   // guard and arming this beside a live proxy.
   const host = process.env.CACHE_FIX_HELD_HOST || "127.0.0.1";
-  const bornOf = process.ppid;
+  // The pid we were HANDED, not the one we can see: `process.ppid` is read tens
+  // of milliseconds after spawn, and a holder that died inside that window has
+  // already been replaced by init — so this would compare 1 against 1 forever
+  // and never arm, while still holding a listening socket. Accept-and-hang.
+  const bornOf = Number(process.env.CACHE_FIX_STANDBY_PARENT) || process.ppid;
   const answered = () => new Promise((res) => {
     const s = net.connect(port, host);
     let done = false;
