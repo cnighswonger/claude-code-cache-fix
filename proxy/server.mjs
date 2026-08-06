@@ -16,7 +16,7 @@ import { publishableGates } from "./gate-allowlist.mjs";
 // CACHE_FIX_DEBUG_LOG). Self-gated on CACHE_FIX_DEBUG=1; a no-op otherwise.
 // Env is read on every call so tests (and operators flipping the flag at
 // runtime) see live behavior — same pattern as image-strip's #98 gate.
-import { appendFileSync, mkdirSync, readFileSync, readlinkSync, rmSync } from "node:fs";
+import { appendFileSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -928,6 +928,33 @@ const invokedAsScript =
 // a second. Gated on being spawned by the holder (CACHE_FIX_PROXY_PORT=0 is how
 // it tells the child to take an ephemeral port), so a proxy an operator runs
 // directly from a shell is never killed by its parent exiting.
+// Is a DIFFERENT process serving the advertised port? Used only while handing
+// over to a replacement holder: we still hold the socket, so "is the port up"
+// would answer yes about ourselves. Ownership by pid is the question.
+function successorServing(port) {
+  try {
+    const hex = Number(port).toString(16).toUpperCase().padStart(4, "0");
+    const inodes = new Set();
+    for (const line of readFileSync("/proc/net/tcp", "utf8").split("\n").slice(1)) {
+      const f = line.trim().split(/\s+/);
+      if (f[1]?.endsWith(":" + hex) && f[3] === "0A") inodes.add(f[9]);
+    }
+    if (!inodes.size) return false;
+    for (const p of readdirSync("/proc")) {
+      if (!/^\d+$/.test(p) || Number(p) === process.pid) continue;
+      let fds;
+      try { fds = readdirSync(`/proc/${p}/fd`); } catch { continue; }
+      for (const fd of fds) {
+        let t;
+        try { t = readlinkSync(`/proc/${p}/fd/${fd}`); } catch { continue; }
+        const m = /^socket:\[(\d+)\]$/.exec(t);
+        if (m && inodes.has(m[1])) return true;
+      }
+    }
+  } catch { /* /proc unavailable (macOS): fall through to the timeout */ }
+  return false;
+}
+
 function exitWithParent() {
   // TWO BEHAVIOURS, AND ONLY ONE IS OPTIONAL. Noticing the parent is gone and
   // EXITING must always happen; putting a new holder back on the port is what
@@ -964,6 +991,26 @@ function exitWithParent() {
           env: { ...process.env, CACHE_FIX_PROXY_PORT: advertised, CACHE_FIX_HELD_PORT: undefined },
         }).unref();
         process.stderr.write(`[cache-fix] holder died; started a new one on ${advertised}\n`);
+        // KEEP SERVING UNTIL THE SUCCESSOR IS UP. Exiting the instant we have
+        // spawned a holder leaves the port with no owner for that holder's
+        // whole boot — measured, 133-138 refused per holder death while we sat
+        // idle waiting to die. We already hold the socket; there is no reason
+        // to stop answering with it before someone else can.
+        //
+        // Poll, do not guess a delay: a boot takes what it takes, and a fixed
+        // sleep is either an outage or a stall. When the new holder's proxy has
+        // the port, our own accept attempts stop winning connections and we can
+        // go. Bounded so a successor that never starts cannot pin us forever —
+        // at the ceiling we exit anyway and the holder's own restart ladder
+        // takes over, which is the pre-existing behaviour.
+        const until = Date.now() + 30_000;
+        const wait = setInterval(() => {
+          if (Date.now() < until && !successorServing(advertised)) return;
+          clearInterval(wait);
+          process.exit(0);
+        }, 100);
+        wait.unref();
+        return;
       } catch (e) {
         process.stderr.write(`[cache-fix] holder died and the respawn failed: ${e.message}\n`);
       }
