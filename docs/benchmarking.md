@@ -17,7 +17,9 @@ Anthropic's prompt-cache billing weights (as of Claude 4.x):
 | `input` (uncached) | 1.0× |
 | `cache_read` | 0.1× |
 | `cache_creation` (5m tier) | 1.25× |
-| `cache_creation` (1h tier) | 2.0× |
+| `cache_creation` (1h tier) | 2.0× (conservative — see below) |
+
+The 2.0× figure is what our own `tools/quota-analysis.mjs:57` uses (`W_CACHE_CREATION = 2.0; // 1h tier conservative; 5m would be 1.25`); the true 1h weight is not published verbatim by Anthropic and we've held the conservative side of the range. An evaluator computing headline cost from these numbers is inheriting that assumption — worth stating rather than borrowing silently.
 
 Two implications:
 
@@ -108,7 +110,7 @@ An honest report includes this section. The proxy's value has real boundaries:
 - **Sessions that avoid resume.** If your workload is a pattern of many short fresh sessions rather than fewer long ones, the proxy carries overhead (a local network hop, an extension pipeline) against a small ceiling of improvement.
 - **Small system prompts.** The wins scale with the size of the prefix that would otherwise be re-billed. A minimal system-prompt session has little to save.
 - **Tool-call-heavy turns on non-deferred tools.** The extension pipeline touches tool ordering, not tool execution; a workload dominated by tool latency won't see time-per-turn move at all, even if cost-per-turn does.
-- **Sessions on 5m tier throughout.** The `ttl-management` extension is largest-lever component on the cost side; without a 1h assignment, its arithmetic is smaller.
+- **Sessions on 5m tier throughout.** The `ttl-management` extension is the largest-lever component on the cost side; without a 1h assignment, its arithmetic is smaller.
 
 If your evaluation is on any of these workloads, the honest number is close to "no significant difference." That's the correct result, and the proxy is not the right tool for that workload.
 
@@ -127,7 +129,7 @@ Provenance: this measurement is from **v3.0.0** (released 2026-04-22), A/B teste
 - The number of paired runs behind "95.5% vs 82.3%" was not recorded.
 - The `ttl_tier` on each variant at the moment of measurement is not in the record.
 
-The current release is `v4.x`, three major-version pipelines ahead of the measurement (added since v3.0.0: `thinking-block-sanitize`, `session-budget-breaker`, `insertion-normalization`, `deferred-tool-rewrite`, and pipeline reorderings). We have not re-measured on v4.x under a controlled A/B, so the headline is **directional guidance** for the current release, not a claim of current-release provenance.
+The current release is `v4.x`, three major-version pipelines ahead of the measurement. Extensions added to `proxy/extensions/` since v3.0.0 (verified against `git log --diff-filter=A -- proxy/extensions/*.mjs`, first-added date shown): `thinking-display.mjs` (2026-05-17), `bootstrap-defense.mjs` (2026-05-25), `session-health.mjs` (2026-05-28), `thinking-block-sanitize.mjs` (2026-05-29), `auto-1m-guard.mjs` (2026-06-03), `image-retry-circuit-breaker.mjs` (2026-06-12), `read-dedupe.mjs` (2026-06-24), `session-budget-breaker.mjs` (2026-07-27), `insertion-normalization.mjs` (2026-08-06), and several others; plus pipeline reorderings. We have not re-measured on v4.x under a controlled A/B, so the headline is **directional guidance** for the current release, not a claim of current-release provenance.
 
 If you're evaluating v4.x specifically, treat the headline as "the improvement is real and non-trivial on the workloads it targets" — not as a number to test the current release against. Then apply this doc's protocol to derive a number on your own workload.
 
