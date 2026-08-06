@@ -627,13 +627,23 @@ const HANDED_DOWN = {
 delete process.env.LISTEN_FDS;
 delete process.env.LISTEN_PID;
 
-// RELEASING IS A LINEAGE-WIDE FACT, so it cannot live inside the shutdown
-// closure. The self-heal below runs on its own timer and could not see it:
-// measured on wmac, nine holders were told to release and nine were back on the
-// same ports within 23 seconds, because each dying proxy noticed its holder was
-// gone and put a replacement there — correct behaviour for a holder that DIED,
-// wrong for one that was asked to let go. "Release" has to mean the lineage
-// stops, not that it respawns one level up.
+// RELEASING IS A LINEAGE-WIDE FACT, and this guard is DEFENCE IN DEPTH rather
+// than the fix for a live defect — the first version of this comment said
+// otherwise and was wrong.
+//
+// What was measured: nine stray holders on the work Mac were told to release and
+// nine were back on the same ports in 23 seconds. I attributed that to this
+// timer not seeing `releasing`. Re-measured afterwards and the attribution does
+// not hold: on current code the child ALWAYS dies before its holder (0 samples
+// of the reverse across 200 at 50ms), because forward() signals the child and
+// the holder only settles on its exit. The nine were 4-27h old and predate
+// today's SIGHUP handler, so SIGHUP took node's DEFAULT and killed them without
+// telling their children — the orphans then self-healed, correctly.
+//
+// Kept anyway, and the reason is cswap's pin's: ordering is only as good as its
+// invariant, and ANY future teardown path that drops a holder without first
+// stopping its child re-opens the race silently. A flag survives new call sites;
+// an ordering does not.
 let releasingPort = false;
 
 function inheritedFd() {
