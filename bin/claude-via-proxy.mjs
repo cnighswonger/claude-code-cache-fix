@@ -34,16 +34,26 @@ const GAP_RELAY_PATH = resolve(__dirname, "gap-relay.mjs");
 // watchdog asking "does disk still match what I loaded" and wrong for an
 // identity handed down. Same function, opposite requirement.
 //
-// BOTH FILES OF THIS LAYER. The relay is not covered by proxy_tree — it is not
-// under proxy/ — and it was not covered here either, so a change to it was
-// invisible to everything: the deploy printed "live proxy already on this code"
-// and verify agreed, on three machines running the OLD relay. That is the same
-// blind spot that made proxy_tree alone insufficient, one layer further down,
-// and it is why this hashes the layer rather than the file.
+// THE WHOLE DIRECTORY, which is what "this layer" means. Naming files here has
+// now been wrong twice: the relay was covered by nothing until it was added, and
+// then ca-trust.mjs — which the launcher imports — was still covered by nothing,
+// since proxy_tree only walks proxy/. A change confined to it would move no
+// fingerprint at all, and every check would call the machine current.
+//
+// cswap's pin hit the identical shape the same day: its daemon fingerprint
+// hashed proxy.py alone while the daemon also imports _host.py. Naming the
+// members of a layer is the bug; walking it is the fix.
+//
+// Sorted, so the digest does not depend on directory order, and synchronous
+// because this is an identity fixed at module load — the async walk in
+// source-fingerprint.mjs answers a different question for the proxy.
 const HOLDER_TREE = (() => {
   try {
+    const dir = dirname(LAUNCHER_PATH);
     const h = createHash("sha256");
-    for (const f of [LAUNCHER_PATH, GAP_RELAY_PATH]) h.update(readFileSync(f));
+    for (const f of readdirSync(dir).filter((n) => n.endsWith(".mjs")).sort()) {
+      h.update(f).update(readFileSync(resolve(dir, f)));
+    }
     return h.digest("hex").slice(0, 12);
   } catch { return ""; }
 })();

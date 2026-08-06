@@ -6,7 +6,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
@@ -290,13 +290,14 @@ describe("holder handover (SIGUSR2)", () => {
           .on("error", () => res("{}"));
       });
       const reported = JSON.parse(health).holder_tree;
-      // THE WHOLE LAYER, not the one file. The relay lives in bin/ beside the
-      // launcher and is covered by no other fingerprint, so a relay-only change
-      // used to read as "already on this code" everywhere — deploy and verify
-      // both said OK on three machines running the old one.
+      // THE WHOLE DIRECTORY, not a list of files. Naming them was wrong twice —
+      // first gap-relay.mjs, then ca-trust.mjs which the launcher imports — and
+      // both times a stale machine reported itself current. Recomputed the way
+      // the launcher does, so this fails if the two ever diverge.
+      const dir = dirname(launcherPath);
       const layer = createHash("sha256");
-      for (const f of [launcherPath, join(dirname(launcherPath), "gap-relay.mjs")]) {
-        layer.update(readFileSync(f));
+      for (const f of readdirSync(dir).filter((n) => n.endsWith(".mjs")).sort()) {
+        layer.update(f).update(readFileSync(join(dir, f)));
       }
       const onDisk = layer.digest("hex").slice(0, 12);
       assert.equal(reported, onDisk,
