@@ -346,7 +346,19 @@ function holdPort(rest) {
     //
     // Not gated on being under a test: a holder orphaned in production is the
     // same leak with a longer fuse.
-    if (process.ppid > 1) {
+    // ONLY WHEN A SUPERVISOR ASKS FOR IT. Reparenting to init is the NORMAL
+    // launch here, not a death: `wire.zsh` starts us with `&!` and the shell
+    // that did it exits immediately, so ppid goes 1 within seconds of boot.
+    // Treating that as "our parent died" made this holder release the port and
+    // stop — measured on this box, 9901 went down twice under a live session
+    // and had to be restarted by hand, with the log saying exactly
+    // "[cache-fix] parent gone; releasing the port and stopping".
+    //
+    // So the guard exists for the case it was written for — a TEST RUNNER that
+    // is SIGKILLed, leaving a holder nothing will ever collect (151 of them,
+    // 9.17 GiB) — and that caller can ask for it. A production holder outliving
+    // its shell is the design.
+    if (process.env.CACHE_FIX_EXIT_WITH_PARENT === "1" && process.ppid > 1) {
       const orphanCheck = setInterval(() => {
         if (stopping || process.ppid > 1) return;
         process.stderr.write("[cache-fix] parent gone; releasing the port and stopping\n");
@@ -1463,6 +1475,26 @@ if (remoteControl) {
   }
   if (caForClaude) claudeEnv.NODE_EXTRA_CA_CERTS = caForClaude;
   else delete claudeEnv.NODE_EXTRA_CA_CERTS;
+  // MAKE NODE ACTUALLY USE THE PROXY WE JUST POINTED IT AT.
+  //
+  // node has no implicit proxy support: HTTPS_PROXY is inert unless this is set
+  // (node 24+). Measured on the work Mac with a DEAD proxy, which is the only
+  // way to tell "used it" from "ignored it" — a live one succeeds either way:
+  //   HTTPS_PROXY=<dead>                     -> UNABLE_TO_GET_ISSUER_CERT
+  //   no proxy variable at all               -> UNABLE_TO_GET_ISSUER_CERT
+  // identical, so nothing read the variable. curl given the same dead proxy
+  // fails to connect, because curl does honour it.
+  //
+  // WHAT THAT COST: the CLI's own auto-updater is node, so it dialled DIRECT,
+  // landed on the corporate TLS interceptor, and failed — three times, then
+  // wrote install_failed and pinned "✘ Auto-update failed" for the session's
+  // life. And NODE_EXTRA_CA_CERTS could not save it: on node 26 the file is
+  // loaded (getCACertificates("extra") = 168) but not used for verification —
+  // the same bundle passed as `ca:[...]` verifies the same chain fine. So the
+  // fix is not more trust, it is going through the proxy at all.
+  //
+  // With it: the same updater URL returns 200 body "2.1.223" through our port.
+  claudeEnv.NODE_USE_ENV_PROXY = "1";
   // Exclude localhost from the proxy. Without this, HTTPS_PROXY routes EVERY
   // connection claude makes — including to local services like HTTP/SSE-transport
   // MCP servers (e.g. an MCP on 127.0.0.1) — at the cache-fix proxy, which only

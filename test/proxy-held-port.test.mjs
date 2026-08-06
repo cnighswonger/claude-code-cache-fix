@@ -75,7 +75,12 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
   for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "LISTEN_FDS", "LISTEN_PID",
                    "CACHE_FIX_WATCH_DEPLOY_MS", "CACHE_FIX_SELF_HEAL"]) delete env[k];
   Object.assign(env, { CACHE_FIX_HOLD_PORT: "on", CACHE_FIX_PROXY_PORT: String(port),
-                       CACHE_FIX_SELF_HEAL: "off", ...extraEnv });
+                       CACHE_FIX_SELF_HEAL: "off",
+                       // A SIGKILLed runner runs no cleanup, so ask the holder to
+                       // notice and go. Production does the opposite on purpose:
+                       // wire.zsh backgrounds it and the shell exits, so ppid 1 is
+                       // the normal launch, not a death.
+                       CACHE_FIX_EXIT_WITH_PARENT: "1", ...extraEnv });
   const launcher = spawn(process.execPath, [launcherPath, subcommand], { env, stdio: ["ignore", "pipe", "pipe"] });
   const exited = new Promise((r) => launcher.on("exit", () => r(true)));
   const get = () => new Promise((res) => {
