@@ -219,40 +219,39 @@ const carry = () => srv.listen({ fd: 3 }, () => process.stderr.write("[cache-fix
 // `netstat -an` on the mac does not.
 if (process.env.CACHE_FIX_STANDBY !== "1") carry();
 else {
-  const port = Number(process.env.CACHE_FIX_HELD_PORT);
-  // The host the socket is BOUND to, not loopback by assumption: a holder on a
-  // non-loopback bind would refuse every probe, leaving orphanhood as the only
-  // guard and arming this beside a live proxy.
-  const host = process.env.CACHE_FIX_HELD_HOST || "127.0.0.1";
   // The pid we were HANDED, not the one we can see: `process.ppid` is read tens
   // of milliseconds after spawn, and a holder that died inside that window has
   // already been replaced by init — so this would compare 1 against 1 forever
   // and never arm, while still holding a listening socket. Accept-and-hang.
   const bornOf = Number(process.env.CACHE_FIX_STANDBY_PARENT) || process.ppid;
-  const answered = () => new Promise((res) => {
-    const s = net.connect(port, host);
-    let done = false;
-    const end = (v) => { if (done) return; done = true; clearTimeout(t); s.destroy(); res(v); };
-    // A hang IS the symptom: listening with nobody accepting reads exactly like
-    // this, and it is the state we exist to end.
-    const t = setTimeout(() => end(false), 250);
-    s.on("connect", () => s.write(`GET /health HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\n\r\n`));
-    s.on("data", () => end(true));
-    s.on("error", () => end(false));
-    s.on("close", () => end(false));
-  });
-  let silent = 0;
-  const tick = async () => {
-    if (process.ppid === bornOf) { silent = 0; return void setTimeout(tick, 250); }
-    // ORPHANED BUT ANSWERED is a steady state, not a transient: it is where every
-    // machine sits once a holder has died and the lineage self-healed. Polling
-    // it four times a second for ever costs the live proxy a connection every
-    // 250ms and buys nothing — back off, and come back to 250ms the moment the
-    // answer stops.
-    if (await answered()) { silent = 0; return void setTimeout(tick, 2_000); }
-    silent += 1;
-    if (silent < 3) return void setTimeout(tick, 150);
+
+  // TAKE THE ADDRESS THE INSTANT OUR HOLDER IS GONE. No probe, no window, no
+  // decision to wait for.
+  //
+  // Every earlier version proved first and armed second, and the proof WAS the
+  // outage: the request arriving in the gap paid the whole of it. Measured on
+  // one shape, holder and proxy both killed — two 2s windows: 3,899ms. Three
+  // 250ms windows: 694ms. No window at all: 3ms, which is the steady state, so
+  // there is no gap left to measure.
+  //
+  // Being wrong is cheap and being slow is not. The only way to arm wrongly is
+  // for a proxy to have outlived our holder, and then both of us accept: ours
+  // carries to the same hop the proxy would have used, so those connections are
+  // served uncached rather than lost or delayed. That state is also
+  // self-clearing — the surviving proxy self-heals into a new holder, and a new
+  // holder takes the port by asking everything still on it to let go, which is
+  // what retires us. Measured across exactly that sequence: one standby before,
+  // one standby after.
+  //
+  // We do NOT stand down on our own. An earlier draft closed the server and
+  // exited when a probe returned 200, which is irreversible: the proxy that
+  // answered can die a moment later and there is no descriptor left to re-arm
+  // with. Measured on that draft — the address went to ECONNREFUSED in exactly
+  // the sequence this exists to survive. Yielding is the claimant's decision,
+  // made with SIGHUP, not ours.
+  const tick = () => {
+    if (process.ppid === bornOf) return void setTimeout(tick, 250);
     carry();
   };
-  setTimeout(tick, 250);
+  setTimeout(tick, 100);
 }
