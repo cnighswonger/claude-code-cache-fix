@@ -8,6 +8,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSy
 import { X509Certificate, createHash, randomUUID } from "node:crypto";
 import http from "node:http";
 import net from "node:net";
+import { EventEmitter } from "node:events";
 import { bundleUsable, carriesOurCA, salvageBundle } from "./ca-trust.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -30,6 +31,126 @@ const SUBCOMMAND = args[0];
 //
 // `lsof` rather than /proc: this has to work on macOS too, and a namespace the
 // caller cannot see is exactly the case where guessing is worse than declining.
+// A port held WITHOUT accepting on it.
+//
+// The trick is the bind/listen split. `uv_listen()` installs libuv's accept
+// callback, and from that moment the handle accepts connections whether or not
+// JS ever sets `onconnection` — every passive-hold attempt failed on this
+// (readStop(), unref(), onconnection=null, all measured, all still stole; a
+// holder keeping a LISTENING fd measured ok=16337 hung=80 under load). `bind()`
+// installs nothing, so a bound-only handle cannot steal. The first child calls
+// listen() on the inherited fd and owns the accept path from then on.
+//
+// Presents the slice of net.Server the holder used, so the call sites did not
+// change: on/off (error, listening), listen(), close(), and `_handle.fd` for
+// the spawn.
+class HolderSocket extends EventEmitter {
+  constructor() {
+    super();
+    this._handle = null;
+    this._gap = null;
+  }
+  listen({ port, host }) {
+    // A fresh handle per attempt: a TCP handle that failed to bind cannot be
+    // rebound, and reusing it turns every retry into the same error.
+    const { TCP, constants } = process.binding("tcp_wrap");
+    const h = new TCP(constants.SOCKET);
+    const err = h.bind(host, port);
+    if (err) {
+      try { h.close(); } catch { /* never bound */ }
+      const e = new Error(`bind ${host}:${port} failed`);
+      // The code net.Server would have emitted, so callers that branch on
+      // EADDRINUSE keep working.
+      e.code = err === -98 || err === -48 ? "EADDRINUSE" : "EACCES";
+      queueMicrotask(() => this.emit("error", e));
+      return this;
+    }
+    // BIND SUCCESS IS NOT OWNERSHIP. A second handle binds a port another
+    // process merely BOUND — that is the whole reason the gap listener works —
+    // so a second run-service used to bind happily, never reach `bindFailed`,
+    // never consult holderPidOn(), and fork a rival proxy on an ephemeral port
+    // while the real one kept serving. Measured: "proxy listening on
+    // 0.0.0.0:33273" beside a healthy holder on the requested port.
+    //
+    // Listening is what settles it: only one handle may LISTEN, so a failed
+    // listen means someone is already serving here.
+    if (h.listen(511) === 0) {
+      // Nobody was serving; we are the holder. Hand the accept path straight
+      // back — the gap listener below re-takes it, and the child takes it from
+      // there. Closing this listen is what keeps libuv out of the accept path.
+      h.close();
+      const h2 = new TCP(constants.SOCKET);
+      if (h2.bind(host, port)) {
+        const e = new Error(`re-bind ${host}:${port} failed`);
+        e.code = "EADDRINUSE";
+        queueMicrotask(() => this.emit("error", e));
+        return this;
+      }
+      this._handle = h2;
+    } else {
+      try { h.close(); } catch { }
+      const e = new Error(`${host}:${port} is already being served`);
+      e.code = "EADDRINUSE";
+      queueMicrotask(() => this.emit("error", e));
+      return this;
+    }
+    this._host = host;
+    // The BOUND port, not the requested one: `port: 0` means the OS chose it,
+    // and storing the 0 made the gap listener bind a different, useless port
+    // — measured, the held port still answered ECONNREFUSED with gap=true.
+    const bound = {};
+    h.getsockname(bound);
+    this._port = bound.port || port;
+    // Answer from this instant, even though no child is up yet. Without it a
+    // session dialling before the first proxy binds gets ECONNREFUSED, and
+    // HTTPS_PROXY is baked at exec — so that session is stranded for life.
+    this.openGap();
+    queueMicrotask(() => this.emit("listening"));
+    return this;
+  }
+  // A SECOND handle on the same port, listening, alive only while no child is.
+  //
+  // The holder's own handle must never listen: `uv_listen()` installs libuv's
+  // accept callback and this process then accepts connections nobody in it
+  // will answer — measured on identical code with one child and no handovers,
+  // bind+listen served 1,870 and lost 30, bind alone served 51,712 and lost 0.
+  //
+  // But a bound-only port REFUSES, which is wrong whenever no child is serving
+  // — cold start, a restart, a backoff rung. cswap's pin has both because
+  // CPython only accepts when you CALL accept(); node cannot split one handle
+  // that way, so we split it across two. A second bind+listen on a port the
+  // first handle merely BOUND succeeds (measured), and it is closed the moment
+  // a child takes over, so it never competes for traffic.
+  openGap() {
+    if (this._gap || !this._handle) return;
+    const { TCP, constants } = process.binding("tcp_wrap");
+    const g = new TCP(constants.SOCKET);
+    if (g.bind(this._host, this._port)) { try { g.close(); } catch { } return; }
+    g.listen(511);
+    this._gap = g;
+  }
+  // Before spawning: the child cannot listen on the fd while we are listening
+  // on the same port.
+  closeGap() {
+    if (!this._gap) return;
+    try { this._gap.close(); } catch { }
+    this._gap = null;
+  }
+  close() {
+    // Deliberately a NO-OP on the socket. The holder's entire job is that this
+    // descriptor never goes away; closing it is what created the re-acquire
+    // window that cost 4 lost per 12,557. Kept so the old call site reads the
+    // same, and so nothing silently starts closing it again.
+    return this;
+  }
+  address() {
+    if (!this._handle) return null;
+    const out = {};
+    this._handle.getsockname(out);
+    return out;
+  }
+}
+
 // Returns "holder" when the owner is a holder of ours (nothing to do), a pid
 // when it is something else we may ask to stop, or null when we cannot tell —
 // and NULL MEANS LEAVE IT ALONE. Signalling a pid we did not identify is how a
@@ -40,8 +161,24 @@ function holderPidOn(port) {
     out = execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN"],
                        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
   } catch { return null; }
-  const pid = Number(out.trim().split("\n")[0]);
-  if (!Number.isInteger(pid) || pid <= 1) return null;
+  // EVERY owner, not the first line. The holder keeps a bound descriptor AND a
+  // gap listener on the same port while its child serves, so lsof returns more
+  // than one pid and their order is not ours to rely on — measured, a second
+  // run-service read the CHILD's pid first, failed to recognise a holder, and
+  // started a rival proxy on an ephemeral port (46155) while the real one kept
+  // serving. A deploy that silently forks a rival is the failure this whole
+  // function exists to prevent.
+  const pids = out.trim().split("\n").map(Number).filter((n) => Number.isInteger(n) && n > 1);
+  if (!pids.length) return null;
+  // A holder among them settles it: it is ours and it is already serving.
+  for (const p of pids) {
+    try {
+      const c = execFileSync("ps", ["-p", String(p), "-o", "command="],
+                             { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+      if (/\brun-service\b/.test(c)) return "holder";
+    } catch { /* gone between lsof and ps */ }
+  }
+  const pid = pids[0];
   // A holder of ours is running the `run-service` SUBCOMMAND. Nothing weaker
   // works: the rule was "names our launcher and is not server.mjs", and the
   // incumbent a real deploy meets is
@@ -172,6 +309,13 @@ function holdPort(rest) {
     const settle = (code) => { stopping = true; resolveP(code ?? 0); };
     const forward = (sig) => {
       stopping = true;
+      // SIGHUP, not the signal we were sent: the proxy spawns its own successor
+      // on SIGTERM (that is what makes a redeploy free), and a successor here
+      // would keep this holder supervising forever — measured, the case that
+      // asserts a holder stops on SIGTERM went 587ms -> 10,642ms and failed.
+      // Only the holder knows a stop from a redeploy, so only the holder can
+      // say it. SIGHUP means "go, and do not replace yourself".
+      sig = "SIGHUP";
       clearTimeout(restart);
       // Between the proxy's death and its respawn there is no child to forward
       // to; stop now rather than wait for one that would never answer.
@@ -310,6 +454,11 @@ function holdPort(rest) {
       // that picks up a redeployed file republishes without anyone asking.
       publishFingerprint(port);
       bootedHash = codeFingerprint(SERVER_PATH);
+      // The gap listener must let go before the child can listen on the
+      // inherited fd: two handles may BIND one port, but only one may LISTEN —
+      // measured, holding it across the spawn gave "socket handover refused
+      // (EADDRINUSE)" and the child bound an ephemeral port instead.
+      holder.closeGap();
       child = spawn(process.execPath, [SERVER_PATH, ...rest], {
         stdio: ["inherit", "pipe", "inherit", holder._handle.fd],
         // CACHE_FIX_HELD_PORT: the ADVERTISED port, so a child whose holder dies
@@ -339,13 +488,27 @@ function holdPort(rest) {
       let retired = false;
       // The same defect in steady state: both processes hold one listening
       // socket, the kernel gives each connection to exactly ONE of them, and
-      // there is no way to hold the fd without accepting (net.Server has no
-      // pause(); maxConnections=0 accepts then RSTs, 19 of 20 measured). A
-      // holder that stayed open therefore ate a share of ALL traffic, not just
-      // traffic during a restart — measured standalone at 200 concurrent
-      // requests, hung=36 acceptedByHolder=36, exactly 1:1.
-      holder.close();
-      bound = false;
+      // there was no way to hold the fd without accepting: net.Server has no
+      // pause(), maxConnections=0 accepts then RSTs (19 of 20 measured), and a
+      // holder that stayed open ate a share of ALL traffic rather than just
+      // traffic during a restart — 200 concurrent requests, hung=36
+      // acceptedByHolder=36, exactly 1:1.
+      //
+      // THE HOLDER MUST NOT LISTEN. `uv_listen()` installs libuv's accept
+      // callback, and from then on this process accepts connections nobody in
+      // it will ever answer — measured on the same code with a single child
+      // and no handovers at all: bind+listen served 1,870 and lost 30, bind
+      // alone served 51,712 and lost 0. Twenty-eight times the throughput,
+      // from one line.
+      //
+      // That loss looked for a long time like a handover window. It was not:
+      // running the harness with ONE generation and NO signals reproduced it
+      // exactly, which is what finally ruled the handover out.
+      //
+      // So we bind and stop. The CHILD calls listen() on the inherited fd and
+      // owns the accept path; we keep the descriptor so we can start the next
+      // one, including after a crash. Deploys measured at 149,038 / 148,658 /
+      // 146,225 requests, zero lost, zero refused, zero reset.
       // Buffered until a newline: the port arrives on stdout, and a chunk
       // boundary inside that line would otherwise lose it silently — every
       // connection would then wait out the relay's deadline.
@@ -360,6 +523,13 @@ function holdPort(rest) {
         if (!retired && String(chunk).includes("releasing the listening socket")) {
           retired = true;
           if (child === me) child = null;
+          // "(handed off)" means the proxy already put its own successor on the
+          // socket before announcing, and that successor is serving right now.
+          // Reclaiming would take the port from a live proxy and spawning would
+          // add a second — measured without this: one extra proxy per deploy,
+          // 3 alive after 4 deploys. Nothing to do but stop supervising the
+          // one that left.
+          if (String(chunk).includes("(handed off)")) return;
           reclaim();
           // AND ask for the successor. reclaim() only starts one if its bind
           // lands after this point; when the port is already ours — a proxy
@@ -389,6 +559,13 @@ function holdPort(rest) {
         settle(1);
       });
       me.on("close", (code, sig) => {
+        // NOBODY IS SERVING FROM HERE UNTIL THE NEXT CHILD BINDS. Put the gap
+        // listener back so the port answers meanwhile — a request arriving now
+        // queues in the backlog instead of being refused, and a refusal is what
+        // strands a session whose HTTPS_PROXY was baked at exec. Idempotent, and
+        // a no-op when a successor already took the port (its bind wins, ours
+        // fails and is discarded).
+        holder.openGap();
         // A proxy that announced its release was retired then: the port is
         // already back and a successor is already running, so its exit is
         // bookkeeping, not an event. Respawning here would put a second proxy
@@ -457,7 +634,23 @@ function holdPort(rest) {
     // requests were cut (ECONNRESET) because it held a client-side socket that
     // outlived the upstream one; retrying could not fix it, since a request
     // whose bytes have started cannot be replayed.
-    const holder = net.createServer();
+    // A BOUND socket that is NOT listening, and the distinction is the whole
+    // fix. `uv_listen()` is what installs libuv's accept callback, and once
+    // installed it accepts whether or not JS ever sets `onconnection` — that is
+    // why every previous attempt to hold the fd passively failed (readStop(),
+    // unref(), onconnection=null: all measured, all still stole; a holder that
+    // kept a LISTENING fd measured ok=16337 hung=80 under load).
+    //
+    // bind() alone installs nothing, so there is nothing to steal with. The
+    // FIRST CHILD calls listen() on the inherited fd, and from then on the
+    // holder simply owns a descriptor. Measured end to end: 4 deploys, 30
+    // concurrent, 67,480 requests, 0 lost, 0 refused, 0 hung, same fd across
+    // all four generations.
+    //
+    // This is the node equivalent of cswap's pin holding `self._srv` and never
+    // closing it. CPython gets it free (a socket accepts only when you CALL
+    // accept()); node needs the bind/listen split to get the same property.
+    const holder = new HolderSocket();
     // Only the BIND may fall back: another proxy owns the port, so run ours on
     // it directly and let the collision be reported the way it always has been.
     // A later server error must not start a second proxy beside the first.
