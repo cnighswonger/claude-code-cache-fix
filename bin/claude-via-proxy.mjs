@@ -186,7 +186,16 @@ class HolderSocket extends EventEmitter {
     const { TCP, constants } = process.binding("tcp_wrap");
     const g = new TCP(constants.SOCKET);
     if (g.bind(this._host, this._port)) { try { g.close(); } catch { } return; }
-    g.listen(511);
+    // THE LISTEN CAN FAIL, and ignoring it kept a handle that answers nothing.
+    // Measured: a second handle binds this port either way, but listen() returns
+    // -98 once the socket is already LISTENING — which it is from the moment the
+    // first child listens on the inherited fd, and stays even after that child
+    // dies, because the holder still holds a descriptor to it. So this device is
+    // a COLD-START one: it covers the window between our bind and the first
+    // child, and every later call is the kernel telling us the port already
+    // answers. Retaining the failed handle made closeGap() think it had
+    // something to close and hid that fact.
+    if (g.listen(511) !== 0) { try { g.close(); } catch { } return; }
     this._gap = g;
   }
   // Before spawning: the child cannot listen on the fd while we are listening
