@@ -686,6 +686,37 @@ describe("zero-downtime reload", () => {
         "the refusal message would leak a token into every log that captures it");
     });
 
+    // THE PORT THE HOLDER ADVERTISES, not the one we were asked to bind. This
+    // is the ONLY shape the guard was written for and the one it could never
+    // see: a holder hands its child the socket on fd 3 and spawns it with
+    // CACHE_FIX_PROXY_PORT=0, so `port` is 0 here and every real upstream
+    // compares unequal. The measured incident the guard cites (9901 -> 36301 ->
+    // 9901) is exactly this. /health made it worse by reading the BOUND port,
+    // so a looped child booted fine and then published upstream_is_self: true,
+    // contradicting the comment claiming that can never happen.
+    it("refuses a loop through the ADVERTISED port, not just the requested one", async () => {
+      const saved = { p: process.env.HTTPS_PROXY, h: process.env.CACHE_FIX_HELD_PORT };
+      process.env.HTTPS_PROXY = "http://127.0.0.1:19894";
+      process.env.CACHE_FIX_HELD_PORT = "19894";
+      // CLOSED IF IT STARTS. When this assertion fails, startProxy has RESOLVED
+      // — it bound a real port — and leaving that behind hung the whole file for
+      // its 200s ceiling on the first run. A fixture that hangs on failure hides
+      // the defect it just found.
+      let started = null;
+      try {
+        await assert.rejects(
+          // port 0 == "bind anything", which is what the holder passes.
+          async () => { started = await startProxy({ port: 0, bind: "127.0.0.1", watch: false }); },
+          /refusing to start/,
+          "a child handed an inherited socket booted with its upstream pointing at " +
+          "the address it serves — every request loops back into itself");
+      } finally {
+        try { await started?.close?.(); } catch {}
+        if (saved.p === undefined) delete process.env.HTTPS_PROXY; else process.env.HTTPS_PROXY = saved.p;
+        if (saved.h === undefined) delete process.env.CACHE_FIX_HELD_PORT; else process.env.CACHE_FIX_HELD_PORT = saved.h;
+      }
+    });
+
     it("startProxy actually refuses, not just the predicate", async () => {
       const saved = process.env.HTTPS_PROXY;
       process.env.HTTPS_PROXY = "http://127.0.0.1:19893";
@@ -823,7 +854,7 @@ after(async () => {
         // sweep time the OS may have given it to something unrelated — and
         // signalling a stranger is exactly what holderPidOn's own comment
         // refuses to do.
-        if (!/claude-via-proxy|gap-relay|server\.mjs|test-launcher-|test-fake-server-/.test(cmdOf(q))) continue;
+        if (!/claude-via-proxy|gap-relay|server\.mjs|scratch-launcher-|scratch-fake-server-/.test(cmdOf(q))) continue;
         try { process.kill(Number(q), "SIGHUP"); any = true; } catch { }
       }
     }

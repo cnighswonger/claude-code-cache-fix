@@ -44,6 +44,57 @@ function exitOf(proc) {
 }
 
 describe("SIGTERM exit code", () => {
+  // A REQUEST THAT NEVER GOT HEADERS MUST NOT BE ANSWERED "200".
+  //
+  // The 5s watchdog res.end()s every live response so a client that already
+  // received its bytes reads FIN rather than RST. But `liveResponses` is filled
+  // at request START, so it also holds requests still blocked upstream — and
+  // `res.end()` on a response with no writeHead emits an implicit
+  // `HTTP/1.1 200 OK` + `Content-Length: 0`. Measured directly against node:
+  // a handler that only calls res.end() puts exactly that on the wire.
+  //
+  // So a `systemctl stop` during a slow upstream call turned a retryable
+  // ECONNRESET into a well-formed empty SUCCESS. A client cannot tell that from
+  // a real empty answer, and will not retry.
+  it("does not fabricate a 200 for a request that never got headers", async () => {
+    // An upstream that accepts and never replies: the proxy is stuck waiting,
+    // so the response is live with headersSent false when the watchdog fires.
+    // Sockets tracked because close() alone WAITS for them — the proxy's
+    // connection never ends, so the first cut of this hung the whole file for
+    // 200s in its own cleanup. That was the fixture, not the product.
+    const upSockets = [];
+    const hung = net.createServer((s) => upSockets.push(s));
+    await new Promise((r) => hung.listen(0, "127.0.0.1", r));
+    const { proc, port } = startProxy({
+      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${hung.address().port}`,
+    });
+    try {
+      const p = await port;
+      let firstLine = null, err = null;
+      const c = net.connect(p, "127.0.0.1", () => c.write(
+        "POST /v1/messages HTTP/1.1\r\nHost: x\r\ncontent-type: application/json\r\n" +
+        "content-length: 2\r\n\r\n{}"));
+      c.on("data", (d) => { firstLine = firstLine ?? String(d).split("\r\n")[0]; });
+      c.on("error", (e) => (err = err || e.code));
+      // Let the request reach the hung upstream, then stop.
+      await new Promise((r) => setTimeout(r, 500));
+      const exited = exitOf(proc);
+      proc.kill("SIGTERM");
+      await exited;
+      await new Promise((r) => setTimeout(r, 300));
+      c.destroy();
+
+      assert.ok(firstLine === null || !/^HTTP\/1\.[01] 2\d\d/.test(firstLine),
+        `the shutdown answered a never-started response with ${JSON.stringify(firstLine)} — ` +
+        `an empty 200 is indistinguishable from a real one, so the client keeps it ` +
+        `instead of retrying`);
+    } finally {
+      try { proc.kill("SIGKILL"); } catch {}
+      for (const s of upSockets) { try { s.destroy(); } catch {} }
+      await new Promise((r) => hung.close(r));
+    }
+  });
+
   it("exits 0 when nothing is in flight", async () => {
     const { proc, port } = startProxy();
     await port;

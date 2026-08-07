@@ -74,10 +74,17 @@ async function withRelay(chain, fn) {
   }
 }
 
+// Returns the CONNECT REPLY LINE, not merely "something answered". The status
+// on that line is a cross-component contract: cswap's pin reads a non-200
+// CONNECT reply as a refusal and walks past us to the next hop
+// (_blind_tunnel -> "chain refused <target> (<status>)"), and their
+// runtime_health chain probe requires " 200 " in this exact line or reports the
+// connect stage FAILED. Their /health probes are deliberately status-blind — a
+// 503 there is fine and intended — so THIS line is the only status we owe them.
 const connectThrough = (port, target) => new Promise((resolve) => {
   const c = net.connect(port, "127.0.0.1");
   c.on("connect", () => c.write(`CONNECT ${target} HTTP/1.1\r\nHost: x\r\n\r\n`));
-  c.on("data", () => { c.destroy(); resolve("answered"); });
+  c.on("data", (d) => { c.destroy(); resolve(String(d).split("\r\n")[0]); });
   c.on("error", (e) => resolve(`ERR:${e.code}`));
   setTimeout(() => { c.destroy(); resolve("TIMEOUT"); }, 6_000);
 });
@@ -89,8 +96,15 @@ test("a refused first hop falls to the SECOND, not straight to a direct dial", a
   const dead = await freePort();
   try {
     await withRelay(`http://127.0.0.1:${dead},http://127.0.0.1:${hop2.port}`, async ({ port, stderr }) => {
-      await connectThrough(port, `127.0.0.1:${origin.port}`);
+      const reply = await connectThrough(port, `127.0.0.1:${origin.port}`);
       await new Promise((r) => setTimeout(r, 300));
+      // Carrying VIA A HOP: the hop's own reply is piped straight back, so the
+      // 200 the client sees is the hop's. Asserted because pin walks past any
+      // non-200 on this line — a relay that falls through to a live hop but
+      // reports the fall-through in the status has still broken their chain.
+      assert.match(reply, /^HTTP\/1\.[01] 200\b/,
+        `the CONNECT reply while carrying was ${JSON.stringify(reply)} — pin reads ` +
+        `anything but 200 here as a refusal and routes around this address`);
       assert.deepEqual(touched, ["HOP2"],
         `the second hop was skipped; endpoints touched: ${JSON.stringify(touched)} ` +
         `(ORIGIN means it dialled direct past a hop that would have carried)`);
@@ -107,8 +121,15 @@ test("direct is the LAST resort, reached only when no hop will carry", async () 
   const dead1 = await freePort(), dead2 = await freePort();
   try {
     await withRelay(`http://127.0.0.1:${dead1},http://127.0.0.1:${dead2}`, async ({ port, stderr }) => {
-      await connectThrough(port, `127.0.0.1:${origin.port}`);
+      const reply = await connectThrough(port, `127.0.0.1:${origin.port}`);
       await new Promise((r) => setTimeout(r, 300));
+      // AND ON THE DIRECT PATH TOO, where the 200 is ours to write rather than
+      // a hop's to forward. This is the state pin is most likely to meet us in
+      // — every hop refused, us terminating CONNECT ourselves — and answering
+      // anything else here makes the last line of defence read as a refusal.
+      assert.match(reply, /^HTTP\/1\.[01] 200\b/,
+        `the CONNECT reply on the direct path was ${JSON.stringify(reply)} — this is ` +
+        `the fall-open state, and a non-200 makes pin route around a working address`);
       // NOT a close. Closing here would trade an invisible fall-open for an
       // invisible outage, on the tunnel that runs when the proxy is down.
       assert.deepEqual(touched, ["ORIGIN"],

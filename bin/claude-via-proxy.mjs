@@ -52,13 +52,21 @@ const HOLDER_TREE = (() => {
   try {
     const dir = dirname(LAUNCHER_PATH);
     const h = createHash("sha256");
-    // NOT DOTFILES. The suite writes `.test-launcher-*.mjs` and
-    // `.test-fake-server-*.mjs` into this very directory while it runs, so a walk
+    // NOT THE SUITE'S SCRATCH. It writes `scratch-launcher-*.mjs` and
+    // `scratch-fake-server-*.mjs` into this very directory while it runs, so a walk
     // that counts them gives a different answer depending on WHEN it looks —
     // measured on CI: the holder hashed ba5cbf0b4567 at startup and the case
     // recomputed a7a72ba4c005 a moment later, both correct for their instant.
-    // A hidden file is not part of the shipped layer.
-    for (const f of readdirSync(dir).filter((n) => n.endsWith(".mjs") && !n.startsWith(".")).sort()) {
+    //
+    // BY NAME, not by a leading dot. The dot also hid them from `ls bin/`, so an
+    // interrupted run left litter in the shipped directory that only `ls -a`
+    // found — ten of them, once. They must live here (the copy resolves
+    // `./ca-trust.mjs` relative to itself), so name them in the one place that
+    // has to ignore them and let them be visible everywhere else.
+    const scratch = /^scratch-(launcher|fake-server)-/;
+    for (const f of readdirSync(dir)
+                      .filter((n) => n.endsWith(".mjs") && !n.startsWith(".") && !scratch.test(n))
+                      .sort()) {
       h.update(f).update(readFileSync(resolve(dir, f)));
     }
     return h.digest("hex").slice(0, 12);
@@ -120,7 +128,8 @@ class HolderSocket extends EventEmitter {
     // and will replace me" and "my predecessor gave me this on its way out"
     // look identical in the fd variables and mean opposite things when we are
     // signalled. The proxy already distinguishes them with CACHE_FIX_HELD_PORT
-    // against CACHE_FIX_FROM_HANDOVER; this is the same distinction one layer up.
+    // against whether HELD_BY names a live parent; this is the same distinction
+    // one layer up.
     if (process.env.CACHE_FIX_HOLDER_HANDOVER === "1" && Number(process.env.LISTEN_FDS) >= 1) {
       delete process.env.CACHE_FIX_HOLDER_HANDOVER;
       delete process.env.LISTEN_FDS;
@@ -245,7 +254,16 @@ class HolderSocket extends EventEmitter {
         // HELD_PORT so it can exclude THIS address from its own hop list. The
         // shipped fallback list may begin with self, and a relay that forwards
         // to itself recurses until it runs out of descriptors.
+        //
+        // HELD_HOST TOO, and its absence here was a real hole: gap-relay builds
+        // its self-exclusion from ["127.0.0.1","localhost","[::1]", HELD_HOST],
+        // so without it the bind address is silently dropped and only loopback
+        // is excluded. With CACHE_FIX_PROXY_BIND=<lan-ip> and a fallback list
+        // naming that same address — the symmetric chain this file describes —
+        // the armed gap forwards to itself. gap-relay measured that shape at
+        // 22 -> 8,195 -> 29,814 descriptors. openStandby has always passed it.
         env: { ...process.env, CACHE_FIX_HELD_PORT: String(this._port),
+               CACHE_FIX_HELD_HOST: this._host || "127.0.0.1",
                CACHE_FIX_HOLDER_TREE: undefined, CACHE_FIX_HELD_BY: undefined },
       });
       this._gap.on("exit", () => { this._gap = null; });
@@ -389,7 +407,7 @@ function holderPidOn(port) {
     try {
       const c = execFileSync("ps", ["-p", String(p), "-o", "command="],
                              { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
-      if (/\brun-service\b/.test(c)) return runningOurCode(port) ? "holder" : p;
+      if (/\brun-service\b/.test(c)) return runningOurCode(port) !== false ? "holder" : p;
     } catch { /* gone between lsof and ps */ }
   }
   // NOT THE STANDBY, unless it is all there is. lsof returns ascending pid order
@@ -435,13 +453,23 @@ function holderPidOn(port) {
     cmd = execFileSync("ps", ["-p", String(pid), "-o", "ppid=,command="],
                        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
   } catch { return pid; }
-  if (/\brun-service\b/.test(cmd)) return "holder";
+  // THE SAME SENTENCE AS ITS TWO SIBLINGS, and it was the one left ungated when
+  // they were fixed: "names run-service" is not "is running our code", and the
+  // difference is what makes a deploy a deploy instead of a no-op.
+  //
+  // NEARLY UNREACHABLE, and the one path is nameable: the loop above tests every
+  // pid and `pid` comes from that same array, so this is only reached when `ps`
+  // throws for it there (fork pressure) and succeeds here. No test drives it;
+  // gating it costs one comparison. An earlier comment called the reachability
+  // unestablished on the strength of a write-probe whose CONTROL also recorded
+  // nothing — void, not negative. Reading settled it.
+  if (/\brun-service\b/.test(cmd)) return runningOurCode(port) !== false ? "holder" : pid;
   const ppid = Number(cmd.trim().split(/\s+/)[0]);
   if (Number.isInteger(ppid) && ppid > 1) {
     try {
       const parent = execFileSync("ps", ["-p", String(ppid), "-o", "command="],
                                   { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
-      if (/\brun-service\b/.test(parent)) return runningOurCode(port) ? "holder" : ppid;
+      if (/\brun-service\b/.test(parent)) return runningOurCode(port) !== false ? "holder" : ppid;
     } catch { /* parent gone: fall through and treat the listener on its own */ }
   }
   return pid;
@@ -455,10 +483,39 @@ function holderPidOn(port) {
 function otherHolderOn(port) {
   let pids = [];
   try {
+    // stderr PIPED, not ignored — it is the only field that separates "found
+    // nothing" from "could not look". See the catch.
     pids = execFileSync("lsof", ["-nP", "-t", `-iTCP@${bindAddr()}:${port}`, "-sTCP:LISTEN"],
-                        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
+                        { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })
       .trim().split("\n").map(Number).filter((n) => Number.isInteger(n) && n > 1 && n !== process.pid);
-  } catch { return 0; }
+  } catch (e) {
+    // ABSENCE AND FAILURE EXIT ALIKE, and this used to translate the second
+    // into the first — returning 0, i.e. "no other holder on this address".
+    // On a box where the probe cannot run, every launcher reads that, none is
+    // surplus, and the pileup this function exists to prevent comes back.
+    //
+    // Measured here, lsof 4.93.2:
+    //   nothing listening   status=1 stdout=0B stderr=0B      <- true absence
+    //   bad flag / bad -i   status=1 stdout=0B stderr=568/561B
+    //   binary missing      code=ENOENT status=null
+    // Only stderr separates the first two — and this call DISCARDED stderr, so
+    // the instrument could not answer even in principle.
+    //
+    // cswap measured the identical split from the other side and supplied the
+    // discriminator; their control is why it is not hypothetical — `ss` is not
+    // installed on the box they measured from, and an empty result from a
+    // missing binary reads exactly like "no ports".
+    //
+    // Still 0, because there is no pid to report and refusing to start would
+    // leave the address unserved. What changes is that it is no longer silent.
+    const absent = e?.code === undefined && e?.status === 1
+                   && !String(e?.stdout || "") && !String(e?.stderr || "");
+    if (!absent) process.stderr.write(
+      `[cache-fix] ${port}: the ownership probe could not run ` +
+      `(${e?.code || `exit ${e?.status}`}${e?.stderr ? `: ${String(e.stderr).trim().split("\n")[0]}` : ""}) — ` +
+      `continuing as if no other holder is here, which can put a second one beside it\n`);
+    return 0;
+  }
   for (const p of pids) {
     let line = "";
     try {
@@ -476,7 +533,27 @@ function otherHolderOn(port) {
     // left, and the old holder kept serving with nothing saying so. Only a
     // holder running the SAME code is a duplicate; a different one is what the
     // deploy exists to replace.
-    if (!runningOurCode(port)) continue;
+    const same = runningOurCode(port);
+    if (same === false) continue;
+    // UNKNOWN STAYS SURPLUS. Returning 0 here instead was MEASURED to change no
+    // outcome UNDER run-service — it sets CACHE_FIX_EXIT_IF_RUNNING, so a failed
+    // bind routes to takeOver(), which reads the same unknown as "holder" and
+    // exits 0 anyway — while deleting the line below. (A bare
+    // CACHE_FIX_HOLD_PORT=on caller without that variable would fall through to
+    // runProxy instead; that is a counterfactual for a path not taken.) It also
+    // opens a window to bind beside a live holder, REASONED not measured: it
+    // needs the incumbent to stop listening between our lsof and our bind.
+    // Unknown must change VISIBILITY, not the exit: "already held, this one is
+    // surplus" reads as "the new code is running" — the reassuring wrong answer.
+    // NAME BOTH SIDES. `null` means the comparison could not be made, and that
+    // is EITHER end of it: no usable record in tmp, or our own SERVER_PATH
+    // unreadable. Blaming the record sent an operator to /tmp for a broken
+    // install — measured, a valid record plus a missing server.mjs printed
+    // "no record in /tmp".
+    if (same === null) process.stderr.write(
+      `[cache-fix] ${port}: cannot compare builds — no usable fingerprint record in ` +
+      `${tmpdir()}, or ${SERVER_PATH} is unreadable. Treating pid ${p} as ours; ` +
+      `if this was a deploy, it has NOT taken effect.\n`);
     return p;
   }
   return 0;
@@ -514,9 +591,6 @@ function otherHolderOn(port) {
 // so it cannot outlive the fact — and if it does (a holder killed -9 mid-write,
 // a stale file from a previous boot), the fallback below is "leave it alone",
 // which is the safe direction.
-//
-// Unknown answers "yes" — a listener we cannot identify is one we must not
-// signal, or this becomes the thing that kills an unrelated service on the port.
 function codeFingerprint(file) {
   try {
     return createHash("sha256").update(readFileSync(file)).digest("hex");
@@ -539,12 +613,16 @@ function publishFingerprint(port) {
   } catch { /* best effort: an unwritable tmpdir must not stop a proxy starting */ }
 }
 
+// TRUE, FALSE, or NULL for "cannot tell" — a third state because the callers
+// must be able to TELL unknown apart, not because they answer it differently.
+// Both end at exit 0; only one of them says why (see otherHolderOn). Unknown is
+// ordinary: the record lives in /tmp, which systemd-tmpfiles sweeps.
 function runningOurCode(port) {
   let theirs = "";
-  try { theirs = readFileSync(fingerprintPath(port), "utf8").trim(); } catch { return true; }
-  if (!theirs) return true;                       // cannot tell: leave it alone
+  try { theirs = readFileSync(fingerprintPath(port), "utf8").trim(); } catch { return null; }
+  if (!theirs) return null;                       // no record: cannot tell
   const ours = codeFingerprint(SERVER_PATH);
-  if (!ours) return true;                         // cannot read our own: same
+  if (!ours) return null;                         // cannot read our own: same
   return theirs === ours;
 }
 

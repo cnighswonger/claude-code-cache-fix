@@ -364,8 +364,15 @@ it("leaks no descriptor when a client aborts", async () => {
 let fakeSeq = 0;
 async function withFakeProxy(serverSrc, fn, { watchMs, selfHeal = "" } = {}) {
   const tag = `${process.pid}-${++fakeSeq}`;
-  const failing = join(dirname(launcherPath), `.test-fake-server-${tag}.mjs`);
-  const copy = join(dirname(launcherPath), `.test-launcher-${tag}.mjs`);
+  // NO LEADING DOT. These have to sit inside bin/ — the copy resolves its
+  // imports relative to the real launcher — but a hidden file inside the tree is
+  // the worst of both: `git status` sees it, `ls bin/` does not. The finally
+  // below removes them, so the only way they survive is a runner that was
+  // KILLED, which is exactly the moment someone needs to see them. Measured:
+  // ten of these sat in bin/ after an interrupted run and were invisible to
+  // every listing that did not ask for dotfiles.
+  const failing = join(dirname(launcherPath), `scratch-fake-server-${tag}.mjs`);
+  const copy = join(dirname(launcherPath), `scratch-launcher-${tag}.mjs`);
   await writeFile(failing, serverSrc);
   await writeFile(copy, readFileSync(launcherPath, "utf8").replace(
     /const SERVER_PATH = .*/, `const SERVER_PATH = ${JSON.stringify(failing)};`));
@@ -462,7 +469,7 @@ it("gives the port up when the proxy never starts", async () => {
       // behind carrying the address — the line a human reads while diagnosing
       // must not promise a free port that is still bound.
       assert.match(stderr(), /failed to start 5 times; stopping/);
-      const lineage = listeners(port).filter((q) => /test-launcher-|test-fake-server-/.test(cmdOf(q)));
+      const lineage = listeners(port).filter((q) => /scratch-launcher-|scratch-fake-server-/.test(cmdOf(q)));
       assert.deepEqual(lineage, [],
         "the launcher gave up but its lineage is still on the port, so it never really let go");
       // AND THE ADDRESS STILL RETIRES, which is the other half of the same
@@ -499,7 +506,7 @@ it("keeps the port and backs off when a proxy that had served stops starting", a
       // first pid killed that instead — the fake proxy went on serving and the
       // case measured a backoff that never happened.
       const kid = Number(out.trim().split("\n").filter(Boolean)
-        .find((q) => /test-fake-server-/.test(cmdOf(q))));
+        .find((q) => /scratch-fake-server-/.test(cmdOf(q))));
       assert.ok(Number.isInteger(kid) && kid > 1, "the fake proxy never started, so this measures nothing");
       process.kill(kid, "SIGKILL");
       // Long enough for an UNBACKED-OFF loop to blow the ceiling: at the 25ms
@@ -903,14 +910,32 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
     // relaunched six sessions onto a proxy carrying none of the deployed code.
     it("does not read a plain `cache-fix-proxy server` as one of its own holders", () => {
       const src = readFileSync(launcherPath, "utf8");
+      // THE WHOLE FUNCTION, not a prefix cut at the first `return "holder"`.
+      // That literal is not a landmark: gating the third of three returns on
+      // runningOurCode() removed it, indexOf answered -1, and this case failed
+      // against a change that did exactly what its own message asks for. A test
+      // that parses source has to key on something the code cannot legitimately
+      // stop containing.
+      // COMMENTS STRIPPED BEFORE BOTH ASSERTIONS, and that is the load-bearing
+      // half. This case is about what the CODE keys on, and the prose here says
+      // `run-service` a dozen times — against the raw slice the first assertion
+      // passes on the explanation of the rule rather than the rule, whatever the
+      // slice boundary is.
+      //
+      // The brace cut is belt-and-braces on top: `\nfunction ` overshoots into
+      // otherHolderOn's leading comment (5,505 -> 5,809 chars), which widens what
+      // the raw text can match on. Measured after stripping, both landmarks
+      // behave the same; the earlier version of this comment claimed the
+      // landmark was what made the assertion failable, and it is not.
       const fn = src.slice(src.indexOf("function holderPidOn"));
-      const rule = fn.slice(0, fn.indexOf('return "holder"'));
+      const rule = fn.slice(0, fn.indexOf("\n}\n") + 3);
+      const code = rule.replace(/\/\/[^\n]*/g, "");
       // The distinguishing fact is the SUBCOMMAND. `cache-fix-proxy` is our own
       // bin name, so matching it identifies the package, not the role.
-      assert.match(rule, /run-service/,
+      assert.match(code, /run-service/,
         "holder detection does not key on the run-service subcommand, so a plain " +
         "`cache-fix-proxy server` reads as a holder and a deploy silently skips it");
-      assert.ok(!/cache-fix-proxy\b(?!.*run-service)/.test(rule.replace(/\/\/[^\n]*/g, "")),
+      assert.ok(!/cache-fix-proxy\b(?!.*run-service)/.test(code),
         "detection still matches the bin name alone — that is what misread pid 15060");
     });
 
@@ -1196,10 +1221,22 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       const sha = (f) => createHash("sha256").update(readFileSync(f)).digest("hex");
 
       // The incumbent published what IT booted with; we hash what WE would run.
-      const decide = () => {
+      //
+      // TWO SHAPES, because a one-pid stub only ever exercised one of the
+      // branches that reach the fingerprint question.
+      //   listener-only ("4242")      -> the LISTENER is the proxy child, so the
+      //                                  answer comes from its PARENT.
+      //   holder + child ("4241\n4242") -> what lsof actually reports, per this
+      //                                  function's own comment: the holder keeps
+      //                                  a bound descriptor while its child
+      //                                  serves. The holder is found in the list
+      //                                  itself, on the earlier branch.
+      // The old stub returned one pid while the comment claimed the multi-pid
+      // reality, so the branch that reads the list was never run by this case.
+      const decide = (lsofOut = "4241\n4242\n") => {
         const fake = {
           execFileSync: (cmd, args) => {
-            if (cmd === "lsof") return "4242\n";
+            if (cmd === "lsof") return lsofOut;
             if (cmd === "pgrep") return "4243\n";
             if (cmd === "ps") {
               const pid = args[args.indexOf("-p") + 1];
@@ -1240,11 +1277,37 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         assert.equal(decide(), "holder",
           "a newer mtime with identical bytes retired a healthy proxy");
 
-        // No record at all (killed -9 mid-write, first boot): leave it alone.
+        // No record at all (killed -9 mid-write, first boot, /tmp swept): leave
+        // it alone. THIS IS THE ROW THAT INVERTS between the two callers —
+        // otherHolderOn's copy of this state must answer "not surplus" instead,
+        // because there the destructive move is exiting rather than signalling.
         rmSync(record, { force: true });
         assert.equal(decide(), "holder",
           "an unreadable record must mean LEAVE ALONE — guessing here signals a " +
           "process we cannot identify");
+
+        // TWO OF THE THREE, on every row above — and the count matters, because
+        // this used to read "BOTH BRANCHES" and claim a completeness the fixture
+        // does not have. holderPidOn asks the fingerprint question at three call
+        // sites: the loop over the lsof list, the listener-self branch, and the
+        // parent lookup. Each assertion so far ran the two-pid shape (loop);
+        // these replay them against the listener-only shape (parent).
+        //
+        // THE LISTENER-SELF BRANCH IS DRIVEN BY NEITHER, and it is the one this
+        // change newly gated. That is deliberate and stated at its own line: it
+        // is reachable only when `ps` throws for a pid inside the loop and then
+        // succeeds — measured, reverting it leaves 65/65 green. Gated anyway,
+        // because the cost is one comparison and the wrong answer is a silent
+        // no-op deploy. Do not read the rows below as covering it.
+        writeFileSync(record, sha(ours));
+        assert.equal(decide("4242\n"), "holder",
+          "via the parent lookup, a holder on THIS build was not left alone");
+        writeFileSync(ours, "// build C\n");
+        assert.equal(decide("4242\n"), 4241,
+          "via the parent lookup, an in-place upgrade left the older build serving");
+        rmSync(record, { force: true });
+        assert.equal(decide("4242\n"), "holder",
+          "via the parent lookup, an unreadable record did not mean LEAVE ALONE");
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }
@@ -1274,18 +1337,37 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       const record = join(dir, "cache-fix-proxy-9901.sha256");
       const sha = (f) => createHash("sha256").update(readFileSync(f)).digest("hex");
       const lsofArgs = [];
+      // What the rule wrote to stderr. Captured rather than ignored: after the
+      // end-to-end measurement below, the MESSAGE is the behaviour this row
+      // protects, and a fixture that discards it would pass against silence.
+      const said = [];
 
-      const decide = () => {
+      // SERVER_PATH is a parameter so one row can point it at a file that is not
+      // there — the second way runningOurCode answers "cannot tell", and the one
+      // the message used to misattribute.
+      const decideWith = (serverPath, lsofThrows) => {
         const fake = (cmd, args) => {
-          if (cmd === "lsof") { lsofArgs.push(args.join(" ")); return "4242\n"; }
+          if (cmd === "lsof") {
+            lsofArgs.push(args.join(" "));
+            if (lsofThrows) throw Object.assign(new Error("lsof"), lsofThrows);
+            return "4242\n";
+          }
           if (cmd === "ps") return "999999 node /usr/local/bin/cache-fix-proxy run-service\n";
           throw new Error("unexpected " + cmd);
         };
+        // env and pid FORWARDED, not stubbed away: bindAddr() reads
+        // process.env, and a fake without it throws inside otherHolderOn's own
+        // try/catch, which swallows it and returns 0 — a fixture that silently
+        // answers "no other holder" to every row. Caught only because the first
+        // row asserts a positive 4242 rather than merely "not surplus".
+        const proc = { env: process.env, pid: process.pid, uptime: () => 0,
+                       stderr: { write: (s) => said.push(s) } };
         // eslint-disable-next-line no-new-func
-        return Function("execFileSync", "SERVER_PATH", "readFileSync", "createHash", "join", "tmpdir",
+        return Function("execFileSync", "SERVER_PATH", "readFileSync", "createHash", "join", "tmpdir", "process",
           `${bindFn}${fpFns}\n${rule}\nreturn otherHolderOn(9901);`)(
-            fake, ours, readFileSync, createHash, () => record, () => dir);
+            fake, serverPath, readFileSync, createHash, () => record, () => dir, proc);
       };
+      const decide = () => decideWith(ours);
 
       const priorBind = process.env.CACHE_FIX_PROXY_BIND;
       try {
@@ -1301,6 +1383,74 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         assert.equal(decide(), 0,
           "the new code called itself surplus against an OLDER build — every " +
           "deploy a no-op, with the old holder still serving and nothing saying so");
+
+        // NO RECORD (/tmp swept under a healthy long-lived holder). The answer
+        // stays "surplus" because returning 0 was measured to change no outcome
+        // — takeOver() reads the same unknown as "holder" and exits 0 anyway —
+        // so what this row pins is the LINE, not the value.
+        writeFileSync(record, sha(ours));
+        said.length = 0;
+        assert.equal(decide(), 4242, "premise: with a matching record this IS the surplus copy");
+        assert.deepEqual(said, [],
+          "a CONFIRMED duplicate must stay quiet — warning on every idempotent " +
+          "re-run is how the one warning that matters gets ignored");
+
+        rmSync(record, { force: true });
+        said.length = 0;
+        assert.equal(decide(), 4242,
+          "an unreadable record must still read as surplus: returning 0 here changes " +
+          "no outcome (the bind fails and takeOver exits 0 anyway) and opens a window " +
+          "where this copy binds beside a live holder");
+        assert.match(said.join(""), /cannot compare builds/,
+          "the deploy no-opped in silence — an operator gets no way to tell " +
+          "'already running your code' from 'could not tell, and did nothing'");
+
+        // THE OTHER WAY TO REACH UNKNOWN, and the one the message used to lie
+        // about: the record is present and valid, and OUR OWN server.mjs is
+        // unreadable. Same null, opposite cause — a message that blames the
+        // record sends an operator to /tmp to debug a broken install.
+        writeFileSync(record, sha(ours));
+        const gone = join(dir, "not-here.mjs");
+        said.length = 0;
+        assert.equal(decideWith(gone), 4242, "premise: an unreadable own build still reads as unknown");
+        assert.match(said.join(""), new RegExp(gone.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+          `the message named only the record: ${JSON.stringify(said.join(""))} — the ` +
+          `fingerprint that could not be read was OURS, and the operator is sent to the wrong file`);
+
+        // A PROBE THAT COULD NOT RUN IS NOT AN EMPTY PORT. lsof exits 1 when it
+        // finds nothing — the ordinary case — AND when it cannot run the query,
+        // with the same empty stdout. Measured here on lsof 4.93.2:
+        //   nothing listening   status=1 stdout=0B stderr=0B
+        //   bad flag / bad -i   status=1 stdout=0B stderr=568B / 561B
+        //   binary missing      code=ENOENT status=null
+        // Only stderr separates the first two, and this call used to DISCARD
+        // stderr — so the instrument could not answer even in principle.
+        //
+        // Both still return 0 (there is no pid to report, and refusing to start
+        // leaves the address unserved). What must differ is whether anyone is
+        // told: on a box with no usable lsof, every launcher reads "no other
+        // holder", none is surplus, and the pileup this rule exists to prevent
+        // returns — in silence.
+        writeFileSync(record, sha(ours));
+
+        said.length = 0;
+        assert.equal(decideWith(ours, { status: 1, stdout: "", stderr: "" }), 0,
+          "premise: a genuinely empty port must read as no other holder");
+        assert.deepEqual(said, [],
+          "a true absence warned — then the warning means nothing, because it fires " +
+          "on the ordinary case too");
+
+        for (const [label, err] of [
+          ["a bad query (lsof present, rejects argv)", { status: 1, stdout: "", stderr: "lsof: unsupported\n" }],
+          ["no lsof on the box at all", { code: "ENOENT", status: null, stdout: "", stderr: "" }],
+        ]) {
+          said.length = 0;
+          assert.equal(decideWith(ours, err), 0, `premise: ${label} still returns 0`);
+          assert.match(said.join(""), /ownership probe could not run/,
+            `${label} was reported as "no other holder is here", silently — that is a ` +
+            `read failure translated into an absence, and it puts a second holder on a ` +
+            `live address with nothing saying why`);
+        }
 
         // THE PROBE MUST FOLLOW THE BIND ADDRESS. It asked lsof about
         // 127.0.0.1 while the proxy honoured CACHE_FIX_PROXY_BIND, so under any
@@ -1519,10 +1669,54 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         assert.deepEqual(seen, announcements,
           `a chunk boundary at ${cut} split an announcement: ${JSON.stringify(seen)}`);
       }
-      // And the reader must ACT on the whole line. A raw-chunk test for
-      // "(handed off)" is the defect; this is what tells them apart.
-      assert.ok(!/String\(chunk\)\.includes/.test(src),
-        "an announcement is still being matched against a raw chunk rather than a line");
+      // AND THE DISPATCH, not only the splitter. The defect lives in WHERE
+      // `(handed off)` is read, so moving that test back onto the raw chunk
+      // passes everything above — the splitter still splits, nothing asks what
+      // the holder concluded. I deleted the old source-text assertion calling it
+      // "the appearance of a second guard"; measured, it was the only coverage
+      // of this. Replaced with the behaviour rather than restored.
+      const dispatch = /const onLine = \(line\) => \{[\s\S]*?\n      \};/.exec(src)?.[0];
+      assert.ok(dispatch, "the holder's announcement dispatch is gone — this tests nothing");
+      // What the holder DID, per chunk boundary: "reclaim+spawn" or "-".
+      const drive = (text) => Array.from({ length: text.length + 1 }, (_, cut) => {
+        // eslint-disable-next-line no-new-func
+        const run = Function("chunkA", "chunkB", "reclaim", "spawnWhenReady", `
+          let retired = false, child = null, childPort = 0, served = false, failures = 0;
+          const me = null, process = { env: {} };
+          const publishOurCA = () => {}, ourCAPath = () => "";
+          ${dispatch}
+          let buf = "";
+          for (const chunk of [chunkA, chunkB]) {
+            buf += chunk;
+            for (let nl; (nl = buf.indexOf("\\n")) !== -1;) {
+              const line = buf.slice(0, nl); buf = buf.slice(nl + 1); onLine(line);
+            }
+          }`);
+        const at = [];
+        run(text.slice(0, cut), text.slice(cut),
+            () => at.push("reclaim"), () => at.push("spawn"));
+        return at.join("+") || "-";
+      });
+      const firstOther = (rows, want) => rows.findIndex((r) => r !== want);
+
+      // THE POSITIVE CONTROL FIRST, because the handover assertion below expects
+      // "-" everywhere and "-" is also what a DEAD dispatch produces. Measured:
+      // renaming the string onLine matches on leaves the holder never retiring,
+      // reclaiming or spawning — and the handover assertion alone still passed.
+      const plain = drive("proxy releasing the listening socket\n");
+      assert.equal(firstOther(plain, "reclaim+spawn"), -1,
+        `a plain release did not reclaim AND respawn at boundary ` +
+        `${firstOther(plain, "reclaim+spawn")} (got "${plain[firstOther(plain, "reclaim+spawn")]}") — ` +
+        `if that is "-", the dispatch is dead and the handover check below proves nothing`);
+
+      // A HANDOVER MUST DO NEITHER. Reclaiming takes the port from the successor
+      // already serving on it; spawning adds a second proxy — the "3 alive after
+      // 4 deploys" this case exists to stop.
+      const handed = drive(stream);
+      assert.equal(firstOther(handed, "-"), -1,
+        `a chunk boundary at ${firstOther(handed, "-")} made the holder ` +
+        `"${handed[firstOther(handed, "-")]}" on a handover — it read "(handed off)" as a ` +
+        `plain release and went after a live proxy's port`);
     });
   });
 
@@ -1547,7 +1741,7 @@ describe("deploy watcher (CACHE_FIX_WATCH_DEPLOY_MS)", () => {
     try {
       const out = execFileSync("pgrep", ["-P", String(launcher.pid)], { encoding: "utf8" });
       const p = Number(out.trim().split("\n").filter(Boolean)
-        .find((q) => /test-fake-server-/.test(cmdOf(q))));
+        .find((q) => /scratch-fake-server-/.test(cmdOf(q))));
       return Number.isInteger(p) && p > 1 ? p : 0;
     } catch { return 0; }
   };
@@ -1657,7 +1851,7 @@ after(async () => {
         // sweep time the OS may have given it to something unrelated — and
         // signalling a stranger is exactly what holderPidOn's own comment
         // refuses to do.
-        if (!/claude-via-proxy|gap-relay|server\.mjs|test-launcher-|test-fake-server-/.test(cmdOf(q))) continue;
+        if (!/claude-via-proxy|gap-relay|server\.mjs|scratch-launcher-|scratch-fake-server-/.test(cmdOf(q))) continue;
         try { process.kill(Number(q), "SIGHUP"); any = true; } catch { }
       }
     }

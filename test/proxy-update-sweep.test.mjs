@@ -133,4 +133,61 @@ describe("auto-update fossil sweep", { concurrency: true }, () => {
     });
     assert.equal(survived, true, "CACHE_FIX_UPDATE_SWEEP=off did not switch it off");
   });
+
+  // A MALFORMED CHANNEL URL MUST NOT KILL THE PROXY. `new URL()` throws, and it
+  // is called inside an async setTimeout callback — so the throw becomes an
+  // unhandledRejection rather than a caught error. In FORWARD mode installSelfHeal
+  // swallows those; in REVERSE mode nothing does, and Node >=15 terminates the
+  // process. This fixture is reverse mode (no CACHE_FIX_FORWARD_PROXY), which is
+  // the half that dies.
+  //
+  // The proxy is the process every live session dials, so a typo in one env var
+  // taking it down ~25s after boot is the whole goal failing on a config slip.
+  //
+  // Asserted on the PROCESS BEING ALIVE past the sweep, not on the sweep's
+  // result: the sweep legitimately does nothing here, and "did nothing" is what
+  // a dead process looks like too.
+  it("survives a malformed update-channel URL instead of dying to an unhandled rejection", async () => {
+    // THE FULL PRECONDITION, or this case tests nothing. The parse sits behind
+    // four early returns: sweep not off, a readable .last-update-result.json,
+    // its outcome === "failed", and a resolvable ~/.local/bin/claude symlink.
+    // Measured: without the record the sweep returns at the first catch, the URL
+    // is never parsed, and removing the guard leaves this GREEN — the fixture
+    // agreed with itself. Same fossil + symlink setup sweepLeaves uses.
+    const cfg = mkdtempSync(join(tmpdir(), "ccf-badurl-cfg-"));
+    const home = mkdtempSync(join(tmpdir(), "ccf-badurl-home-"));
+    writeFileSync(join(cfg, ".last-update-result.json"),
+                  JSON.stringify({ outcome: "failed", status: "install_failed" }));
+    mkdirSync(join(home, ".local", "bin"), { recursive: true });
+    symlinkSync("/nonexistent/versions/2.1.222", join(home, ".local", "bin", "claude"));
+    const env = { ...process.env,
+      HOME: home,
+      CLAUDE_CONFIG_DIR: cfg,
+      CACHE_FIX_PROXY_PORT: String(await freePort()),
+      CACHE_FIX_UPDATE_SWEEP_DELAY_MS: String(DELAY_MS),
+      CACHE_FIX_UPDATE_CHANNEL_URL: "not a url at all",
+    };
+    for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                     "LISTEN_FDS", "CACHE_FIX_FORWARD_PROXY"]) delete env[k];
+    const proc = spawn(process.execPath, [serverPath], { env, stdio: ["ignore", "pipe", "pipe"] });
+    let died = null;
+    proc.on("exit", (c, s) => { died = `exit=${c} signal=${s}`; });
+    try {
+      await new Promise((res, rej) => {
+        const to = setTimeout(() => rej(new Error("proxy never reported listening")), 15_000);
+        proc.stdout.on("data", (d) => { if (/listening/.test(String(d))) { clearTimeout(to); res(); } });
+        proc.on("exit", (c) => rej(new Error(`proxy exited ${c} before listening`)));
+      });
+      // Past the moment the timer fires, with room for the rejection to land.
+      await new Promise((r) => setTimeout(r, DELAY_MS + 1_500));
+      assert.equal(died, null,
+        `the proxy died after the update sweep fired (${died}) — an unparseable ` +
+        `CACHE_FIX_UPDATE_CHANNEL_URL threw inside an async timer, and in reverse ` +
+        `mode nothing catches it, so every session on this address is stranded`);
+    } finally {
+      proc.kill("SIGKILL");
+      await exitWithin(proc, 20_000, "the proxy never exited after SIGKILL");
+      for (const d of [cfg, home]) { try { rmSync(d, { recursive: true, force: true }); } catch { } }
+    }
+  });
 });

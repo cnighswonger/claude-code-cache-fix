@@ -71,6 +71,40 @@ const probe = (port) => new Promise((res) => {
 // cswap's pin hit the same failure first and fixed it the same way — a
 // successor that adopts rather than binds, which makes the replacement
 // same-tree instead of cross-tree.
+// BOTH RELAYS MUST KNOW THE SAME ADDRESS IS THEIRS.
+//
+// gap-relay excludes itself from its own hop list using
+// ["127.0.0.1","localhost","[::1]", CACHE_FIX_HELD_HOST] — so a relay spawned
+// without HELD_HOST silently falls back to loopback-only. openStandby passed it;
+// openGap did not, for the whole life of the file. With
+// CACHE_FIX_PROXY_BIND=<lan-ip> and a fallback list naming that same address —
+// the symmetric chain this repo documents — the armed gap forwards to ITSELF.
+// gap-relay measured that: 22 -> 8,195 -> 29,814 descriptors, climbing.
+//
+// Asserted as a PAIR rather than on one spawn, because the defect was a
+// divergence: one of two siblings drifted, and only comparing them says so.
+describe("relay self-identification", () => {
+  it("hands the gap and the standby the same self-address keys", () => {
+    const src = readFileSync(launcherPath, "utf8");
+    const envOf = (fn) => {
+      const body = src.slice(src.indexOf(`  ${fn}(`));
+      const env = /env: \{[\s\S]*?\},\n/.exec(body.slice(0, body.indexOf("\n  }")))?.[0];
+      assert.ok(env, `${fn}'s spawn env is gone — this no longer compares anything`);
+      return new Set([...env.matchAll(/CACHE_FIX_[A-Z_]+/g)].map((m) => m[0]));
+    };
+    const gap = envOf("openGap"), standby = envOf("openStandby");
+    // Not set equality: the standby legitimately carries STANDBY and
+    // STANDBY_PARENT, which say "arm later", not "this address is mine".
+    for (const k of ["CACHE_FIX_HELD_PORT", "CACHE_FIX_HELD_HOST"]) {
+      assert.ok(standby.has(k), `openStandby stopped passing ${k}`);
+      assert.ok(gap.has(k),
+        `openGap does not pass ${k} while openStandby does — the gap relay then ` +
+        `excludes only loopback from its hop list, and a non-loopback bind whose ` +
+        `fallback names the same address makes it forward to itself`);
+    }
+  });
+});
+
 describe("holder handover (SIGUSR2)", () => {
   // ONE SWEEP FOR THE FILE, over the ports it used and nobody else's. Reaping
   // by process name would reach into a neighbouring file's live fixture, since
@@ -84,7 +118,7 @@ describe("holder handover (SIGUSR2)", () => {
           // sweep time the OS may have given it to something unrelated — and
           // signalling a stranger is exactly what holderPidOn's own comment
           // refuses to do.
-          if (!/claude-via-proxy|gap-relay|server\.mjs|test-launcher-|test-fake-server-/.test(cmdOf(q))) continue;
+          if (!/claude-via-proxy|gap-relay|server\.mjs|scratch-launcher-|scratch-fake-server-/.test(cmdOf(q))) continue;
           try { process.kill(Number(q), "SIGHUP"); any = true; } catch { }
         }
       }
@@ -307,9 +341,46 @@ describe("holder handover (SIGUSR2)", () => {
       // the launcher does, so this fails if the two ever diverge.
       const dir = dirname(launcherPath);
       const layer = createHash("sha256");
-      // Dot-prefixed files excluded, exactly as the launcher does: the suite
-      // writes its stand-ins into this directory while running.
-      for (const f of readdirSync(dir).filter((n) => n.endsWith(".mjs") && !n.startsWith(".")).sort()) {
+      // THE LAUNCHER'S OWN RULE, BOTH HALVES OF IT. A first attempt lifted only
+      // the `.filter(...)` and passed `scratch` in as a parameter — which left
+      // the regex a hand-written copy, so narrowing it to
+      // /^scratch-launcher-/ produced a byte-identical lift and the case still
+      // passed. Lifting the `const scratch = ...;` statement too is what makes
+      // "this fails if the two diverge" actually true.
+      // COMMENTS STRIPPED BEFORE LIFTING, and this is the load-bearing half —
+      // the sibling source-parsing case in proxy-held-port.test.mjs learned it
+      // first. Both regexes take the FIRST match in the file, so a comment that
+      // quotes the rule shadows the code: measured, narrowing the real regex to
+      // /^scratch-launcher-/ while a correct `const scratch = ...` sits quoted
+      // in the prose above it makes this case PASS. That prose block is eleven
+      // lines directly above the code and already discusses this filter, so the
+      // trigger is one ordinary edit away, and it disarms the case silently.
+      const src = readFileSync(launcherPath, "utf8").replace(/\/\/[^\n]*/g, "");
+      const decl = /const scratch = \/[^\n]*\/;/.exec(src)?.[0];
+      const pred = /\.filter\(\(n\) => n\.endsWith\("\.mjs"\)[^\n]*\)/.exec(src)?.[0];
+      assert.ok(decl && pred,
+        "the holder-tree filter moved — this no longer recomputes what the launcher does");
+      // eslint-disable-next-line no-new-func
+      const keep = Function("names", `${decl}\nreturn names${pred};`);
+
+      // THE SUITE'S SCRATCH MUST NOT COUNT, and it is VISIBLE now (no leading
+      // dot), so nothing but this predicate keeps it out. Counting it would make
+      // holder_tree depend on WHEN it was read — measured on CI once as
+      // ba5cbf0b4567 at startup vs a7a72ba4c005 a moment later.
+      //
+      // The names are `scratch-*`, NOT `test-*`, and that is load-bearing
+      // elsewhere: `node --test` with no path argument globs `**/test-*.?(c|m)js`,
+      // so a `bin/test-launcher-<tag>.mjs` left by a killed run would be
+      // DISCOVERED AND EXECUTED as a test file — a launcher copy with no argv,
+      // which falls through to wrapper mode inside the runner. Measured.
+      assert.deepEqual(
+        keep(["claude-via-proxy.mjs", "ca-trust.mjs", "scratch-launcher-99-1.mjs",
+              "scratch-fake-server-99-1.mjs", ".hidden.mjs", "notes.txt"]),
+        ["claude-via-proxy.mjs", "ca-trust.mjs"],
+        "the holder-tree walk no longer ignores the suite's stand-ins — a run of the " +
+        "tests now changes the identity the holder publishes about itself");
+
+      for (const f of keep(readdirSync(dir)).sort()) {
         layer.update(f).update(readFileSync(join(dir, f)));
       }
       const onDisk = layer.digest("hex").slice(0, 12);
@@ -721,6 +792,42 @@ describe("holder handover (SIGUSR2)", () => {
           "successor forever and every handover waits out the full 30s ceiling");
       } finally {
         try { wild.kill("SIGKILL"); } catch { }
+      }
+
+      // AND WITH /proc AVAILABLE BUT BLIND. Everything above disables /proc to
+      // reach the lsof branch; this is the case where /proc answers and its
+      // answer is wrong. `/proc/net/tcp` is IPv4-ONLY — an IPv6 listener lives
+      // in tcp6 — so under CACHE_FIX_PROXY_BIND=::1 the scan found no inode and
+      // the function used to `return false` right there, never consulting lsof.
+      // False means "no successor", so the outgoing proxy waited out its entire
+      // 30s ceiling on every handover instead of leaving when its replacement
+      // was already serving.
+      //
+      // NOT stubbed: a real IPv6 listener in a real other process, so the
+      // blindness is the kernel's own and not a fixture's.
+      const v6Port = await freePort();
+      const v6 = spawn(process.execPath, ["-e",
+        `require("net").createServer(()=>{}).listen(${v6Port},"::1",()=>process.stdout.write("up\\n"))`],
+        { stdio: ["ignore", "pipe", "ignore"] });
+      try {
+        await Promise.race([
+          new Promise((r) => v6.stdout.once("data", r)),
+          new Promise((_, j) => setTimeout(() => j(new Error("IPv6 listener never came up")), 8_000)),
+        ]);
+        // The premise this case rests on: /proc/net/tcp really cannot see it.
+        const hex = v6Port.toString(16).toUpperCase().padStart(4, "0");
+        const inV4 = readFileSync("/proc/net/tcp", "utf8").split("\n").slice(1)
+          .some((l) => l.trim().split(/\s+/)[1]?.endsWith(":" + hex));
+        assert.equal(inV4, false,
+          "premise: an IPv6 listener must be absent from /proc/net/tcp, or this case " +
+          "is not exercising the blindness it was written for");
+        // /proc ENABLED — the whole point. A miss must fall through, not answer.
+        assert.equal(successorServing(v6Port), true,
+          "an IPv6 listener read as 'no successor' because /proc/net/tcp is IPv4-only " +
+          "and the scan answered instead of falling through to lsof — every handover " +
+          "under an IPv6 bind then burns its full 30s ceiling");
+      } finally {
+        try { v6.kill("SIGKILL"); } catch { }
       }
     } finally {
       try { holder.kill("SIGTERM"); } catch { }

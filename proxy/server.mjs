@@ -813,8 +813,18 @@ export async function startProxy(options = {}) {
   // enough to build the loop. The polluted process measured on <linux-host> had
   // exactly that split — HTTPS_PROXY/ALL_PROXY on the pin, HTTP_PROXY on 9901
   // itself — so a guard reading only https would have passed it.
-  const selfUpstream = upstreamPointsAtSelf(config.httpsProxy, port, bind)
-                    || upstreamPointsAtSelf(config.httpProxy, port, bind);
+  // EVERY PORT WE WILL ANSWER ON, not just the one we were asked to bind. A
+  // holder hands its child the socket on fd 3 and spawns it with
+  // CACHE_FIX_PROXY_PORT=0, so `port` here is 0 and every real upstream compares
+  // unequal — the guard could never fire on the deployment shape it was written
+  // for, which is the measured 9901 -> 36301 -> 9901 loop it cites. The
+  // advertised port is the address the fleet actually dials.
+  const answersOn = [...new Set([port, Number(process.env.CACHE_FIX_HELD_PORT) || 0])]
+    .filter((n) => Number.isInteger(n) && n > 0);
+  const selfUpstream = answersOn
+    .map((p) => upstreamPointsAtSelf(config.httpsProxy, p, bind)
+             || upstreamPointsAtSelf(config.httpProxy, p, bind))
+    .find(Boolean) || "";
   if (selfUpstream) {
     throw new Error(
       `refusing to start: upstream proxy ${selfUpstream} is this proxy's own ` +
@@ -988,8 +998,15 @@ function sweepUpdateFossil() {
     // which would read as "channel unreachable" and sweep nothing. Never
     // through OURSELVES — our MITM leaf is signed by a CA only the client
     // trusts. The URL is overridable so a test can stand one up locally.
-    const url = new URL(process.env.CACHE_FIX_UPDATE_CHANNEL_URL ||
-      "https://downloads.claude.ai/claude-code-releases/latest");
+    // GUARDED, like every other failure in this callback. It runs from an async
+    // setTimeout, so a malformed CACHE_FIX_UPDATE_CHANNEL_URL throws into an
+    // unhandledRejection: in forward mode installSelfHeal swallows it, but in
+    // reverse mode nothing does and Node >=15 kills the process 25s after start.
+    let url;
+    try {
+      url = new URL(process.env.CACHE_FIX_UPDATE_CHANNEL_URL ||
+        "https://downloads.claude.ai/claude-code-releases/latest");
+    } catch { return; }
     const isHTTPS = url.protocol === "https:";
     const latest = await new Promise((res) => {
       const req = (isHTTPS ? https : http).get({
@@ -1059,7 +1076,13 @@ export function successorServing(port) {
       const f = line.trim().split(/\s+/);
       if (f[1]?.endsWith(":" + hex) && f[3] === "0A") inodes.add(f[9]);
     }
-    if (!inodes.size) return false;
+    // NO MATCH IS NOT AN ANSWER — fall through to the lsof branch below.
+    // /proc/net/tcp is IPv4-ONLY; an IPv6 listener lives in /proc/net/tcp6, so
+    // with CACHE_FIX_PROXY_BIND=::1 (or a proxy on ::) this found nothing and
+    // reported "no successor", and the handover wait burned its full 30s
+    // ceiling every time. Same defect class as the macOS lsof one this branch
+    // pair already fixed: when one instrument is blind, ask the other.
+    if (!inodes.size) throw new Error("no IPv4 listener on this port; try lsof");
     for (const p of readdirSync("/proc")) {
       if (!/^\d+$/.test(p) || Number(p) === process.pid) continue;
       let fds;
@@ -1361,6 +1384,14 @@ if (invokedAsScript) {
     const heldByLiveHolder = !!process.env.CACHE_FIX_HELD_BY
       && process.env.CACHE_FIX_HELD_BY === String(process.ppid);
     const askForSuccessor = active.inheritedSocket && !releasing && !heldByLiveHolder;
+    // WHETHER ONE ACTUALLY STARTED, which is not the same question as whether we
+    // wanted one. The announcement below used to be keyed on the WANT, so a
+    // spawn that threw still printed "(handed off)" — and the holder reads that
+    // exact string as "a successor is already serving, do nothing": it skips
+    // reclaim() AND spawnWhenReady(), and its `retired` flag makes our exit a
+    // no-op too. A failed spawn therefore ended with nobody on the socket and a
+    // supervisor that believed it was covered.
+    let handedOff = false;
     if (askForSuccessor) {
       try {
         spawn(process.execPath, [fileURLToPath(import.meta.url), ...process.argv.slice(2)], {
@@ -1372,10 +1403,10 @@ if (invokedAsScript) {
           // the self-heal below needs no blanket exemption for the whole
           // lineage — which is what left two of three machines unable to put a
           // holder back for 30 and 48 days.
-          env: { ...process.env, LISTEN_FDS: "1", CACHE_FIX_FROM_HANDOVER: "1",
-                 CACHE_FIX_HELD_BY: undefined },
+          env: { ...process.env, LISTEN_FDS: "1", CACHE_FIX_HELD_BY: undefined },
           detached: true,
         }).unref();
+        handedOff = true;
       } catch (err) {
         // Say so and go: a holder that still has its handle will restart us the
         // old way, and one that has detached is better told than left guessing.
@@ -1388,8 +1419,8 @@ if (invokedAsScript) {
     // of us put two proxies on one socket — measured, one extra per deploy:
     // PEAK CONCURRENT 4 and 3 still alive after 4 deploys.
     say(process.stdout,
-        `proxy releasing the listening socket${askForSuccessor ? " (handed off)" : ""}\n`);
-    active.close().finally(() => process.exit(askForSuccessor ? 75 : 0));
+        `proxy releasing the listening socket${handedOff ? " (handed off)" : ""}\n`);
+    active.close().finally(() => process.exit(handedOff ? 75 : 0));
     // The 5 s grace is DELIBERATELY UNCHANGED. A supervised stop is SERIAL
     // (stop, wait for exit, start), so a longer grace only extends the outage:
     // measured at 120 s against `DefaultTimeoutStopSec=90s`, the stop was
@@ -1404,14 +1435,34 @@ if (invokedAsScript) {
       // that had already received every byte still surfaced ECONNRESET and
       // threw the delivered data away. `res.end()` sends FIN, which the same
       // client reads as a clean EOF.
-      for (const res of liveResponses) { try { res.end(); } catch {} }
+      //
+      // ONLY THE ONES THAT ALREADY SENT HEADERS. `liveResponses` is filled at
+      // request START, so it also holds requests still blocked upstream — and
+      // `res.end()` on a response with no writeHead emits an implicit
+      // `HTTP/1.1 200 OK` + `Content-Length: 0`. Measured on the wire: a stop
+      // during a slow upstream call turned a retryable reset into a well-formed
+      // EMPTY SUCCESS, which a client cannot tell from a real one and will not
+      // retry. The FIN-not-RST argument only ever applied to a response that had
+      // bytes to finish; for one that has sent nothing, a reset is the honest
+      // answer and the only retryable one.
+      for (const res of liveResponses) {
+        try { if (res.headersSent) res.end(); else res.destroy(); } catch {}
+      }
       // Then force whatever did not take the FIN. Node >=18.2; package.json
       // engines allows 18.0/18.1, where exiting without forcing is the only
       // option.
+      // THE SAME EXIT CODE THE GRACEFUL PATH USES. It exits
+      // `askForSuccessor ? 75 : 0`, and the comment above it says the two paths
+      // must not disagree about what our exit means — but this one exited 0
+      // unconditionally, and the file calls the watchdog "the normal exit under
+      // systemd". So the ordinary stop of a proxy that DID hand its socket on
+      // reported EX_OK, and a supervisor keyed on 75 read "nothing to succeed
+      // to" for a lineage that had a successor waiting.
+      const code = handedOff ? 75 : 0;
       if (typeof active.server.closeAllConnections === "function") {
-        setImmediate(() => { active.server.closeAllConnections(); process.exit(0); });
+        setImmediate(() => { active.server.closeAllConnections(); process.exit(code); });
       } else {
-        setImmediate(() => process.exit(0));
+        setImmediate(() => process.exit(code));
       }
     }, 5000).unref();
   };
