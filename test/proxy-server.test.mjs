@@ -904,7 +904,14 @@ describe("/health hop reporting", () => {
       process.env.CACHE_FIX_FORWARD_PROXY = "on";
       process.env.CACHE_FIX_CA_DIR = caDir;
       process.env.CACHE_FIX_FALLBACK_PROXIES = `http://127.0.0.1:${deadPort}`;
-      process.env.CACHE_FIX_CHAIN_GRACE_MS = "1";
+      // THE GRACE IS PAID, and the comment that used to sit here said it was not.
+      // CHAIN_GRACE_MS is a module-level const captured at import, so setting the
+      // env after upstream.mjs is already loaded changes nothing — measured, this
+      // case runs 2,616 ms, which is one full 2,500 ms default window. Setting it
+      // anyway and calling the retry loop "not under test" was a lie in a comment,
+      // which is worse than the 2.5 s: it tells the next reader the wait is gone.
+      // Not worth a production getter — an operator sets this before the proxy
+      // starts, which is the only moment it is read, and that path works.
 
       handle = await startProxy({ port: 0, watch: false });
 

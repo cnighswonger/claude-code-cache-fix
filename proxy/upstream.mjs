@@ -222,7 +222,20 @@ export const requireHop = () => process.env.CACHE_FIX_REQUIRE_HOP === "1";
 export async function resolveHop(isHTTPS) {
   const primary = selectProxyUrl(isHTTPS);
   const chain = [primary, ...fallbackProxyUrls()].filter(Boolean);
-  if (!chain.length) return "";
+  if (!chain.length) {
+    // NOTHING TO USE, SO PUBLISH NOTHING. Both getters read the env per call, so
+    // a chain can empty at runtime — and this early return used to leave
+    // _lastHop at its previous value, so /health went on naming a hop no request
+    // could possibly take. Measured: hop resolves to :40559, chain emptied,
+    // resolveHop returns "" and lastHop() still said :40559.
+    //
+    // _directLast is deliberately NOT stamped here. "No chain was ever
+    // configured" is not a fall-through — there was no chain to fall through —
+    // and stamping it would fire on every reverse-mode proxy that never had one,
+    // which empties the field of the meaning it exists for.
+    _lastHop = "";
+    return "";
+  }
   const deadline = Date.now() + CHAIN_GRACE_MS;
   for (;;) {
     for (const hop of chain) {

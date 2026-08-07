@@ -72,6 +72,13 @@ describe("hop fallback", () => {
       for (const [file, re] of [
         ["../proxy/upstream.mjs", /netConnect\(\{ host: u\.hostname, port: (Number\(u\.port\)[^}]*?) \}\)/],
         ["../proxy/forward-proxy.mjs", /port: (Number\(u\.port\)[^}]*?) \};/],
+        // THREE copies, not two. bin/gap-relay.mjs carries its own because it
+        // imports node:net and nothing else — it is what runs when the proxy is
+        // DOWN, so depending on proxy/ modules would let a broken one take the
+        // relay with it. The duplication is deliberate; leaving it unchecked was
+        // not, and it was already correct here, which is why the other two read
+        // as a regression against it.
+        ["../bin/gap-relay.mjs", /const portOf = \(u\) => (Number\(u\.port\)[^;]*?);/],
       ]) {
         const src = readFileSync(new URL(file, import.meta.url), "utf8");
         const expr = re.exec(src)?.[1];
@@ -109,7 +116,14 @@ describe("hop fallback", () => {
                          "CACHE_FIX_FALLBACK_PROXIES", "CACHE_FIX_CHAIN_GRACE_MS"];
     const prior = Object.fromEntries(PRIMARY_ENV.map((k) => [k, process.env[k]]));
     for (const k of PRIMARY_ENV) delete process.env[k];
-    process.env.CACHE_FIX_CHAIN_GRACE_MS = "1";   // no retry loop; this is not what is under test
+    // THE GRACE IS PAID, and the comment that used to sit here said it was not.
+    // CHAIN_GRACE_MS is a module-level const captured at import, so setting the
+    // env after upstream.mjs is already loaded changes nothing — measured, this
+    // case runs 2,616 ms, which is one full 2,500 ms default window. Setting it
+    // anyway and calling the retry loop "not under test" was a lie in a comment,
+    // which is worse than the 2.5 s: it tells the next reader the wait is gone.
+    // Not worth a production getter — an operator sets this before the proxy
+    // starts, which is the only moment it is read, and that path works.
     try {
       // Dead first, live second: the answer must be the one that ANSWERED, not
       // the one that was configured first.
@@ -141,6 +155,22 @@ describe("hop fallback", () => {
       assert.equal(directLast(), mark,
         "the chain coming back cleared the direct-dial mark — the flap is now invisible, " +
         "which is the state this field exists to make visible");
+
+      // AND AN EMPTIED CHAIN MUST NOT LEAVE A HOP BEHIND. Both getters read the
+      // env per call, so the list can go away under a running proxy — and the
+      // early return for "no chain" used to skip _lastHop entirely, so /health
+      // went on naming a hop no request could take. Measured before the fix:
+      // resolved :40559, chain emptied, resolveHop returned "" and lastHop()
+      // still said :40559.
+      const beforeEmpty = directLast();
+      process.env.CACHE_FIX_FALLBACK_PROXIES = "";
+      assert.equal(await resolveHop(true), "", "premise: an empty chain must resolve to direct");
+      assert.equal(lastHop(), "",
+        "an emptied chain left the previous hop published — /health names an address " +
+        "no request can take, which is the lie this field was fixed to stop telling");
+      assert.equal(directLast(), beforeEmpty,
+        "an unconfigured chain stamped direct_last — that field means the chain was " +
+        "walked and nothing carried, not that there was never a chain");
     } finally {
       for (const [k, v] of Object.entries(prior)) {
         if (v === undefined) delete process.env[k]; else process.env[k] = v;
