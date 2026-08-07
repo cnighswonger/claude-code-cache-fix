@@ -44,26 +44,27 @@ Review labels (directive/spec stage):
 - `reviewed-by-codex-agent` — Codex has reviewed, no blocking findings
 - `reviewed-by-lead` — Project lead has reviewed
 
-Approval labels (final implementation sign-off):
-- `approved-by-code-agent` — Implementation agent approves for merge
-- `approved-by-codex-agent` — Codex approves for merge
-- `approved-by-lead` — Project lead approves for merge
+Approval labels (LLM-agent sign-off — record that the reviewer completed a
+review, not that the PR is cleared for merge):
+- `approved-by-code-agent` — Implementation agent completed review with no blockers
+- `approved-by-codex-agent` — Codex completed review with no blockers
+- `approved-by-lead` — Project lead completed review with no blockers
 
 Workflow state labels:
 - `plan-approved` — directive/spec approved; implementation may begin
 - `directive-stage` — PR is in directive/spec review; remove when implementation begins
 - `implementation-stage` — PR is in implementation
 - `changes-requested` — blocking findings remain
-- `ready-for-merge` — all required `approved-by-*` labels present, no blockers
+- `ready-for-merge` — Chris's merge gate. Applied by Chris only, after his formal `gh` review. No agent applies it, including the lead.
 - `needs-sim-validation` — requires integration testing with live CC traffic
 - `schema-change` — changes affect extension pipeline interface, telemetry format, or config schema
 
 Policy:
 - `reviewed-by-*` labels are for the directive/spec stage.
-- `approved-by-*` labels are the final implementation sign-off. Must be paired with a review comment.
+- `approved-by-*` labels record that an LLM agent has reviewed with no blockers. They are necessary preconditions for merge, not merge authorization. Must be paired with a review comment.
 - `plan-approved` allows implementation to begin but does not mean the PR is merge-ready.
-- `ready-for-merge` requires `approved-by-codex-agent` and `approved-by-lead`. Must not coexist with `changes-requested`.
-- Each agent owns only their own review and approval labels. No agent may add or remove another agent's labels.
+- `ready-for-merge` is **Chris's alone.** He applies it after his formal `gh` review. All required `approved-by-*` labels + no `changes-requested` are its preconditions but not sufficient — his `gh` review is an additional requirement. Its absence alongside `approved-by-lead` and `approved-by-codex-agent` is the normal waiting-on-human state, not an oversight to be corrected.
+- Each agent owns only their own review and approval labels. No agent may add or remove another agent's labels. `ready-for-merge` is not any agent's own label; it is Chris's, per above.
 - Codex should communicate desired shared-label changes in the review comment unless the user explicitly asks Codex to apply them.
 - **Approval labels are bound to the commit at which the approval was granted.** If new commits land on a PR after an approval label was applied, the label becomes stale relative to the new HEAD and re-approval is required. This applies to `approved-by-codex-agent`, `approved-by-code-agent`, `approved-by-lead`, and `ready-for-merge` (since the latter depends on the underlying approvals being current). Before treating any approval label as authoritative for the current HEAD, pull its timestamp via `gh api repos/<o>/<r>/issues/<n>/timeline --jq '.[] | select(.event=="labeled") | "\(.created_at)  \(.label.name)"'` and compare against the timestamps of commits since.
 - **When refreshing approval after new commits, remove and reapply the label** rather than leaving the original in place. The reapply updates the timestamp on the GitHub timeline so the label's freshness can be verified at a glance. A label whose timestamp predates the current HEAD's most recent material commit is, by definition, stale — even if the labeler intended their approval to cover the newer commits, the timeline doesn't reflect that.
