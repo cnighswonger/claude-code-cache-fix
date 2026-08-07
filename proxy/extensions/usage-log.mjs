@@ -271,7 +271,7 @@ export function assembleRecord({ start, delta, quota, requestedModel, sid, prevQ
   }
 
   // Optional: emit ttl_tier + duration_ms when CACHE_FIX_USAGE_LOG_EXTENDED=on.
-  // Cross-repo contract: claude-code-meter v0.9.0+ accepts these fields on
+  // Cross-repo contract: claude-code-meter v0.9.1+ accepts these fields on
   // MeterRowSchema. Older meter installs reject any row carrying an unknown
   // key, and rejection is silent at both chokepoints (writer.mjs:68-70
   // safeParse→null; jsonl-tailer.mjs:143-153 parse→skip). The env-var IS
