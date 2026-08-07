@@ -178,3 +178,52 @@ test("every /health probe carries the body it failed with", () => {
     "(`ERR:${r.statusCode} ${b.slice(0, 160)}`) or a red run cannot say which " +
     "of the two 503 authors answered");
 });
+
+// A SOCKET MAY BE ENDED ONCE, AND A data HANDLER RUNS PER READ. Calling end()
+// or write() on the socket from inside its own data handler is therefore a bet
+// that no second read arrives, and whether one does is pure timing: how the
+// peer's writes are coalesced, how loaded the box is, which libuv version.
+//
+// CI node 22 collected on that bet (run 31146142838): "write after end",
+// ERR_STREAM_WRITE_AFTER_END, uncaughtException, while 18 and 20 passed and no
+// local run of the case ever split the reads. Reproduced away from the suite
+// with a 1KiB drip writer — unguarded: UNCAUGHT ERR_STREAM_WRITE_AFTER_END,
+// guarded: end() once, clean.
+//
+// Static and by SHAPE, because the way it returns is a paste. When this was
+// written the tree held exactly two of these; one had just cost a red CI and
+// the other, `s.on("data", () => s.end("pong"))`, was still live and had simply
+// not been unlucky yet.
+//
+// Matched on the receiver, not on the word: `r.on("end", …)` one line below a
+// data handler REGISTERS a listener and calls nothing — a looser pattern
+// counted 18 sites, all but one of them that false shape, and a guard that
+// crying wolf 17 times out of 18 is a guard somebody deletes.
+test("no test ends a socket from inside its own data handler, unguarded", () => {
+  const pat = /(\w+)\.on\(\s*"data"\s*,\s*(?:async\s*)?\(?[^)]*\)?\s*=>\s*/g;
+  const bad = [];
+  // This file is skipped because it CONTAINS the pattern as data — it matched
+  // itself on the first run, which is the shape of every static check that
+  // reads the directory it lives in.
+  for (const f of readdirSync(testDir).filter((n) => n.endsWith(".mjs") && n !== "suite-collection.test.mjs")) {
+    const src = readFileSync(join(testDir, f), "utf8");
+    for (const m of src.matchAll(pat)) {
+      const obj = m[1];
+      let depth = 0, i = m.index + m[0].length, end = src.length;
+      while (i < src.length) {
+        const c = src[i];
+        if (c === "(" || c === "[" || c === "{") depth++;
+        else if (c === ")" || c === "]" || c === "}") { if (depth === 0) { end = i; break; } depth--; }
+        i++;
+      }
+      const body = src.slice(m.index + m[0].length, end);
+      if (!new RegExp(`\\b${obj}\\.(end|write)\\s*\\(`).test(body)) continue;
+      if (/\bif\s*\(\s*!\w+/.test(body)) continue;          // answer-once guard present
+      bad.push(`${f}:${src.slice(0, m.index).split("\n").length}`);
+    }
+  }
+  assert.deepEqual(bad, [],
+    `these end/write on the socket from inside its own data handler with no ` +
+    `answer-once guard, so a second read throws ERR_STREAM_WRITE_AFTER_END: ` +
+    `${bad.join(", ")}`);
+});

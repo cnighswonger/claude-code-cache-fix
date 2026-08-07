@@ -442,7 +442,13 @@ describe("holder handover (SIGUSR2)", () => {
   it(`carries the address when the holder and its child are both killed and ${what}`, async () => {
     // A real origin, because ANSWERING IS NOT CARRYING. A relay that accepted
     // and then sat there would pass a health probe and fail every request.
-    const origin = net.createServer((s) => s.on("data", () => s.end("pong")));
+    // Answer once: a second read reaching an already-ended socket throws
+        // ERR_STREAM_WRITE_AFTER_END, which is what broke CI node 22 in the
+        // sibling case below (run 31146142838).
+        const origin = net.createServer((s) => {
+          let answered = false;
+          s.on("data", () => { if (!answered) { answered = true; s.end("pong"); } });
+        });
     await new Promise((r) => origin.listen(0, "127.0.0.1", r));
     const originPort = origin.address().port;
     const port = await freePort();
