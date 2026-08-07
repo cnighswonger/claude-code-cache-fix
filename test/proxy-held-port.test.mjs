@@ -98,10 +98,18 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
   // against the relay that covers a cold start — measured, six cases in this
   // file went red on `JSON.parse(body).status` being undefined, and which ones
   // depended on the race.
+  //
+  // THE BODY RIDES ALONG ON A FAILURE, because 503 has two authors and the
+  // status line cannot tell them apart: the relay says {"carrying":"gap-relay"}
+  // and a degraded proxy says {"status":"degraded","failed_extensions":[...]}.
+  // Measured on CI run 31137828018 (node 18 only): "cut 6 connection(s) ...
+  // ERR:503" named neither, and the case reproduces on no local run — 9 of 9
+  // green, 8 of them under saturating load — so the log was the only witness
+  // and it had thrown the evidence away.
   const get = () => new Promise((res) => {
     http.get({ host: "127.0.0.1", port, path: "/health", timeout: 8_000 }, (r) => {
       let b = ""; r.on("data", (d) => (b += d));
-      r.on("end", () => res(r.statusCode === 200 ? b : `ERR:${r.statusCode}`));
+      r.on("end", () => res(r.statusCode === 200 ? b : `ERR:${r.statusCode} ${b.slice(0, 160)}`));
     }).on("error", (e) => res(`ERR:${e.code}`));
   });
   // pgrep, never a pid arithmetic shortcut: `process.kill(0, ...)` signals the
