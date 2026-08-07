@@ -690,6 +690,38 @@ describe("holder handover (SIGUSR2)", () => {
       assert.equal(viaLsof, true,
         "a live proxy on this port was not recognised — on a machine without /proc the " +
         "self-heal waits out its 30s ceiling instead of handing over when the successor is up");
+
+      // AND IT MUST NOT DEPEND ON THE BIND ADDRESS. The lsof branch pinned the
+      // 127.0.0.1 literal while the /proc branch matched on the port alone, so
+      // the two instruments answered the same question differently — and the
+      // lsof one is the ONLY branch a mac reaches, which is two of our three
+      // machines. A proxy bound anywhere else read as "no successor" forever.
+      //
+      // Asserted against a listener on a DIFFERENT address than the literal
+      // that used to be hardcoded, so a revert fails here rather than passing
+      // on a loopback-only fixture.
+      // ANOTHER PROCESS, on 0.0.0.0. Ours would not do: the function excludes
+      // its own pid, so a self-owned listener answers false either way and the
+      // case would pass against the hardcoded literal it exists to catch.
+      const wildPort = await freePort();
+      const wild = spawn(process.execPath, ["-e",
+        `require("net").createServer(()=>{}).listen(${wildPort},"0.0.0.0",()=>process.stdout.write("up\\n"))`],
+        { stdio: ["ignore", "pipe", "ignore"] });
+      try {
+        await Promise.race([
+          new Promise((r) => wild.stdout.once("data", r)),
+          new Promise((_, j) => setTimeout(() => j(new Error("wildcard listener never came up")), 8_000)),
+        ]);
+        process.env.CACHE_FIX_NO_PROC = "1";
+        const seen = successorServing(wildPort);
+        delete process.env.CACHE_FIX_NO_PROC;
+        assert.equal(seen, true,
+          "a listener on 0.0.0.0 was invisible to the lsof branch — that branch is the " +
+          "ONLY one a mac reaches, so a proxy bound off loopback reads as having no " +
+          "successor forever and every handover waits out the full 30s ceiling");
+      } finally {
+        try { wild.kill("SIGKILL"); } catch { }
+      }
     } finally {
       try { holder.kill("SIGTERM"); } catch { }
       for (let i = 0; i < 5; i++) {

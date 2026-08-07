@@ -1081,7 +1081,21 @@ export function successorServing(port) {
   //
   // Same question, different instrument: is any OTHER pid listening here.
   try {
-    const out = execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN"],
+    // BY PORT, like the /proc branch above — not by 127.0.0.1. The two branches
+    // answered the same question differently: /proc matches on the port alone
+    // (f[1] ends with :hexport, any local address), while this one pinned the
+    // loopback literal. So on a mac — the only platform that reaches this
+    // branch, and two of our three machines — a proxy bound anywhere else
+    // matched nothing, successorServing() returned false forever, and the
+    // outgoing proxy waited out its whole 30s ceiling on every handover
+    // instead of leaving as soon as its successor served.
+    //
+    // Matching /proc, rather than teaching /proc the address: a wildcard
+    // listener (0.0.0.0) serves loopback traffic but does NOT match an
+    // `-iTCP@127.0.0.1` query, so an address filter has its own blind spot, and
+    // the one that errs toward "a successor exists" would let a proxy leave an
+    // unowned port behind.
+    const out = execFileSync("lsof", ["-nP", "-t", `-iTCP:${port}`, "-sTCP:LISTEN"],
                              { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
     for (const line of out.trim().split("\n")) {
       const pid = Number(line);
