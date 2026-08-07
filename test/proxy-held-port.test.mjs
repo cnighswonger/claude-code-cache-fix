@@ -12,6 +12,17 @@ import { join, dirname } from "node:path";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
+// EVERY variable that can give a child an outbound hop, in one list because six
+// fixtures scrub it and a per-fixture copy is how one gets missed. It was: five
+// of them dropped the four *_PROXY names and none dropped the two CACHE_FIX
+// ones, which the relay reads FIRST (bin/gap-relay.mjs) — so a maintainer behind
+// a corp proxy ran the suite, the relay carried to it, and its host:port went
+// into the 503 body that a failure message now prints. This repo is public and
+// that is the hostname-port class its hygiene rule bans.
+const HOP_ENV = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                 "ALL_PROXY", "all_proxy",
+                 "CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_FALLBACK_PROXIES"];
+
 // Whoever is LISTENING on a port, by port rather than by parentage. The
 // self-heal spawns a DETACHED successor, so it is nobody's child and `pgrep -P`
 // cannot see it — the only durable handle on it is the address it took.
@@ -66,8 +77,9 @@ it("holds the same default port the proxy would bind", () => {
 });
 
 // A launcher holding a real port, its /health probe, and its reaper. The
-// held-port tests need all three; `get` answers "ERR:<code>" rather than
-// throwing so a caller can count failures instead of catching them.
+// held-port tests need all three; `get` answers "ERR:<code> <body>" rather than
+// throwing so a caller can count failures instead of catching them — and the
+// body is what names which of /health's two 503 authors replied.
 async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
   const port = await freePort();          // a real number: the holder owns the ADVERTISED port
   // Self-heal OFF by default. A proxy whose holder was SIGKILLed spawns a
@@ -82,8 +94,7 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
   // measured, an exported WATCH_DEPLOY_MS turns "is off unless asked for"
   // into a failure about the shell rather than about the code.
   const env = { ...process.env };
-  for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "LISTEN_FDS", "LISTEN_PID",
-                   "CACHE_FIX_WATCH_DEPLOY_MS", "CACHE_FIX_SELF_HEAL"]) delete env[k];
+  for (const k of [...HOP_ENV, "LISTEN_FDS", "LISTEN_PID", "CACHE_FIX_WATCH_DEPLOY_MS", "CACHE_FIX_SELF_HEAL"]) delete env[k];
   Object.assign(env, { CACHE_FIX_HOLD_PORT: "on", CACHE_FIX_PROXY_PORT: String(port),
                        CACHE_FIX_SELF_HEAL: "off",
                        // A SIGKILLed runner runs no cleanup, so ask the holder to
@@ -104,8 +115,7 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
   // and a degraded proxy says {"status":"degraded","failed_extensions":[...]}.
   // Measured on CI run 31137828018 (node 18 only): "cut 6 connection(s) ...
   // ERR:503" named neither, and the case reproduces on no local run — 9 of 9
-  // green, 8 of them under saturating load — so the log was the only witness
-  // and it had thrown the evidence away.
+  // green, 8 of them under saturating load.
   const get = () => new Promise((res) => {
     http.get({ host: "127.0.0.1", port, path: "/health", timeout: 8_000 }, (r) => {
       let b = ""; r.on("data", (d) => (b += d));
@@ -216,8 +226,8 @@ it("serves every concurrent request while nothing restarts", async () => {
   await withHeldPort(async ({ port }) => {
     const one = () => new Promise((res) => {
       const r = http.get({ host: "127.0.0.1", port, path: "/health", agent: false }, (q) => {
-        q.resume();
-        q.on("end", () => res(q.statusCode === 200 ? "ok" : `ERR:${q.statusCode}`));
+        let b = ""; q.on("data", (d) => (b += d));
+        q.on("end", () => res(q.statusCode === 200 ? "ok" : `ERR:${q.statusCode} ${b.slice(0, 160)}`));
       });
       // Well under the 8s a hung accept would cost, and far above a served
       // request on loopback: the failure this catches is unbounded, not slow.
@@ -293,8 +303,7 @@ async function withFakeProxy(serverSrc, fn, { watchMs, selfHeal = "" } = {}) {
   // seam shrinks the RUNGS, not the count, so the shape under assertion (does
   // it back off? does it give up after 5?) is the shipped one.
   const env = { ...process.env };
-  for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "LISTEN_FDS", "LISTEN_PID",
-                   "CACHE_FIX_WATCH_DEPLOY_MS", "CACHE_FIX_SELF_HEAL"]) delete env[k];
+  for (const k of [...HOP_ENV, "LISTEN_FDS", "LISTEN_PID", "CACHE_FIX_WATCH_DEPLOY_MS", "CACHE_FIX_SELF_HEAL"]) delete env[k];
   Object.assign(env, { CACHE_FIX_HOLD_PORT: "on", CACHE_FIX_PROXY_PORT: String(port),
                        CACHE_FIX_RESTART_BASE_MS: "25", CACHE_FIX_SELF_HEAL: selfHeal || "off",
                        ...(watchMs ? { CACHE_FIX_WATCH_DEPLOY_MS: String(watchMs) } : {}) });
@@ -535,7 +544,8 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
                    // 200, not merely a reply: a standby relay carrying this
                    // address answers 503, and counting that as served would
                    // hide exactly the loss this sampler exists to count.
-                   (r) => { r.resume(); r.on("end", () => res(r.statusCode === 200 ? "ok" : `ERR:${r.statusCode}`)); })
+                   (r) => { let b = ""; r.on("data", (d) => (b += d));
+                            r.on("end", () => res(r.statusCode === 200 ? "ok" : `ERR:${r.statusCode} ${b.slice(0, 160)}`)); })
             .on("error", (e) => res(`ERR:${e.code}`));
         });
         // A pause between requests, and it is NOT politeness. This describe
@@ -632,9 +642,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       // SELF_HEAL too: this case MEASURES the self-heal, so an operator who
       // exported the off switch while debugging would turn it into a failure
       // about their shell. WATCH_DEPLOY_MS for the same reason.
-      for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
-                       "ALL_PROXY", "all_proxy", "LISTEN_FDS", "LISTEN_PID",
-                       "CACHE_FIX_SELF_HEAL", "CACHE_FIX_WATCH_DEPLOY_MS"]) delete env[k];
+      for (const k of [...HOP_ENV, "LISTEN_FDS", "LISTEN_PID", "CACHE_FIX_SELF_HEAL", "CACHE_FIX_WATCH_DEPLOY_MS"]) delete env[k];
       const holder = spawn(process.execPath, [launcherPath, "run-service"], { env, stdio: ["ignore", "pipe", "pipe"] });
       let kid = 0;
       try {
@@ -712,16 +720,16 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
     it("puts a new holder back on the port when the old one is killed", async () => {
       const port = await freePort();
       const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port), CACHE_FIX_FORWARD_PROXY: "on" };
-      for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
-                       "ALL_PROXY", "all_proxy", "LISTEN_FDS", "LISTEN_PID"]) delete env[k];
+      for (const k of [...HOP_ENV, "LISTEN_FDS", "LISTEN_PID"]) delete env[k];
       // 200 OR IT IS NOT THE PROXY. A standby relay carrying this address answers
       // /health with a 503 and a JSON body of its own, and a helper that returned
       // any body let a readiness loop finish on it — measured, `JSON.parse(body)
       // .status` came back undefined against a relay that was working perfectly.
+      // The body rides along on a failure for the reason withHeldPort's does.
       const get = () => new Promise((res) => {
         http.get({ host: "127.0.0.1", port, path: "/health", timeout: 3_000 }, (r) => {
           let b = ""; r.on("data", (d) => (b += d));
-          r.on("end", () => res(r.statusCode === 200 ? b : `ERR:${r.statusCode}`));
+          r.on("end", () => res(r.statusCode === 200 ? b : `ERR:${r.statusCode} ${b.slice(0, 160)}`));
         }).on("error", (e) => res(`ERR:${e.code}`));
       });
       const first = spawn(process.execPath, [launcherPath, "run-service"], { env, stdio: ["ignore", "pipe", "pipe"] });
@@ -843,17 +851,16 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       const port = await freePort();
       const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port), CACHE_FIX_FORWARD_PROXY: "on",
                     CACHE_FIX_SELF_HEAL: "off" };
-      for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
-                       "ALL_PROXY", "all_proxy", "LISTEN_FDS", "LISTEN_PID",
-                       "CACHE_FIX_HOLD_PORT"]) delete env[k];
+      for (const k of [...HOP_ENV, "LISTEN_FDS", "LISTEN_PID", "CACHE_FIX_HOLD_PORT"]) delete env[k];
       // 200 OR IT IS NOT THE PROXY. A standby relay carrying this address answers
       // /health with a 503 and a JSON body of its own, and a helper that returned
       // any body let a readiness loop finish on it — measured, `JSON.parse(body)
       // .status` came back undefined against a relay that was working perfectly.
+      // The body rides along on a failure for the reason withHeldPort's does.
       const get = () => new Promise((res) => {
         http.get({ host: "127.0.0.1", port, path: "/health", timeout: 3_000 }, (r) => {
           let b = ""; r.on("data", (d) => (b += d));
-          r.on("end", () => res(r.statusCode === 200 ? b : `ERR:${r.statusCode}`));
+          r.on("end", () => res(r.statusCode === 200 ? b : `ERR:${r.statusCode} ${b.slice(0, 160)}`));
         }).on("error", (e) => res(`ERR:${e.code}`));
       });
       const old = spawn(process.execPath, [launcherPath, "server"], { env, stdio: ["ignore", "pipe", "pipe"] });
@@ -877,7 +884,8 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
                    // 200, not merely a reply: a standby relay carrying this
                    // address answers 503, and counting that as served would
                    // hide exactly the loss this sampler exists to count.
-                   (r) => { r.resume(); r.on("end", () => res(r.statusCode === 200 ? "ok" : `ERR:${r.statusCode}`)); })
+                   (r) => { let b = ""; r.on("data", (d) => (b += d));
+                            r.on("end", () => res(r.statusCode === 200 ? "ok" : `ERR:${r.statusCode} ${b.slice(0, 160)}`)); })
             .on("error", (e) => res(`ERR:${e.code}`));
         });
         const pump = (async () => {
@@ -918,8 +926,9 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
           : 0;
         assert.ok(outage < 4_000,
           `the port was refusing for ${outage}ms across a takeover (${refused.length} of ` +
-          `${served + refused.length} requests) — that is past a child's boot, so the ` +
-          `takeover did not complete, it stranded the address`);
+          `${served + refused.length} requests: ${[...new Set(refused.map((r) => r.code))].join(", ")}) ` +
+          `— that is past a child's boot, so the takeover did not complete, it ` +
+          `stranded the address`);
         assert.equal((await get()).startsWith("ERR:"), false,
           "the port never came back after the takeover");
         // PROXIES, which is what the sentence says. A holder also parents one
@@ -1165,7 +1174,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
     it("exits 0 and starts nothing when a proxy is already serving", async () => {
       await withHeldPort(async ({ get, port, proxyPid }) => {
         const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port) };
-        for (const k of ["HTTPS_PROXY", "https_proxy", "LISTEN_FDS", "LISTEN_PID"]) delete env[k];
+        for (const k of [...HOP_ENV, "LISTEN_FDS", "LISTEN_PID"]) delete env[k];
         const incumbentPid = proxyPid();
         assert.ok(incumbentPid, "premise: the first run-service must have a proxy to protect");
         const second = spawn(process.execPath, [launcherPath, "run-service"], { env, stdio: ["ignore", "pipe", "pipe"] });

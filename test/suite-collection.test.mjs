@@ -125,3 +125,56 @@ test("a test that SIGKILLs a holder reaps the successor, holder first", () => {
     "nothing looks up the listener's parent, so the reaper kills a listener " +
     "that a live holder immediately replaces");
 });
+
+// A FAILURE MESSAGE IS PUBLISHED OUTPUT. proxy-held-port's probes append the
+// 503 body to what they assert on, and the gap relay's 503 body carries the hop
+// it would forward to — so an env var that gives a child a hop and is not
+// scrubbed puts a corp proxy's host:port into a red run that someone pastes
+// into a public issue. That is the hostname-port class this repo's hygiene rule
+// bans, and it reaches CI logs, not just terminals.
+//
+// Static and by pattern, because the failure mode is ADDING a var: the relay
+// learns a new one, six fixtures keep scrubbing the old five, and nothing is
+// red. Matching PROX rather than PROXY is not pedantry — CACHE_FIX_FALLBACK_
+// PROXIES has no "PROXY" in it, and a PROXY-shaped grep missed exactly that one
+// while this was being written.
+test("every hop-bearing env the relay reads is scrubbed by the fixtures", () => {
+  const relay = readFileSync(join(testDir, "..", "bin", "gap-relay.mjs"), "utf8");
+  const reads = [...new Set([...relay.matchAll(/process\.env\.([A-Za-z_]*[Pp][Rr][Oo][Xx][A-Za-z_]*)/g)]
+    .map((m) => m[1]))];
+  assert.ok(reads.length >= 3, `expected the relay to read several hop vars, found ${reads.length}`);
+
+  const src = readFileSync(join(testDir, "proxy-held-port.test.mjs"), "utf8");
+  const list = /const HOP_ENV = \[([\s\S]*?)\];/.exec(src)?.[1];
+  assert.ok(list, "HOP_ENV moved — the fixtures' scrub list is no longer readable from here");
+  const scrubbed = new Set([...list.matchAll(/"([A-Za-z_]+)"/g)].map((m) => m[1]));
+
+  for (const v of reads) {
+    assert.ok(scrubbed.has(v),
+      `bin/gap-relay.mjs reads ${v} but HOP_ENV does not scrub it: a machine ` +
+      `with it set publishes that hop's host:port in a failing assertion`);
+  }
+
+  // And the fixtures must go through the shared list, or the next var added to
+  // it reaches only the sites someone remembered.
+  assert.equal(/for \(const k of \["HTTPS_PROXY"/.test(src), false,
+    "a fixture still scrubs a hand-written proxy list instead of ...HOP_ENV");
+});
+
+// A PROBE THAT DROPS THE STATUS BODY COSTS AN INVESTIGATION. /health has two
+// 503 authors — the relay carrying an address with no proxy behind it, and a
+// proxy reporting failed extensions — and the code alone names neither. CI run
+// 31137828018 failed node 18 with "cut 6 connection(s) ... ERR:503", did not
+// reproduce in 9 local runs, and the log was the only witness.
+//
+// Static, because the way it comes back is COPYING: proxy-held-port carries
+// several byte-identical probe closures, and the first fix reached three of
+// them while two kept returning a bare code. A fourth copy is one paste away.
+test("every /health probe carries the body it failed with", () => {
+  const src = readFileSync(join(testDir, "proxy-held-port.test.mjs"), "utf8");
+  const bare = [...src.matchAll(/`ERR:\$\{[qr]\.statusCode\}`/g)];
+  assert.equal(bare.length, 0,
+    `${bare.length} probe(s) return a bare ERR:<code>; append the body ` +
+    "(`ERR:${r.statusCode} ${b.slice(0, 160)}`) or a red run cannot say which " +
+    "of the two 503 authors answered");
+});
