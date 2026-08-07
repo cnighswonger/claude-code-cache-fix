@@ -256,6 +256,15 @@ test("CONNECT falls open to a direct dial, unless CACHE_FIX_REQUIRE_HOP says oth
   // Where a direct dial lands. Reaching it is the fail-OPEN outcome.
   const direct = net.createServer((sock) => { seen.push("DIRECT"); sock.destroy(); });
   const directPort = await listen(direct);
+  // A LOCAL upstream that answers unmistakably. Without it config.upstream is
+  // the real https://api.anthropic.com and the relayed probe below dials it for
+  // real — measured as a CI regression: the run that added this probe went red
+  // on node 22 while the identical code without it was green, and
+  // integrated.conf line 20 already warns that an unproxied test here "hangs on
+  // this network until it times out". 418 is a status nothing else in this
+  // chain produces, so reaching it cannot be confused with a refusal.
+  const upstream = http.createServer((_q, r) => { r.writeHead(418); r.end("teapot"); });
+  await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
   // A hop address with nothing behind it: the whole chain refuses.
   const deadHop = net.createServer();
   const deadPort = await listen(deadHop);
@@ -311,6 +320,14 @@ test("CONNECT falls open to a direct dial, unless CACHE_FIX_REQUIRE_HOP says oth
     // aborted=true, writableEnded=false, no response, client timed out at 10s.
     // Change this assertion the day that abort listener distinguishes "body
     // done" from "client gone".
+    // ITS OWN INSTANCE. Pointing config.upstream at loopback for the whole case
+    // breaks the CONNECT half above — the forward proxy then reads the tunnel
+    // target 127.0.0.1:<port> as the upstream host and stops blind-tunnelling
+    // it, so `seen` came back empty and the fail-open assertion failed for a
+    // reason that had nothing to do with fail-open.
+    await handle.close();
+    process.env.CACHE_FIX_PROXY_UPSTREAM = `http://127.0.0.1:${upstream.address().port}`;
+    handle = await startProxy({ port: 0, watch: false });
     const relayed = await new Promise((resolve) => {
       const r = http.request({ host: "127.0.0.1", port: handle.port, method: "POST",
                                path: "/v1/messages", headers: { "content-type": "application/json" } },
@@ -319,14 +336,15 @@ test("CONNECT falls open to a direct dial, unless CACHE_FIX_REQUIRE_HOP says oth
       r.setTimeout(4_000, () => { r.destroy(); resolve("TIMEOUT"); });
       r.end("{}");
     });
-    assert.notEqual(relayed, 502,
-      "the relayed path now refuses under CACHE_FIX_REQUIRE_HOP — good, but the " +
-      "comment above and this assertion both describe the OLD state; update them");
+    assert.equal(relayed, 418,
+      `the relayed path answered ${relayed} instead of reaching the upstream. 502 ` +
+      `means CACHE_FIX_REQUIRE_HOP now covers it — good, but the comment above and ` +
+      `this assertion both describe the OLD state, so update them together`);
 
   } finally {
     restoreEnv(saved);
     if (handle) await handle.close();
-    direct.close();
+    direct.close(); upstream.close();
     try { rmSync(caDir, { recursive: true, force: true }); } catch {}
   }
 });

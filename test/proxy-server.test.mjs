@@ -939,3 +939,98 @@ describe("/health hop reporting", () => {
     }
   });
 });
+
+// THE CLIENT-ABANDON ABORT, IN BOTH DIRECTIONS.
+//
+// handleMessages installs an abort so a client that gives up mid-SSE frees the
+// upstream. It was keyed on clientReq's "close" — which Node emits when the
+// request BODY is consumed, i.e. on every request, immediately — so it aborted
+// while the client was still waiting, and the forwardRequest catch opens with
+// `if (aborted) return`. Nothing was written back.
+//
+// Measured before the fix, reverse mode, upstream refusing instantly (what a
+// dead local hop does): POST /v1/messages hung for the client's full timeout
+// instead of answering 502, for both an at-once and a delayed body.
+//
+// BOTH CASES OR NEITHER. Asserting only the 502 would pass against a build that
+// deleted the listener outright, which leaks an upstream connection for every
+// abandoned stream — a worse bug, and invisible until the box runs out of
+// sockets.
+describe("client-abandon abort", () => {
+  const ENV = ["CACHE_FIX_PROXY_UPSTREAM", "CACHE_FIX_FORWARD_PROXY", "CACHE_FIX_CA_DIR",
+               "CACHE_FIX_FALLBACK_PROXIES", "CACHE_FIX_UPSTREAM_PROXY",
+               "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"];
+  const save = () => Object.fromEntries(ENV.map((k) => [k, process.env[k]]));
+  const restore = (s) => { for (const [k, v] of Object.entries(s)) {
+    if (v === undefined) delete process.env[k]; else process.env[k] = v; } };
+
+  it("answers 502 when the upstream refuses, instead of hanging the client", async () => {
+    const saved = save();
+    const dead = await freePort();               // nothing listening: instant ECONNREFUSED
+    let h;
+    try {
+      for (const k of ENV) delete process.env[k];
+      process.env.CACHE_FIX_PROXY_UPSTREAM = `http://127.0.0.1:${dead}`;
+      h = await startProxy({ port: 0, watch: false });
+      const got = await new Promise((resolve) => {
+        const r = http.request({ host: "127.0.0.1", port: h.port, method: "POST",
+                                 path: "/v1/messages", headers: { "content-type": "application/json" } },
+          (res) => { res.resume(); res.on("end", () => resolve(res.statusCode)); });
+        r.on("error", (e) => resolve(`ERR:${e.code}`));
+        r.setTimeout(6_000, () => { r.destroy(); resolve("HANG"); });
+        r.end(JSON.stringify({ model: "x", messages: [] }));
+      });
+      assert.equal(got, 502,
+        `a refusing upstream produced ${got} — the client was never answered, ` +
+        `which is a live session stalling on the most ordinary upstream failure`);
+    } finally { restore(saved); if (h) await h.close(); }
+  });
+
+  // NO UPSTREAM LEAK WHEN A CLIENT WALKS AWAY — the PROPERTY, and deliberately
+  // not a claim about which mechanism provides it.
+  //
+  // I could not build a case that dies when the abort listener is deleted. Two
+  // tries: letting the client take a frame then leave (the pipe tears the
+  // upstream down on its own), and an upstream that accepts and never answers
+  // so no pipe exists (still freed). Both passed with the listener removed
+  // outright. So the listener may be doing nothing here that socket teardown
+  // does not already do — which would make it pure liability, since keying it
+  // on clientReq is what hung every fast upstream failure.
+  //
+  // It stays, because "I could not demonstrate it matters" is not "it does not
+  // matter", and removing it is a bigger change than this evidence supports.
+  // This case pins the property so a future refactor that DOES introduce a leak
+  // is caught, and says plainly that it is not a guard on the listener.
+  it("frees an upstream that has not answered yet when the client walks away", async () => {
+    const saved = save();
+    let liveUpstream = 0;
+    const upstream = http.createServer(() => { /* accept, never respond */ });
+    upstream.on("connection", (sock) => {
+      liveUpstream++;
+      sock.on("close", () => { liveUpstream--; });
+    });
+    await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
+    let h;
+    try {
+      for (const k of ENV) delete process.env[k];
+      process.env.CACHE_FIX_PROXY_UPSTREAM = `http://127.0.0.1:${upstream.address().port}`;
+      h = await startProxy({ port: 0, watch: false });
+      await new Promise((resolve) => {
+        const r = http.request({ host: "127.0.0.1", port: h.port, method: "POST",
+                                 path: "/v1/messages", headers: { "content-type": "application/json" } },
+          (res) => { res.resume(); });
+        r.on("error", () => {});
+        r.end(JSON.stringify({ model: "x", messages: [] }));
+        // Long enough for the proxy to have dialled and be WAITING on the
+        // upstream — the state this case is about — then walk away.
+        setTimeout(() => { r.destroy(); resolve(); }, 400);
+      });
+      assert.ok(liveUpstream > 0 || true, "");   // the count below is the assertion
+      for (let i = 0; i < 40 && liveUpstream > 0; i++) await new Promise((r) => setTimeout(r, 50));
+      assert.equal(liveUpstream, 0,
+        `the client walked away while the upstream had not answered, and ${liveUpstream} ` +
+        `upstream connection(s) stayed open — one leak per abandoned request, with no ` +
+        `pipe in place to tear it down`);
+    } finally { restore(saved); if (h) await h.close(); await new Promise((r) => upstream.close(r)); }
+  });
+});

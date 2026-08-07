@@ -151,7 +151,22 @@ async function handleMessages(clientReq, clientRes) {
   // Bootstrap (handleBootstrap) doesn't install this because its response is
   // a single non-SSE JSON payload — aborting on clientReq close prematurely
   // would race the response write on fast-failure paths (e.g. ECONNREFUSED).
-  clientReq.on("close", () => {
+  // THE RESPONSE'S close, NOT THE REQUEST'S. Node emits "close" on an
+  // IncomingMessage when the request BODY has been consumed — which is every
+  // request, immediately, not only the ones where the client left. So this
+  // aborted while the client was still sitting there waiting, and the catch
+  // below opens with `if (aborted) return`, so nothing was ever written back.
+  //
+  // Measured in reverse mode against an upstream that refuses instantly, which
+  // is what a dead local hop does: POST /v1/messages HUNG for the client's full
+  // 6s timeout instead of answering 502. Both body shapes, sent-at-once and
+  // sent-delayed. That is a live session stalling on the most ordinary upstream
+  // failure there is.
+  //
+  // clientRes's close fires when the response is finished OR the connection is
+  // destroyed, so pairing it with writableEnded separates the two: ended means
+  // we answered, not-ended means the client hung up and the upstream should go.
+  clientRes.on("close", () => {
     if (!clientRes.writableEnded) abortController.abort();
   });
 
@@ -481,7 +496,11 @@ function handleNotFound(_req, res) {
 // /v1/messages arrives there), so its 404 contract is unchanged.
 async function handlePassthrough(clientReq, clientRes) {
   const abortController = new AbortController();
-  clientReq.on("close", () => { if (!clientRes.writableEnded) abortController.abort(); });
+  // clientRes, not clientReq — see handleMessages' matching comment. The request
+  // object's "close" fires when its body is consumed, so this aborted every
+  // request the instant it arrived and the catch below then returned without
+  // writing anything.
+  clientRes.on("close", () => { if (!clientRes.writableEnded) abortController.abort(); });
 
   const method = (clientReq.method || "GET").toUpperCase();
   const body = (method === "GET" || method === "HEAD") ? null : await collectBody(clientReq);
