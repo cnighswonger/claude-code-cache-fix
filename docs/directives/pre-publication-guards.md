@@ -1,6 +1,6 @@
 # Directive: pre-publication guards for capture-derived data
 
-Status: **proposed** — directive only, no implementation in this PR.
+Status: **approved** (all open questions resolved on this PR's thread; see "Resolved decisions" below). Directive only, no implementation in this PR.
 
 ## Goal
 
@@ -53,11 +53,19 @@ finds.
 
 **In scope:**
 
-1. `hooks/pre-push` — tracked, installed via `core.hooksPath`, scanning the
-   **incoming diff only**.
-2. `hooks/install.sh` — one command, works for contributors and maintainers.
-3. A CI step in the existing `.github/workflows/test.yml` (`pull_request`
-   already triggers there) running the same scanner over the PR diff.
+1. `.githooks/pre-push` — tracked shell wrapper. **Chains** to any existing
+   `.git/hooks/pre-push` first (calling it with stdin passed through and
+   respecting its exit code), then calls the standalone scanner in
+   `--git-range <old>..<new>` mode over the incoming diff. See "Resolved
+   decisions" for why this is a chain wrapper and not `core.hooksPath`.
+2. `scripts/install-git-hooks.sh` — one command. Copies (or symlinks) each
+   `.githooks/<name>` to `.git/hooks/<name>`, preserving any prior content by
+   moving it to `.git/hooks/<name>.chained` first; the wrapper reads
+   `.chained` and exec's it before running the guard. Works for contributors
+   and maintainers.
+3. A CI step in `.github/workflows/test.yml` (`pull_request` already triggers
+   there) running the same scanner over the PR diff. **Annotates only** — see
+   "Resolved decisions" for why this doesn't block merge.
 4. A `CONTRIBUTING.md` section: install the hook before your first push. The
    pre-publication gate is contributor-side; a contributor who does not install
    it has no gate at all.
@@ -94,13 +102,34 @@ signature, 1 absolute home path" — never the matched strings. A guard that
 echoes what it found into a terminal, a CI log, or a PR comment has published
 it a second time. #292 was reported this way and it is the right pattern.
 
-**Mechanical classes only, and say so.** Catchable: UUIDs, PEM blocks,
-high-entropy strings, `/home/<user>` and `/Users/<user>` paths, IPv4/IPv6
-literals, `ssh <user>@<host>`. Not catchable: 2,305 characters of someone
-else's GitHub comment, which is what #292 actually carried and what a human
-noticed. A heuristic flagging unusually long verbatim strings under
-`test/fixtures/` would surface it *for review* — that is the honest ceiling,
-and the directive should not imply more.
+**Mechanical classes only, and say so.** Catchable, in the required
+implementation scope:
+
+- Session/message UUIDs (8-4-4-4-12 lowercase hex)
+- Anthropic/CC object-shape IDs: `msg_[A-Za-z0-9]{22,}`, `req_[A-Za-z0-9]{22,}`,
+  `toolu_[A-Za-z0-9]{22,}`
+- GitHub node IDs: `IC_kw[A-Za-z0-9_+/=]{20,}`, `PR_kw...`, `MDU...`-shape
+  legacy IDs
+- Base64-shape runs >200 chars (thinking signatures, JWTs, PEM bodies)
+- PEM block delimiters
+- `/home/<user>` and `/Users/<user>` filesystem paths
+- IPv4/IPv6 literals
+- `ssh <user>@<host>` lines
+- Internal hostnames matching the operator's configured list (default:
+  `visits-0[0-9]`, extensible via `git-push-guard/patterns`)
+
+Not catchable mechanically: 2,305 characters of someone else's GitHub comment,
+which is what #292 actually carried and what a human noticed. A heuristic
+flagging unusually long verbatim strings under `test/fixtures/` would surface
+it *for review* — that is the honest ceiling, and the directive should not
+imply more.
+
+**Deferred (documented, not implemented):** hostname-port-stack fingerprints
+(e.g. `hostname:port + node/nginx/systemd`), because we do not yet have a
+non-brittle regex; and origin-service-name fingerprints (e.g. Cloudflare
+worker IDs), because the enumeration is open-ended. These are review-time
+checks per CLAUDE.md § Public-Repo Information Hygiene, not scanner classes,
+until we have a concrete false-fire rate to argue from.
 
 **Fail closed with an override that is visible.** Exit non-zero on a finding.
 `--no-verify` remains available because git provides it; the CI backstop is
@@ -124,7 +153,12 @@ what makes bypassing it survivable.
   scanning keeps it sub-second on normal changes. A scanner failure must fail
   the push, not silently pass.
 - **Load-bearing?** — **yes.** It gates what becomes public, and its failure
-  mode is irreversible.
+  mode is irreversible. Per CLAUDE.md § Non-Functional Requirements &
+  Anti-Bloat, all downstream implementation PRs (scanner integration, chain
+  installer, `.githooks/pre-push` wrapper, CI annotate workflow, CONTRIBUTING
+  section) require **Chris human review** before merge, not just Lead + Codex.
+  This is called out explicitly here so no downstream PR under this directive
+  can slip merge on two LLM approvals alone.
 
 ## Fork-vs-upstream boundary conditions
 
@@ -159,23 +193,42 @@ rate on the two byte-level classes was zero.
 This repo has no `test/fixtures/harvested/`. So upstream must either scope the
 semantic classes to an equivalent or accept byte-level-only coverage. Note
 byte-level-only would still have caught #292 — 9 of its 10 findings are
-byte-level. The decision must be explicit, not discovered later as three
-classes that never ran.
+byte-level.
 
-## Open questions
+**Resolved (acceptance criterion for the impl):** the upstream integration
+runs the semantic classes over `test/fixtures/**` (the whole fixtures tree),
+not just a harvested subdirectory. Byte-level classes remain repo-wide. If
+the semantic-class false-fire rate against the current fixture tree exceeds
+the fork's measured zero on byte-level, the impl PR must either narrow the
+scope with justification or add per-class exemptions (documented, not
+inferred). The measurement gate must be on the impl PR body, not deferred.
 
-1. **Does the scanner land standalone?** Asked on #292. If @Gunther-Schulz
-   prefers to own the whole thing including the hooks, this directive should be
-   closed in favour of his.
-2. **Should the CI step block merge or annotate?** Blocking is stronger;
-   annotating avoids a fork PR being unmergeable over a false positive the
-   contributor cannot iterate on quickly (fork PRs get no CI here until
-   approved). Leaning blocking, on the grounds that the failure it prevents is
-   unrecoverable.
-3. **Is `core.hooksPath` acceptable?** It replaces `.git/hooks` wholesale, so
-   anyone with existing local hooks in this repo loses them unless the
-   installer chains. The maintainer host has a `post-merge`/`post-checkout`
-   pair that must survive.
+## Resolved decisions
+
+Answered by Chris on this PR's thread ([here](https://github.com/cnighswonger/claude-code-cache-fix/pull/302#issuecomment-5208032266)
+and [here](https://github.com/cnighswonger/claude-code-cache-fix/pull/302#issuecomment-5208148217))
+and reproduced in the directive so implementers build against the file, not
+the thread.
+
+1. **Scanner ownership: standalone (not bundled with #276).** Landed as
+   [#306](https://github.com/cnighswonger/claude-code-cache-fix/pull/306).
+   This directive **depends on** #306 (or its split-out equivalent) reaching
+   `main` before any impl PR under this directive can land. The scanner's
+   `--git-range` mode is the required surface.
+2. **CI: annotate, not block.** *"Once a thing is public, it is public. The
+   one pushing owns it."* The scanner's two-exit-code shape (0 clean, 2
+   findings) makes annotate cheap: CI reads exit code and posts a PR check
+   annotation without gating merge. Fork PRs (which get no CI here until
+   approved) are not made unmergeable over a false positive. Prevention is
+   pre-push's job; CI is detection and containment, and its value survives
+   annotating.
+3. **Chain installer, not `core.hooksPath`.** `core.hooksPath` replaces
+   `.git/hooks` wholesale for the repo, which would blow away the maintainer
+   host's `post-merge`/`post-checkout` hooks (and any contributor's local
+   hooks). A small `scripts/install-git-hooks.sh` + per-hook shell wrapper
+   (`.githooks/<name>`) that first exec's any `.git/hooks/<name>.chained`
+   preserves existing content per-hook, without owning the whole hooks
+   directory.
 
 ## Why this is a directive and not a PR
 
