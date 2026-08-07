@@ -535,10 +535,21 @@ describe("holder handover (SIGUSR2)", () => {
     const BODY = 1 << 20;
     let head = "", bytes = 0;
     const hop = net.createServer((s) => {
+      // ANSWER ONCE. `bytes >= BODY` is monotonic, so without this every read
+      // that lands after the threshold re-enters and calls end() on an already
+      // ended socket. The threshold is crossed with body still in flight (it
+      // counts the request line and headers too), so whether another read
+      // follows is pure timing — this box coalesces the writes and never split
+      // it in any local run, while CI node 22 did: "write after end",
+      // ERR_STREAM_WRITE_AFTER_END, thrown from this handler (run 31146142838).
+      let answered = false;
       s.on("data", (d) => {
         if (head.length < 200) head += d.subarray(0, 200);
         bytes += d.length;
-        if (bytes >= BODY) s.end("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        if (!answered && bytes >= BODY) {
+          answered = true;
+          s.end("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        }
       });
     });
     await new Promise((r) => hop.listen(0, "127.0.0.1", r));
