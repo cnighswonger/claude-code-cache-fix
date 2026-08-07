@@ -23,6 +23,43 @@ const HOP_ENV = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
                  "ALL_PROXY", "all_proxy",
                  "CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_FALLBACK_PROXIES"];
 
+// WHAT A PROBE RESULT MEANS. One definition, because four hand-rolled ones is
+// how the same lesson gets learned once per case and then goes red again in the
+// next one.
+//
+// The holder's guarantee is that the ADDRESS ALWAYS HAS AN OWNER — a session
+// bakes HTTPS_PROXY at exec, so one refusal strands it for good. It does not
+// promise that a caching proxy is behind that address every instant, and three
+// of the four buckets below are states where it is not and nothing is lost:
+//
+//   served     200. a proxy answered.
+//   carrying   503 {"carrying":"gap-relay"}. THE HOLDER'S OWN MECHANISM. It
+//              re-opens the gap on the child-death path and closes it as the
+//              successor spawns, and through that window it carries real
+//              traffic and 503s /health ONLY — a 200 there would announce a
+//              proxy that does not exist. Measured with the window forced to
+//              400ms: 19 of 20 probes, body {"carrying":"gap-relay"}. On a fast
+//              box the window is ~0 and it never appears, which is why this
+//              cost CI 31137828018 (node 18) and would not reproduce locally in
+//              13 runs.
+//   reset      the kernel tearing down a socket whose last owner was killed.
+//              01a9b98 measured 0.046ms/0.880ms with holderAccepted=0 — no
+//              holder that releases and reclaims can cover that instant.
+//   refused    NOBODY OWNS THE PORT. the one thing that strands a session.
+//   degraded   503 {"status":"degraded"}. a real proxy came up with extensions
+//              broken. same status line as carrying, opposite meaning.
+//
+// Order matters: carrying and degraded are both 503 and only the body separates
+// them, so the body is tested before the code.
+const OUTAGE = { REFUSED: "refused", RESET: "reset", DEGRADED: "degraded" };
+function classify(body) {
+  if (!body.startsWith("ERR:")) return null;
+  if (/"carrying"\s*:\s*"gap-relay"/.test(body)) return null;
+  if (/"status"\s*:\s*"degraded"/.test(body)) return OUTAGE.DEGRADED;
+  if (/ECONNREFUSED|ETIMEDOUT|HUNG/.test(body)) return OUTAGE.REFUSED;
+  return OUTAGE.RESET;
+}
+
 // Whoever is LISTENING on a port, by port rather than by parentage. The
 // self-heal spawns a DETACHED successor, so it is nobody's child and `pgrep -P`
 // cannot see it — the only durable handle on it is the address it took.
@@ -195,12 +232,33 @@ it("cuts nothing on the held port while the proxy restarts", async () => {
     // Every failure counts, not just ECONNREFUSED: a holder that accepts then
     // drops turns a refusal into a reset while serving nobody. The one allowed
     // is the request in flight at the SIGKILL, which no holder can save.
+    //
+    // A CARRYING GAP IS NOT A CUT, and this is the one exception. The holder
+    // re-opens the gap relay on the child-death path (claude-via-proxy.mjs, at
+    // `holder.openGap()` before the restart ladder) and closes it again only as
+    // the successor spawns, because two handles may bind one port but only one
+    // may listen. Through that window the ADDRESS IS OWNED AND ANSWERING: the
+    // relay carries real traffic and answers /health — and only /health — with
+    // 503, since every readiness check in the tree reads that endpoint and a
+    // 200 there would announce a proxy that does not exist.
+    //
+    // So a 503 whose body says gap-relay is this case's own probe meeting the
+    // mechanism that exists to prevent the outage, not the outage. Measured on
+    // CI 31137828018 (node 18, where the window is widest): six of them at 20ms
+    // spacing, about 120ms of gap, counted as six cuts. 01a9b98 narrowed the
+    // sibling case for exactly this reason a day earlier — "assert what the
+    // holder guarantees, not what it cannot" — and this case was left behind.
+    //
+    // A DEGRADED PROXY'S 503 IS STILL A CUT. Same status line, different author:
+    // {"status":"degraded","failed_extensions":[…]} means a real proxy came up
+    // broken, which is a defect and must stay red. Telling them apart needs the
+    // body, which is why the probe carries it.
     const cut = [];
     let served = false;
     const until = Date.now() + 10_000;
     while (!served && Date.now() < until) {
       const b = await get();
-      if (b.startsWith("ERR:")) cut.push(b);
+      if (b.startsWith("ERR:")) { if (classify(b)) cut.push(b); }
       else served = JSON.parse(b).status === "ok";
       await new Promise((r) => setTimeout(r, 20));
     }
@@ -564,7 +622,8 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         const pump = (async () => {
           while (!stop) {
             const body = await once();
-            if (body.startsWith("ERR:")) refused.push(body); else ok++;
+            if (body.startsWith("ERR:")) { if (classify(body)) refused.push(body); }
+            else ok++;
             await new Promise((r) => setTimeout(r, 2));
           }
         })();
@@ -891,7 +950,8 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         const pump = (async () => {
           while (!stop) {
             const b = await once();
-            if (b.startsWith("ERR:")) refused.push({ code: b, at: Date.now() }); else served++;
+            if (b.startsWith("ERR:")) { if (classify(b)) refused.push({ code: b, at: Date.now() }); }
+            else served++;
             await new Promise((r) => setTimeout(r, 2));   // yield to neighbours
           }
         })();
@@ -1073,7 +1133,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
           // A NUMBER, not a bare bound: CI observed 1 of 40 (run 31044769115).
           // 2 leaves room for a slower runner without letting a regression that
           // doubles the window pass unnoticed.
-          const refused = cut.filter((c) => c === "ECONNREFUSED" || c === "ETIMEDOUT");
+          const refused = cut.filter((c) => classify(c) === OUTAGE.REFUSED);
           assert.ok(refused.length <= 2,
             `the port had no owner for ${refused.length} of 40 requests across ONE ` +
             `forced kill — the re-acquire window is structural but bounded, and this ` +
