@@ -1386,6 +1386,102 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         `the bind failure was mislabelled; stderr: ${err.slice(-400)}`);
     });
 
+    // Two readers this case needs, kept local because nothing else wants them.
+    // The child's ENVIRONMENT is the fact under test — not what the holder
+    // printed — because the child's self-heal reads it, not the log.
+    const childOf = (pid, re) => {
+      try {
+        return execFileSync("pgrep", ["-P", String(pid)], { encoding: "utf8" }).trim().split("\n")
+          .filter(Boolean)
+          .find((q) => { try {
+            return re.test(execFileSync("ps", ["-p", q, "-o", "command="], { encoding: "utf8" }));
+          } catch { return false; } });
+      } catch { return undefined; }
+    };
+    const heldPortOf = (pid) => {
+      try {
+        // Linux only; the case skips itself elsewhere rather than guessing.
+        return readFileSync(`/proc/${pid}/environ`, "utf8").split("\0")
+          .find((v) => v.startsWith("CACHE_FIX_HELD_PORT="))?.slice("CACHE_FIX_HELD_PORT=".length);
+      } catch { return undefined; }
+    };
+
+    // AN EPHEMERAL PORT MUST BE CARRIED DOWNSTREAM, NOT THE 0 THAT ASKED FOR IT.
+    //
+    // Removing `Number(env) || 9801` made CACHE_FIX_PROXY_PORT=0 reachable, and
+    // reachable is not the same as working: two sites below the bind still
+    // passed the REQUESTED port where the BOUND one is required, while the gap
+    // and standby a couple of hundred lines up already used this._port.
+    //
+    // Measured before the fix, with CACHE_FIX_PROXY_PORT=0 and 43557 bound:
+    //   record written as cache-fix-proxy-0.sha256, so runningOurCode(43557)
+    //     from any other launcher finds nothing and every port-0 install on the
+    //     box collides on one file
+    //   child told CACHE_FIX_HELD_PORT=0, so its self-heal would respawn on a
+    //     DIFFERENT ephemeral port and strand every session on the served one,
+    //     and successorServing("0") can never answer
+    it("hands the BOUND port downstream when asked for an ephemeral one", async () => {
+      // A PRIVATE TMPDIR. fingerprintPath() writes under os.tmpdir(), which is
+      // shared with every other test in this run and with the whole box — the
+      // first cut asserted on /tmp/cache-fix-proxy-0.sha256 and failed in the
+      // full suite while passing alone, because something else had created it.
+      // Asserting a global path can only ever measure the machine's history.
+      const tmp = mkdtempSync(join(tmpdir(), "ccf-port0-"));
+      const env = { ...process.env, CACHE_FIX_PROXY_PORT: "0", CACHE_FIX_SELF_HEAL: "off",
+                    TMPDIR: tmp };
+      for (const k of [...HOP_ENV, "LISTEN_FDS", "LISTEN_PID", "CACHE_FIX_HOLD_PORT"]) delete env[k];
+      const p = spawn(process.execPath, [launcherPath, "run-service"], { env, stdio: ["ignore", "pipe", "pipe"] });
+      let out = "";
+      p.stdout.on("data", (d) => { out += d; });
+      const bound = await Promise.race([
+        new Promise((r) => {
+          const tick = setInterval(() => {
+            const m = /listening on [\d.]+:(\d+)/.exec(out);
+            if (m) { clearInterval(tick); r(Number(m[1])); }
+          }, 100);
+        }),
+        new Promise((r) => setTimeout(() => r(0), 25_000)),
+      ]);
+      try {
+        assert.ok(bound > 0, `the holder never reported a bound port; stdout: ${JSON.stringify(out.slice(-200))}`);
+        assert.notEqual(bound, 9801,
+          "an explicit 0 was rewritten to the legacy port — the whole point of removing `|| 9801`");
+
+        // The record another launcher will look for is named after the address
+        // that is actually being served.
+        assert.equal(existsSync(join(tmp, `cache-fix-proxy-${bound}.sha256`)), true,
+          `no fingerprint record for the bound port ${bound} — every other launcher's ` +
+          `runningOurCode(${bound}) finds nothing and treats a live holder as unknown`);
+        assert.equal(existsSync(join(tmp, "cache-fix-proxy-0.sha256")), false,
+          "the record was named for the REQUESTED port, so every port-0 install on this " +
+          "box shares one file and none of them describes the port it serves");
+
+        // And the child is told the address it is serving, because its self-heal
+        // reads this as "the advertised port" when the holder dies.
+        const kid = await Promise.race([
+          new Promise((r) => {
+            const tick = setInterval(() => {
+              const q = childOf(p.pid, /server\.mjs/);
+              if (q) { clearInterval(tick); r(q); }
+            }, 100);
+          }),
+          new Promise((r) => setTimeout(() => r(0), 15_000)),
+        ]);
+        assert.ok(kid, "premise: the holder never spawned a proxy child, so nothing was measured");
+        const held = heldPortOf(kid);
+        if (held === undefined) return;   // no /proc: the two assertions above still ran
+        assert.equal(held, String(bound),
+          `the child was told CACHE_FIX_HELD_PORT=${held} while ${bound} is being ` +
+          `served — its self-heal would respawn on a different ephemeral port and strand ` +
+          `every session on this one`);
+      } finally {
+        try { p.kill("SIGHUP"); } catch { }
+        await new Promise((r) => setTimeout(r, 1_500));
+        try { p.kill("SIGKILL"); } catch { }
+        try { rmSync(tmp, { recursive: true, force: true }); } catch { }
+      }
+    });
+
     // THE HOLDER READS ITS CHILD'S ANNOUNCEMENTS AS LINES, NOT AS CHUNKS.
     //
     // Buffering was added for the port line, because a chunk boundary inside it

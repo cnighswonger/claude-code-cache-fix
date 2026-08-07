@@ -827,7 +827,16 @@ function holdPort(rest) {
       //
       // Written on every spawn, so a restart that picks up a redeployed file
       // republishes without anyone asking.
-      publishFingerprint(port);
+      //
+      // THE BOUND PORT, NOT THE REQUESTED ONE. They differ exactly when the
+      // caller asked for 0, which is now reachable — the `|| 9801` that used to
+      // rewrite it away was removed as a defect, and removing it made this line
+      // wrong instead. Measured with CACHE_FIX_PROXY_PORT=0: bound 43557, record
+      // written as cache-fix-proxy-0.sha256, so runningOurCode(43557) from any
+      // other launcher finds nothing and every port-0 install on the box
+      // collides on one record. The gap and standby two hundred lines up already
+      // use this._port for the same reason.
+      publishFingerprint(holder._port || port);
       bootedHash = codeFingerprint(SERVER_PATH);
       // The gap listener must let go before the child can listen on the
       // inherited fd: two handles may BIND one port, but only one may LISTEN —
@@ -848,8 +857,15 @@ function holdPort(rest) {
         // cswap's pin answers the same question this way; we had been answering
         // it with "did my ppid change", which is true on every handover too and
         // therefore cost a rival holder — 1,970 then 6,528 requests.
+        // CACHE_FIX_HELD_PORT is the BOUND port, for the same reason as the
+        // fingerprint above: the child's self-heal reads it as the advertised
+        // address, so telling it "0" makes a respawn take a DIFFERENT ephemeral
+        // port and strand every session on the one actually being served. And
+        // successorServing("0") can never answer, so the handover exit condition
+        // is dead too. Measured with CACHE_FIX_PROXY_PORT=0 before this line
+        // changed: bound 43557, child told 0.
         env: { ...process.env, CACHE_FIX_PROXY_PORT: "0", CACHE_FIX_PROXY_BIND: "127.0.0.1",
-               CACHE_FIX_HELD_PORT: String(port), CACHE_FIX_HELD_BY: String(process.pid),
+               CACHE_FIX_HELD_PORT: String(holder._port || port), CACHE_FIX_HELD_BY: String(process.pid),
                // OUR OWN BYTES, so the holder's version is observable instead of
                // inferred. The proxy already publishes proxy_tree and a checker
                // can compare it with disk; there was no equivalent for the layer

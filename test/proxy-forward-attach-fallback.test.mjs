@@ -253,8 +253,25 @@ test("CONNECT falls open to a direct dial, unless CACHE_FIX_REQUIRE_HOP says oth
   const saved = saveEnv();
   const caDir = mkdtempSync(join(tmpdir(), "ccf-require-hop-"));
   const seen = [];
+  // EVERY endpoint records, not only the one under assertion. An empty `seen`
+  // says a connection did not arrive HERE; it cannot say where it went instead,
+  // and an assertion firing on `[]` has already discarded the evidence that
+  // would narrow it. Measured today: this case failed with `actual: []` and
+  // cost a round to learn the CONNECT had not been tunnelled at all.
+  //
+  // WHAT IT BUYS, stated precisely rather than overclaimed: `trace` separates
+  // "reached a DIFFERENT endpoint" from "reached NO endpoint". It does not name
+  // the third case — the proxy MITM'ing the target itself, which touches
+  // nothing downstream and is what the loopback-upstream mutation actually
+  // produces. `[]` versus `["UPSTREAM"]` is still the distinction that was
+  // missing, and it is one grep instead of a round.
+  //
+  // Shape borrowed from cswap's pin, who found the same class in their suite
+  // the same day: when an assertion discards the evidence, the fix is a
+  // tripwire that survives it, not a louder message on the same assertion.
+  const trace = [];
   // Where a direct dial lands. Reaching it is the fail-OPEN outcome.
-  const direct = net.createServer((sock) => { seen.push("DIRECT"); sock.destroy(); });
+  const direct = net.createServer((sock) => { seen.push("DIRECT"); trace.push("DIRECT"); sock.destroy(); });
   const directPort = await listen(direct);
   // A LOCAL upstream that answers unmistakably. Without it config.upstream is
   // the real https://api.anthropic.com and the relayed probe below dials it for
@@ -264,6 +281,7 @@ test("CONNECT falls open to a direct dial, unless CACHE_FIX_REQUIRE_HOP says oth
   // this network until it times out". 418 is a status nothing else in this
   // chain produces, so reaching it cannot be confused with a refusal.
   const upstream = http.createServer((_q, r) => { r.writeHead(418); r.end("teapot"); });
+  upstream.on("connection", () => trace.push("UPSTREAM"));
   await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
   // A hop address with nothing behind it: the whole chain refuses.
   const deadHop = net.createServer();
@@ -296,7 +314,9 @@ test("CONNECT falls open to a direct dial, unless CACHE_FIX_REQUIRE_HOP says oth
       "the default refused a tunnel instead of falling open — a hop restarting " +
       "would strand every session wired to this proxy");
     await new Promise((r) => setTimeout(r, 100));
-    assert.deepEqual(seen, ["DIRECT"], "the fail-open path did not reach the target");
+    assert.deepEqual(seen, ["DIRECT"],
+      `the fail-open path did not reach the target; endpoints touched: ${JSON.stringify(trace)} ` +
+      `(empty = the tunnel reached NO endpoint, so the proxy handled it rather than forwarding it)`);
     await handle.close(); handle = undefined;
 
     // Same chain, same dead hop, opt-in on.
@@ -308,7 +328,7 @@ test("CONNECT falls open to a direct dial, unless CACHE_FIX_REQUIRE_HOP says oth
     await new Promise((r) => setTimeout(r, 100));
     assert.deepEqual(seen, [],
       "CACHE_FIX_REQUIRE_HOP=1 dialled the target directly anyway — the bypass " +
-      "this variable exists to close");
+      `this variable exists to close; endpoints touched: ${JSON.stringify(trace)}`);
 
     // THE RELAYED PATH IS NOT COVERED, and that is deliberate — asserted so the
     // gap is a fact this suite states rather than one a reader has to discover.
