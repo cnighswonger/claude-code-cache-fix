@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import https from "node:https";
 import { pathToFileURL, URL } from "node:url";
 import config from "./config.mjs";
-import { forwardRequest, parseAbsoluteForm, getAgent, fallbackProxyUrls } from "./upstream.mjs";
+import { forwardRequest, parseAbsoluteForm, getAgent, fallbackProxyUrls, lastHop, directLast } from "./upstream.mjs";
 import { streamResponse, createTelemetryRecord } from "./stream.mjs";
 import { loadExtensions, snapshotRegistry, runOnRequest, runOnResponseStart, runOnResponse, getFailedExtensions } from "./pipeline.mjs";
 import { startWatcher } from "./watcher.mjs";
@@ -398,7 +398,33 @@ function handleHealth(_req, res) {
     status: "ok",
     version: config.version,
     forward_proxy: _forwardActive > 0,
-    https_proxy: (_forwardActive > 0 && hopAddress(config.httpsProxy || fallbackProxyUrls()[0])) || null,
+    // THE HOP IN USE ONCE THERE IS ONE. resolveHop() falls THROUGH the chain
+    // and can end at a direct dial, so naming candidate #1 published ":8118"
+    // while CONNECTs left via the second fallback — or via nothing at all. Same
+    // class of lie as the config.httpsProxy-only read above it, one step
+    // further along.
+    //
+    // The three states are distinct and only two of them are a claim about a
+    // dial: a URL is the hop the last one took; "" is "we checked the whole
+    // chain and nothing answered", which must publish null rather than a
+    // candidate; `undefined` is a proxy that has dialled nothing yet — every
+    // successor is in that state for its first request — and there the
+    // configured candidate is the only thing known and asserts nothing false.
+    https_proxy: (_forwardActive > 0 && hopAddress(
+      lastHop() ?? (config.httpsProxy || fallbackProxyUrls()[0]))) || null,
+    // MEASURED OR MERELY CONFIGURED. The line above publishes a URL in two
+    // different situations — the hop a resolve actually used, and the first
+    // candidate on a proxy that has dialled nothing yet — and a reader cannot
+    // tell them apart from the string. cswap's pin raised exactly this against
+    // the fix above: one field carrying two meanings is the same defect as the
+    // one being fixed, and its confirm logic would have to guess.
+    //
+    // So: true = that address was used, false = it is a candidate. `null` in
+    // https_proxy needs no flag; it already means "checked, nothing reachable".
+    https_proxy_measured: _forwardActive > 0 && !!lastHop(),
+    // Sticky: when the chain last fell through to a direct dial (never = null).
+    // See directLast() — a point-in-time field cannot report a flap.
+    direct_last: directLast(),
     // Content fingerprint of the source this process LOADED. Hot-reload is
     // off, so after an edit without a restart this stays at the old value
     // while the working tree moves on — which is precisely the drift an
@@ -897,7 +923,15 @@ export async function startProxy(options = {}) {
         try {
           if (watcher) watcher.close();
         } catch {}
-        server.close((err) => (err ? reject(err) : resolve()));
+        // ERR_SERVER_NOT_RUNNING is not a failure HERE. shutdown() unbinds
+        // first — announcing while we still hold the socket makes the
+        // supervisor race a bind it must lose — and then drains through this,
+        // so the second close always reports "not running" and this promise
+        // ALWAYS rejected on the one path that calls it. Nothing handles that
+        // rejection; only the process.exit() inside .finally() beat the
+        // unhandled-rejection report to it. Both callbacks fire on the same
+        // 'close' event, after the drain, so resolving is the true answer.
+        server.close((err) => (err && err.code !== "ERR_SERVER_NOT_RUNNING" ? reject(err) : resolve()));
       }),
   };
 }
@@ -1220,7 +1254,16 @@ if (invokedAsScript) {
   // "status=1/FAILURE", which (a) makes a crash and a clean stop
   // indistinguishable in the journal and (b) trips Restart=on-failure on a
   // deliberate stop. Force the laggards, report the forcing on stderr, exit 0.
+  // ONCE. SIGTERM, SIGINT and SIGHUP all land here, and a supervised stop
+  // delivers more than one: systemd SIGTERMs the whole control group, so the
+  // proxy gets it directly AND the holder forwards its own SIGHUP. Re-entering
+  // spawns a SECOND successor on fd 3 — two proxies on one socket, which is the
+  // "one extra per deploy" the (handed off) announcement exists to stop — and
+  // announces the release twice, and arms a second 5s force-close.
+  let shuttingDown = false;
   const shutdown = () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     if (!active) {
       process.exit(0);
       return;

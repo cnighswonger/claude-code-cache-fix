@@ -46,7 +46,7 @@ describe("hop fallback", () => {
     }
   });
 
-  it("calls a listening hop alive and a closed one dead", async () => {
+  it("calls a listening hop alive and a closed one dead, defaulting the port from the scheme", async () => {
     const { hopAlive } = await import("../proxy/upstream.mjs");
     const srv = net.createServer();
     await new Promise((r) => srv.listen(0, "127.0.0.1", r));
@@ -57,7 +57,94 @@ describe("hop fallback", () => {
       // The control that matters: a probe that answers true for everything
       // would route around nothing and read as working.
       assert.equal(await hopAlive(dead), false, "a closed port read as alive");
+      // A PORTLESS URL TAKES ITS SCHEME'S PORT, in BOTH readers. `|| 80` sent an
+      // `https://hop` carrying no explicit port to :80 — which refuses, so a
+      // live TLS hop read as dead and the chain fell through past it, and the
+      // CONNECT that did go out went to the wrong port on the right host.
+      //
+      // Read from source and evaluated, not spied: hopAlive holds a live ESM
+      // binding to net.connect, so reassigning the module's export patches
+      // nothing (measured — the first version of this case collected zero dials
+      // and would have passed against any port at all). Two files carry the same
+      // expression and both must agree; a fix applied to one is the shape this
+      // catches.
+      const readFileSync = (await import("node:fs")).readFileSync;
+      for (const [file, re] of [
+        ["../proxy/upstream.mjs", /netConnect\(\{ host: u\.hostname, port: (Number\(u\.port\)[^}]*?) \}\)/],
+        ["../proxy/forward-proxy.mjs", /port: (Number\(u\.port\)[^}]*?) \};/],
+      ]) {
+        const src = readFileSync(new URL(file, import.meta.url), "utf8");
+        const expr = re.exec(src)?.[1];
+        assert.ok(expr, `${file} no longer chooses a hop port here — this case tests nothing`);
+        const pick = Function("u", `return ${expr};`);
+        assert.equal(pick(new URL("https://h")), 443, `${file}: a portless https hop did not dial 443`);
+        assert.equal(pick(new URL("http://h")), 80, `${file}: a portless http hop did not dial 80`);
+        assert.equal(pick(new URL("https://h:8443")), 8443, `${file}: an explicit port was overridden`);
+      }
     } finally {
+      await new Promise((r) => srv.close(r));
+    }
+  });
+
+  // THE FIELD /health PUBLISHES MUST BE THE HOP THAT WAS USED. The chain falls
+  // THROUGH, so naming candidate #1 reports ":8118" while CONNECTs leave via
+  // the second fallback — or via nothing at all. cswap's pin reads exactly this
+  // field to confirm the next hop and treats null as "cannot confirm", so a
+  // confident wrong answer is worse there than no answer.
+  it("remembers the hop a resolve landed on, and empty when it fell through to direct", async () => {
+    const mod = await import("../proxy/upstream.mjs");
+    const { resolveHop, lastHop, directLast } = mod;
+    const srv = net.createServer();
+    await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+    const live = `http://127.0.0.1:${srv.address().port}`;
+    const dead = `http://127.0.0.1:${await freePort()}`;
+    // The PRIMARY comes from the ambient environment, and this box has a live
+    // one — the first version of this case resolved to the operator's real pin
+    // hop and asserted against it. Scrub every name config.httpsProxy reads.
+    // Every name in BOTH getters: selectProxyUrl(true) falls through to
+    // config.httpProxy, so scrubbing only the https ones left the live proxy on
+    // :9901 as the primary and this case measured the operator's box.
+    const PRIMARY_ENV = ["CACHE_FIX_UPSTREAM_PROXY", "HTTPS_PROXY", "https_proxy",
+                         "HTTP_PROXY", "http_proxy",
+                         "CACHE_FIX_FALLBACK_PROXIES", "CACHE_FIX_CHAIN_GRACE_MS"];
+    const prior = Object.fromEntries(PRIMARY_ENV.map((k) => [k, process.env[k]]));
+    for (const k of PRIMARY_ENV) delete process.env[k];
+    process.env.CACHE_FIX_CHAIN_GRACE_MS = "1";   // no retry loop; this is not what is under test
+    try {
+      // Dead first, live second: the answer must be the one that ANSWERED, not
+      // the one that was configured first.
+      process.env.CACHE_FIX_FALLBACK_PROXIES = `${dead},${live}`;
+      assert.equal(await resolveHop(true), live, "the chain did not fall through to the live hop");
+      assert.equal(lastHop(), live, "lastHop() named a candidate rather than the hop that answered");
+      const beforeDirect = directLast();
+
+      // Nothing reachable: resolveHop falls open to a direct dial, and the
+      // record must say so rather than keep the last good value — a stale hop
+      // published here is a chain confirmed by a probe that is no longer true.
+      process.env.CACHE_FIX_FALLBACK_PROXIES = dead;
+      assert.equal(await resolveHop(true), "", "an unreachable chain did not fall through to direct");
+      assert.equal(lastHop(), "",
+        "lastHop() kept the previous hop after the chain went to a direct dial");
+
+      // AND IT MUST LEAVE A MARK THAT SURVIVES THE RECOVERY. The chain is back
+      // within ~1s, so a point-in-time field reads green from the next probe on
+      // and the outage that happened is unfindable. cswap's pin publishes the
+      // same field under the same name after measuring that `egress` alone told
+      // it nothing.
+      const mark = directLast();
+      assert.notEqual(mark, beforeDirect, "a direct fall-through left no mark at all");
+      assert.match(String(mark), /^\d{4}-\d{2}-\d{2}T.*Z$/, `direct_last is not an ISO instant: ${mark}`);
+
+      // The recovery must NOT erase it — that is the whole point of sticky.
+      process.env.CACHE_FIX_FALLBACK_PROXIES = live;
+      assert.equal(await resolveHop(true), live, "premise: the chain must come back");
+      assert.equal(directLast(), mark,
+        "the chain coming back cleared the direct-dial mark — the flap is now invisible, " +
+        "which is the state this field exists to make visible");
+    } finally {
+      for (const [k, v] of Object.entries(prior)) {
+        if (v === undefined) delete process.env[k]; else process.env[k] = v;
+      }
       await new Promise((r) => srv.close(r));
     }
   });

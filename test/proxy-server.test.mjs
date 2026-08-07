@@ -831,3 +831,111 @@ after(async () => {
     await new Promise((r) => setTimeout(r, 700));
   }
 });
+
+// close() MUST RESOLVE AFTER shutdown() HAS ALREADY UNBOUND.
+//
+// shutdown() closes the server first — announcing the release while we still
+// hold the socket makes the supervisor race a bind it must lose — and then
+// drains through handle.close(). That second server.close() reports
+// ERR_SERVER_NOT_RUNNING, so on the ONE path that calls it this promise always
+// rejected. Nothing handles that rejection; only the process.exit() inside the
+// .finally() beat the unhandled-rejection report to it, which means the shape
+// was one edit away from turning every clean shutdown into a crash.
+//
+// Both callbacks fire on the same 'close' event, after the drain, so resolving
+// is not a papered-over failure — it is the true answer.
+describe("close() after an external server.close()", () => {
+  it("resolves rather than rejecting with ERR_SERVER_NOT_RUNNING", async () => {
+    const handle = await startProxy({ port: 0, watch: false });
+    // Exactly what shutdown() does one line before it calls close().
+    handle.server.close();
+    await handle.close();   // rejecting here fails the case
+  });
+
+  it("still rejects a close that fails for a REAL reason", async () => {
+    const handle = await startProxy({ port: 0, watch: false });
+    const boom = new Error("disk on fire");
+    boom.code = "EIO";
+    const real = handle.server.close.bind(handle.server);
+    handle.server.close = (cb) => cb(boom);
+    try {
+      await assert.rejects(() => handle.close(), /disk on fire/,
+        "the ERR_SERVER_NOT_RUNNING exemption swallowed a genuine close failure");
+    } finally {
+      // The stub never closed anything, so the listener is still up.
+      handle.server.close = real;
+      await new Promise((r) => real(r));
+    }
+  });
+});
+
+// ONE FIELD MUST NOT CARRY TWO MEANINGS.
+//
+// /health.https_proxy publishes a URL in two different situations: the hop a
+// resolve actually used, and the first configured candidate on a proxy that has
+// dialled nothing yet. From the string alone a reader cannot tell them apart —
+// cswap's pin reads this field to confirm the next hop, and raised exactly this
+// against the fix that introduced it: its confirm logic would have to guess,
+// and a guess is what the fix was removing.
+describe("/health hop reporting", () => {
+  const ENV = ["CACHE_FIX_FORWARD_PROXY", "CACHE_FIX_CA_DIR", "CACHE_FIX_FALLBACK_PROXIES",
+               "CACHE_FIX_UPSTREAM_PROXY", "HTTPS_PROXY", "https_proxy",
+               "HTTP_PROXY", "http_proxy", "CACHE_FIX_CHAIN_GRACE_MS"];
+
+  const health = (port) => new Promise((resolve, reject) => {
+    const r = http.request({ host: "127.0.0.1", port, method: "GET", path: "/health" }, (res) => {
+      let b = ""; res.on("data", (c) => { b += c; }); res.on("end", () => resolve(JSON.parse(b)));
+    });
+    r.on("error", reject); r.end();
+  });
+
+  it("says whether the published hop was MEASURED or merely configured", async () => {
+    const saved = Object.fromEntries(ENV.map((k) => [k, process.env[k]]));
+    const caDir = join(tmpdir(), `ccf-health-hop-${process.pid}`);
+    // A hop address with nothing behind it, so the chain is guaranteed to fail.
+    const probe = net.createServer();
+    await new Promise((r) => probe.listen(0, "127.0.0.1", r));
+    const deadPort = probe.address().port;
+    await new Promise((r) => probe.close(r));
+
+    let handle;
+    try {
+      for (const k of ENV) delete process.env[k];
+      process.env.CACHE_FIX_FORWARD_PROXY = "on";
+      process.env.CACHE_FIX_CA_DIR = caDir;
+      process.env.CACHE_FIX_FALLBACK_PROXIES = `http://127.0.0.1:${deadPort}`;
+      process.env.CACHE_FIX_CHAIN_GRACE_MS = "1";
+
+      handle = await startProxy({ port: 0, watch: false });
+
+      // Nothing dialled yet: the candidate is all that is known, and it must be
+      // flagged as such rather than read as a confirmed hop.
+      const fresh = await health(handle.port);
+      assert.equal(fresh.https_proxy, `http://127.0.0.1:${deadPort}`,
+        "a fresh proxy published no candidate at all — the pin loses its hop entirely");
+      assert.equal(fresh.https_proxy_measured, false,
+        "a candidate nothing has dialled was published as a measured hop");
+      assert.equal(fresh.direct_last, null, "premise: nothing has fallen direct yet");
+
+      // Now force a resolve. The chain is dead, so it falls through to direct:
+      // https_proxy becomes null ("checked, nothing reachable") and the sticky
+      // mark appears.
+      const { resolveHop } = await import("../proxy/upstream.mjs");
+      assert.equal(await resolveHop(true), "", "premise: the dead chain must fall through");
+
+      const after = await health(handle.port);
+      assert.equal(after.https_proxy, null,
+        "a chain that was checked and found dead still named a hop — a confidently " +
+        "wrong answer is worse here than no answer");
+      assert.equal(after.https_proxy_measured, false, "null needs no measured flag");
+      assert.match(String(after.direct_last), /^\d{4}-\d{2}-\d{2}T.*Z$/,
+        `the direct fall-through left no timestamp: ${after.direct_last}`);
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k]; else process.env[k] = v;
+      }
+      if (handle) await handle.close();
+      try { await rm(caDir, { recursive: true, force: true }); } catch {}
+    }
+  });
+});

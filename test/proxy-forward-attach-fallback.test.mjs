@@ -24,7 +24,8 @@ import { startProxy } from "../proxy/server.mjs";
 const ENV_KEYS = [
   "CACHE_FIX_FORWARD_PROXY", "CACHE_FIX_CA_DIR", "CACHE_FIX_PROXY_UPSTREAM",
   "CACHE_FIX_HTTPS_PROXY", "HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy",
-  "CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_FALLBACK_PROXIES",
+  "CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_FALLBACK_PROXIES", "CACHE_FIX_REQUIRE_HOP",
+  "CACHE_FIX_CHAIN_GRACE_MS",
   "PATH",
 ];
 
@@ -229,6 +230,80 @@ test("CONNECT traverses the fallback chain when only a fallback is configured", 
     restoreEnv(saved);
     if (handle) await handle.close();
     hop.close(); direct.close();
+    try { rmSync(caDir, { recursive: true, force: true }); } catch {}
+  }
+});
+
+// FALLING OPEN IS THE DEFAULT AND MUST STAY THE DEFAULT — a hop that is
+// restarting is back in ~1s, and refusing meanwhile strands a session whose
+// HTTPS_PROXY was baked at exec, which is the outage the whole chain exists to
+// avoid.
+//
+// But where the hop is a POLICY boundary rather than a cache, a direct dial is
+// a silent bypass: the client is handed "200 Connection Established" and has no
+// way to tell the tunnel left unproxied. CACHE_FIX_REQUIRE_HOP=1 is the opt-in
+// that turns it into an error.
+//
+// BOTH DIRECTIONS IN ONE CASE, because either alone passes for the wrong
+// reason: assert only the refusal and a proxy that refuses unconditionally
+// looks correct; assert only the fall-through and so does one that never
+// refuses. The hop here is a CLOSED port, so the chain genuinely has nothing to
+// reach and the difference is entirely the variable.
+test("CONNECT falls open to a direct dial, unless CACHE_FIX_REQUIRE_HOP says otherwise", async () => {
+  const saved = saveEnv();
+  const caDir = mkdtempSync(join(tmpdir(), "ccf-require-hop-"));
+  const seen = [];
+  // Where a direct dial lands. Reaching it is the fail-OPEN outcome.
+  const direct = net.createServer((sock) => { seen.push("DIRECT"); sock.destroy(); });
+  const directPort = await listen(direct);
+  // A hop address with nothing behind it: the whole chain refuses.
+  const deadHop = net.createServer();
+  const deadPort = await listen(deadHop);
+  await new Promise((r) => deadHop.close(r));
+
+  let handle;
+  const connect = (port, target) => new Promise((resolve) => {
+    const req = http.request({ host: "127.0.0.1", port, method: "CONNECT",
+                               path: target, headers: { host: target } });
+    // Node fires 'connect' even for a denial, which is how the status reaches us.
+    req.on("connect", (res, socket) => { socket.destroy(); resolve(res.statusCode); });
+    req.on("error", (e) => resolve(`ERR:${e.code}`));
+    req.setTimeout(4_000, () => { req.destroy(); resolve("TIMEOUT"); });
+    req.end();
+  });
+
+  try {
+    process.env.CACHE_FIX_FORWARD_PROXY = "on";
+    process.env.CACHE_FIX_CA_DIR = caDir;
+    process.env.CACHE_FIX_FALLBACK_PROXIES = `http://127.0.0.1:${deadPort}`;
+    process.env.CACHE_FIX_CHAIN_GRACE_MS = "1";   // the retry loop is not what is under test
+    for (const k of ["CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_HTTPS_PROXY",
+                     "HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"]) delete process.env[k];
+    delete process.env.CACHE_FIX_REQUIRE_HOP;
+
+    handle = await startProxy({ port: 0, watch: false });
+    const target = `127.0.0.1:${directPort}`;
+    assert.equal(await connect(handle.port, target), 200,
+      "the default refused a tunnel instead of falling open — a hop restarting " +
+      "would strand every session wired to this proxy");
+    await new Promise((r) => setTimeout(r, 100));
+    assert.deepEqual(seen, ["DIRECT"], "the fail-open path did not reach the target");
+    await handle.close(); handle = undefined;
+
+    // Same chain, same dead hop, opt-in on.
+    seen.length = 0;
+    process.env.CACHE_FIX_REQUIRE_HOP = "1";
+    handle = await startProxy({ port: 0, watch: false });
+    assert.equal(await connect(handle.port, target), 502,
+      "CACHE_FIX_REQUIRE_HOP=1 still handed the client a tunnel");
+    await new Promise((r) => setTimeout(r, 100));
+    assert.deepEqual(seen, [],
+      "CACHE_FIX_REQUIRE_HOP=1 dialled the target directly anyway — the bypass " +
+      "this variable exists to close");
+  } finally {
+    restoreEnv(saved);
+    if (handle) await handle.close();
+    direct.close();
     try { rmSync(caDir, { recursive: true, force: true }); } catch {}
   }
 });

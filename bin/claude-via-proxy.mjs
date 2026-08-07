@@ -9,6 +9,7 @@ import { X509Certificate, createHash, randomUUID } from "node:crypto";
 import http from "node:http";
 import net from "node:net";
 import { EventEmitter } from "node:events";
+import { getSystemErrorName } from "node:util";
 import { bundleUsable, carriesOurCA, salvageBundle } from "./ca-trust.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -152,8 +153,13 @@ class HolderSocket extends EventEmitter {
       try { h.close(); } catch { /* never bound */ }
       const e = new Error(`bind ${host}:${port} failed`);
       // The code net.Server would have emitted, so callers that branch on
-      // EADDRINUSE keep working.
-      e.code = err === -98 || err === -48 ? "EADDRINUSE" : "EACCES";
+      // EADDRINUSE keep working. From libuv's own table rather than the two
+      // literals it replaced (-98 linux / -48 darwin): those named the in-use
+      // case on both platforms and called EVERYTHING ELSE "EACCES", so a bind
+      // address not on this host (EADDRNOTAVAIL) and a privileged port arrived
+      // indistinguishable — and bindFailed() reads the code to tell "someone
+      // else is serving" from "this bind can never work".
+      e.code = getSystemErrorName(err);
       queueMicrotask(() => this.emit("error", e));
       return this;
     }
@@ -347,6 +353,13 @@ class HolderSocket extends EventEmitter {
   }
 }
 
+// The address the proxy binds, read the same way by the bind and by every
+// ownership probe. They disagreed: the probes asked lsof about 127.0.0.1 while
+// the bind honoured CACHE_FIX_PROXY_BIND, so with any other bind address lsof
+// matched nothing, holderPidOn() answered null, and takeOver() took "cannot
+// identify it: leave it alone" and exited 0 beside a live proxy of ours.
+const bindAddr = () => process.env.CACHE_FIX_PROXY_BIND || "127.0.0.1";
+
 // Returns "holder" when the owner is a holder of ours (nothing to do), a pid
 // when it is something else we may ask to stop, or null when we cannot tell —
 // and NULL MEANS LEAVE IT ALONE. Signalling a pid we did not identify is how a
@@ -354,7 +367,7 @@ class HolderSocket extends EventEmitter {
 function holderPidOn(port) {
   let out = "";
   try {
-    out = execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN"],
+    out = execFileSync("lsof", ["-nP", "-t", `-iTCP@${bindAddr()}:${port}`, "-sTCP:LISTEN"],
                        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
   } catch { return null; }
   // EVERY owner, not the first line. The holder keeps a bound descriptor AND a
@@ -366,12 +379,17 @@ function holderPidOn(port) {
   // function exists to prevent.
   const pids = out.trim().split("\n").map(Number).filter((n) => Number.isInteger(n) && n > 1);
   if (!pids.length) return null;
-  // A holder among them settles it: it is ours and it is already serving.
+  // A holder among them settles it ONLY IF IT RUNS OUR CODE. Returning "holder"
+  // on the mere presence of a run-service made runningOurCode() dead: the holder
+  // always keeps a descriptor to the listening socket, so it is always in this
+  // list, so this loop always returned before the fingerprint branch below.
+  // Measured: a deploy printed "this one is surplus", exited 0, and left the OLD
+  // code serving — every upgrade a no-op.
   for (const p of pids) {
     try {
       const c = execFileSync("ps", ["-p", String(p), "-o", "command="],
                              { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
-      if (/\brun-service\b/.test(c)) return "holder";
+      if (/\brun-service\b/.test(c)) return runningOurCode(port) ? "holder" : p;
     } catch { /* gone between lsof and ps */ }
   }
   // NOT THE STANDBY, unless it is all there is. lsof returns ascending pid order
@@ -437,7 +455,7 @@ function holderPidOn(port) {
 function otherHolderOn(port) {
   let pids = [];
   try {
-    pids = execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN"],
+    pids = execFileSync("lsof", ["-nP", "-t", `-iTCP@${bindAddr()}:${port}`, "-sTCP:LISTEN"],
                         { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
       .trim().split("\n").map(Number).filter((n) => Number.isInteger(n) && n > 1 && n !== process.pid);
   } catch { return 0; }
@@ -452,7 +470,14 @@ function otherHolderOn(port) {
     // process has been up; a tie goes to the incumbent, which is the safe way
     // round — the surplus one leaving is free, two holders is not.
     const theirs = Number(line.split(/\s+/)[0]);
-    if (Number.isFinite(theirs) && theirs >= Math.floor(process.uptime())) return p;
+    if (!Number.isFinite(theirs) || theirs < Math.floor(process.uptime())) continue;
+    // AGE IS NOT ENOUGH. Every incumbent outlives a process that just started,
+    // so age alone fired on every deploy: the NEW code called itself surplus and
+    // left, and the old holder kept serving with nothing saying so. Only a
+    // holder running the SAME code is a duplicate; a different one is what the
+    // deploy exists to replace.
+    if (!runningOurCode(port)) continue;
+    return p;
   }
   return 0;
 }
@@ -526,8 +551,15 @@ function runningOurCode(port) {
 function holdPort(rest) {
   // The proxy's own default: holding a different port than the proxy would have
   // served leaves nothing at the documented address.
-  const port = Number(process.env.CACHE_FIX_PROXY_PORT) || 9801;
-  const bind = process.env.CACHE_FIX_PROXY_BIND || "127.0.0.1";
+  // `|| 9801` REWROTE PORT 0 to 9801. "0" is a truthy string so the run-service
+  // guard let it through, and this line then bound the LEGACY port — measured:
+  // `CACHE_FIX_PROXY_PORT=0 run-service` listening on 127.0.0.1:9801, the "took
+  // 9801 while the fleet dialled 9901" failure that guard exists to prevent.
+  // proxy/config.mjs reads the same variable with envInt and yields 0.
+  const rawPort = process.env.CACHE_FIX_PROXY_PORT;
+  const port = rawPort === undefined || rawPort === "" || Number.isNaN(Number(rawPort))
+    ? 9801 : Number(rawPort);
+  const bind = bindAddr();
 
   return new Promise((resolveP) => {
     let child = null, childPort = 0, stopping = false, restart = null, failures = 0, served = false;
@@ -869,18 +901,22 @@ function holdPort(rest) {
       // owns the accept path; we keep the descriptor so we can start the next
       // one, including after a crash. Deploys measured at 149,038 / 148,658 /
       // 146,225 requests, zero lost, zero refused, zero reset.
-      // Buffered until a newline: the port arrives on stdout, and a chunk
-      // boundary inside that line would otherwise lose it silently — every
-      // connection would then wait out the relay's deadline.
-      let line = "";
-      me.stdout.on("data", (chunk) => {
-        process.stdout.write(chunk);
+      // WHOLE LINES, for every announcement and not just the port. Buffering
+      // was added for the port line — a chunk boundary inside it loses the
+      // port silently and every connection then waits out the relay's deadline
+      // — and the release test was left reading the raw chunk. Same defect,
+      // worse outcome: a boundary between "…listening socket" and "(handed
+      // off)" reads a handover as a plain release, so this holder reclaims the
+      // port from the successor already serving on it and spawns a second one.
+      // That is the "one extra proxy per deploy, 3 alive after 4" the (handed
+      // off) test exists to prevent, re-entered through the test itself.
+      const onLine = (line) => {
         // The proxy announces the release before it drains, so the port comes
         // back to us at the START of its shutdown rather than at its exit.
         // Retire it here: it is no longer the proxy this holder supervises, so
         // the successor can boot while it finishes its in-flight work, and its
         // eventual exit must not be read as a death needing a respawn.
-        if (!retired && String(chunk).includes("releasing the listening socket")) {
+        if (!retired && line.includes("releasing the listening socket")) {
           retired = true;
           if (child === me) child = null;
           // "(handed off)" means the proxy already put its own successor on the
@@ -889,7 +925,7 @@ function holdPort(rest) {
           // add a second — measured without this: one extra proxy per deploy,
           // 3 alive after 4 deploys. Nothing to do but stop supervising the
           // one that left.
-          if (String(chunk).includes("(handed off)")) return;
+          if (line.includes("(handed off)")) return;
           reclaim();
           // AND ask for the successor. reclaim() only starts one if its bind
           // lands after this point; when the port is already ours — a proxy
@@ -900,10 +936,9 @@ function holdPort(rest) {
           spawnWhenReady();
         }
         if (childPort) return;
-        line += chunk;
-        const m = /listening on [\d.]+:(\d+)\n/.exec(line);
+        const m = /listening on [\d.]+:(\d+)$/.exec(line);
         if (m) {
-          childPort = Number(m[1]); served = true; failures = 0; line = "";
+          childPort = Number(m[1]); served = true; failures = 0;
           // The proxy has generated its CA by the time it says this, so publish
           // it now. A host wired by rc starts the proxy HERE and launches claude
           // from the shell, so the --remote-control path that used to be the
@@ -912,7 +947,21 @@ function holdPort(rest) {
           // terminates no TLS, so it has no CA to offer.
           if (process.env.CACHE_FIX_FORWARD_PROXY === "on") publishOurCA(ourCAPath());
         }
-        else if (line.length > 4096) line = line.slice(-256);
+      };
+      let buf = "";
+      me.stdout.on("data", (chunk) => {
+        process.stdout.write(chunk);
+        buf += chunk;
+        // Both announcements end in "\n" (server.mjs `say`), so a complete line
+        // is the whole fact and a partial one is never acted on.
+        for (let nl; (nl = buf.indexOf("\n")) !== -1;) {
+          const line = buf.slice(0, nl);
+          buf = buf.slice(nl + 1);
+          onLine(line);
+        }
+        // A child that writes megabytes without a newline must not grow this
+        // without bound; keep only enough tail to finish a split announcement.
+        if (buf.length > 4096) buf = buf.slice(-256);
       });
       me.on("error", (err) => {
         process.stderr.write(`Failed to start proxy server: ${err.message}\n`);
@@ -1022,8 +1071,18 @@ function holdPort(rest) {
     // A later server error must not start a second proxy beside the first.
     // Under run-service the collision is the ANSWER, not a fallback: something
     // is already serving, which is all the caller asked for.
-    const bindFailed = () => {
+    const bindFailed = (e) => {
       holder.off("error", bindFailed);
+      // ONLY EADDRINUSE MEANS "SOMEONE ELSE HAS IT". Every other bind failure —
+      // EADDRNOTAVAIL from a CACHE_FIX_PROXY_BIND that is not an address here,
+      // EACCES on a privileged port as non-root — went down the same path:
+      // takeOver() found no listener to identify, hit "cannot identify it:
+      // leave it alone" and exited 0. A deploy that started nothing reported
+      // success, and deploy.sh has no way to tell that from a real no-op.
+      if (e?.code && e.code !== "EADDRINUSE") {
+        process.stderr.write(`[cache-fix] cannot bind ${bind}:${port} — ${e.code}\n`);
+        return settle(1);
+      }
       if (alreadyRunning) return takeOver();
       resolveP(runProxy(rest));
     };

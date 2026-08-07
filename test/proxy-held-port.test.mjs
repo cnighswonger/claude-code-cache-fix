@@ -103,14 +103,28 @@ describe("held port (CACHE_FIX_HOLD_PORT)", { concurrency: CONCURRENCY }, () => 
 // The default is declared in proxy/config.mjs and repeated in the launcher.
 // If they drift, an unset CACHE_FIX_PROXY_PORT binds one port while callers
 // dial the other.
-it("holds the same default port the proxy would bind", () => {
+it("holds the same default port the proxy would bind, and only when unset", () => {
   const launcher = readFileSync(launcherPath, "utf8");
   const cfg = readFileSync(join(dirname(launcherPath), "..", "proxy", "config.mjs"), "utf8");
   const want = /envInt\("CACHE_FIX_PROXY_PORT",\s*(\d+)\)/.exec(cfg)?.[1];
   assert.ok(want, "proxy/config.mjs no longer declares a CACHE_FIX_PROXY_PORT default");
-  // Not assert.match: a failing match prints the whole launcher.
-  const held = /Number\(process\.env\.CACHE_FIX_PROXY_PORT\) \|\| (\d+)/.exec(launcher)?.[1];
+  // Anchored on the CONDITIONAL, not on the number: the comment beside it names
+  // 9801 too, so a bare grep for the literal passes on the prose that explains
+  // the bug. Not assert.match either — a failing match prints the whole launcher.
+  const held = /\?\s*(\d+)\s*:\s*Number\(rawPort\)/.exec(launcher)?.[1];
   assert.equal(held, want, `the holder falls back to ${held}, the proxy to ${want}`);
+  // AND THE DEFAULT MUST NOT SWALLOW AN EXPLICIT 0. `Number(env) || 9801` read
+  // "take an ephemeral port" as "take the legacy port", so a holder asked for 0
+  // bound 9801 — the address the fleet stopped dialling — while config.mjs read
+  // the same variable with envInt and yielded 0. Measured: `run-service` with
+  // CACHE_FIX_PROXY_PORT=0 listening on 127.0.0.1:9801.
+  const decide = Function("rawPort",
+    `${/const port = rawPort ===[\s\S]*?Number\(rawPort\);/.exec(launcher)?.[0]}\nreturn port;`);
+  assert.equal(decide("0"), 0, "an explicit port 0 was rewritten to the default");
+  assert.equal(decide(undefined), Number(want), "an unset port did not fall back to the default");
+  assert.equal(decide(""), Number(want), "an empty port did not fall back to the default");
+  assert.equal(decide("nonsense"), Number(want), "an unparseable port did not fall back to the default");
+  assert.equal(decide("9901"), 9901, "an explicit port was not honoured");
 });
 
 // A launcher holding a real port, its /health probe, and its reaper. The
@@ -1167,8 +1181,13 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       const src = readFileSync(launcherPath, "utf8");
       const rule = /function holderPidOn[\s\S]*?\n}/.exec(src)?.[0];
       const fpFns = /function codeFingerprint[\s\S]*?\nfunction runningOurCode[\s\S]*?\n}/.exec(src)?.[0];
-      assert.ok(rule && fpFns,
-        "holderPidOn/runningOurCode are gone — the upgrade decision moved and this no longer tests it");
+      // holderPidOn asks lsof about the address the proxy BINDS, not a literal
+      // 127.0.0.1 — the two disagreed under CACHE_FIX_PROXY_BIND and the probe
+      // then matched nothing. Lifted from source rather than stubbed, so this
+      // keeps failing if the real one stops honouring the variable.
+      const bindFn = /const bindAddr = [^\n]*\n/.exec(src)?.[0];
+      assert.ok(rule && fpFns && bindFn,
+        "holderPidOn/runningOurCode/bindAddr are gone — the upgrade decision moved and this no longer tests it");
 
       const dir = mkdtempSync(join(tmpdir(), "ccf-fp-"));
       const ours = join(dir, "server.mjs");
@@ -1193,7 +1212,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         };
         // eslint-disable-next-line no-new-func
         return Function("execFileSync", "SERVER_PATH", "readFileSync", "createHash", "join", "tmpdir",
-          `${fpFns}\n${rule}\nreturn holderPidOn(9901);`)(
+          `${bindFn}${fpFns}\n${rule}\nreturn holderPidOn(9901);`)(
             fake.execFileSync, ours, readFileSync, createHash, () => record, () => dir);
       };
 
@@ -1231,6 +1250,74 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       }
     });
 
+    // THE OTHER HALF OF THE SAME DECISION, and the half that had no test at
+    // all. holderPidOn() above answers "may I signal the incumbent"; this one
+    // answers "am I the surplus copy and should I just leave" — and it ran
+    // BEFORE the bind, on age alone. Every incumbent is older than a process
+    // that just started, so the NEW code called itself surplus on every deploy,
+    // exited 0, and the OLD holder kept serving with nothing saying so.
+    //
+    // Same sandbox as above and for the same two reasons: the decision is a
+    // content hash (a stub cannot exercise hashing) and the rule around it is a
+    // pure function of what `ps` and `lsof` report.
+    it("leaves a surplus copy of the SAME build, and replaces an older one", () => {
+      const src = readFileSync(launcherPath, "utf8");
+      const rule = /function otherHolderOn[\s\S]*?\n}/.exec(src)?.[0];
+      const fpFns = /function codeFingerprint[\s\S]*?\nfunction runningOurCode[\s\S]*?\n}/.exec(src)?.[0];
+      const bindFn = /const bindAddr = [^\n]*\n/.exec(src)?.[0];
+      assert.ok(rule && fpFns && bindFn,
+        "otherHolderOn/runningOurCode/bindAddr are gone — this no longer tests the surplus rule");
+
+      const dir = mkdtempSync(join(tmpdir(), "ccf-surplus-"));
+      const ours = join(dir, "server.mjs");
+      writeFileSync(ours, "// build A\n");
+      const record = join(dir, "cache-fix-proxy-9901.sha256");
+      const sha = (f) => createHash("sha256").update(readFileSync(f)).digest("hex");
+      const lsofArgs = [];
+
+      const decide = () => {
+        const fake = (cmd, args) => {
+          if (cmd === "lsof") { lsofArgs.push(args.join(" ")); return "4242\n"; }
+          if (cmd === "ps") return "999999 node /usr/local/bin/cache-fix-proxy run-service\n";
+          throw new Error("unexpected " + cmd);
+        };
+        // eslint-disable-next-line no-new-func
+        return Function("execFileSync", "SERVER_PATH", "readFileSync", "createHash", "join", "tmpdir",
+          `${bindFn}${fpFns}\n${rule}\nreturn otherHolderOn(9901);`)(
+            fake, ours, readFileSync, createHash, () => record, () => dir);
+      };
+
+      const priorBind = process.env.CACHE_FIX_PROXY_BIND;
+      try {
+        // Same bytes: a second run-service IS surplus and must go. Without this
+        // an idempotent `run-service` would put a second holder on the address.
+        writeFileSync(record, sha(ours));
+        assert.equal(decide(), 4242,
+          "a second run-service on the SAME build did not recognise itself as surplus");
+
+        // A DEPLOY. Same age relationship, different bytes: the incumbent is
+        // what we came to replace, so we are not surplus and must NOT leave.
+        writeFileSync(ours, "// build B\n");
+        assert.equal(decide(), 0,
+          "the new code called itself surplus against an OLDER build — every " +
+          "deploy a no-op, with the old holder still serving and nothing saying so");
+
+        // THE PROBE MUST FOLLOW THE BIND ADDRESS. It asked lsof about
+        // 127.0.0.1 while the proxy honoured CACHE_FIX_PROXY_BIND, so under any
+        // other address lsof matched nothing and the rule silently answered
+        // "no other holder" about a live one.
+        lsofArgs.length = 0;
+        process.env.CACHE_FIX_PROXY_BIND = "0.0.0.0";
+        decide();
+        assert.ok(lsofArgs.every((a) => a.includes("-iTCP@0.0.0.0:9901")),
+          `the ownership probe ignored CACHE_FIX_PROXY_BIND: ${JSON.stringify(lsofArgs)}`);
+      } finally {
+        if (priorBind === undefined) delete process.env.CACHE_FIX_PROXY_BIND;
+        else process.env.CACHE_FIX_PROXY_BIND = priorBind;
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
     it("exits 0 and starts nothing when a proxy is already serving", async () => {
       await withHeldPort(async ({ get, port, proxyPid }) => {
         const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port) };
@@ -1261,6 +1348,85 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         assert.equal(proxyPid(), incumbentPid,
           "the second run-service replaced the running proxy instead of leaving it alone");
       }, { subcommand: "run-service", extraEnv: { CACHE_FIX_HOLD_PORT: "" } });
+    });
+
+    // A BIND THAT CAN NEVER WORK IS NOT "SOMEBODY ELSE HAS IT".
+    //
+    // bindFailed() read no error code, so every failure took the same path:
+    // "the port is taken, go ask the incumbent to hand it over". With an
+    // address that is not on this host there IS no incumbent, so takeOver()
+    // reached "cannot identify it: leave it alone" and exited 0 — a deploy that
+    // started nothing, reporting success, indistinguishable from a real no-op
+    // to deploy.sh and to a human reading the log. The mislabelling upstream
+    // made it worse: libuv's EADDRNOTAVAIL arrived here named "EACCES".
+    it("fails loudly when the bind address can never work, rather than exiting 0", async () => {
+      const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(await freePort()),
+                    // 192.0.2.0/24 is TEST-NET-1 (RFC 5737): reserved for
+                    // documentation, so it is never a live address on any host
+                    // and the bind is guaranteed to fail for a reason that is
+                    // NOT "in use".
+                    CACHE_FIX_PROXY_BIND: "192.0.2.1" };
+      for (const k of [...HOP_ENV, "LISTEN_FDS", "LISTEN_PID", "CACHE_FIX_HOLD_PORT"]) delete env[k];
+      const p = spawn(process.execPath, [launcherPath, "run-service"], { env, stdio: ["ignore", "pipe", "pipe"] });
+      let err = "";
+      p.stderr.on("data", (d) => { err += d; });
+      const code = await Promise.race([
+        new Promise((r) => p.on("exit", (c) => r(c))),
+        new Promise((r) => setTimeout(() => r("HUNG"), 25_000)),
+      ]);
+      try { p.kill("SIGKILL"); } catch {}
+      assert.equal(code, 1,
+        `run-service exited ${code} with nothing bound — a deploy that started ` +
+        `nothing must not report success. stderr: ${err.slice(-400)}`);
+      assert.match(err, /cannot bind 192\.0\.2\.1:/,
+        `the failure was not reported at all; stderr: ${err.slice(-400)}`);
+      // The TRUE errno, not the catch-all. EACCES here sends whoever reads it
+      // hunting for a permissions problem that does not exist.
+      assert.match(err, /EADDRNOTAVAIL/,
+        `the bind failure was mislabelled; stderr: ${err.slice(-400)}`);
+    });
+
+    // THE HOLDER READS ITS CHILD'S ANNOUNCEMENTS AS LINES, NOT AS CHUNKS.
+    //
+    // Buffering was added for the port line, because a chunk boundary inside it
+    // loses the port and every connection then waits out the relay's deadline.
+    // The release test beside it kept reading the raw chunk, and that one is
+    // worse: a boundary between "…listening socket" and "(handed off)" reads a
+    // handover as a plain release, so the holder reclaims the port from the
+    // successor that is already serving on it and spawns a second — the "one
+    // extra proxy per deploy, 3 alive after 4" the (handed off) marker exists
+    // to prevent, re-entered through the marker itself.
+    //
+    // The dispatch loop is lifted from source and driven at every boundary,
+    // because the writes it must survive come from a real proxy's stdout and
+    // cannot be forced from outside.
+    it("reads the child's announcements as whole lines, at any chunk boundary", () => {
+      const src = readFileSync(launcherPath, "utf8");
+      const loop = /for \(let nl; \(nl = buf\.indexOf[\s\S]*?\n        \}/.exec(src)?.[0];
+      assert.ok(loop, "the holder's stdout line-splitter is gone — this tests nothing");
+
+      const announcements = [
+        "proxy listening on 127.0.0.1:9901",
+        "proxy releasing the listening socket (handed off)",
+      ];
+      const stream = announcements.join("\n") + "\n";
+      // EVERY split, not a chosen one: the boundary that broke this sat inside
+      // "(handed off)", and picking the split by hand is how a test agrees with
+      // the bug it was written from.
+      for (let cut = 0; cut <= stream.length; cut++) {
+        const seen = [];
+        const feed = Function("buf", "chunk", "onLine",
+          `buf += chunk;\n${loop}\nreturn buf;`);
+        let buf = "";
+        buf = feed(buf, stream.slice(0, cut), (l) => seen.push(l));
+        buf = feed(buf, stream.slice(cut), (l) => seen.push(l));
+        assert.deepEqual(seen, announcements,
+          `a chunk boundary at ${cut} split an announcement: ${JSON.stringify(seen)}`);
+      }
+      // And the reader must ACT on the whole line. A raw-chunk test for
+      // "(handed off)" is the defect; this is what tells them apart.
+      assert.ok(!/String\(chunk\)\.includes/.test(src),
+        "an announcement is still being matched against a raw chunk rather than a line");
     });
   });
 

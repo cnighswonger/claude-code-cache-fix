@@ -181,6 +181,26 @@ const CHAIN_POLL_MS = Number(process.env.CACHE_FIX_CHAIN_POLL_MS) || 200;
 // Logged per episode, not per request, and in the string the pin also emits so
 // one probe greps both: `hop <addr> unusable`.
 let _lastHopReport = "";
+// The hop the LAST resolve actually landed on: a URL, "" for the direct-dial
+// fall-through, or undefined before anything has been dialled. /health publishes
+// this rather than a configured candidate — the chain falls through, so naming
+// candidate #1 while CONNECTs leave via #2 (or direct) is the same lie that
+// field already carried once.
+let _lastHop;
+export const lastHop = () => _lastHop;
+// WHEN THE CHAIN LAST WENT DIRECT, ISO-8601 UTC, null if never. A point-in-time
+// field cannot report a flap: the chain is back within ~1s and every probe after
+// that reads green, so the outage that actually happened leaves no trace anyone
+// can find. cswap's pin publishes the same thing under the same name for the
+// same reason ("`egress` alone was useless") — one name, one meaning, both ends.
+//
+// STICKY ON PURPOSE. It is not "are we direct now", it is "did this ever happen
+// on this process", which is the question a supervisor can act on. Direct on a
+// TLS-inspecting host is not degraded-but-fine: the pin measured the direct
+// route's leaf carrying no Authority Key Identifier, so a strict verifier
+// refuses it and OAuth fails with nothing on screen.
+let _directLast = null;
+export const directLast = () => _directLast;
 export async function resolveHop(isHTTPS) {
   const primary = selectProxyUrl(isHTTPS);
   const chain = [primary, ...fallbackProxyUrls()].filter(Boolean);
@@ -196,6 +216,7 @@ export async function resolveHop(isHTTPS) {
           _lastHopReport = "";
           process.stderr.write(`[upstream] hop ${addrOf(primary)} is back\n`);
         }
+        _lastHop = hop;
         return hop;
       }
     }
@@ -207,6 +228,8 @@ export async function resolveHop(isHTTPS) {
   // request goes out unpinned rather than not at all.
   const note = `hop ${addrOf(primary)} unusable — no chain hop reachable, dialling direct`;
   if (note !== _lastHopReport) { _lastHopReport = note; process.stderr.write(`[upstream] ${note}\n`); }
+  _lastHop = "";
+  _directLast = new Date().toISOString();
   return "";
 }
 
@@ -219,7 +242,10 @@ export function hopAlive(proxyUrl, timeoutMs = 700) {
   return new Promise((res) => {
     let u;
     try { u = new URL(proxyUrl); } catch { return res(false); }
-    const sock = netConnect({ host: u.hostname, port: Number(u.port) || 80 });
+    // Default from the SCHEME. `|| 80` dialled :80 for an `https://hop` with no
+    // explicit port, which refuses, so a perfectly live TLS hop read as dead and
+    // the chain fell through past it — to a fallback, or to a direct dial.
+    const sock = netConnect({ host: u.hostname, port: Number(u.port) || (u.protocol === "https:" ? 443 : 80) });
     const done = (ok) => { sock.destroy(); res(ok); };
     sock.on("connect", () => done(true));
     sock.on("error", () => done(false));

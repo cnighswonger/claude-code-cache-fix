@@ -241,7 +241,10 @@ export function ensureCA() {
 // Parse an http(s)://host:port proxy URL into { host, port }.
 function parseProxy(url) {
   if (!url) return null;
-  try { const u = new URL(url); return { host: u.hostname, port: Number(u.port) || 80 }; }
+  // Scheme-defaulted, like hopAlive(): `|| 80` sent the CONNECT for an
+  // `https://hop` carrying no explicit port to :80, so the tunnel died against
+  // a hop hopAlive() had just confirmed on :443.
+  try { const u = new URL(url); return { host: u.hostname, port: Number(u.port) || (u.protocol === "https:" ? 443 : 80) }; }
   catch { return null; }
 }
 
@@ -262,6 +265,18 @@ function parseProxy(url) {
 // hanging.
 const hopFor = async () => parseProxy(await resolveHop(true));
 
+// Falling open — dialling the target directly when no chain hop answers — is
+// the DEFAULT and stays that way: a hop restarting is back in ~1s, and refusing
+// meanwhile strands a session whose HTTPS_PROXY was baked at exec, which is the
+// outage this whole chain exists to avoid.
+//
+// It is wrong where the hop is a POLICY boundary rather than a cache. There the
+// direct dial is a silent bypass: the client gets "200 Connection Established"
+// and cannot tell it left unproxied, and until /health started publishing the
+// resolved hop nothing downstream could either. One opt-in, off by default, so
+// the deployment that needs fail-closed can say so instead of discovering it.
+const requireHop = () => process.env.CACHE_FIX_REQUIRE_HOP === "1";
+
 // Blind-tunnel a CONNECT to `target` (host:port) untouched. Routes through the
 // resolved hop when there is one, else dials the target directly. No TLS
 // termination; bytes pass through opaque.
@@ -272,6 +287,11 @@ async function blindTunnel(target, clientSocket, head) {
   // The client may have given up while we probed the chain; dialling for a
   // dead socket leaks the upstream connection.
   if (clientSocket.destroyed) return;
+  if (!via && requireHop()) {
+    process.stderr.write(`[forward-proxy] no chain hop reachable and CACHE_FIX_REQUIRE_HOP=1 — refusing ${target}\n`);
+    clientSocket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+    return;
+  }
   const onUpstream = (upstream) => {
     clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
     if (head && head.length) upstream.write(head);
@@ -321,6 +341,7 @@ async function connectUpstreamTLS(cb, onErr) {
   // Same chain as the blind tunnel above — see hopFor().
   let via;
   try { via = await hopFor(); } catch (err) { return onErr(err); }
+  if (!via && requireHop()) return onErr(new Error("no chain hop reachable (CACHE_FIX_REQUIRE_HOP=1)"));
   if (via) {
     const r = http.request({ host: via.host, port: via.port, method: "CONNECT",
                              path: `${upHost}:${upPort}`, headers: { host: `${upHost}:${upPort}` } });
