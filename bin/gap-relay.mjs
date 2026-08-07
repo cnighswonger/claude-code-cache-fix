@@ -47,10 +47,25 @@ const mine = new Set();
 // hop there either, and the protocol check is what keeps `user:pass@host:port` —
 // which URL reads as the scheme `user:` — from becoming one, or from reaching
 // /health below.
-const hopUrl = (() => {
+// EVERY usable candidate, in order — not the first one only.
+//
+// This took the first and fell straight to direct when it would not carry, so a
+// configured second hop was never tried. proxy/upstream.mjs resolveHop() walks
+// the whole list, which made one chain carry two different definitions of what
+// "the chain" is — and the relay's copy is the one that runs precisely when the
+// proxy is down. cswap's pin walks its own candidates the same way, treats a
+// refusal as "refused BY this hop", and reaches direct only when none will
+// carry.
+//
+// NOT a hard close when none carries: their measurement is that closing there
+// trades an invisible fall-open for an invisible outage, and this tunnel is the
+// most expensive place to take one. Direct stays the last resort, and the
+// refusals are traced so it is not a silent one.
+const hopUrls = (() => {
   const candidates = [process.env.CACHE_FIX_UPSTREAM_PROXY,
                       process.env.HTTPS_PROXY, process.env.https_proxy,
                       ...(process.env.CACHE_FIX_FALLBACK_PROXIES || "").split(",")];
+  const out = [], seen = new Set();
   for (const raw of candidates) {
     const v = (raw || "").trim();
     if (!v) continue;
@@ -58,12 +73,15 @@ const hopUrl = (() => {
       const u = new URL(v);
       if (u.protocol !== "http:" && u.protocol !== "https:") continue;
       if (mine.has(u.host)) continue;
-      return u;
+      if (seen.has(u.host)) continue;   // the same hop named twice is one hop
+      seen.add(u.host);
+      out.push(u);
     } catch { /* not a hop; try the next */ }
   }
-  return null;
+  return out;
 })();
-const hopPort = hopUrl ? Number(hopUrl.port) || (hopUrl.protocol === "https:" ? 443 : 80) : 0;
+const hopUrl = hopUrls[0] || null;
+const portOf = (u) => Number(u.port) || (u.protocol === "https:" ? 443 : 80);
 // Address only, never the credentials: a hop URL may carry them (cswap's pin
 // publishes its own as cswap:<token>@127.0.0.1:53749) and this goes into a
 // /health body that anything able to reach the port can read.
@@ -140,7 +158,7 @@ const srv = net.createServer((client) => {
         client.pipe(up); up.pipe(client);
       });
     };
-    if (!hopUrl) return void direct();
+    if (!hopUrls.length) return void direct();
 
     // A CONFIGURED HOP THAT IS DOWN IS NOT THE END OF THE LINE. The hop is read
     // once at startup, so "privoxy is off too" leaves this pointing at a port
@@ -155,7 +173,15 @@ const srv = net.createServer((client) => {
     // A hop speaks the same protocol we were handed, so CONNECT and
     // absolute-form both pass through untouched, including the chunk we had to
     // read to get here.
-    const hopSock = net.connect(hopPort, hopUrl.hostname);
+    // One attempt per hop, in order. `i` is the only state the walk needs.
+    let i = 0;
+    const tryHop = () => {
+      if (i >= hopUrls.length) return void direct();
+      const u = hopUrls[i++];
+      dial(u);
+    };
+    const dial = (u) => {
+    const hopSock = net.connect(portOf(u), u.hostname);
     up = hopSock;
     let carried = false;
     // A DEADLINE ON THE DIAL. The measured fall-through case was a hop that
@@ -165,7 +191,15 @@ const srv = net.createServer((client) => {
     // a refusal" outcome this path exists to prevent, on the path that prevents
     // it. Same 2s the standby's own probe uses.
     hopSock.setTimeout(2_000, () => { if (!carried) hopSock.destroy(new Error("hop dial timed out")); });
-    hopSock.on("error", () => { hopSock.destroy(); if (carried) client.destroy(); else direct(); });
+    // REFUSED BY THIS HOP, so try the one behind it — and SAY SO. A relay that
+    // falls through silently is indistinguishable from one that had no chain at
+    // all. Same string proxy/upstream.mjs emits, so one grep reads both.
+    hopSock.on("error", (e) => {
+      hopSock.destroy();
+      if (carried) return void client.destroy();
+      process.stderr.write(`[gap-relay] hop ${u.protocol}//${u.host} unusable (${e?.code || e?.message}) — trying the next\n`);
+      tryHop();
+    });
     hopSock.on("close", () => { if (carried) client.destroy(); });
     hopSock.on("connect", () => {
       carried = true;
@@ -173,6 +207,8 @@ const srv = net.createServer((client) => {
       hopSock.write(first);
       client.pipe(hopSock); hopSock.pipe(client);
     });
+    };
+    tryHop();
   });
 });
 srv.on("error", (e) => { process.stderr.write(`[cache-fix] gap-relay: ${e.code}\n`); process.exit(1); });
