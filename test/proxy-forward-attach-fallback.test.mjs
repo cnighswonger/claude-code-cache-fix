@@ -300,6 +300,29 @@ test("CONNECT falls open to a direct dial, unless CACHE_FIX_REQUIRE_HOP says oth
     assert.deepEqual(seen, [],
       "CACHE_FIX_REQUIRE_HOP=1 dialled the target directly anyway — the bypass " +
       "this variable exists to close");
+
+    // THE RELAYED PATH IS NOT COVERED, and that is deliberate — asserted so the
+    // gap is a fact this suite states rather than one a reader has to discover.
+    // forwardRequest() still dials direct with the variable set. Throwing there
+    // hangs the client instead of refusing it: handleMessages' catch opens with
+    // `if (abortController.signal.aborted) return`, and the abort fires on
+    // clientReq's own "close", which Node emits when the request BODY completes
+    // — not only when the client leaves. Measured: the throw caught with
+    // aborted=true, writableEnded=false, no response, client timed out at 10s.
+    // Change this assertion the day that abort listener distinguishes "body
+    // done" from "client gone".
+    const relayed = await new Promise((resolve) => {
+      const r = http.request({ host: "127.0.0.1", port: handle.port, method: "POST",
+                               path: "/v1/messages", headers: { "content-type": "application/json" } },
+        (res) => { res.resume(); res.on("end", () => resolve(res.statusCode)); });
+      r.on("error", (e) => resolve(`ERR:${e.code}`));
+      r.setTimeout(4_000, () => { r.destroy(); resolve("TIMEOUT"); });
+      r.end("{}");
+    });
+    assert.notEqual(relayed, 502,
+      "the relayed path now refuses under CACHE_FIX_REQUIRE_HOP — good, but the " +
+      "comment above and this assertion both describe the OLD state; update them");
+
   } finally {
     restoreEnv(saved);
     if (handle) await handle.close();

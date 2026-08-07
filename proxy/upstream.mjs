@@ -201,6 +201,24 @@ export const lastHop = () => _lastHop;
 // refuses it and OAuth fails with nothing on screen.
 let _directLast = null;
 export const directLast = () => _directLast;
+
+// Falling open — dialling the target directly when no chain hop answers — is the
+// DEFAULT and stays that way: a hop restarting is back in ~1s, and refusing
+// meanwhile strands a session whose HTTPS_PROXY was baked at exec.
+//
+// It is wrong where the hop is a POLICY boundary rather than a cache.
+//
+// SCOPE, AND IT IS NOT THE WHOLE DOOR: this guards the two CONNECT paths in
+// forward-proxy.mjs only. forwardRequest() below — the relayed /v1/messages
+// path — still dials direct with the variable set, and that is recorded rather
+// than fixed because the obvious fix is worse. Throwing there IS caught by
+// handleMessages, but its catch begins `if (abortController.signal.aborted)
+// return`, and the abort fires on clientReq's own "close" — which Node emits
+// when the request BODY completes, not only when the client leaves. Measured:
+// hop="" requireHop=true, the throw caught with aborted=true and
+// writableEnded=false, and the client got no response at all, timing out after
+// 10s. A leak that is honest beats a hang that reads as a refusal.
+export const requireHop = () => process.env.CACHE_FIX_REQUIRE_HOP === "1";
 export async function resolveHop(isHTTPS) {
   const primary = selectProxyUrl(isHTTPS);
   const chain = [primary, ...fallbackProxyUrls()].filter(Boolean);

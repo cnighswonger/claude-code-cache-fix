@@ -25,7 +25,7 @@ import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { randomBytes, X509Certificate, createPublicKey } from "node:crypto";
 import config from "./config.mjs";
-import { getAgent, resolveHop } from "./upstream.mjs";
+import { getAgent, resolveHop, requireHop } from "./upstream.mjs";
 import { discoverBucket } from "./downloads-bucket.mjs";
 
 function upstreamHost() {
@@ -264,18 +264,6 @@ function parseProxy(url) {
 // accepted connect, one syscall, and a hop that is down refuses rather than
 // hanging.
 const hopFor = async () => parseProxy(await resolveHop(true));
-
-// Falling open — dialling the target directly when no chain hop answers — is
-// the DEFAULT and stays that way: a hop restarting is back in ~1s, and refusing
-// meanwhile strands a session whose HTTPS_PROXY was baked at exec, which is the
-// outage this whole chain exists to avoid.
-//
-// It is wrong where the hop is a POLICY boundary rather than a cache. There the
-// direct dial is a silent bypass: the client gets "200 Connection Established"
-// and cannot tell it left unproxied, and until /health started publishing the
-// resolved hop nothing downstream could either. One opt-in, off by default, so
-// the deployment that needs fail-closed can say so instead of discovering it.
-const requireHop = () => process.env.CACHE_FIX_REQUIRE_HOP === "1";
 
 // Blind-tunnel a CONNECT to `target` (host:port) untouched. Routes through the
 // resolved hop when there is one, else dials the target directly. No TLS
