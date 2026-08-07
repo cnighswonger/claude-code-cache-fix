@@ -205,10 +205,10 @@ inferred). The measurement gate must be on the impl PR body, not deferred.
 
 ## Resolved decisions
 
-Answered by Chris on this PR's thread ([here](https://github.com/cnighswonger/claude-code-cache-fix/pull/302#issuecomment-5208032266)
-and [here](https://github.com/cnighswonger/claude-code-cache-fix/pull/302#issuecomment-5208148217))
-and reproduced in the directive so implementers build against the file, not
-the thread.
+Answered by Chris on this PR's thread — the authoritative
+[decision comment](https://github.com/cnighswonger/claude-code-cache-fix/pull/302#issuecomment-5208602677)
+carries Q1/Q2/Q3 verbatim. Reproduced in the directive so implementers build
+against the file, not the thread.
 
 1. **Scanner ownership: standalone (not bundled with #276).** Landed as
    [#306](https://github.com/cnighswonger/claude-code-cache-fix/pull/306).
