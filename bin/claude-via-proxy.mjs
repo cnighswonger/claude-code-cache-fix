@@ -51,7 +51,13 @@ const HOLDER_TREE = (() => {
   try {
     const dir = dirname(LAUNCHER_PATH);
     const h = createHash("sha256");
-    for (const f of readdirSync(dir).filter((n) => n.endsWith(".mjs")).sort()) {
+    // NOT DOTFILES. The suite writes `.test-launcher-*.mjs` and
+    // `.test-fake-server-*.mjs` into this very directory while it runs, so a walk
+    // that counts them gives a different answer depending on WHEN it looks —
+    // measured on CI: the holder hashed ba5cbf0b4567 at startup and the case
+    // recomputed a7a72ba4c005 a moment later, both correct for their instant.
+    // A hidden file is not part of the shipped layer.
+    for (const f of readdirSync(dir).filter((n) => n.endsWith(".mjs") && !n.startsWith(".")).sort()) {
       h.update(f).update(readFileSync(resolve(dir, f)));
     }
     return h.digest("hex").slice(0, 12);

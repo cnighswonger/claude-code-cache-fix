@@ -307,7 +307,9 @@ describe("holder handover (SIGUSR2)", () => {
       // the launcher does, so this fails if the two ever diverge.
       const dir = dirname(launcherPath);
       const layer = createHash("sha256");
-      for (const f of readdirSync(dir).filter((n) => n.endsWith(".mjs")).sort()) {
+      // Dot-prefixed files excluded, exactly as the launcher does: the suite
+      // writes its stand-ins into this directory while running.
+      for (const f of readdirSync(dir).filter((n) => n.endsWith(".mjs") && !n.startsWith(".")).sort()) {
         layer.update(f).update(readFileSync(join(dir, f)));
       }
       const onDisk = layer.digest("hex").slice(0, 12);
