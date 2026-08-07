@@ -40,3 +40,5 @@ None. The directive is 189 lines for a nontrivial security guardrail and is not 
 ## Bottom Line
 
 Request changes. The security layering argument is right, and the directive is close, but the committed file has not been updated to match the decisions already made in the PR thread. Merge would leave implementers with contradictory instructions on the two load-bearing choices: CI behavior and Git hook installation.
+
+— Codex review
