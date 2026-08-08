@@ -246,12 +246,23 @@ export async function resolveHop(isHTTPS) {
   for (;;) {
     for (const hop of chain) {
       if (await hopAlive(hop)) {
-        if (hop !== primary) {
-          const note = `hop ${addrOf(primary)} unusable — routing via ${addrOf(hop)}`;
-          if (note !== _lastHopReport) { _lastHopReport = note; process.stderr.write(`[upstream] ${note}\n`); }
-        } else if (_lastHopReport) {
-          _lastHopReport = "";
-          process.stderr.write(`[upstream] hop ${addrOf(primary)} is back\n`);
+        // ONLY WHEN THERE WAS A PRIMARY TO LOSE. `primary` is "" on the shipped
+        // wiring (CACHE_FIX_FALLBACK_PROXIES and nothing else), and "" is not in
+        // `chain` — so `hop !== primary` was true of every fallback and every
+        // generation announced `hop direct unusable` on its first resolve.
+        // Nothing was unusable; there was no primary. Measured: 8 such lines in
+        // one 24,026-line log on <linux-host>, and a peer read them as eight
+        // real degradations of ours. stderr is the only surface a genuine
+        // degrade appears on, so a false fault here costs the one instrument
+        // that can answer the question.
+        if (primary) {
+          if (hop !== primary) {
+            const note = `hop ${addrOf(primary)} unusable — routing via ${addrOf(hop)}`;
+            if (note !== _lastHopReport) { _lastHopReport = note; process.stderr.write(`[upstream] ${note}\n`); }
+          } else if (_lastHopReport) {
+            _lastHopReport = "";
+            process.stderr.write(`[upstream] hop ${addrOf(primary)} is back\n`);
+          }
         }
         _lastHop = hop;
         return hop;

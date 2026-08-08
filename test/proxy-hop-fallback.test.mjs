@@ -17,6 +17,67 @@ const freePort = () => new Promise((res) => {
 });
 
 describe("hop fallback", () => {
+  // A HEALTHY START MUST NOT REPORT A FAULT.
+  //
+  // The shipped wiring sets CACHE_FIX_FALLBACK_PROXIES and nothing else, so
+  // `primary` is "" and `addrOf("")` renders "direct". The report fired on
+  // `hop !== primary`, which is true of every fallback when there is no
+  // primary — so every proxy generation logged
+  //     [upstream] hop direct unusable — routing via 127.0.0.1:8118
+  // on its first resolve. Nothing was unusable; there was no primary. Measured
+  // on <linux-host>: 8 such lines in one 24,026-line log, one per generation,
+  // and a peer session read them as eight real degradations of ours.
+  //
+  // That is worse than noise. stderr is the ONLY place a real degrade is
+  // findable — it is unpublished and non-sticky — so a line that cries fault on
+  // every healthy start poisons the one instrument that can answer the question.
+  it("does not report a fault when there was no primary to lose", async () => {
+    const { resolveHop } = await import("../proxy/upstream.mjs");
+    const srv = net.createServer();
+    await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+    const live = `http://127.0.0.1:${srv.address().port}`;
+    const PRIMARY_ENV = ["CACHE_FIX_UPSTREAM_PROXY", "HTTPS_PROXY", "https_proxy",
+                         "HTTP_PROXY", "http_proxy", "CACHE_FIX_FALLBACK_PROXIES"];
+    const prior = Object.fromEntries(PRIMARY_ENV.map((k) => [k, process.env[k]]));
+    const write = process.stderr.write.bind(process.stderr);
+    let said = "";
+    try {
+      for (const k of PRIMARY_ENV) delete process.env[k];
+      process.env.CACHE_FIX_FALLBACK_PROXIES = live;   // fallback ONLY
+      process.stderr.write = (s, ...rest) => { said += s; return write(s, ...rest); };
+      const got = await resolveHop(true);
+      process.stderr.write = write;
+      // Premise first: if the resolve did not even land on the fallback, the
+      // assertion below would pass for the wrong reason.
+      assert.equal(got, live, "premise: a fallback-only chain must resolve to the fallback");
+      // The port is unique per run, so the report's dedup guard cannot be what
+      // suppresses this line — a previous case's note never matches it.
+      assert.ok(!/unusable/.test(said),
+        `a healthy fallback-only start reported a fault: ${said.trim()}`);
+
+      // AND THE CARVE-OUT MUST NOT EAT THE CASE IT CAME FROM. A real degrade —
+      // a configured primary that is down, traffic leaving via a fallback — has
+      // to still announce itself, or silencing the false positive has silenced
+      // the true one with it. This is the assertion that earns its keep: the
+      // guard above passes just as well if the report is deleted outright.
+      const deadPrimary = `http://127.0.0.1:${await freePort()}`;
+      process.env.HTTPS_PROXY = deadPrimary;
+      said = "";
+      process.stderr.write = (s, ...rest) => { said += s; return write(s, ...rest); };
+      const degraded = await resolveHop(true);
+      process.stderr.write = write;
+      assert.equal(degraded, live, "premise: a dead primary must fall through to the live fallback");
+      assert.match(said, /unusable/,
+        "a REAL degrade went unreported — the no-primary carve-out swallowed it too");
+    } finally {
+      process.stderr.write = write;
+      for (const [k, v] of Object.entries(prior)) {
+        if (v === undefined) delete process.env[k]; else process.env[k] = v;
+      }
+      await new Promise((r) => srv.close(r));
+    }
+  });
+
   it("lists nothing by default, so an unconfigured proxy behaves exactly as before", async () => {
     const { fallbackProxyUrls } = await import("../proxy/upstream.mjs");
     const prior = process.env.CACHE_FIX_FALLBACK_PROXIES;
