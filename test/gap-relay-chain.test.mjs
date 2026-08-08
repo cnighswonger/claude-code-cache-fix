@@ -52,13 +52,31 @@ async function withRelay(chain, fn) {
   // touched and zero traces, which looks exactly like a broken fix.
   const carrier = net.createServer();
   await new Promise((r) => carrier.listen(0, "127.0.0.1", r));
-  const env = { ...process.env, CACHE_FIX_HELD_PORT: String(carrier.address().port),
+  // The port has to be read now: the parent stops listening below, and the
+  // address is gone once it does.
+  const carrierPort = carrier.address().port;
+  const env = { ...process.env, CACHE_FIX_HELD_PORT: String(carrierPort),
                 CACHE_FIX_FALLBACK_PROXIES: chain };
   for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
                    "CACHE_FIX_UPSTREAM_PROXY", "ALL_PROXY", "all_proxy",
                    "CACHE_FIX_STANDBY"]) delete env[k];
   const relay = spawn(process.execPath, [relayPath],
                       { env, stdio: ["ignore", "ignore", "pipe", carrier._handle.fd] });
+  // THE PARENT MUST STOP ACCEPTING once the child has the fd. Both processes are
+  // listeners on the same socket, so the kernel gives each connection to
+  // whichever accepts first — and this parent has no `connection` handler, so a
+  // connection it wins is held open with nothing to end it. `close(cb)` waits for
+  // every open connection, so its callback never comes, the promise never
+  // settles, and the file hangs until CI's 6-hour ceiling.
+  //
+  // Timing-dependent, which is why it hid: 48 cores here let the child win every
+  // time; a 4-core runner does not. Measured with `taskset -c 0-3` — reproduces
+  // constrained, never unconstrained.
+  //
+  // Closing here does NOT disturb the child: `stdio` handed it a dup of the fd,
+  // and the socket lives until the last descriptor goes. Done AFTER spawn and
+  // before any client dials, so there is no window where nobody is listening.
+  await new Promise((r) => carrier.close(r));
   let err = "";
   relay.stderr.on("data", (d) => { err += d; });
   try {
@@ -67,10 +85,9 @@ async function withRelay(chain, fn) {
     while (!/gap-relay carrying/.test(err) && Date.now() < up) await new Promise((r) => setTimeout(r, 50));
     assert.match(err, /gap-relay carrying/,
       `the relay never took the socket, so nothing below was measured; stderr: ${JSON.stringify(err.slice(-200))}`);
-    await fn({ port: carrier.address().port, stderr: () => err });
+    await fn({ port: carrierPort, stderr: () => err });
   } finally {
     try { relay.kill("SIGKILL"); } catch {}
-    await new Promise((r) => carrier.close(r));
   }
 }
 
