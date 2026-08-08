@@ -191,8 +191,14 @@ export const lastHop = () => _lastHop;
 // WHEN THE CHAIN LAST WENT DIRECT, ISO-8601 UTC, null if never. A point-in-time
 // field cannot report a flap: the chain is back within ~1s and every probe after
 // that reads green, so the outage that actually happened leaves no trace anyone
-// can find. cswap's pin publishes the same thing under the same name for the
-// same reason ("`egress` alone was useless") — one name, one meaning, both ends.
+// can find through /health. It is still written to stderr, which is where the
+// same event was reconstructed on the peer side — "no trace" is only true of
+// the published surface.
+//
+// cswap's pin happens to publish a field of this NAME too, for its own reason.
+// That coincidence is not a contract, and reading it as one cost both projects
+// an hour: neither endpoint consumes the other's copy. One name, two meanings,
+// two ends — compare field SETS before believing in a shared field.
 //
 // STICKY ON PURPOSE. It is not "are we direct now", it is "did this ever happen
 // on this process", which is the question a supervisor can act on. Direct on a

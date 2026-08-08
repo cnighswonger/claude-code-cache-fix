@@ -400,11 +400,14 @@ function handleHealth(_req, res) {
   // THE FALLBACK COUNTS, and reading only config.httpsProxy is why this field
   // was a lie on every machine we run: the shipped wiring configures
   // CACHE_FIX_FALLBACK_PROXIES and nothing else, so the getter is empty and this
-  // published null while CONNECTs left through :8118 all day. cswap's pin reads
-  // exactly this field to confirm the next hop in the chain and treats null as
-  // "cannot confirm", so its confirmation had been dead for weeks and it was
-  // running on a preserved historical value — a hop that moved would not have
-  // been noticed by anything.
+  // published null while CONNECTs left through :8118 all day, so a hop that
+  // moved would not have been noticed by anything.
+  //
+  // This used to name cswap's pin as the consumer that "reads exactly this
+  // field". MEASURED, and it does not: their chain check dials pin's own :36301
+  // and reads chain/egress/direct_last, every one of them produced by pin. Only
+  // direct_last exists on both endpoints, and theirs is pin's. The field is
+  // still worth getting right — it is simply ours, with no external contract.
   //
   // Address only, never the credentials. A hop URL may carry them (the pin
   // publishes its own as cswap:<token>@127.0.0.1:53749) and this field is

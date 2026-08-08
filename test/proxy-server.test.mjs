@@ -904,10 +904,14 @@ describe("close() after an external server.close()", () => {
 //
 // /health.https_proxy publishes a URL in two different situations: the hop a
 // resolve actually used, and the first configured candidate on a proxy that has
-// dialled nothing yet. From the string alone a reader cannot tell them apart —
-// cswap's pin reads this field to confirm the next hop, and raised exactly this
-// against the fix that introduced it: its confirm logic would have to guess,
-// and a guess is what the fix was removing.
+// dialled nothing yet. From the string alone a reader cannot tell them apart,
+// so any consumer's confirm logic would have to guess — and a guess is what the
+// fix was removing. That is why https_proxy_measured exists.
+//
+// The objection was raised by cswap's pin during review; the comment then went
+// further and said pin READS this field, which is measured false — their check
+// dials pin's own :36301. A good review point does not make the reviewer a
+// consumer, and this comment turned one into the other.
 describe("/health hop reporting", () => {
   const ENV = ["CACHE_FIX_FORWARD_PROXY", "CACHE_FIX_CA_DIR", "CACHE_FIX_FALLBACK_PROXIES",
                "CACHE_FIX_UPSTREAM_PROXY", "HTTPS_PROXY", "https_proxy",

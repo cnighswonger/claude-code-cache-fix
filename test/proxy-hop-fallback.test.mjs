@@ -95,9 +95,15 @@ describe("hop fallback", () => {
 
   // THE FIELD /health PUBLISHES MUST BE THE HOP THAT WAS USED. The chain falls
   // THROUGH, so naming candidate #1 reports ":8118" while CONNECTs leave via
-  // the second fallback — or via nothing at all. cswap's pin reads exactly this
-  // field to confirm the next hop and treats null as "cannot confirm", so a
-  // confident wrong answer is worse there than no answer.
+  // the second fallback — or via nothing at all. A confident wrong answer is
+  // worse than no answer for anything that reads it to confirm the next hop.
+  //
+  // This comment used to say cswap's pin reads exactly this field. It does not,
+  // and both projects believed it for an hour: their check dials pin's own
+  // :36301 and reads chain/egress/direct_last, all produced by pin. The only
+  // overlapping NAME with our :9901 is direct_last, and theirs is pin's. Two
+  // sessions agreed on a dependency neither had measured because one field name
+  // appeared on both endpoints — read the field SETS, never match on names.
   it("remembers the hop a resolve landed on, and empty when it fell through to direct", async () => {
     const mod = await import("../proxy/upstream.mjs");
     const { resolveHop, lastHop, directLast } = mod;
@@ -142,9 +148,16 @@ describe("hop fallback", () => {
 
       // AND IT MUST LEAVE A MARK THAT SURVIVES THE RECOVERY. The chain is back
       // within ~1s, so a point-in-time field reads green from the next probe on
-      // and the outage that happened is unfindable. cswap's pin publishes the
-      // same field under the same name after measuring that `egress` alone told
-      // it nothing.
+      // and the outage is unfindable THROUGH /health. Not unfindable full stop:
+      // resolveHop writes `hop <primary> unusable — ...` to stderr, and that log
+      // is how the same event was reconstructed on the peer side. The precision
+      // matters in the reader's direction — told nothing survives, nobody opens
+      // the log, which is the one place the trace actually is.
+      //
+      // The degrade-to-a-LOWER-HOP case has no sticky mark at all, only that
+      // stderr line, and `_lastHopReport` is cleared on recovery — so the
+      // recovery erases even the in-memory trace. Known gap, deliberately not
+      // fixed here: a new /health field does not belong in this PR.
       const mark = directLast();
       assert.notEqual(mark, beforeDirect, "a direct fall-through left no mark at all");
       assert.match(String(mark), /^\d{4}-\d{2}-\d{2}T.*Z$/, `direct_last is not an ISO instant: ${mark}`);
