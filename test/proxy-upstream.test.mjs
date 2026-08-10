@@ -1,14 +1,16 @@
-import { describe, it, before, after } from "node:test";
+import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 
 let fakeUpstream;
 let fakePort;
 let forwardRequest;
+let defaultHits = 0;
 
 describe("upstream.mjs", () => {
   before(async () => {
     fakeUpstream = http.createServer((req, res) => {
+      defaultHits++;
       let body = "";
       req.on("data", (c) => { body += c; });
       req.on("end", () => {
@@ -119,5 +121,67 @@ describe("upstream.mjs", () => {
         err.message.includes("socket hang up")
       );
     }
+  });
+
+  // Per-request upstream override: the 4th forwardRequest parameter
+  // (upstreamBase) replaces config.upstream for that call only.
+  describe("forwardRequest upstreamBase override", () => {
+    let overrideUpstream;
+    let overrideReceived = null;
+
+    before(async () => {
+      overrideUpstream = http.createServer((req, res) => {
+        overrideReceived = { url: req.url, headers: req.headers };
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end("{}");
+      });
+      await new Promise((r) => overrideUpstream.listen(0, "127.0.0.1", r));
+    });
+
+    beforeEach(() => {
+      defaultHits = 0;
+      overrideReceived = null;
+    });
+
+    after(() => {
+      overrideUpstream.close();
+    });
+
+    it("sends the request to the override base with mutated headers", async () => {
+      const override = `http://127.0.0.1:${overrideUpstream.address().port}/anthropic`;
+      const mockReq = {
+        url: "/v1/messages",
+        method: "POST",
+        headers: {
+          "x-api-key": "sk-override-test",
+          "content-type": "application/json",
+          "proxy-authorization": "Basic abc", // proxy-*: stripped on override path too
+        },
+      };
+
+      const { statusCode, upstreamRes } = await forwardRequest(mockReq, "{}", null, override);
+      for await (const _ of upstreamRes) {}
+
+      assert.equal(statusCode, 200);
+      assert.equal(defaultHits, 0, "default upstream must not be contacted");
+      assert.equal(overrideReceived.url, "/anthropic/v1/messages",
+        "base path of the override is preserved (buildUpstreamUrl concatenation)");
+      assert.equal(overrideReceived.headers["x-api-key"], "sk-override-test");
+      assert.equal(overrideReceived.headers.authorization, undefined);
+      assert.equal(overrideReceived.headers["proxy-authorization"], undefined);
+    });
+
+    it("uses config.upstream when no override is given", async () => {
+      const mockReq = {
+        url: "/v1/messages",
+        method: "POST",
+        headers: { "content-type": "application/json" },
+      };
+      const { statusCode, upstreamRes } = await forwardRequest(mockReq, "{}", null);
+      for await (const _ of upstreamRes) {}
+
+      assert.equal(statusCode, 200);
+      assert.equal(defaultHits, 1);
+    });
   });
 });

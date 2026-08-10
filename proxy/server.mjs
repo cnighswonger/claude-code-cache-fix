@@ -196,10 +196,14 @@ async function handleMessages(clientReq, clientRes) {
     // directly — forwardRequest only reads .url/.method/.headers off its
     // first argument, so a minimal wrapper carrying the mutated headers is
     // sufficient and avoids touching upstream.mjs's signature.
+    // meta.upstreamOverride is the per-request upstream base an extension
+    // may have set in onRequest; undefined → config.upstream inside
+    // forwardRequest.
     ({ upstreamRes, responseHeaders, statusCode, upstreamConnectionId } = await forwardRequest(
       { url: clientReq.url, method: clientReq.method, headers },
       forwardBody,
-      abortController.signal
+      abortController.signal,
+      meta.upstreamOverride
     ));
   } catch (err) {
     debugLog("[PROXY] forwardRequest error:", err.message);
