@@ -49,12 +49,16 @@ absorbs (#273): the client is not in a position to recognize what it just cost.
   passes through.
 - **Maintainability constraints** — one new file (`proxy/extensions/anthropic-
   beta-stabilize.mjs`), one line in `proxy/extensions.json`, one test file
-  (`test/proxy-anthropic-beta-stabilize.test.mjs`). No new abstractions. The
-  header parse/join idiom mirrors `deferred-tool-rewrite`'s existing
-  `parseBetaTokens`/`addBetaToken` (which are also the closest thing to prior
-  art in this repo); if the shape converges further during review, factor to
-  a shared helper — otherwise inline is fine (see [[feedback-inline-comment-
-  guidelines-post-release]]).
+  (`test/proxy-anthropic-beta-stabilize.test.mjs`), and a two-line change to
+  `proxy/server.mjs` (add `{ path: clientReq.url }` as the sixth argument to
+  the two `preForward()` call sites — `handleMessages` line 155 and
+  `handleBootstrap` line 275). The server.mjs addition is in scope per Codex
+  R2: it fixes the subpath discrimination the pipeline route filter can't
+  provide. No new abstractions. The header parse/join idiom mirrors
+  `deferred-tool-rewrite`'s existing `parseBetaTokens`/`addBetaToken`
+  (which are also the closest thing to prior art in this repo); if the shape
+  converges further during review, factor to a shared helper — otherwise
+  inline is fine (see [[feedback-inline-comment-guidelines-post-release]]).
 - **Performance/reliability** — header parse + Set-difference + join per
   request. O(n) where n is the token count (typically < 5). Negligible.
 - **Load-bearing? YES.** The extension modifies what we send upstream on every
@@ -68,13 +72,27 @@ absorbs (#273): the client is not in a position to recognize what it just cost.
 
 Per-request `onRequest(ctx)`:
 
-Route filtering is handled by the pipeline (`proxy/pipeline.mjs:96-99`).
-Extensions default to `routes: ["messages"]` when they don't declare a
-`routes` array; the pipeline skips `onRequest` for any other route. This
-extension does **not** declare `routes:` and inherits that default. As a
-result `/v1/messages/count_tokens`, `/v1/messages/batches`, admin routes,
-and any future non-`messages` addition are never invoked — no explicit
-guard in the extension body is required or wanted.
+Route filtering at the pipeline layer (`proxy/pipeline.mjs:96-99`, default
+`routes: ["messages"]`) narrows to the `messages` route but does NOT
+distinguish `/v1/messages` from `/v1/messages/count_tokens` or
+`/v1/messages/batches`: `proxy/server.mjs:514` dispatches ANY
+`POST /v1/messages*` (subpath included) to `handleMessages()`, which calls
+`preForward(..., "messages")` at `server.mjs:155`. All subpaths get
+`ctx.meta.route === "messages"`. Codex R2 caught this on 2026-08-11
+(review: `pullrequestreview-4910070912`).
+
+Fix (this directive): a minimal pipeline contract addition — pass
+`{ path: clientReq.url }` as `baseMeta` to `preForward()` at both call
+sites (`handleMessages` line 155, `handleBootstrap` line 275 for
+symmetry — bootstrap route already only serves one path but the
+add-both-sites approach keeps future symmetric routes trivial). Extension
+reads `ctx.meta.path`, computes pathname (strip `?query`, `#fragment`),
+no-ops when pathname is not exactly `/v1/messages`.
+
+0. **Pathname guard** — let `p = (ctx.meta.path || "").split("?")[0].split("#")[0]`;
+   if `p !== "/v1/messages"`, no-op. Guards against `/v1/messages/count_tokens`,
+   `/v1/messages/batches`, and any future subpath sharing the same dispatcher
+   entry.
 
 1. Parse the incoming `anthropic-beta` header (Node.js normalizes HTTP
    header keys to lowercase before the pipeline sees them; the parse reads
@@ -218,24 +236,43 @@ distinct system prompts on the same session-id header. Over-key cheap,
 under-key silently wrong. Match `deferred-tool-rewrite`'s three-part key
 (session-id + system-prompt hash + conversation sub-key).
 
-### Q3. Endpoint scope — pipeline route filter (R0-added, revised by Codex R1)
+### Q3. Endpoint scope — pipeline route filter + `ctx.meta.path` guard
 
-R0 originally proposed `ctx.url === "/v1/messages"` as an in-extension
-guard. Codex R1 caught that `ctx.url` doesn't exist — `proxy/server.mjs`
-and `proxy/pipeline.mjs` construct the extension context with `body`,
-`headers`, `meta` only. But: the same review's fix suggestions
-(`ctx.meta.route === "messages"` or adding `url`/`pathname` to context)
-are both unnecessary — the pipeline (`proxy/pipeline.mjs:96-99`) already
-filters extensions by route, defaulting to `routes: ["messages"]` when the
-extension doesn't declare a `routes` array. Neither `deferred-tool-
-rewrite` nor `insertion-normalization` declare `routes:`; both inherit the
-messages-only default. Same mechanism, no extension body change needed.
+Third-time-revised. The progression is worth preserving so the next
+reviewer knows what was tried and why the current shape is the answer:
 
-**Resolved:** don't declare `routes:` in the extension export; rely on the
-pipeline's default. Encoded in the algorithm's preamble above and in the
-"Extension contract" section below. The count_tokens/batches subpath
-policy Codex asked for follows directly: not opted into, therefore never
-touched.
+- **R0 (AITL)**: "check `ctx.url === '/v1/messages'`" — reasoned from
+  HTTP analogy without reading pipeline context shape.
+- **R1 (Codex)**: caught `ctx.url` doesn't exist (`proxy/server.mjs:103,106`
+  build reqCtx with `body`, `headers`, `meta` only). Proposed either
+  `ctx.meta.route === "messages"` or adding `url`/`pathname` to the pipeline
+  contract.
+- **R1 fold (Proxy Builder)**: went one layer deeper into the pipeline
+  and found `proxy/pipeline.mjs:96-99`'s default `routes: ["messages"]`.
+  Removed the guard entirely, relied on the pipeline default. Claimed
+  count_tokens/batches "fall out" as never touched.
+- **R2 (Codex)**: caught that the pipeline default DOESN'T distinguish
+  subpaths. `server.mjs:514` dispatches any `POST /v1/messages*` to
+  `handleMessages`, which calls `preForward(..., "messages")` at line 155.
+  All subpaths ride `ctx.meta.route === "messages"`. Route filter alone
+  is not enough.
+- **R2 fold (this revision)**: add `{ path: clientReq.url }` as `baseMeta`
+  to the two `preForward()` call sites in `server.mjs` (handleMessages line
+  155 + handleBootstrap line 275 for symmetry). Extension does exact-
+  pathname guard in algorithm step 0 above. This is Codex R1's option 2
+  (`add url/pathname to context`) — the option R1-fold prematurely
+  rejected as unnecessary because the pipeline default appeared sufficient.
+  It wasn't; option 2 is now the right answer.
+
+**Resolved:** pipeline route filter narrows to `messages` dispatcher;
+extension step 0 narrows to exact `/v1/messages` pathname via
+`ctx.meta.path`. `count_tokens`, `batches`, admin routes: no-op.
+Explicitly tested — see Tests 20a, 20b, 20c below.
+
+**Discipline banked:** three layers of the same-file miss in one PR
+cycle. Memory `feedback-read-further-than-the-immediate-question` added
+2026-08-11 — "read further than the immediate question requires" is the
+rule that would have collapsed this into a single R0 pass.
 
 ## Extension contract
 
@@ -250,8 +287,11 @@ touched.
 - **Order:** 450 (between `deferred-tool-rewrite`/425 and
   `ttl-management`/500 — see "Order" above)
 - **Routes:** default (`["messages"]`) — do NOT declare a `routes:` field.
-  See "Q3. Endpoint scope" below for why.
-- **Hook:** `onRequest(ctx)` — reads and rewrites `ctx.headers`
+  See "Q3. Endpoint scope" below for why (spoiler: pipeline route filter
+  narrows to the `messages` dispatcher; extension body then narrows to the
+  exact `/v1/messages` pathname via `ctx.meta.path`).
+- **Hook:** `onRequest(ctx)` — reads `ctx.meta.path` for pathname
+  discrimination; reads and rewrites `ctx.headers`
 - **In-PR telemetry surface:** DTR-style per-session-key event log at
   `${cache-fix-snapshots}/${sessionKey}-anthropic-beta-events.jsonl`,
   one JSONL row per invocation with `{ ts, key, sid, action, adds,
@@ -264,6 +304,8 @@ touched.
   - `parseBetaHeader(rawHeaderValue) → Set<string>`
   - `canonicalizeBetaTokens(Set<string>) → string`
   - `resolveBetaSessionKey(headers, body) → string`
+  - `extractPathname(rawPath) → string | null` — strips `?query` and
+    `#fragment`; returns `null` for undefined/empty input
   - `ALWAYS_PASSTHROUGH_TOKENS: readonly string[]` — the whitelist constant
   - `default.onRequest(ctx)` — the composed extension
 
@@ -338,16 +380,36 @@ closest prior art for the shape and idiom expected here.
     two rows; each row is valid JSON parseable back to the emitted shape.
     Test uses tmpdir-injected snapshot dir via the same pattern
     deferred-tool-rewrite's tests use.
-20. **Route filter (pipeline-level, not extension-body)**: the extension's
-    default export does NOT declare a `routes` field. Verified by
-    `assert.equal(defaultExport.routes, undefined)`. Pipeline behavior for
-    the messages-only default is exercised by existing pipeline tests
-    (`test/proxy-pipeline.test.mjs`) and is not re-tested here — this
-    single assertion is the contract check.
+20. **Route filter contract (extension body)**: the extension's default
+    export does NOT declare a `routes` field. Verified by
+    `assert.equal(defaultExport.routes, undefined)` — pipeline behavior is
+    exercised in `test/proxy-pipeline.test.mjs`.
+
+21. **Pathname guard: `/v1/messages/count_tokens` no-op**. `ctx` has
+    `meta.path = "/v1/messages/count_tokens"` and a valid `body` +
+    `anthropic-beta` header. Assert: no state written to the in-memory Map,
+    no telemetry row appended to the per-session event log, `ctx.headers`
+    unchanged, `ctx.meta.betaStabilizeStats` not set.
+
+22. **Pathname guard: `/v1/messages/batches` no-op**. Same shape as 21
+    with path `/v1/messages/batches`.
+
+23. **Pathname guard: exact `/v1/messages` DOES run**. Same shape but
+    path `/v1/messages` — assert extension executed normally (state
+    written, event row appended, header rewritten if non-empty pinned
+    Set, stats populated).
+
+24. **Pathname guard: `/v1/messages?trace=1` DOES run**. Query strings
+    are stripped before comparison; `?trace=1` is a valid /v1/messages
+    request with a query param. Assert extension executed.
+
+25. **Pathname guard: missing `ctx.meta.path`**. If preForward hasn't been
+    updated (regression scenario), the extension MUST no-op (fail-safe).
+    Assert no-op on `ctx.meta.path === undefined`.
 
 ## Acceptance
 
-- All 20 new tests pass; full proxy test suite green
+- All 25 new tests pass; full proxy test suite green
 - Extension registered in `proxy/extensions.json` at order 450, `enabled:
   true`
 - Live A/B verification on the beta soak host: enable the gate and confirm
