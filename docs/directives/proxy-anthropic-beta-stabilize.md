@@ -443,5 +443,17 @@ closest prior art for the shape and idiom expected here.
   the pattern already established for `deferred_tool_rewrite_stats` and
   `insertion_normalization_stats`. Enables 6-month-later debugging without
   a proxy-side event-log scan. Track in a follow-on issue after this ships.
+- **Pipeline-level regression test for default-routed extensions**
+  (Codex R2 recommendation) — `test/proxy-pipeline.test.mjs` currently
+  covers load order, enabled/config, hook execution, error isolation,
+  stream hooks, snapshots, and failed-extension bookkeeping, but does not
+  have an explicit case for the `ext.routes || ["messages"]` default. Add
+  a small test in that file (1-2 assertions) covering the case a
+  default-routed extension is called under `ctx.meta.route = "messages"`
+  and skipped under any other route. Not in-scope for this PR (this PR's
+  test file is the extension's own, and its Test 20 already covers the
+  `defaultExport.routes === undefined` extension-side contract), but the
+  pipeline-side counterpart is worth having as a hygiene item — Codex R2
+  flagged it as absent and it wouldn't cost much to add.
 
 — Proxy Builder
