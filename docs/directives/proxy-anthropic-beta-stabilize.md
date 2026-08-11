@@ -68,14 +68,19 @@ absorbs (#273): the client is not in a position to recognize what it just cost.
 
 Per-request `onRequest(ctx)`:
 
-0. **URL guard** — if `ctx.url !== "/v1/messages"`, no-op. (`deferred-tool-
-   rewrite` and `insertion-normalization` narrow implicitly via `body.tools`
-   / `body.messages`; the stabilizer only reads the header, so an explicit
-   URL check is required or it would run on `/v1/complete`, `/v1/models`,
-   admin endpoints, etc.)
-1. Parse the incoming `anthropic-beta` header into a Set of trimmed
-   non-empty tokens. Accept BOTH `,` and ` ` as separators (CC has been
-   observed emitting both within the same run — see design note in #326).
+Route filtering is handled by the pipeline (`proxy/pipeline.mjs:96-99`).
+Extensions default to `routes: ["messages"]` when they don't declare a
+`routes` array; the pipeline skips `onRequest` for any other route. This
+extension does **not** declare `routes:` and inherits that default. As a
+result `/v1/messages/count_tokens`, `/v1/messages/batches`, admin routes,
+and any future non-`messages` addition are never invoked — no explicit
+guard in the extension body is required or wanted.
+
+1. Parse the incoming `anthropic-beta` header (Node.js normalizes HTTP
+   header keys to lowercase before the pipeline sees them; the parse reads
+   `ctx.headers["anthropic-beta"]` directly) into a Set of trimmed non-empty
+   tokens. Accept BOTH `,` and ` ` as separators (CC has been observed
+   emitting both within the same run — see design note in #326).
 2. Resolve session key via the same `resolveSessionId(headers)` idiom used by
    `deferred-tool-rewrite` and `insertion-normalization`. Sub-key by system-
    prompt hash and conversation-sub-key (see "Session key" below).
@@ -92,10 +97,10 @@ Per-request `onRequest(ctx)`:
      removes are logged but not forwarded. Telemetry: `action=pinned,
      adds=[...], removes=[...], passthrough=[...]`.
 4. Emit the canonical form: sort the emitted Set ASCII-ascending, join with
-   `", "` (comma+space), write to whichever header key the incoming request
-   used (case-preserving), or default to `"anthropic-beta"` if incoming had no
-   such header at all. If the emitted Set is empty (rare — first-seen session
-   with no beta header), emit no header at all.
+   `", "` (comma+space), write to `ctx.headers["anthropic-beta"]`. If the
+   emitted Set is empty (rare — first-seen session with no beta header),
+   emit no header at all. (Node's HTTP layer lowercases header keys before
+   the pipeline runs, so there is no case-preservation concern to solve.)
 
 ### Always-passthrough whitelist
 
@@ -213,14 +218,24 @@ distinct system prompts on the same session-id header. Over-key cheap,
 under-key silently wrong. Match `deferred-tool-rewrite`'s three-part key
 (session-id + system-prompt hash + conversation sub-key).
 
-### Q3. Endpoint scope — URL-guard on `/v1/messages`
+### Q3. Endpoint scope — pipeline route filter (R0-added, revised by Codex R1)
 
-Added by R0. `deferred-tool-rewrite` and `insertion-normalization` narrow
-implicitly via `body.tools` / `body.messages` presence. This extension only
-reads the header, so it needs an explicit `ctx.url === "/v1/messages"`
-guard or it would fire on `/v1/complete`, admin endpoints, and any future
-addition that carries an `anthropic-beta` header. Encoded as step 0 of the
-algorithm above.
+R0 originally proposed `ctx.url === "/v1/messages"` as an in-extension
+guard. Codex R1 caught that `ctx.url` doesn't exist — `proxy/server.mjs`
+and `proxy/pipeline.mjs` construct the extension context with `body`,
+`headers`, `meta` only. But: the same review's fix suggestions
+(`ctx.meta.route === "messages"` or adding `url`/`pathname` to context)
+are both unnecessary — the pipeline (`proxy/pipeline.mjs:96-99`) already
+filters extensions by route, defaulting to `routes: ["messages"]` when the
+extension doesn't declare a `routes` array. Neither `deferred-tool-
+rewrite` nor `insertion-normalization` declare `routes:`; both inherit the
+messages-only default. Same mechanism, no extension body change needed.
+
+**Resolved:** don't declare `routes:` in the extension export; rely on the
+pipeline's default. Encoded in the algorithm's preamble above and in the
+"Extension contract" section below. The count_tokens/batches subpath
+policy Codex asked for follows directly: not opted into, therefore never
+touched.
 
 ## Extension contract
 
@@ -234,7 +249,17 @@ algorithm above.
   pattern for anything that changes what we send upstream)
 - **Order:** 450 (between `deferred-tool-rewrite`/425 and
   `ttl-management`/500 — see "Order" above)
+- **Routes:** default (`["messages"]`) — do NOT declare a `routes:` field.
+  See "Q3. Endpoint scope" below for why.
 - **Hook:** `onRequest(ctx)` — reads and rewrites `ctx.headers`
+- **In-PR telemetry surface:** DTR-style per-session-key event log at
+  `${cache-fix-snapshots}/${sessionKey}-anthropic-beta-events.jsonl`,
+  one JSONL row per invocation with `{ ts, key, sid, action, adds,
+  removes, passthrough, pinned }`. Same directory and file-naming idiom
+  as `deferred-tool-rewrite`'s `<sessionKey>-deferred-tool-events.jsonl`
+  (deferred-tool-rewrite.mjs:177). This satisfies Codex R1's requirement
+  for durable per-request telemetry in-PR; the `usage.jsonl` integration
+  remains a follow-on.
 - **Exports for tests:**
   - `parseBetaHeader(rawHeaderValue) → Set<string>`
   - `canonicalizeBetaTokens(Set<string>) → string`
@@ -261,8 +286,10 @@ closest prior art for the shape and idiom expected here.
    still contains `beta2`; telemetry entry has `removes=["beta2"]`
 7. Delta-both: turn 2 both adds and removes; both diffs telemetried; pinned
    set forwarded
-8. Case-preserving header key: incoming used `Anthropic-Beta`; outgoing uses
-   the same case
+8. Header key is always lowercase `anthropic-beta` on the outgoing
+   `ctx.headers` (Node lowercases incoming headers; no case-preservation
+   needed — this test just guards against a regression that re-introduces
+   case-sensitive key handling)
 9. Missing header first-seen: incoming has no `anthropic-beta`; pinned Set is
    empty; outgoing has no `anthropic-beta`
 10. Missing header on a session with a non-empty pinned Set: incoming has no
@@ -291,20 +318,36 @@ closest prior art for the shape and idiom expected here.
     mutation via passed-by-reference on the pinned Set)
 16. `ctx.meta.betaStabilizeStats` populated with
     `{ action, adds, removes, passthrough }` on every action
-17. **URL guard**: `ctx.url === "/v1/complete"` with a beta header does NOT
-    invoke the extension (no state written, no header rewritten, no
-    telemetry emitted). Also verify `ctx.url === "/v1/models"` and an
-    admin path both no-op.
-18. **Whitelist token isolation**: pinned Set is `{a, b}`; incoming has
+17. **Whitelist token isolation**: pinned Set is `{a, b}`; incoming has
     `{a, b, mid-conversation-tool-changes-2026-07-01}`. Outgoing header
     contains `{a, b, mid-conversation-tool-changes-2026-07-01}` and
     telemetry has `passthrough=["mid-conversation-tool-changes-2026-07-01"]`,
     `adds=[]`, `removes=[]`. Whitelist token was recognized as
     passthrough, not counted as a delta-add.
+18. **Empty-pin + non-whitelist add**: first-seen session had no
+    `anthropic-beta` header (pinned Set is empty). Turn 2 adds a
+    non-whitelist token like `beta-x`. Outgoing has NO `anthropic-beta`
+    header (pinned Set stays empty, `beta-x` is a delta-add and stripped);
+    telemetry records `adds=["beta-x"]`, `removes=[]`, `passthrough=[]`.
+    Covers the edge case where the "emit nothing if empty" clause
+    interacts with delta-add accounting.
+19. **Per-session event-log file**: onRequest invocations append one JSONL
+    row per call to `${snapshotDir}/${sessionKey}-anthropic-beta-events.jsonl`
+    with `{ ts, key, sid, action, adds, removes, passthrough, pinned }`.
+    Verify: file exists after first invocation; two invocations produce
+    two rows; each row is valid JSON parseable back to the emitted shape.
+    Test uses tmpdir-injected snapshot dir via the same pattern
+    deferred-tool-rewrite's tests use.
+20. **Route filter (pipeline-level, not extension-body)**: the extension's
+    default export does NOT declare a `routes` field. Verified by
+    `assert.equal(defaultExport.routes, undefined)`. Pipeline behavior for
+    the messages-only default is exercised by existing pipeline tests
+    (`test/proxy-pipeline.test.mjs`) and is not re-tested here — this
+    single assertion is the contract check.
 
 ## Acceptance
 
-- All 18 new tests pass; full proxy test suite green
+- All 20 new tests pass; full proxy test suite green
 - Extension registered in `proxy/extensions.json` at order 450, `enabled:
   true`
 - Live A/B verification on the beta soak host: enable the gate and confirm
@@ -315,8 +358,10 @@ closest prior art for the shape and idiom expected here.
 - Chris human review before merge (load-bearing per NFR § above)
 - CHANGELOG update deferred to release-PR (matches `deferred-tool-rewrite`
   precedent)
-- Header comment in the extension names both design choices explicitly:
-  strict-pin vs monotonic-union, and the in-memory state lifetime
+- Header comment in the extension names three design choices explicitly:
+  strict-pin vs monotonic-union, the in-memory state lifetime, and the
+  reliance on the pipeline's default route filter (why no `routes:` field
+  and no `ctx.url` check)
 
 ## Out of scope
 
