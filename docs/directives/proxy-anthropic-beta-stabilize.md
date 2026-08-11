@@ -49,12 +49,19 @@ absorbs (#273): the client is not in a position to recognize what it just cost.
   passes through.
 - **Maintainability constraints** — one new file (`proxy/extensions/anthropic-
   beta-stabilize.mjs`), one line in `proxy/extensions.json`, one test file
-  (`test/proxy-anthropic-beta-stabilize.test.mjs`), and a two-line change to
-  `proxy/server.mjs` (add `{ path: clientReq.url }` as the sixth argument to
-  the two `preForward()` call sites — `handleMessages` line 155 and
-  `handleBootstrap` line 275). The server.mjs addition is in scope per Codex
-  R2: it fixes the subpath discrimination the pipeline route filter can't
-  provide. No new abstractions. The header parse/join idiom mirrors
+  (`test/proxy-anthropic-beta-stabilize.test.mjs`), and a **one-line change
+  to `proxy/server.mjs`**: add `{ path: clientReq.url }` as the sixth
+  argument to the `preForward()` call in `handleMessages` (line 155 — this
+  site does not currently pass a `baseMeta`, so the added object IS the
+  `baseMeta`; nothing to merge). `handleBootstrap`'s `preForward()` call
+  (line 275) is deliberately left alone: it already populates `baseMeta`
+  with `_bootstrapUpstreamHost` and `_bootstrapRequestId` for audit, and
+  this extension's route filter (default `["messages"]`) never fires on
+  the `bootstrap` route regardless. When a future extension needs `path`
+  on the bootstrap route, add it there (as `{ ...baseMeta, path:
+  clientReq.url }`, merged in — not replaced). The server.mjs addition is
+  in scope per Codex R2: it fixes the subpath discrimination the pipeline
+  route filter can't provide. No new abstractions. The header parse/join idiom mirrors
   `deferred-tool-rewrite`'s existing `parseBetaTokens`/`addBetaToken`
   (which are also the closest thing to prior art in this repo); if the shape
   converges further during review, factor to a shared helper — otherwise
@@ -82,12 +89,16 @@ distinguish `/v1/messages` from `/v1/messages/count_tokens` or
 (review: `pullrequestreview-4910070912`).
 
 Fix (this directive): a minimal pipeline contract addition — pass
-`{ path: clientReq.url }` as `baseMeta` to `preForward()` at both call
-sites (`handleMessages` line 155, `handleBootstrap` line 275 for
-symmetry — bootstrap route already only serves one path but the
-add-both-sites approach keeps future symmetric routes trivial). Extension
-reads `ctx.meta.path`, computes pathname (strip `?query`, `#fragment`),
-no-ops when pathname is not exactly `/v1/messages`.
+`{ path: clientReq.url }` as `baseMeta` to `preForward()` at the
+`handleMessages` call site only (line 155). That site currently has no
+`baseMeta` argument, so the added object IS the `baseMeta`; no merge
+needed and no risk of clobbering existing meta.  Do NOT modify
+`handleBootstrap`'s call (line 275) — it already populates `baseMeta`
+with `_bootstrapUpstreamHost` and `_bootstrapRequestId` for audit, and
+this extension's route filter (default `["messages"]`) never fires on
+the `bootstrap` route regardless. Extension reads `ctx.meta.path`,
+computes pathname (strip `?query`, `#fragment`), no-ops when pathname is
+not exactly `/v1/messages`.
 
 0. **Pathname guard** — let `p = (ctx.meta.path || "").split("?")[0].split("#")[0]`;
    if `p !== "/v1/messages"`, no-op. Guards against `/v1/messages/count_tokens`,
@@ -256,13 +267,19 @@ reviewer knows what was tried and why the current shape is the answer:
   `handleMessages`, which calls `preForward(..., "messages")` at line 155.
   All subpaths ride `ctx.meta.route === "messages"`. Route filter alone
   is not enough.
-- **R2 fold (this revision)**: add `{ path: clientReq.url }` as `baseMeta`
-  to the two `preForward()` call sites in `server.mjs` (handleMessages line
-  155 + handleBootstrap line 275 for symmetry). Extension does exact-
-  pathname guard in algorithm step 0 above. This is Codex R1's option 2
-  (`add url/pathname to context`) — the option R1-fold prematurely
-  rejected as unnecessary because the pipeline default appeared sufficient.
-  It wasn't; option 2 is now the right answer.
+- **R2 fold (this revision)**: add `{ path: clientReq.url }` as
+  `baseMeta` to the `preForward()` call in `handleMessages` (line 155)
+  only — that site has no existing `baseMeta`, so the added object IS the
+  baseMeta and no merge is needed. `handleBootstrap` (line 275) is left
+  alone — it already populates `baseMeta` for audit and this extension's
+  route filter never fires on the bootstrap route regardless (AITL
+  caught this ambiguity before R3 dispatch; earlier draft said "both
+  call sites for symmetry" which would have required a merge at the
+  bootstrap site to avoid clobbering the audit fields). Extension does
+  exact-pathname guard in algorithm step 0 above. This is Codex R1's
+  option 2 (`add url/pathname to context`) — the option R1-fold
+  prematurely rejected as unnecessary because the pipeline default
+  appeared sufficient. It wasn't; option 2 is now the right answer.
 
 **Resolved:** pipeline route filter narrows to `messages` dispatcher;
 extension step 0 narrows to exact `/v1/messages` pathname via
