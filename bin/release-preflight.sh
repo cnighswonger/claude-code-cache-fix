@@ -24,11 +24,13 @@ set -uo pipefail
 # --- args ---
 
 SKIP_RUNNING_VERSION=0
+SELF_TEST=0
 LAST_TAG=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --skip-running-version) SKIP_RUNNING_VERSION=1; shift ;;
+        --self-test) SELF_TEST=1; shift ;;
         -h|--help)
             cat <<'EOF'
 Usage: bin/release-preflight.sh <last-tag> [--skip-running-version]
@@ -40,6 +42,8 @@ exits 0 if all checks pass, 1 if any check fires, 2 on usage error.
 Options:
   --skip-running-version  Skip check 7 (local :9801 /health query).
                           Use on CI or a host without the proxy running.
+  --self-test             Run the parser regression fixtures and exit.
+                          No git/gh calls; no <last-tag> required.
 
 Checks:
   1. Every PR author merged since <last-tag> appears in README Contributors
@@ -76,8 +80,115 @@ EOF
     esac
 done
 
+# --- self-test (parser regression fixtures) ---
+#
+# Each Codex R1 finding on PR #332 (2026-08-12) is guarded by a
+# fixture here. If a future refactor regresses any of these behaviors,
+# --self-test surfaces the specific breakage before it reaches a real
+# release preflight run. No git/gh calls; runs standalone.
+if [ "$SELF_TEST" -eq 1 ]; then
+    SELF_FAIL=0
+
+    run_case() {
+        # $1 = case name, $2 = expected, $3 = actual
+        local name="$1" expected="$2" actual="$3"
+        if [ "$expected" = "$actual" ]; then
+            printf '  PASS  %s\n' "$name"
+        else
+            printf '  FAIL  %s\n' "$name"
+            printf '        expected:\n%s\n' "$expected" | sed 's/^/          /'
+            printf '        actual:\n%s\n' "$actual" | sed 's/^/          /'
+            SELF_FAIL=$((SELF_FAIL + 1))
+        fi
+    }
+
+    echo "== self-test: fetch_coauthored_handles =="
+    # Feeds a fixture directly through the parser regex — bypasses
+    # fetch_coauthored_trailers_raw's bot filter so the fixture stays
+    # legible. Directly exercises the noreply-shape regex Codex flagged.
+    FIXTURE=$(cat <<'EOF'
+<111+alice@users.noreply.github.com>
+<bob@users.noreply.github.com>
+<carol@example.com>
+<222+dave@users.noreply.github.com>
+EOF
+)
+    ACTUAL=$(printf '%s\n' "$FIXTURE" \
+        | grep -oE '<([0-9]+\+)?[A-Za-z0-9][A-Za-z0-9-]*@users\.noreply\.github\.com>' \
+        | sed -E 's/^<([0-9]+\+)?([A-Za-z0-9][A-Za-z0-9-]*)@.*/\2/' \
+        | sort -uf)
+    EXPECTED=$(printf 'alice\nbob\ndave')
+    run_case "extract handles from both NNN+handle and handle-only noreply shapes" "$EXPECTED" "$ACTUAL"
+
+    UNKNOWN_ACTUAL=$(printf '%s\n' "$FIXTURE" \
+        | grep -vE '<([0-9]+\+)?[A-Za-z0-9][A-Za-z0-9-]*@users\.noreply\.github\.com>' \
+        | sort -uf)
+    UNKNOWN_EXPECTED='<carol@example.com>'
+    run_case "surface non-noreply trailer as UNKNOWN" "$UNKNOWN_EXPECTED" "$UNKNOWN_ACTUAL"
+
+    echo
+    echo "== self-test: fetch_commit_body_handles regex =="
+    # The @users false-positive Codex caught: prose discussing @users
+    # separately from the domain reference must be excluded.
+    FIXTURE=$(cat <<'EOF'
+Thanks to @Victor-Sun for the report.
+Old code was matching @users out of email domains
+users.noreply.github.com because of a loose regex.
+Also credit @1Password for their SSH-agent integration.
+This is not a mention: user@example.com
+Co-authored-by: bob <bob@users.noreply.github.com>
+EOF
+)
+    ACTUAL=$(printf '%s\n' "$FIXTURE" \
+        | grep -viE '^Co-authored-by:|^Signed-off-by:|users\.noreply\.github\.com' \
+        | grep -oE '(^|[[:space:](\[{,;:!?—])@[A-Za-z0-9][A-Za-z0-9-]{0,38}\b' \
+        | sed -E 's/.*@//' \
+        | grep -viE '^(users|orgs|repos|settings|apps|login|noreply|features|marketplace|topics|explore|trending)$' \
+        | sort -uf)
+    # Order after sort -uf: 1Password, Victor-Sun
+    EXPECTED=$(printf '1Password\nVictor-Sun')
+    run_case "extract @Victor-Sun and @1Password, exclude @users prose and email context" "$EXPECTED" "$ACTUAL"
+
+    echo
+    echo "== self-test: reserved-name exclude =="
+    # Explicit fixture: bare @users, @orgs, @repos should be filtered
+    FIXTURE_LINE='See the @users page and @repos endpoint and @orgs list.'
+    ACTUAL=$(printf '%s\n' "$FIXTURE_LINE" \
+        | grep -oE '(^|[[:space:](\[{,;:!?—])@[A-Za-z0-9][A-Za-z0-9-]{0,38}\b' \
+        | sed -E 's/.*@//' \
+        | grep -viE '^(users|orgs|repos|settings|apps|login|noreply|features|marketplace|topics|explore|trending)$' \
+        | sort -uf)
+    EXPECTED=''
+    run_case "reserved URL-path segments do NOT surface as candidate handles" "$EXPECTED" "$ACTUAL"
+
+    echo
+    echo "== self-test: enhancement-or-feat PR filter (mocked JSON) =="
+    # Fixture: simulate gh's --json output with three PRs
+    FIXTURE_JSON='[
+      {"number": 1, "title": "feat(x): thing", "labels": []},
+      {"number": 2, "title": "fix(y): thing", "labels": [{"name": "enhancement"}]},
+      {"number": 3, "title": "chore(z): thing", "labels": []},
+      {"number": 4, "title": "docs(w): thing", "labels": [{"name": "documentation"}]}
+    ]'
+    ACTUAL=$(printf '%s' "$FIXTURE_JSON" \
+        | jq -r '.[] | select((.labels | map(.name) | any(. == "enhancement")) or (.title | startswith("feat("))) | .number' \
+        | sort -n)
+    EXPECTED=$(printf '1\n2')
+    run_case "select PRs with enhancement label OR feat( title (not chore/docs/fix-only)" "$EXPECTED" "$ACTUAL"
+
+    echo
+    if [ "$SELF_FAIL" -eq 0 ]; then
+        echo "self-test: all parser fixtures pass"
+        exit 0
+    else
+        echo "self-test: ${SELF_FAIL} fixture(s) failed"
+        exit 1
+    fi
+fi
+
 if [ -z "$LAST_TAG" ]; then
     echo "Usage: $0 <last-tag> [--skip-running-version]" >&2
+    echo "       $0 --self-test" >&2
     exit 2
 fi
 
@@ -171,34 +282,67 @@ fetch_pr_authors_since_tag() {
         | sort -uf
 }
 
-# All @handle mentions in commit bodies over the range. Handles must
-# start with a letter (GH constraint), 1-39 chars. Filters:
+# Reserved URL-path segments and API namespaces that appear in prose
+# and would be picked up by the @-mention regex, but are never
+# legitimate credit targets. Not a full block-list of reserved GitHub
+# names — just the ones observed in this repo's commit bodies. Codex
+# R1 on PR #332 (2026-08-12) caught @users slipping through when the
+# fix commit message discussed "@users" in prose separately from the
+# domain line the earlier filter was targeting.
+COMMIT_BODY_HANDLE_EXCLUDES='users|orgs|repos|settings|apps|login|noreply|features|marketplace|topics|explore|trending'
+
+# All @handle mentions in commit bodies over the range. Handles: 1-39
+# chars, alphanumeric with optional single hyphens; may start with a
+# digit (Codex R1 caught the @1Password / @1password regression — GH
+# signup does NOT require a leading letter). Filters:
 #   - Skip trailer lines (Co-authored-by:, Signed-off-by:) entirely —
 #     those go through fetch_coauthored_handles with proper parsing.
 #   - Skip lines containing a users.noreply.github.com email — this
 #     defends against emails like <279815601+vsits-proxy-builder[bot]@
 #     users.noreply.github.com> matching "@users" via the loose char
-#     class (this was the retro-test false positive of 2026-08-12).
+#     class.
 #   - Require the @ to be preceded by whitespace or a
 #     conversational-punctuation char, not an email/URL residue char.
+#   - Exclude reserved URL-path segments (see COMMIT_BODY_HANDLE_EXCLUDES).
 fetch_commit_body_handles() {
     git log "$RANGE" --format='%b' \
         | grep -viE '^Co-authored-by:|^Signed-off-by:|users\.noreply\.github\.com' \
-        | grep -oE '(^|[[:space:](\[{,;:!?—])@[A-Za-z][A-Za-z0-9-]{0,38}\b' \
+        | grep -oE '(^|[[:space:](\[{,;:!?—])@[A-Za-z0-9][A-Za-z0-9-]{0,38}\b' \
         | sed -E 's/.*@//' \
+        | grep -viE "^(${COMMIT_BODY_HANDLE_EXCLUDES})$" \
         | sort -uf
 }
 
-# All Co-authored-by: emails/handles in commit trailers over the range.
-# Only handles whose email is at users.noreply.github.com are convertible
-# to a login without an extra lookup; others are surfaced as-is for
-# manual verification. Bots and Anthropic-model identities excluded.
-fetch_coauthored_handles() {
+# Co-authored-by trailer parser. GitHub noreply emails come in TWO
+# shapes: <NNN+handle@users.noreply.github.com> (new-style, with
+# numeric user-id prefix) and <handle@users.noreply.github.com>
+# (legacy). Codex R1 on PR #332 (2026-08-12) caught that the earlier
+# version only matched the new-style shape and silently dropped
+# legacy-style + real-email trailers. Both shapes are converted to
+# the handle; real-email trailers are surfaced separately as
+# UNKNOWN via fetch_coauthored_unknown so the reviewer can verify
+# them manually (real emails don't cleanly map to a login).
+#
+# Bots and Anthropic-model identities excluded.
+fetch_coauthored_trailers_raw() {
     git log "$RANGE" --format='%(trailers:key=Co-authored-by,valueonly)' \
         | grep -vE '^$' \
-        | grep -viE 'noreply@anthropic\.com|-bot@|\[bot\]@' \
-        | grep -oE '<[0-9]+\+([A-Za-z0-9-]+)@users\.noreply\.github\.com>' \
-        | sed -E 's/.*\+([A-Za-z0-9-]+)@.*/\1/' \
+        | grep -viE 'noreply@anthropic\.com|-bot@|\[bot\]@|users\.noreply\.github\.com>\s*$.*bot'
+}
+
+fetch_coauthored_handles() {
+    fetch_coauthored_trailers_raw \
+        | grep -oE '<([0-9]+\+)?[A-Za-z0-9][A-Za-z0-9-]*@users\.noreply\.github\.com>' \
+        | sed -E 's/^<([0-9]+\+)?([A-Za-z0-9][A-Za-z0-9-]*)@.*/\2/' \
+        | sort -uf
+}
+
+# Trailer lines whose email is NOT the noreply shape — a real email
+# that we can't safely map to a login without a per-email API lookup.
+# These are surfaced as UNKNOWN so the reviewer can verify by hand.
+fetch_coauthored_unknown() {
+    fetch_coauthored_trailers_raw \
+        | grep -vE '<([0-9]+\+)?[A-Za-z0-9][A-Za-z0-9-]*@users\.noreply\.github\.com>' \
         | sort -uf
 }
 
@@ -234,6 +378,7 @@ fi
 section "Co-authored-by trailer coverage in README Contributors"
 
 COAUTHORED=$(fetch_coauthored_handles)
+UNKNOWN_TRAILERS=$(fetch_coauthored_unknown)
 
 MISSING=""
 while IFS= read -r author; do
@@ -243,16 +388,39 @@ while IFS= read -r author; do
     fi
 done <<< "$COAUTHORED"
 
+MISSING_COUNT=0
 if [ -n "$MISSING" ]; then
     MISSING_LIST=$(printf '%s' "$MISSING" | sed '/^$/d')
-    MISSING_COUNT=$(printf '%s\n' "$MISSING_LIST" | wc -l)
-    fail "$MISSING_COUNT" "MISSING Co-authored-by handles:"
-    while IFS= read -r m; do
-        [ -z "$m" ] && continue
-        echo "    - @${m}"
-    done <<< "$MISSING_LIST"
-else
+    if [ -n "$MISSING_LIST" ]; then
+        MISSING_COUNT=$(printf '%s\n' "$MISSING_LIST" | wc -l)
+    fi
+fi
+
+UNKNOWN_COUNT=0
+if [ -n "$UNKNOWN_TRAILERS" ]; then
+    UNKNOWN_LIST=$(printf '%s' "$UNKNOWN_TRAILERS" | sed '/^$/d')
+    if [ -n "$UNKNOWN_LIST" ]; then
+        UNKNOWN_COUNT=$(printf '%s\n' "$UNKNOWN_LIST" | wc -l)
+    fi
+fi
+
+if [ "$MISSING_COUNT" -eq 0 ] && [ "$UNKNOWN_COUNT" -eq 0 ]; then
     pass
+else
+    if [ "$MISSING_COUNT" -gt 0 ]; then
+        fail "$MISSING_COUNT" "MISSING Co-authored-by handles:"
+        while IFS= read -r m; do
+            [ -z "$m" ] && continue
+            echo "    - @${m}"
+        done <<< "$MISSING_LIST"
+    fi
+    if [ "$UNKNOWN_COUNT" -gt 0 ]; then
+        fail "$UNKNOWN_COUNT" "UNKNOWN Co-authored-by trailers (real email, cannot auto-map to a GH login — verify by hand):"
+        while IFS= read -r u; do
+            [ -z "$u" ] && continue
+            echo "    - ${u}"
+        done <<< "$UNKNOWN_LIST"
+    fi
 fi
 
 # ---------- Check 3: @-handles in commit bodies covered ----------
@@ -370,7 +538,7 @@ fi
 
 # ---------- Check 5: 'enhancement' PRs referenced in CHANGELOG additions ----------
 
-section "Every 'enhancement' PR since ${LAST_TAG} referenced in CHANGELOG additions"
+section "Every 'enhancement' or feat( PR since ${LAST_TAG} referenced in CHANGELOG additions"
 
 # Look for PR numbers in the CHANGELOG DIFF since the last tag, not just
 # the Unreleased section. This covers both workflows:
@@ -383,11 +551,15 @@ section "Every 'enhancement' PR since ${LAST_TAG} referenced in CHANGELOG additi
 # whose number happens to appear in an OLDER release's entry.
 CHANGELOG_ADDS=$(git diff "${LAST_TAG}..HEAD" -- "$CHANGELOG" | grep -E '^\+' || true)
 
-# All PR numbers with enhancement label merged since the tag
+# All merged PRs in range that are either labelled 'enhancement' OR
+# whose title starts with 'feat(' (Conventional Commits marker).
+# Directive #324 spec: "Every merged PR labelled `enhancement` (or with
+# a `feat(` commit)". Codex R1 caught that label-only filtering silently
+# passed 7 feat-commits missing labels on the v4.3.0..HEAD test range.
 readarray -t ENHANCE_PRS < <(
-    gh pr list --state merged --search "merged:>=$(tag_iso_date) label:enhancement" \
-        --limit 200 --json number \
-        --jq '.[] | .number'
+    gh pr list --state merged --search "merged:>=$(tag_iso_date)" \
+        --limit 200 --json number,title,labels \
+        --jq '.[] | select((.labels | map(.name) | any(. == "enhancement")) or (.title | startswith("feat("))) | .number'
 )
 
 MISSING_PRS=()
@@ -398,7 +570,7 @@ for n in "${ENHANCE_PRS[@]}"; do
 done
 
 if [ ${#MISSING_PRS[@]} -gt 0 ]; then
-    fail "${#MISSING_PRS[@]}" "MISSING 'enhancement' PRs from CHANGELOG additions since ${LAST_TAG}:"
+    fail "${#MISSING_PRS[@]}" "MISSING 'enhancement'/'feat(' PRs from CHANGELOG additions since ${LAST_TAG}:"
     for n in "${MISSING_PRS[@]}"; do
         title=$(gh pr view "$n" --json title --jq '.title' 2>/dev/null || echo "")
         echo "    - #${n}  ${title}"
