@@ -28,8 +28,26 @@ CACHE_TTL_5M = 300                # 5-minute ephemeral TTL
 CACHE_TTL_1H = 3600              # 1-hour extended TTL
 CONTEXT_THRESHOLD = 50_000        # Minimum tokens to recommend compact
 COMPACT_RESULT_ESTIMATE = 12_000  # Estimated tokens after compaction
-CACHE_CREATE_RATE_5M = 3.75       # Opus $/MTok for 5min cache writes
-CACHE_CREATE_RATE_1H = 7.50       # Opus $/MTok for 1h cache writes
+
+# Cache write pricing derives from base input rate × tier multiplier
+# (docs/benchmarking.md:19-22, docs/cost-report.md:164; matches the
+# weights tools/quota-analysis.mjs:57 uses). BASE_INPUT_RATE names
+# Sonnet 4.5 as the reference model — it is the closest to typical
+# advisor traffic, and using one model's rate throughout is a
+# deliberate approximation for a blended-model transcript; the
+# advisory recommendation this feeds does not require per-request
+# accuracy.
+#
+# Deriving both write rates from ONE base + TWO multipliers (rather
+# than storing two independent constants) is the fix for #330: the
+# prior hard-coded pair had drifted so that 1h = 2 × 5m instead of
+# 1h = 2 × base_input, overstating estimate_savings() on the 1h tier
+# by ~25%.
+CACHE_WRITE_MULT_5M = 1.25
+CACHE_WRITE_MULT_1H = 2.00
+BASE_INPUT_RATE = 3.00                                        # Sonnet 4.5 input $/MTok
+CACHE_CREATE_RATE_5M = BASE_INPUT_RATE * CACHE_WRITE_MULT_5M  # 3.75
+CACHE_CREATE_RATE_1H = BASE_INPUT_RATE * CACHE_WRITE_MULT_1H  # 6.00
 
 
 def read_tail_lines(filepath, n=300):
@@ -132,9 +150,11 @@ def format_duration(seconds):
 def estimate_savings(total_context, ttl_tier="5m"):
     """Estimate $ savings from compacting before a cold start.
 
-    Rate depends on the active cache TTL tier — 1h cache writes are 2x the
-    5m rate. Caller should pass the tier returned by detect_cache_ttl().
-    Default is the conservative 5m rate for backward compatibility.
+    Rate depends on the active cache TTL tier. Both rates derive from
+    BASE_INPUT_RATE (Sonnet 4.5) × the tier's write multiplier —
+    5m = 1.25×, 1h = 2.0× — per docs/benchmarking.md and
+    docs/cost-report.md. Caller should pass the tier returned by
+    detect_cache_ttl(); default is the 5m rate.
     """
     rate = CACHE_CREATE_RATE_1H if ttl_tier.startswith("1h") else CACHE_CREATE_RATE_5M
     cold_cost = (total_context / 1_000_000) * rate
