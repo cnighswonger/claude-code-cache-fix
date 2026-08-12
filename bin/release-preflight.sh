@@ -128,38 +128,44 @@ EOF
 
     echo
     echo "== self-test: fetch_commit_body_handles regex =="
-    # The @users false-positive Codex caught: prose discussing @users
-    # separately from the domain reference must be excluded.
+    # The @users false-positive Codex R1 caught: prose discussing @users
+    # separately from the domain reference must be excluded. Fixture
+    # simulates a feature-commit body (NOT a release-preflight commit,
+    # since those are filtered out at the git-log level upstream).
     FIXTURE=$(cat <<'EOF'
 Thanks to @Victor-Sun for the report.
 Old code was matching @users out of email domains
 users.noreply.github.com because of a loose regex.
 Also credit @1Password for their SSH-agent integration.
+Backtick-wrapped `@codeword` should NOT match — markdown-code convention.
 This is not a mention: user@example.com
 Co-authored-by: bob <bob@users.noreply.github.com>
 EOF
 )
     ACTUAL=$(printf '%s\n' "$FIXTURE" \
         | grep -viE '^Co-authored-by:|^Signed-off-by:|users\.noreply\.github\.com' \
+        | sed -E 's/`@[A-Za-z0-9][A-Za-z0-9-]*`//g' \
         | grep -oE '(^|[[:space:](\[{,;:!?—])@[A-Za-z0-9][A-Za-z0-9-]{0,38}\b' \
         | sed -E 's/.*@//' \
-        | grep -viE '^(users|orgs|repos|settings|apps|login|noreply|features|marketplace|topics|explore|trending)$' \
+        | grep -viE '^(users|orgs|repos|settings|apps|login|noreply|features|marketplace|topics|explore|trending|issues|pulls|packages|notifications|stars|watching|actions|projects|discussions|releases)$' \
         | sort -uf)
-    # Order after sort -uf: 1Password, Victor-Sun
+    # Order after sort -uf: 1Password, Victor-Sun.
+    # @users (prose, no context) excluded via reserved-name list.
+    # @codeword excluded via backtick-strip.
     EXPECTED=$(printf '1Password\nVictor-Sun')
-    run_case "extract @Victor-Sun and @1Password, exclude @users prose and email context" "$EXPECTED" "$ACTUAL"
+    run_case "extract @Victor-Sun and @1Password; exclude @users prose, backtick-wrapped @codeword, email context" "$EXPECTED" "$ACTUAL"
 
     echo
-    echo "== self-test: reserved-name exclude =="
-    # Explicit fixture: bare @users, @orgs, @repos should be filtered
-    FIXTURE_LINE='See the @users page and @repos endpoint and @orgs list.'
+    echo "== self-test: reserved-name exclude (broadened per AITL hygiene hint) =="
+    # Explicit fixture: bare @users, @orgs, @issues, @pulls should be filtered
+    FIXTURE_LINE='See the @users page, @repos endpoint, @orgs list, @issues tracker, @pulls queue, @actions runner.'
     ACTUAL=$(printf '%s\n' "$FIXTURE_LINE" \
         | grep -oE '(^|[[:space:](\[{,;:!?—])@[A-Za-z0-9][A-Za-z0-9-]{0,38}\b' \
         | sed -E 's/.*@//' \
-        | grep -viE '^(users|orgs|repos|settings|apps|login|noreply|features|marketplace|topics|explore|trending)$' \
+        | grep -viE '^(users|orgs|repos|settings|apps|login|noreply|features|marketplace|topics|explore|trending|issues|pulls|packages|notifications|stars|watching|actions|projects|discussions|releases)$' \
         | sort -uf)
     EXPECTED=''
-    run_case "reserved URL-path segments do NOT surface as candidate handles" "$EXPECTED" "$ACTUAL"
+    run_case "reserved URL-path segments (incl. AITL-added issues/pulls/etc.) do NOT surface" "$EXPECTED" "$ACTUAL"
 
     echo
     echo "== self-test: enhancement-or-feat PR filter (mocked JSON) =="
@@ -284,29 +290,39 @@ fetch_pr_authors_since_tag() {
 
 # Reserved URL-path segments and API namespaces that appear in prose
 # and would be picked up by the @-mention regex, but are never
-# legitimate credit targets. Not a full block-list of reserved GitHub
-# names — just the ones observed in this repo's commit bodies. Codex
-# R1 on PR #332 (2026-08-12) caught @users slipping through when the
-# fix commit message discussed "@users" in prose separately from the
-# domain line the earlier filter was targeting.
-COMMIT_BODY_HANDLE_EXCLUDES='users|orgs|repos|settings|apps|login|noreply|features|marketplace|topics|explore|trending'
+# legitimate credit targets. Broadened per AITL R0 hygiene hint on
+# PR #332 (2026-08-12): added issues, pulls, packages, notifications,
+# stars, watching (the GitHub top-level URL-path set that could plausibly
+# appear in commit-body prose about workflow/API paths). Not exhaustive.
+COMMIT_BODY_HANDLE_EXCLUDES='users|orgs|repos|settings|apps|login|noreply|features|marketplace|topics|explore|trending|issues|pulls|packages|notifications|stars|watching|actions|projects|discussions|releases'
 
 # All @handle mentions in commit bodies over the range. Handles: 1-39
 # chars, alphanumeric with optional single hyphens; may start with a
-# digit (Codex R1 caught the @1Password / @1password regression — GH
-# signup does NOT require a leading letter). Filters:
-#   - Skip trailer lines (Co-authored-by:, Signed-off-by:) entirely —
-#     those go through fetch_coauthored_handles with proper parsing.
-#   - Skip lines containing a users.noreply.github.com email — this
-#     defends against emails like <279815601+vsits-proxy-builder[bot]@
-#     users.noreply.github.com> matching "@users" via the loose char
-#     class.
-#   - Require the @ to be preceded by whitespace or a
-#     conversational-punctuation char, not an email/URL residue char.
-#   - Exclude reserved URL-path segments (see COMMIT_BODY_HANDLE_EXCLUDES).
+# digit (@1Password is valid — GH signup does NOT require a leading
+# letter). Filters, in order:
+#   1. Skip commits whose subject touches `release-preflight` (this
+#      script's own maintenance) — those commits ship prose about
+#      handles the parser handles, a self-inflicted Sisyphean false-
+#      positive source Codex R2 on PR #332 caught. Legitimate credit
+#      prose lives in feature/fix commits, not parser-work commits.
+#   2. Skip trailer lines (Co-authored-by:, Signed-off-by:) entirely —
+#      those go through fetch_coauthored_handles with proper parsing.
+#   3. Skip lines containing a users.noreply.github.com email — this
+#      defends against emails like <279815601+vsits-proxy-builder[bot]@
+#      users.noreply.github.com> matching "@users" via the loose char
+#      class.
+#   4. Strip backtick-wrapped @handle mentions — markdown convention:
+#      `@X` refers to the token/handle-shape, not the person. Codex R2
+#      suggested this as one shape; adopted as belt-and-suspenders on
+#      top of the release-preflight commit-subject filter.
+#   5. Require the @ to be preceded by whitespace or a
+#      conversational-punctuation char, not an email/URL residue char.
+#   6. Exclude reserved URL-path segments (see COMMIT_BODY_HANDLE_EXCLUDES).
 fetch_commit_body_handles() {
     git log "$RANGE" --format='%b' \
+        --invert-grep --grep='release-preflight' \
         | grep -viE '^Co-authored-by:|^Signed-off-by:|users\.noreply\.github\.com' \
+        | sed -E 's/`@[A-Za-z0-9][A-Za-z0-9-]*`//g' \
         | grep -oE '(^|[[:space:](\[{,;:!?—])@[A-Za-z0-9][A-Za-z0-9-]{0,38}\b' \
         | sed -E 's/.*@//' \
         | grep -viE "^(${COMMIT_BODY_HANDLE_EXCLUDES})$" \
