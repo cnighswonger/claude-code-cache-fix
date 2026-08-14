@@ -632,20 +632,52 @@ let _selfHealHandlers = null;
 function installSelfHeal() {
   _selfHealRefs++;
   if (_selfHealHandlers) return;
+  // AN EPIPE ON STDIO MUST NOT REACH uncaughtException, because the handlers
+  // below answer uncaughtException BY WRITING TO STDERR — so a dead stderr
+  // makes them re-enter themselves for ever.
+  //
+  // say() below is necessary and NOT sufficient: its try/catch covers a
+  // synchronous throw on a destroyed stream, but a write to a pipe whose last
+  // reader is gone does not throw synchronously — it surfaces as an
+  // asynchronous 'error' event, and with no listener Node promotes that to
+  // uncaughtException. Both halves are needed, hence the listeners here.
+  //
+  // Measured on a live proxy whose `| tee` was killed out from under it: 100%
+  // CPU, 22 minutes of CPU time burned, 18 connections accepted and none
+  // answered — while /health still returned 200 with every self-reported field
+  // green. `sample` showed the cycle: TriggerUncaughtException ->
+  // ReportMessage -> ErrorStackGetter -> FormatStackTrace ->
+  // PrepareStackTraceCallback -> the next stderr write -> EPIPE.
+  //
+  // Losing a log reader is ordinary — a closed terminal, a rotated file, a
+  // killed `tee`. It must cost the log line and nothing else.
+  const onStreamError = (err) => {
+    if (err && (err.code === "EPIPE" || err.code === "ERR_STREAM_DESTROYED")) return;
+    say(process.stderr, `[cache-fix] stdio error (proxy stays up): ${(err && err.code) || err}\n`);
+  };
+  process.stdout.on("error", onStreamError);
+  process.stderr.on("error", onStreamError);
+  // Through say(), for the same reason it exists: a handler whose own log line
+  // can throw is a handler that turns one fault into a loop.
   const onException = (err) => {
-    process.stderr.write(`[cache-fix] self-heal: uncaughtException swallowed (proxy stays up): ${err && err.stack || err}\n`);
+    say(process.stderr, `[cache-fix] self-heal: uncaughtException swallowed (proxy stays up): ${err && err.stack || err}\n`);
   };
   const onRejection = (reason) => {
-    process.stderr.write(`[cache-fix] self-heal: unhandledRejection swallowed (proxy stays up): ${reason && reason.stack || reason}\n`);
+    say(process.stderr, `[cache-fix] self-heal: unhandledRejection swallowed (proxy stays up): ${reason && reason.stack || reason}\n`);
   };
   process.on("uncaughtException", onException);
   process.on("unhandledRejection", onRejection);
-  _selfHealHandlers = { onException, onRejection };
+  _selfHealHandlers = { onException, onRejection, onStreamError };
 }
 function removeSelfHeal() {
   if (!_selfHealHandlers || --_selfHealRefs > 0) return;
   process.off("uncaughtException", _selfHealHandlers.onException);
   process.off("unhandledRejection", _selfHealHandlers.onRejection);
+  // The stdio listeners go too, for the same reason the two above do: a host
+  // process that ran forward mode earlier must get Node's default behaviour
+  // back, not keep an EPIPE swallower installed by a proxy that has closed.
+  process.stdout.off("error", _selfHealHandlers.onStreamError);
+  process.stderr.off("error", _selfHealHandlers.onStreamError);
   _selfHealHandlers = null;
 }
 
