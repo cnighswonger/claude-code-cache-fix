@@ -1153,8 +1153,14 @@ export function successorServing(port) {
     // `-iTCP@127.0.0.1` query, so an address filter has its own blind spot, and
     // the one that errs toward "a successor exists" would let a proxy leave an
     // unowned port behind.
+    // BOUNDED, for the same reason the launcher's probes are: `lsof` costs what
+    // the process table costs, and this runs on a user's machine. A timeout is
+    // safe here because the catch below already falls back to the ceiling.
+    // SIGKILL because a probe wedged on a sick box will not honour SIGTERM.
     const out = execFileSync("lsof", ["-nP", "-t", `-iTCP:${port}`, "-sTCP:LISTEN"],
-                             { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+                             { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+                               timeout: Number(process.env.CACHE_FIX_PROBE_TIMEOUT_MS) || 2_000,
+                               killSignal: "SIGKILL", maxBuffer: 1 << 20 });
     for (const line of out.trim().split("\n")) {
       const pid = Number(line);
       if (Number.isInteger(pid) && pid > 1 && pid !== process.pid) return true;

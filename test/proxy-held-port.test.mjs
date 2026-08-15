@@ -1211,8 +1211,13 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       // then matched nothing. Lifted from source rather than stubbed, so this
       // keeps failing if the real one stops honouring the variable.
       const bindFn = /const bindAddr = [^\n]*\n/.exec(src)?.[0];
-      assert.ok(rule && fpFns && bindFn,
-        "holderPidOn/runningOurCode/bindAddr are gone — the upgrade decision moved and this no longer tests it");
+      // probe() too, LIFTED not stubbed, for the same reason as bindAddr: it is
+      // what bounds every shell-out onto a user's machine, and a rule that
+      // stopped going through it would keep passing against an injected
+      // execFileSync while being unbounded in production.
+      const probeFn = /const PROBE_TIMEOUT_MS = [^\n]*\nfunction probe[\s\S]*?\n}/.exec(src)?.[0];
+      assert.ok(rule && fpFns && bindFn && probeFn,
+        "holderPidOn/runningOurCode/bindAddr/probe are gone — the upgrade decision moved and this no longer tests it");
 
       const dir = mkdtempSync(join(tmpdir(), "ccf-fp-"));
       const ours = join(dir, "server.mjs");
@@ -1249,7 +1254,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         };
         // eslint-disable-next-line no-new-func
         return Function("execFileSync", "SERVER_PATH", "readFileSync", "createHash", "join", "tmpdir",
-          `${bindFn}${fpFns}\n${rule}\nreturn holderPidOn(9901);`)(
+          `${bindFn}${probeFn}\n${fpFns}\n${rule}\nreturn holderPidOn(9901);`)(
             fake.execFileSync, ours, readFileSync, createHash, () => record, () => dir);
       };
 
@@ -1328,8 +1333,13 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       const rule = /function otherHolderOn[\s\S]*?\n}/.exec(src)?.[0];
       const fpFns = /function codeFingerprint[\s\S]*?\nfunction runningOurCode[\s\S]*?\n}/.exec(src)?.[0];
       const bindFn = /const bindAddr = [^\n]*\n/.exec(src)?.[0];
-      assert.ok(rule && fpFns && bindFn,
-        "otherHolderOn/runningOurCode/bindAddr are gone — this no longer tests the surplus rule");
+      // probe() too, LIFTED not stubbed, for the same reason as bindAddr: it is
+      // what bounds every shell-out onto a user's machine, and a rule that
+      // stopped going through it would keep passing against an injected
+      // execFileSync while being unbounded in production.
+      const probeFn = /const PROBE_TIMEOUT_MS = [^\n]*\nfunction probe[\s\S]*?\n}/.exec(src)?.[0];
+      assert.ok(rule && fpFns && bindFn && probeFn,
+        "otherHolderOn/runningOurCode/bindAddr/probe are gone — this no longer tests the surplus rule");
 
       const dir = mkdtempSync(join(tmpdir(), "ccf-surplus-"));
       const ours = join(dir, "server.mjs");
@@ -1364,7 +1374,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
                        stderr: { write: (s) => said.push(s) } };
         // eslint-disable-next-line no-new-func
         return Function("execFileSync", "SERVER_PATH", "readFileSync", "createHash", "join", "tmpdir", "process",
-          `${bindFn}${fpFns}\n${rule}\nreturn otherHolderOn(9901);`)(
+          `${bindFn}${probeFn}\n${fpFns}\n${rule}\nreturn otherHolderOn(9901);`)(
             fake, serverPath, readFileSync, createHash, () => record, () => dir, proc);
       };
       const decide = () => decideWith(ours);

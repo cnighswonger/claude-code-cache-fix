@@ -378,6 +378,37 @@ class HolderSocket extends EventEmitter {
 // identify it: leave it alone" and exited 0 beside a live proxy of ours.
 const bindAddr = () => process.env.CACHE_FIX_PROXY_BIND || "127.0.0.1";
 
+// EVERY SHELL-OUT ONTO A USER'S MACHINE IS BOUNDED.
+//
+// `lsof` walks the open files of every process and `ps` walks the table, so
+// both cost what the process table costs — and the moment that table is in
+// trouble is exactly when this code runs hardest: holderPidOn() is called from
+// the takeover retry loop every 500 ms and from the deploy watcher every tick.
+//
+// Measured on a user's laptop 2026-08-14: a crash reporter forked ~500
+// processes per second for fifteen minutes (kernel: "Too many corpses being
+// created", pid 48888 -> 54010 in ten seconds). Every process-enumerating call
+// on that box became unbounded, and an execFileSync with no timeout blocks this
+// process for as long as the machine stays sick — a proxy that answers nothing
+// while adding load to the machine it is waiting on.
+//
+// THE TIMEOUT IS THE REFUSAL, and it is safe because every caller below already
+// treats "cannot tell" as an answer: holderPidOn returns null and NULL MEANS
+// LEAVE IT ALONE. Abandoning a probe is never worse than blocking on it.
+//
+// SIGKILL, not the default SIGTERM: the case worth bounding is a probe wedged
+// on a sick machine, and that is the case least likely to honour a polite stop.
+const PROBE_TIMEOUT_MS = Number(process.env.CACHE_FIX_PROBE_TIMEOUT_MS) || 2_000;
+function probe(cmd, args, stderr = "ignore") {
+  return execFileSync(cmd, args, {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", stderr],
+    timeout: PROBE_TIMEOUT_MS,
+    killSignal: "SIGKILL",
+    maxBuffer: 1 << 20,
+  });
+}
+
 // Returns "holder" when the owner is a holder of ours (nothing to do), a pid
 // when it is something else we may ask to stop, or null when we cannot tell —
 // and NULL MEANS LEAVE IT ALONE. Signalling a pid we did not identify is how a
@@ -385,8 +416,7 @@ const bindAddr = () => process.env.CACHE_FIX_PROXY_BIND || "127.0.0.1";
 function holderPidOn(port) {
   let out = "";
   try {
-    out = execFileSync("lsof", ["-nP", "-t", `-iTCP@${bindAddr()}:${port}`, "-sTCP:LISTEN"],
-                       { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    out = probe("lsof", ["-nP", "-t", `-iTCP@${bindAddr()}:${port}`, "-sTCP:LISTEN"]);
   } catch { return null; }
   // EVERY owner, not the first line. The holder keeps a bound descriptor AND a
   // gap listener on the same port while its child serves, so lsof returns more
@@ -405,8 +435,7 @@ function holderPidOn(port) {
   // code serving — every upgrade a no-op.
   for (const p of pids) {
     try {
-      const c = execFileSync("ps", ["-p", String(p), "-o", "command="],
-                             { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+      const c = probe("ps", ["-p", String(p), "-o", "command="]);
       if (/\brun-service\b/.test(c)) return runningOurCode(port) !== false ? "holder" : p;
     } catch { /* gone between lsof and ps */ }
   }
@@ -420,8 +449,7 @@ function holderPidOn(port) {
   // standby must still be releasable, so it stays eligible when nothing else is.
   const real = pids.filter((p) => {
     try {
-      return !/gap-relay/.test(execFileSync("ps", ["-p", String(p), "-o", "command="],
-                                            { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }));
+      return !/gap-relay/.test(probe("ps", ["-p", String(p), "-o", "command="]));
     } catch { return false; }
   });
   const pid = (real.length ? real : pids)[0];
@@ -450,8 +478,7 @@ function holderPidOn(port) {
   // turning into an outage plus a rival holder on a different port.
   let cmd = "";
   try {
-    cmd = execFileSync("ps", ["-p", String(pid), "-o", "ppid=,command="],
-                       { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    cmd = probe("ps", ["-p", String(pid), "-o", "ppid=,command="]);
   } catch { return pid; }
   // THE SAME SENTENCE AS ITS TWO SIBLINGS, and it was the one left ungated when
   // they were fixed: "names run-service" is not "is running our code", and the
@@ -467,8 +494,7 @@ function holderPidOn(port) {
   const ppid = Number(cmd.trim().split(/\s+/)[0]);
   if (Number.isInteger(ppid) && ppid > 1) {
     try {
-      const parent = execFileSync("ps", ["-p", String(ppid), "-o", "command="],
-                                  { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+      const parent = probe("ps", ["-p", String(ppid), "-o", "command="]);
       if (/\brun-service\b/.test(parent)) return runningOurCode(port) !== false ? "holder" : ppid;
     } catch { /* parent gone: fall through and treat the listener on its own */ }
   }
@@ -485,8 +511,7 @@ function otherHolderOn(port) {
   try {
     // stderr PIPED, not ignored — it is the only field that separates "found
     // nothing" from "could not look". See the catch.
-    pids = execFileSync("lsof", ["-nP", "-t", `-iTCP@${bindAddr()}:${port}`, "-sTCP:LISTEN"],
-                        { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })
+    pids = probe("lsof", ["-nP", "-t", `-iTCP@${bindAddr()}:${port}`, "-sTCP:LISTEN"], "pipe")
       .trim().split("\n").map(Number).filter((n) => Number.isInteger(n) && n > 1 && n !== process.pid);
   } catch (e) {
     // ABSENCE AND FAILURE EXIT ALIKE, and this used to translate the second
@@ -519,8 +544,7 @@ function otherHolderOn(port) {
   for (const p of pids) {
     let line = "";
     try {
-      line = execFileSync("ps", ["-p", String(p), "-o", "etimes=,command="],
-                          { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+      line = probe("ps", ["-p", String(p), "-o", "etimes=,command="]).trim();
     } catch { continue; }
     if (!/\brun-service\b/.test(line)) continue;
     // etimes is SECONDS ALIVE, so larger means older. Ours is whatever this
@@ -1261,8 +1285,7 @@ function holdPort(rest) {
       // spawn, so that case still goes the release route below.
       let argv = "";
       try {
-        argv = execFileSync("ps", ["-o", "command=", "-p", String(incumbent)],
-                            { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+        argv = probe("ps", ["-o", "command=", "-p", String(incumbent)]);
       } catch { }
       if (argv.includes("run-service")) {
         try { process.kill(incumbent, "SIGUSR2"); } catch { return settle(0); }
