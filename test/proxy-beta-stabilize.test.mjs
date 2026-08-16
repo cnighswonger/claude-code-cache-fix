@@ -30,12 +30,15 @@ afterEach(() => {
   resetBetaSnapshots();
 });
 
-function mkCtx({ beta = BASE, sid = SID, on = true } = {}) {
+const SYSTEM = [{ type: "text", text: "You are a Claude agent." }];
+const CONV = [{ role: "user", content: [{ type: "text", text: "conversation A" }] }];
+
+function mkCtx({ beta = BASE, sid = SID, on = true, messages = CONV, system = SYSTEM } = {}) {
   if (on) process.env.CACHE_FIX_BETA_STABILIZE = "1";
   else delete process.env.CACHE_FIX_BETA_STABILIZE;
   const headers = { "anthropic-beta": beta };
   if (sid) headers["x-claude-code-session-id"] = sid;
-  return { headers, meta: {}, body: {} };
+  return { headers, meta: {}, body: { messages, system, model: "test-model" } };
 }
 
 // --- planStableBetas: the decision, in isolation ---
@@ -86,12 +89,48 @@ test("planStableBetas: an empty snapshot is treated as no snapshot", () => {
 
 // --- betaSessionKey ---
 
-test("betaSessionKey: reads the CC session header", () => {
-  assert.equal(betaSessionKey({ "x-claude-code-session-id": SID }), SID);
-});
+const body = (messages, system = SYSTEM) => ({ messages, system, model: "test-model" });
+const H = { "x-claude-code-session-id": SID };
 
 test("betaSessionKey: no session header → null", () => {
-  assert.equal(betaSessionKey({ "anthropic-beta": BASE }), null);
+  assert.equal(betaSessionKey({ "anthropic-beta": BASE }, body(CONV)), null);
+});
+
+test("betaSessionKey: separates CONVERSATIONS under one session id", () => {
+  // The collision test/session-key-invariants.test.mjs exists for: every
+  // subagent of a session runs the same agent prompt under the same session
+  // id, so (session-id, system-prompt) put 39 conversations in one bucket for
+  // insertion-normalization and deferred-tool-rewrite inherited it.
+  const convB = [{ role: "user", content: [{ type: "text", text: "conversation B" }] }];
+  assert.notEqual(betaSessionKey(H, body(CONV)), betaSessionKey(H, body(convB)));
+});
+
+test("betaSessionKey: separates SYSTEM PROMPTS (sidecar classes)", () => {
+  const sidecar = [{ type: "text", text: "Generate a concise 5-word title." }];
+  assert.notEqual(betaSessionKey(H, body(CONV)), betaSessionKey(H, body(CONV, sidecar)));
+});
+
+test("betaSessionKey: STABLE as the conversation grows", () => {
+  // The other half of an identity: a key that moves every turn abandons the
+  // snapshot every request instead of colliding, which fails just as quietly.
+  const grown = [...CONV, { role: "assistant", content: [{ type: "text", text: "reply" }] }];
+  assert.equal(betaSessionKey(H, body(CONV)), betaSessionKey(H, body(grown)));
+});
+
+test("onRequest: a subagent under the same session id gets its own snapshot", () => {
+  // End-to-end consequence of the key: without the conversation sub-key the
+  // subagent would inherit the parent's first-seen set and be sent a beta
+  // header it never asked for.
+  const parent = mkCtx({ beta: BASE });
+  ext.onRequest(parent);
+  const sub = mkCtx({
+    beta: WITH_DIAG,
+    messages: [{ role: "user", content: [{ type: "text", text: "subagent task" }] }],
+  });
+  ext.onRequest(sub);
+  assert.equal(parent.headers["anthropic-beta"], BASE);
+  assert.equal(sub.headers["anthropic-beta"], WITH_DIAG,
+    "the subagent was handed the parent's beta set");
 });
 
 // --- onRequest: the wire behaviour ---

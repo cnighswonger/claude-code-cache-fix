@@ -31,6 +31,8 @@
 
 import { findBetaHeader, parseBetaTokens, joinBetaTokens } from "./auto-1m-guard.mjs";
 import { resolveSessionId } from "./cache-telemetry.mjs";
+import { conversationSubKey } from "./message-hash.mjs";
+import { systemPromptSubKey } from "./insertion-normalization.mjs";
 
 // Per-session first-seen token arrays. In-memory by design: the snapshot is
 // only useful while Anthropic still holds the prefix it was cached against,
@@ -60,12 +62,31 @@ export function resetBetaSnapshots() {
   snapshots.clear();
 }
 
-// The tenant a snapshot belongs to. Null when the request carries no session
-// id, which is the signal to leave the header alone: sharing one snapshot
-// across unrelated sessions would be a worse failure than not stabilizing,
-// since it would send a set the caller never asked for.
-export function betaSessionKey(headers) {
-  return resolveSessionId(headers);
+// The tenant a snapshot belongs to.
+//
+// Session id ALONE is not a tenant, and this is the lesson
+// test/session-key-invariants.mjs exists to carry: every subagent of a session
+// runs the same agent prompt under the same session id, so a (session-id,
+// system-prompt) key put 39 distinct conversations in one bucket for
+// insertion-normalization, and deferred-tool-rewrite inherited the identical
+// collision because nothing connected the two. Same key shape as
+// resolveToolRewriteSessionKey, and for the same reason.
+//
+// It matters here even though the header is CC-process-global: a coarse key
+// would impose conversation A's first-seen set on conversation B, sending B a
+// header nobody asked for. The reverse risk — more keys than processes — costs
+// nothing in this design, because a new key snapshots on its first turn rather
+// than waiting to promote a baseline.
+//
+// Null when the request carries no session id, which leaves the header alone.
+// The sibling falls back to `c-<model>-<conv>` there; this one does not,
+// because anthropic-beta is process-global and two CC processes opening with
+// the same model and first message would then share a beta set.
+export function betaSessionKey(headers, body) {
+  const sid = resolveSessionId(headers);
+  if (!sid) return null;
+  const safe = sid.replace(/[^A-Za-z0-9_-]/g, "_");
+  return `s-${safe}-${systemPromptSubKey(body?.system)}-${conversationSubKey(body?.messages)}`;
 }
 
 // Pure planner. `snapshot` is the first-seen token array (or null on the
@@ -110,7 +131,7 @@ export default {
     const incoming = parseBetaTokens(found.raw);
     if (incoming.length === 0) return;
 
-    const key = betaSessionKey(ctx.headers);
+    const key = betaSessionKey(ctx.headers, ctx.body);
     if (!key) return;
 
     const plan = planStableBetas(snapshots.get(key), incoming);
