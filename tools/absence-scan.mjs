@@ -34,6 +34,7 @@
 import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { basename } from "node:path";
+import { pathToFileURL } from "node:url";
 
 // --- Allowlist ---------------------------------------------------------------
 //
@@ -467,7 +468,12 @@ function main(argv) {
   return 0;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+// Entrypoint guard. pathToFileURL, NOT `file://${argv[1]}`: on Windows
+// import.meta.url is file:///C:/... while argv[1] is C:\... with backslashes,
+// so the template form never matches and main() never runs — the CLI becomes a
+// silent exit-0 no-op, and the pre-push hook that depends on it passes
+// everything. Same helper proxy/pipeline.mjs already uses for its loader.
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   let code;
   try {
     code = main(process.argv);
