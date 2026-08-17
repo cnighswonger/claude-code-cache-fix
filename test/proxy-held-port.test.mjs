@@ -101,9 +101,11 @@ async function freePort() {
 // availableParallelism(), NOT cpus().length — the first version of this bound
 // counted the MACHINE, which is not the same as the cores this process may use.
 // Measured under `taskset -c 6,7`, this very expression: with cpus().length it
-// computes 24, with availableParallelism() it computes 2. So the file ran 24 of
-// these process-spawning cases at once on two cores, and ALONE there it failed
-// 3 of 6 runs with no --test-concurrency in play. Being bounded by the wrong
+// computes 24, with availableParallelism() it computes 2. A bound of 24 does not
+// bound this file — it has fewer children than that — so every case ran at once
+// on two cores, and ALONE there the file failed 3 of 6 runs with no
+// --test-concurrency in play. proxy-wrapper.test.mjs has 39 direct cases, where
+// 24 is not merely ineffective but a real 24-way. Being bounded by the wrong
 // number looks exactly like being unbounded. An affinity mask is what
 // `docker --cpuset-cpus` sets too; taskset is how it was measured here.
 //

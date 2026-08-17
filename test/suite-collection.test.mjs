@@ -624,9 +624,17 @@ test("gap-relay keeps the socket on an error that left it listening", () => {
 //
 //   THE RED ONE. package.json pinned `--test-concurrency=8` — 8 test files in
 //   flight no matter what the runner is. Measured on Node v20.20.2 over two
-//   pinned cores, full suite: with the pin `# fail 5` in 85 s, without it
+//   pinned cores, full suite, ON THE TREE AS IT STOOD (so the inner bound below
+//   was also wrong, at 24): with the pin `# fail 5` in 85 s, without it
 //   `# fail 0` in ~265 s, and green on every run since across Node 18, 20 and
-//   24 (1890/1890/1896 passing, no `not ok`). CI's
+//   24 (1890/1890/1896 passing, no `not ok`).
+//
+//   That pairing is what this commit removes, and it is NOT a claim that the pin
+//   alone reddens a suite whose inner bound is right: re-adding only the pin to
+//   the FIXED tree ran green 5 times in a row on a peer's box (91-93 s). On the
+//   real runner it was red, on that box it was not, and a stochastic failure
+//   needs a rate rather than a count. Treat the 5 as "the state being removed",
+//   not as the pin's yield. CI's
 //   Node 20 leg was red on `refuses nothing when the proxy under it dies` while
 //   18 and 22 were green — same file, a different case each run. How many cores
 //   that runner has is not asserted anywhere here, on purpose; see the SCOPE
@@ -703,11 +711,13 @@ test("the suite derives its parallelism from the machine", () => {
     `A missing one means the bound was renamed, and this guard stopped watching it.`);
   // WHAT THIS DOES NOT WATCH, said here because the test's name is broader than
   // its reach: only files declaring a CONCURRENCY bound. proxy-update-sweep
-  // .test.mjs sizes its describe `{ concurrency: true }` over five cases, four
-  // of which spawn a proxy, and never enters this roster. Left alone
-  // deliberately — 8 runs, all green at ~2.1 s over two pinned cores in this
-  // worktree, so it is the same shape without the failure, and widening the
-  // roster to catch it would flag every cheap `concurrency: true` in the suite.
+  // .test.mjs sizes its describe `{ concurrency: true }` over five cases, ALL of
+  // which spawn a proxy, and never enters this roster. Left alone deliberately —
+  // 8 runs, all green at ~2.1 s over two pinned cores in this worktree, so it is
+  // the same shape without the failure, and widening the roster to catch it
+  // would flag every cheap `concurrency: true` in the suite. An options object
+  // imported from a sibling module would also escape; there is no cheap fix for
+  // that and it is named here rather than guarded.
   for (const f of bounded) {
     // stripComments, because the paragraphs in those files quote `cpus().length`
     // to explain why it is wrong. Recursive and `.mjs` rather than top-level
@@ -777,15 +787,16 @@ test("the suite derives its parallelism from the machine", () => {
     // lists as a reintroduction shape. Measured green on both files: comments
     // are stripped and neither has `cpus` in a string literal.
     //
-    // AS OF THE `uses` CHECK BELOW, THIS IS BELT AND BRACES, NOT LOAD-BEARING —
-    // said plainly because the last person to notice that deleted it and opened
-    // a hole. Re-measured with it removed: a nested describe, an `it()` option
-    // and a second describe are all caught by `uses`, and the ONLY thing left to
-    // this assertion is an unrelated `const FIXTURES = cpus().length;`, which is
-    // not a defect. Kept anyway: "these two files never read cpus()" is a
-    // simpler invariant than the three places that matter, and every round of
-    // this guard so far has been beaten by a shape nobody had thought of.
-    // Delete it if you like — but bring a mutant, not a re-run of the tables.
+    // THIS IS LOAD-BEARING, and the paragraph that used to sit here claiming
+    // otherwise is the reason it says so in capitals. That paragraph was written
+    // after re-measuring, concluded "belt and braces", and was WRONG: a second
+    // describe using `{ concurrency }` shorthand sized by `cpus().length` is red
+    // only because of this assertion — remove it and that mutant goes green.
+    // The re-measurement had simply not tried the shorthand.
+    //
+    // Twice now a deletion here has been justified by evidence that turned out
+    // to be about the shapes already thought of. Bring a mutant this assertion
+    // uniquely catches, and check it against the ones it caught last time.
     assert.doesNotMatch(src, /\bcpus\b/,
       `${f} still reads os.cpus(), which counts the machine rather than the cores ` +
       `this process may use — measured 48 against availableParallelism()'s 2 under ` +
@@ -803,7 +814,13 @@ test("the suite derives its parallelism from the machine", () => {
     // from "./parallelism.mjs"` next to `import { availableParallelism as _x }
     // from "node:os"` is legal JS with no name clash, and passed the first
     // version of this line.
-    const imports = src.split("\n").filter((l) => /^\s*import\b/.test(l) && /\bavailableParallelism\b/.test(l));
+    // Whole import STATEMENTS, not lines: a formatter that wraps the specifier
+    // list across lines made the line-based version report "0 import lines" and
+    // blame a resolution problem for its own work. `[^;]*?` stops at the first
+    // `;`, and `import\s*[{'"]` will not match `import.meta`.
+    const imports = [...src.matchAll(/^\s*import\s*[{'"][^;]*?;/gm)]
+      .map((m) => m[0].replace(/\s+/g, " ").trim())
+      .filter((s) => /\bavailableParallelism\b/.test(s));
     assert.equal(imports.length, 1,
       `${f} has ${imports.length} import lines naming availableParallelism; exactly ` +
       `one may, or the binding in the bound is not the one this guard checked: ` +
@@ -811,6 +828,15 @@ test("the suite derives its parallelism from the machine", () => {
     assert.match(imports[0], /from "node:os"/,
       `${f} imports availableParallelism from ${JSON.stringify(imports[0])}, not node:os — ` +
       `the bound reads as correct while resolving to something that counts the machine`);
+    // AND NOTHING MAY REDECLARE THE NAME. One node:os import satisfies the two
+    // lines above while a local shadow supplies the actual binding:
+    //   import { availableParallelism as osParallelism } from "node:os";
+    //   const availableParallelism = () => Number(process.env.TEST_JOBS) || osParallelism();
+    // passed every assertion here and reinstated verbatim the env override the
+    // `assigns` comment says it refuses. Measured.
+    assert.doesNotMatch(src, /\b(?:const|let|var|function)\s+availableParallelism\b/,
+      `${f} declares its own availableParallelism, shadowing the node:os import — ` +
+      `the bound's text is unchanged and its meaning is not`);
     // EVERY use site, not one. `match(/concurrency: CONCURRENCY/)` is an
     // EXISTENCE test: the first describe satisfies it forever, so a second one
     // could be sized by anything that is not a bare literal. Measured, all green
@@ -825,11 +851,17 @@ test("the suite derives its parallelism from the machine", () => {
     // This one assertion replaces the literal ban AND the use-site existence
     // check it grew out of; both were strictly weaker than asking what the full
     // set of use sites is.
-    // The key may be quoted: `{ "concurrency": 8 }` is the same option and the
-    // unquoted-only pattern could not see it at all, so the set still came back
-    // as ["CONCURRENCY"] and the second describe was invisible. Measured.
-    const uses = [...new Set([...src.matchAll(/["']?concurrency["']?\s*:\s*([^,}]+)/g)]
-      .map((m) => m[1].trim()))].filter((u) => u !== "1").sort();
+    // EVERY spelling of the key, and the colon is OPTIONAL. `{ concurrency }`
+    // shorthand carries a value the `concurrency:` pattern cannot see at all, so
+    // the set came back as ["CONCURRENCY"] with a second describe running at 8 —
+    // measured, four cases starting within 0 ms against a 1208 ms serial spread,
+    // so it is a real behaviour change and not a spelling. It is also the shape
+    // you get for free the moment anyone hoists the value into a variable.
+    // `{ "concurrency": 8 }` and `{ ["concurrency"]: 8 }` were invisible the same
+    // way. A bare occurrence now reports itself rather than contributing nothing.
+    const uses = [...new Set([...src.matchAll(/["']?\bconcurrency\b["']?\s*(?::\s*([^,}]+))?/g)]
+      .map((m) => (m[1] ?? "<a bare `concurrency` with no value here>").trim()))]
+      .filter((u) => u !== "1").sort();
     assert.deepEqual(uses, ["CONCURRENCY"],
       `${f} sizes a describe by something other than CONCURRENCY (or a serial 1). ` +
       `Concurrency values seen: ${JSON.stringify(uses)}`);
