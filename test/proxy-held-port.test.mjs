@@ -1216,8 +1216,19 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       // stopped going through it would keep passing against an injected
       // execFileSync while being unbounded in production.
       const probeFn = /const PROBE_TIMEOUT_MS = [^\n]*\nfunction probe[\s\S]*?\n}/.exec(src)?.[0];
-      assert.ok(rule && fpFns && bindFn && probeFn,
-        "holderPidOn/runningOurCode/bindAddr/probe are gone — the upgrade decision moved and this no longer tests it");
+      // holderVerdict too, and for the reason this whole block lifts rather than
+      // stubs: it is where "the fingerprint could not be read" is turned into an
+      // answer, so a rule that stopped consulting it would keep passing here
+      // while silently calling an unknown build ours in production.
+      const verdictFn = /function holderVerdict[\s\S]*?\n}/.exec(src)?.[0];
+      // AND EVERYTHING holderVerdict CALLS. Lifting source means supplying its
+      // free variables, and this harness has now been broken three times by the
+      // same step: probe(), then holderVerdict(), then the warn helpers under
+      // it. Each new helper the rule reaches through is one more name that must
+      // arrive here or the case dies with a ReferenceError.
+      const warnFns = /function warn\(msg\)[\s\S]*?\n}\n\n[\s\S]*?function warnUncomparable[\s\S]*?\n}/.exec(src)?.[0];
+      assert.ok(rule && fpFns && bindFn && probeFn && verdictFn && warnFns,
+        "holderPidOn/runningOurCode/bindAddr/probe/holderVerdict are gone — the upgrade decision moved and this no longer tests it");
 
       const dir = mkdtempSync(join(tmpdir(), "ccf-fp-"));
       const ours = join(dir, "server.mjs");
@@ -1238,6 +1249,11 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       //                                  itself, on the earlier branch.
       // The old stub returned one pid while the comment claimed the multi-pid
       // reality, so the branch that reads the list was never run by this case.
+      // What the rule wrote to stderr. The VALUE this function returns is the
+      // same for "runs our code" and "cannot tell" — both mean leave it alone —
+      // so the message is the only thing that separates them for an operator,
+      // and a fixture that discards it passes against silence.
+      const said = [];
       const decide = (lsofOut = "4241\n4242\n") => {
         const fake = {
           execFileSync: (cmd, args) => {
@@ -1253,9 +1269,14 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
           },
         };
         // eslint-disable-next-line no-new-func
-        return Function("execFileSync", "SERVER_PATH", "readFileSync", "createHash", "join", "tmpdir",
-          `${bindFn}${probeFn}\n${fpFns}\n${rule}\nreturn holderPidOn(9901);`)(
-            fake.execFileSync, ours, readFileSync, createHash, () => record, () => dir);
+        // `process` FORWARDED, not stubbed away — bindAddr() reads process.env,
+        // and a fake without it throws inside holderPidOn's own try/catch, which
+        // would swallow it and answer "cannot tell" to every row.
+        const proc = { env: process.env, pid: process.pid,
+                       stderr: { write: (s) => said.push(s) } };
+        return Function("execFileSync", "SERVER_PATH", "readFileSync", "createHash", "join", "tmpdir", "process",
+          `${bindFn}${probeFn}\n${fpFns}\n${warnFns}\n${verdictFn}\n${rule}\nreturn holderPidOn(9901);`)(
+            fake.execFileSync, ours, readFileSync, createHash, () => record, () => dir, proc);
       };
 
       try {
@@ -1287,9 +1308,18 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         // otherHolderOn's copy of this state must answer "not surplus" instead,
         // because there the destructive move is exiting rather than signalling.
         rmSync(record, { force: true });
+        said.length = 0;
         assert.equal(decide(), "holder",
           "an unreadable record must mean LEAVE ALONE — guessing here signals a " +
           "process we cannot identify");
+        // AND IT MUST SAY SO. Same value as "runs our code", opposite meaning:
+        // this one exits 0 having changed nothing, so a deploy that did not take
+        // is indistinguishable from one that had nothing to do. otherHolderOn
+        // has warned on this identical null for as long as it has existed; this
+        // caller was silent at all three of its call sites.
+        assert.match(said.join(""), /cannot compare builds/,
+          "the deploy no-opped in silence — an operator gets no way to tell " +
+          "'already running your code' from 'could not tell, and did nothing'");
 
         // TWO OF THE THREE, on every row above — and the count matters, because
         // this used to read "BOTH BRANCHES" and claim a completeness the fixture
@@ -1338,7 +1368,10 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       // stopped going through it would keep passing against an injected
       // execFileSync while being unbounded in production.
       const probeFn = /const PROBE_TIMEOUT_MS = [^\n]*\nfunction probe[\s\S]*?\n}/.exec(src)?.[0];
-      assert.ok(rule && fpFns && bindFn && probeFn,
+      // otherHolderOn warns through the same shared helper, so it needs the
+      // same names — see the note at the holderPidOn case above.
+      const warnFns = /function warn\(msg\)[\s\S]*?\n}\n\n[\s\S]*?function warnUncomparable[\s\S]*?\n}/.exec(src)?.[0];
+      assert.ok(rule && fpFns && bindFn && probeFn && warnFns,
         "otherHolderOn/runningOurCode/bindAddr/probe are gone — this no longer tests the surplus rule");
 
       const dir = mkdtempSync(join(tmpdir(), "ccf-surplus-"));
@@ -1374,7 +1407,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
                        stderr: { write: (s) => said.push(s) } };
         // eslint-disable-next-line no-new-func
         return Function("execFileSync", "SERVER_PATH", "readFileSync", "createHash", "join", "tmpdir", "process",
-          `${bindFn}${probeFn}\n${fpFns}\n${rule}\nreturn otherHolderOn(9901);`)(
+          `${bindFn}${probeFn}\n${warnFns}\n${fpFns}\n${rule}\nreturn otherHolderOn(9901);`)(
             fake, serverPath, readFileSync, createHash, () => record, () => dir, proc);
       };
       const decide = () => decideWith(ours);

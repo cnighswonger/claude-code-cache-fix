@@ -227,3 +227,385 @@ test("no test ends a socket from inside its own data handler, unguarded", () => 
     `answer-once guard, so a second read throws ERR_STREAM_WRITE_AFTER_END: ` +
     `${bad.join(", ")}`);
 });
+
+// Index of the delimiter that closes the one opening at `open`. Six copies of
+// this loop had accumulated across the guards below, in two variants — braces
+// only, and one that counts (), [] and {} together for a call's argument list. They are the same
+// walk, and a guard whose slice is computed by a subtly different copy is a
+// guard that goes quiet without anyone editing it: two of these drifted apart
+// this round and each let through the defect its assertion was written for.
+//
+// Returns -1 when it never closes, which every caller must treat as "could not
+// look" rather than "nothing found" — a slice that runs to end-of-file contains
+// almost anything you might assert about.
+// Comments blanked to spaces, LINE COUNT AND EVERY OTHER BYTE PRESERVED, so an
+// index computed against the result still points at the same place in the
+// original. Callers balance braces over this, and a `}` in prose otherwise votes
+// on where a block ends — measured, a one-line comment ending in `}` shrank a
+// slice enough to hide the statement its assertion forbids, and the size ceiling
+// could not see it because the slice got SMALLER.
+//
+// Strings are copied verbatim, so a `//` or `/*` inside one is not a comment —
+// and a `/*` inside a LINE comment cannot open a phantom block that runs to the
+// next real `*/`, which over raw source blanked 26 lines of bin/claude-via-
+// proxy.mjs and moved its brace balance from 0 to -1.
+//
+// The self-check below is a POSITIVE one — it asserts no comment opener survives
+// — because the two conservative invariants it replaced (line count, brace
+// balance) were both preserved by the failure that actually happened.
+function stripComments(src) {
+  // A ONE-PASS SCANNER with three states — string, regex literal, comment —
+  // because each one of them can contain the others' delimiters and every
+  // shortcut here has already been defeated once:
+  //
+  //   `"https://api.anthropic.com"` — a `//` inside a STRING. Blanking from
+  //     there deleted the rest of the line, including the `}` that followed;
+  //     measured on two files, the tree's brace balance moved by one.
+  //   `.replace(/"/g, "")` — a quote inside a REGEX. Treating it as a string
+  //     opener runs to the next quote in the file and copies everything between
+  //     VERBATIM, comments included. Measured: a comment survived, and with it
+  //     the pre-fix gap-relay handler passed its guard.
+  //
+  // Regex-vs-division is decided by what precedes the `/`: after a value
+  // (identifier, `)`, `]`, literal) it is division; otherwise a literal. That is
+  // the standard heuristic and it is not perfect — which is what the positive
+  // self-check below is for.
+  let out = "", i = 0, prev = "";
+  const kept = new Set();                          // output indices copied verbatim
+  const copyTo = (close, esc) => {                 // copy verbatim until `close`
+    const from = out.length;
+    out += src[i]; i++;
+    while (i < src.length && src[i] !== close) {
+      if (esc && src[i] === "\\") { out += src[i] + (src[i + 1] ?? ""); i += 2; continue; }
+      if (close === "/" && src[i] === "[") {       // a class may hold an unescaped /
+        while (i < src.length && src[i] !== "]") { out += src[i]; i++; }
+      }
+      out += src[i]; i++;
+    }
+    out += src[i] ?? ""; i++;
+    for (let k = from; k < out.length; k++) kept.add(k);
+  };
+  while (i < src.length) {
+    const c = src[i];
+    if (c === '"' || c === "'" || c === "`") { copyTo(c, true); prev = "x"; continue; }
+    if (c === "/" && src[i + 1] === "/") {
+      while (i < src.length && src[i] !== "\n") { out += " "; i++; }
+      continue;
+    }
+    if (c === "/" && src[i + 1] === "*") {
+      const end = src.indexOf("*/", i + 2);
+      const stop = end < 0 ? src.length : end + 2;
+      for (; i < stop; i++) out += src[i] === "\n" ? "\n" : " ";
+      continue;
+    }
+    if (c === "/" && !/[\w)\]]/.test(prev)) { copyTo("/", true); prev = "x"; continue; }
+    out += c; i++;
+    if (!/\s/.test(c)) prev = c;
+  }
+  // NO SELF-CHECK, BECAUSE NONE OF THEM COULD SEE THE FAILURE THAT HAPPENED.
+  //
+  // Three were tried. Line count and brace balance are both preserved when the
+  // scanner mistakes code for a literal and copies a comment through verbatim —
+  // not one byte moves. The third asked "did a comment opener survive", computed
+  // from the scanner's own record of what it copied verbatim — and that record
+  // is exactly where such a comment sits, so the check erased it before looking.
+  // Measured: feeding the pre-fix scanner the shape it was written for left the
+  // comment intact and every check green.
+  //
+  // A heuristic that cannot certify itself must not pretend to. What protects
+  // the guards instead is that each one FAILS CLOSED on anything it cannot parse
+  // (see the `unparsed` push in the shell-out guard) and that the two anchored
+  // guards read only the two files this scanner is verified against — checked by
+  // hand, line by line, against every literal in them.
+  return out;
+}
+
+// `mode` is "brace" (match {} only) or "any" (match (), [] and {} together, for
+// a call's argument list). Named rather than inferred from a third character in
+// a pair string: that spelling silently ignored the pair it was given whenever
+// the string was long enough, so a caller passing "()" would have got a walk it
+// never asked for with nothing to signal it.
+function closesAt(src, open, mode = "brace") {
+  const opens = mode === "any" ? "([{" : "{";
+  const closes = mode === "any" ? ")]}" : "}";
+  let depth = 0;
+  for (let i = open; i < src.length; i++) {
+    if (opens.includes(src[i])) depth++;
+    else if (closes.includes(src[i])) { if (--depth === 0) return i; }
+  }
+  return -1;
+}
+
+// A HANDOVER THAT DID NOT HAPPEN MUST LEAVE A HOLDER THAT STILL WORKS.
+//
+// The SIGUSR2 handler kills its standby, hands the port to a successor and
+// exits. When the successor never starts, three things have to be true or the
+// holder is left alive with no proxy, no standby, or no way to ever start one:
+//
+//   1. recovery exists in one place, reachable from BOTH failure modes;
+//   2. the spawn's async 'error' is wired to it — EAGAIN/ENOMEM under fork
+//      pressure are EMITTED, not thrown, so the try/catch cannot see them and
+//      an unhandled one on a ChildProcess is an uncaughtException that kills
+//      the holder outright;
+//   3. recovery goes through the restart LADDER, not straight to a spawn —
+//      calling spawnWhenReady() directly cancels the backoff and a deploy
+//      watcher retrying SIGUSR2 then burns one immediate respawn per signal,
+//      the shape measured at 51 respawns in 1.2s.
+//
+// STATIC, because reaching the sync catch needs spawn() to throw and node
+// reports a missing executable as an 'error' EVENT — the only synchronous
+// throws are option validation on values this handler computes itself. There
+// is no external lever, and lifting the handler means supplying its whole
+// closure. Three static guards already exist in this file for that trade.
+//
+// Anchored by brace-walking the recovery function and bounded by a length
+// assertion: an earlier cut anchored on `lastIndexOf("catch")`, which matched
+// the word inside a nearby COMMENT and widened the slice to 1,587 chars of
+// unrelated code. A guard whose scope grows when its subject moves reports on
+// whatever happens to be nearby.
+test("a failed SIGUSR2 handover recovers, from both failure modes, through the ladder", () => {
+  const src = stripComments(readFileSync(join(testDir, "..", "bin", "claude-via-proxy.mjs"), "utf8"));
+  const at = src.indexOf("const handoverFailed = (why) =>");
+  assert.ok(at > 0,
+    "the SIGUSR2 recovery function is gone or renamed — this guard no longer " +
+    "watches anything, which is not the same as the defect being fixed");
+  const end = closesAt(src, src.indexOf("{", at));
+  assert.ok(end > at, "handoverFailed never closes — the file did not parse the way this guard assumes");
+  // MEASURED AFTER STRIPPING COMMENTS, because the question the ceiling asks is
+  // "did the anchor slide into unrelated code", and prose volume has no bearing
+  // on that. The raw slice here is ~1.6k chars of which most is the paragraph
+  // explaining why the async door exists; the code is a dozen lines.
+  const body = src.slice(at, end).replace(/\/\/[^\n]*/g, "");
+  assert.ok(body.replace(/\s+/g, " ").length < 800,
+    `the recovery slice is ${body.replace(/\s+/g, " ").length} chars of code — too ` +
+    `wide to be this function, so a match inside it proves nothing about the ` +
+    `statements this guard protects`);
+
+  assert.match(body, /restart\s*=\s*setTimeout\s*\(/,
+    "recovery calls spawnWhenReady() directly instead of re-arming the restart " +
+    "timer, so a SIGUSR2 retry loop skips the backoff ladder entirely");
+  // WHAT IS LEFT AFTER THE TIMER, not where the call sits on its line.
+  //
+  // Three revisions anchored on position and were defeated three times by the
+  // same class: a lookbehind whose 40-char window swallowed `restart = null;`,
+  // then `^\s*spawnWhenReady\(\);\s*$` which only sees a call alone on a line —
+  // `if (bound) { restart = null; spawnWhenReady(); }` beside a decoy timer
+  // passes it, and that is the natural edit ("why wait a rung when the port is
+  // already ours"). Position is not the property.
+  //
+  // The property is: recovery hands the next spawn to the ladder and does
+  // nothing else with it. So delete the timer callbacks — the one legitimate
+  // home for that call — and require the remainder to contain no call at all.
+  const outsideTimer = body.replace(/setTimeout\(\s*\(\s*\)\s*=>\s*\{[\s\S]*?\}\s*,[^)]*\)/g, "TIMER");
+  assert.doesNotMatch(outsideTimer, /spawnWhenReady\s*\(/,
+    "recovery calls spawnWhenReady() outside the restart timer — that is the " +
+    "un-laddered respawn this guard exists to prevent. A proxy that cannot start " +
+    "plus a deploy watcher retrying SIGUSR2 then burns one immediate respawn per " +
+    "signal, the shape measured at 51 respawns in 1.2s");
+  assert.match(body, /setTimeout\(/,
+    "premise: recovery no longer arms a restart timer at all, so the assertion " +
+    "above is checking the absence of something from an empty set");
+
+  // The async door, outside the function: the spawn must route its 'error' here.
+  const spawnAt = src.indexOf("const successor = spawn(", at);
+  assert.ok(spawnAt > at, "the successor spawn moved — re-read this guard before trusting it");
+  // STRIPPED FIRST, THEN WINDOWED, and bounded like the slice above. Taking 2000
+  // RAW chars and stripping afterwards makes the window a function of how much
+  // prose sits between the spawn and its listeners: adding the paragraph that
+  // explains the spawn gate pushed the 'error' listener out of the window and
+  // failed this guard for a reason that had nothing to do with the code. The
+  // ceiling then catches the opposite error, an anchor that slid.
+  // WINDOWED BY CONTENT, NOT BYTES. stripComments() blanks comments to spaces
+  // rather than deleting them — indices must keep lining up — so a fixed byte
+  // window fills with whitespace and stops short of the code it was sized for.
+  // Measured: 1,200 bytes here carried 263 characters of actual content and
+  // excluded both listeners, failing the assertions below for a reason that had
+  // nothing to do with the source.
+  const after = ((raw) => {
+    let kept = "", seenChars = 0;
+    for (const ch of raw) {
+      kept += ch;
+      if (!/\s/.test(ch)) seenChars++;
+      if (seenChars >= 700) break;
+    }
+    return kept;
+  })(src.slice(spawnAt));
+  assert.ok(after.replace(/\s+/g, " ").length > 200,
+    "the window after the successor spawn is empty — the anchor matched the last " +
+    "thing in the file, so every assertion below would pass on nothing");
+  assert.match(after, /successor\.once\(\s*["']error["']\s*,[\s\S]{0,80}?handoverFailed/,
+    "the successor spawn has no 'error' listener routed to handoverFailed. " +
+    "EAGAIN under fork pressure is emitted, not thrown, so it becomes an " +
+    "uncaughtException and kills the holder AFTER its standby is already dead");
+  // AND THE LISTENER MUST LEAD SOMEWHERE. Wiring it is not the property that
+  // matters: 'error' arrives a tick after this handler's synchronous block, so
+  // if departure is announced synchronously the recovery finds the holder
+  // already gone and can only log. The first version of this guard asserted the
+  // wiring and passed against exactly that inert shape.
+  //
+  // Departure must therefore sit behind 'spawn', which node emits only on a
+  // successful exec.
+  assert.match(after, /successor\.once\(\s*["']spawn["']\s*,[\s\S]{0,400}?settle\(0\)/,
+    "settle(0) is not gated on the successor actually starting, so the holder " +
+    "gives the address away on the strength of having CALLED spawn — and the " +
+    "'error' listener above then has nothing left to recover into");
+  // THE GATE'S OWN BODY, CUT BY BRACE BALANCE — not by a lazy regex.
+  //
+  // Two position-anchored attempts failed here. Slicing at the gate's index let
+  // a decoy `successor.once("spawn", () => { if (false) settle(0); })` sit above
+  // a synchronous departure. Replacing the gate with `[\s\S]*?\n\s*\}\);` then
+  // over-matched in the other direction: on that same decoy it ran PAST the
+  // one-line gate and swallowed the real `settle(0)` below it, so the remainder
+  // was clean and the assertion passed on the inert shape it was written for.
+  // Measured both times.
+  //
+  // Balance the braces from the gate's opening `{` and cut exactly that body.
+  // What remains is everything the handler does regardless of whether the
+  // successor started, and none of it may give the address away.
+  const gateAt = after.search(/successor\.once\(\s*["']spawn["']/);
+  assert.ok(gateAt >= 0, "the spawn gate is gone — the departure is no longer proof-gated");
+  const gateEnd = closesAt(after, after.indexOf("{", gateAt));
+  assert.ok(gateEnd > gateAt, "the spawn gate's body never closes inside the window");
+  const outsideGate = after.slice(0, gateAt) + after.slice(gateEnd);
+  assert.doesNotMatch(outsideGate, /settle\s*\(/,
+    "the holder settles outside the spawn gate — it gives the address away on " +
+    "the strength of having CALLED spawn, and the 'error' listener then has " +
+    "nothing left to recover into");
+  assert.match(after, /catch\s*\([\s\S]{0,40}?\)\s*\{[\s\S]{0,200}?handoverFailed/,
+    "the synchronous catch no longer routes to handoverFailed");
+});
+
+// Every .mjs under bin/ and proxy/, as (path, source) pairs. Two static guards
+// below walk the same tree for different questions; they had a copy each.
+function productionSources() {
+  const out = [];
+  const walk = (dir) => {
+    for (const e of readdirSync(join(testDir, "..", dir), { withFileTypes: true })) {
+      if (e.isDirectory()) { walk(join(dir, e.name)); continue; }
+      if (!e.name.endsWith(".mjs")) continue;
+      // The suite writes and deletes bin/scratch-*.mjs while running under
+      // --test-concurrency=8, so a readdir/readFile pair can straddle a delete
+      // and fail these guards for a reason that is not about the tree. They are
+      // also fixtures, not product — one is a 2,400-line copy of the launcher.
+      if (e.name.startsWith("scratch-")) continue;
+      try {
+        out.push([join(dir, e.name),
+                  stripComments(readFileSync(join(testDir, "..", dir, e.name), "utf8"))]);
+      } catch (err) {
+        if (err.code !== "ENOENT") throw err;   // vanished mid-scan: not ours
+      }
+    }
+  };
+  for (const d of ["bin", "proxy"]) walk(d);
+  return out;
+}
+
+// EVERY SHELL-OUT ONTO A USER'S MACHINE IS BOUNDED — enumerated, not sampled.
+//
+// PR #304 bounded eight launcher call sites behind probe(), and the commit said
+// the invariant held. It did not: `execFileSync("openssl", …)` in
+// proxy/forward-proxy.mjs still had no timeout, and it is the worst one to miss
+// — it runs inside startProxy() BEFORE the proxy listens, while holding the CA
+// lock, so a wedged openssl stalls every sibling waiting out caLockWaitMs too.
+// One reviewer found it by reading. Nothing in the suite could.
+//
+// The behavioural test (test/proxy-probe-bounded.test.mjs) proves the launcher's
+// chain is bounded by hanging lsof and ps. It cannot prove a call site nobody
+// routed through probe() exists, because it only exercises the paths it drives.
+// That is the gap this fills, and it is the fourth static guard in this file for
+// the same reason as the other three: judgement already missed it once.
+//
+// Bounded means a `timeout:` in the options object. killSignal and maxBuffer are
+// deliberately not required — a timeout that fires is the property that matters,
+// and demanding the whole triple would fail on a site that is bounded correctly
+// with different defaults.
+test("every synchronous shell-out in bin/ and proxy/ carries a timeout", () => {
+  const unbounded = [];
+  let seen = 0;
+  for (const [rel, src] of productionSources()) {
+    for (const m of src.matchAll(/\b(execFileSync|execSync|spawnSync)\s*\(/g)) {
+      seen++;   // productionSources() strips comments, so no prose reaches here
+      // Balance from the opening paren to find this call's own arguments —
+      // a fixed window would run into the next call on a dense file.
+      // FAIL CLOSED: -1 means the call never balances, and a slice to
+      // end-of-file would contain some `timeout:` somewhere and pass unread.
+      const end = closesAt(src, m.index + m[0].length - 1, "any");
+      if (end < 0) {
+        unbounded.push(`${rel}:unparsed`);
+        continue;
+      }
+      const args = src.slice(m.index, end);
+      // A VALUE, not just the key. `timeout: 0` and `timeout: undefined` both
+      // satisfy the key and bound nothing — node treats 0 as "no timeout".
+      if (!/\btimeout\s*:\s*(?!0\b|undefined\b)[A-Za-z0-9_$]/.test(args)) {
+        unbounded.push(`${rel}:${src.slice(0, m.index).split("\n").length}`);
+      }
+    }
+  }
+
+  // A zero here has two answers, and only one of them is good news.
+  assert.ok(seen >= 4,
+    `only ${seen} shell-out call sites found — the pattern stopped matching, so a ` +
+    `green result means the guard is blind rather than the tree being clean`);
+  assert.deepEqual(unbounded, [],
+    `these shell out with no timeout, so on a machine whose process table is in ` +
+    `trouble they block their caller indefinitely: ${unbounded.join(", ")}. ` +
+    `Route launcher calls through probe(); give others timeout + killSignal inline.`);
+});
+
+// THE RELAY MUST NOT SURRENDER A LIVE SOCKET FOR A TRANSIENT ERROR.
+//
+// bin/gap-relay.mjs exists to keep an address answering when nothing else will.
+// Its server-error handler used to be `process.exit(1)` for EVERY error, which
+// gives the descriptor away — and the errors that reach it are exactly the ones
+// where that is worst: a transient EMFILE/ENFILE at accept time happens when
+// the machine is already out of file handles, i.e. when the gap this relay
+// covers is most likely to be open. Node keeps a listening server listening
+// through such an error, so staying is both possible and correct.
+//
+// STATIC, AND THE BEHAVIOURAL VERSION WAS DELETED TO PUT THIS HERE. That test
+// asserted "an error arrived and the address is still served" while emitting no
+// error at all: SIGURG is ignored by the process and closing the parent's own
+// socket does not touch the relay's inherited descriptor. Measured — it passed
+// unchanged against the pre-fix `process.exit(1)` handler, in 53 ms. Inducing a
+// real accept-time EMFILE was attempted (ulimit -n 24) and is not merely
+// untuned: node cannot start under that limit at all. Unproven, not impossible
+// — so this guard pins the SHAPE and says plainly that it is doing so.
+//
+// The other half of the handler is deliberately unguarded because it cannot be
+// tested: when the LISTEN fails node closes fd 3 itself (measured — a child
+// given a pipe as fd 3 has no `3` in /proc/<pid>/fd, while the same spawn onto
+// a real socket keeps it), so "stay alive to hold the descriptor" is not an
+// option there and exiting is the honest answer.
+test("gap-relay keeps the socket on an error that left it listening", () => {
+  const src = stripComments(readFileSync(join(testDir, "..", "bin", "gap-relay.mjs"), "utf8"));
+  const at = src.indexOf('srv.on("error"');
+  assert.ok(at > 0, "the gap-relay server-error handler is gone or renamed");
+  const end = closesAt(src, src.indexOf("{", src.indexOf("=>", at)));
+  assert.ok(end > at, "the handler never closes — the file did not parse as this guard assumes");
+  const body = src.slice(at, end).replace(/\/\/[^\n]*/g, "");
+  assert.ok(body.replace(/\s+/g, " ").length < 600,
+    `the handler slice is ${body.replace(/\s+/g, " ").length} chars — too wide to be it`);
+
+  assert.match(body, /process\.exit\(/,
+    "premise: the handler no longer exits at all, so this guard is checking the " +
+    "wrong property — re-read it before trusting the green");
+  // The exit must be conditional, and conditional on still-listening in
+  // particular. An unconditional one is the pre-fix handler.
+  assert.match(body, /srv\.listening/,
+    "the handler does not consult srv.listening, so it treats an accept-time " +
+    "error on a live socket the same as a failed listen — and exiting there " +
+    "surrenders an address that was still answering");
+  assert.doesNotMatch(body, /^\s*process\.exit\(\s*1\s*\)\s*;?\s*$/m,
+    "the handler exits unconditionally at statement level — that is the pre-fix " +
+    "shape, which gave the descriptor away on any server error at all");
+  // AND THE CONDITION MUST POINT THE RIGHT WAY. Consulting srv.listening is not
+  // enough: `if (held) process.exit(1)` consults it too, and inverts the rule —
+  // surrender the socket while still listening, hang on when the listen failed.
+  // That is the single most likely wrong edit here and it passed every other
+  // assertion in this test.
+  assert.match(body, /if\s*\(\s*!\s*(held|srv\.listening)\b[^)]*\)[\s\S]{0,40}?process\.exit/,
+    "the exit is not gated on the NOT-listening case — an inverted condition " +
+    "surrenders a live socket and keeps a process that has no descriptor left");
+});
+

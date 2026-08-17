@@ -10,6 +10,7 @@ import { startWatcher } from "./watcher.mjs";
 import { startOAuthRefresher, stopOAuthRefresher } from "./oauth/refresher.mjs";
 import { attachForwardProxy, handleDownloadsAbsolute } from "./forward-proxy.mjs";
 import { sourceFingerprint, PROXY_ROOT } from "./source-fingerprint.mjs";
+
 import { publishableGates } from "./gate-allowlist.mjs";
 
 // Debug logging — writes to ~/.claude/cache-fix-debug.log (override path with
@@ -24,6 +25,12 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 import { homedir } from "node:os";
 import util from "node:util";
 import { claudeHome } from "./claude-home.mjs";
+
+// The ceiling on this layer's one shell-out, snapshotted at load so it means the
+// same thing here as the launcher's identically-named const does there.
+// bin/ and proxy/ share no module; a new one carrying three values would exist
+// only to avoid restating them, so they are restated and cross-referenced.
+const PROBE_TIMEOUT_MS = Number(process.env.CACHE_FIX_PROBE_TIMEOUT_MS) || 2_000;
 
 function debugLogPath() {
   return process.env.CACHE_FIX_DEBUG_LOG ||
@@ -870,7 +877,9 @@ export async function startProxy(options = {}) {
     );
   }
 
-  const listenFd = options.fd ?? inheritedFd();
+  // `let`, because the fallback below clears it: after a refused handover this
+  // must read "we are not on an inherited socket", not "we tried to be".
+  let listenFd = options.fd ?? inheritedFd();
 
   let watcher = null;
   try {
@@ -922,6 +931,13 @@ export async function startProxy(options = {}) {
     } catch (err) {
       process.stderr.write(
         `[cache-fix] socket handover refused (${err?.code || err?.message}); binding ${bind}:${port} instead\n`);
+      // CLEARED, because everything downstream reads it as "we are ON that
+      // socket" and from here we are not. `inheritedSocket` decides
+      // askForSuccessor, which hands fd 3 to a child and exits 75 — telling the
+      // supervisor a successor holds the socket while the port we actually
+      // served is released with nobody on it. Measured on the unfixed code:
+      // exit 75 plus an orphaned successor on the same unservable fd.
+      listenFd = null;
       await listenOnce({ port, host: bind });
     }
   }
@@ -973,7 +989,11 @@ export async function startProxy(options = {}) {
     // Whether we are serving a socket a supervisor handed down. Only then can
     // shutdown hand the SAME socket to a successor: a proxy that bound its own
     // port has nothing to pass on.
-    inheritedSocket: listenFd !== null && listenFd === 3,
+    // `listenFd === 3` alone: the fallback above nulls it on a refused handover,
+    // so this is the whole question. It read `listenFd !== null && listenFd === 3`
+    // — two conjuncts for one fact, the first unable to be false when the second
+    // is true. That shape is what made the original bug readable as correct.
+    inheritedSocket: listenFd === 3,
     close: () =>
       new Promise((resolve, reject) => {
         // Retire this instance's forward-mode vote exactly once (guarded
@@ -1071,6 +1091,33 @@ const invokedAsScript =
   process.argv[1] &&
   import.meta.url === pathToFileURL(process.argv[1]).href;
 
+// THE STDIO GUARD BELONGS TO THE PROCESS, NOT TO FORWARD MODE.
+//
+// installSelfHeal() carries an identical pair of listeners, and 94e1953 is
+// usually described as having fixed this file. It fixed it in ONE OF TWO MODES:
+// installSelfHeal runs only `if (forwardAttached)`, and forward mode is opt-in.
+// Measured on the default (reverse) path — start startProxy() with
+// CACHE_FIX_FORWARD_PROXY unset and read process.stderr.listenerCount("error"):
+// forward gives 1/1, reverse gives 0/0.
+//
+// Reverse mode is not a quiet mode. The proxy child is spawned by the holder
+// with stdio ["inherit","pipe","inherit", fd], so its stderr IS the shared pipe
+// this whole change is about, and it writes to that pipe on ordinary paths —
+// startup banners, `[upstream] using proxy …`, the oauth refresher. The
+// measured 27-minute outage needs exactly one such write after the last reader
+// dies.
+//
+// Installed here rather than inside installSelfHeal because it answers a
+// different question: not "is forward mode attached" but "am I a process".
+// Gated on invokedAsScript so importing this module as a library — which the
+// suite does constantly — never alters the host process's stream semantics,
+// which is the same reason removeSelfHeal() exists.
+if (invokedAsScript) {
+  for (const s of [process.stdout, process.stderr]) {
+    s.on("error", () => { /* the reader left; serving requests is the job */ });
+  }
+}
+
 // A proxy started by the port holder must not outlive it. SIGKILL cannot be
 // forwarded, so the holder's own signal handlers do not cover the case that
 // actually happens in the field — an OOM kill, a container stop, an operator's
@@ -1157,9 +1204,18 @@ export function successorServing(port) {
     // the process table costs, and this runs on a user's machine. A timeout is
     // safe here because the catch below already falls back to the ceiling.
     // SIGKILL because a probe wedged on a sick box will not honour SIGTERM.
+    //
+    // READ ONCE, AT LOAD, like the launcher's PROBE_TIMEOUT_MS — see the const
+    // near the top of this file. It was read from process.env on every call,
+    // inside a 100 ms setInterval, while the launcher snapshots at import: the
+    // same knob then meant two different things in the two layers the moment
+    // anything mutated the env mid-run. The two copies of these three values
+    // are deliberate (no module is shared between bin/ and proxy/, and one
+    // would exist solely to carry them) — so they are named on both sides and
+    // this comment is the link.
     const out = execFileSync("lsof", ["-nP", "-t", `-iTCP:${port}`, "-sTCP:LISTEN"],
                              { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
-                               timeout: Number(process.env.CACHE_FIX_PROBE_TIMEOUT_MS) || 2_000,
+                               timeout: PROBE_TIMEOUT_MS,
                                killSignal: "SIGKILL", maxBuffer: 1 << 20 });
     for (const line of out.trim().split("\n")) {
       const pid = Number(line);

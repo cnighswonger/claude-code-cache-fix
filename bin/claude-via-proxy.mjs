@@ -18,6 +18,7 @@ const SERVER_PATH = resolve(__dirname, "../proxy/server.mjs");
 // DISK rather than from the bytes it booted with — which is the only reason
 // anyone asks it to hand the port on.
 const LAUNCHER_PATH = fileURLToPath(import.meta.url);
+
 const GAP_RELAY_PATH = resolve(__dirname, "gap-relay.mjs");
 // AT MODULE LOAD, not on first use. This value is an IDENTITY — "the bytes this
 // process is running" — and the only moment it is certainly true is next to the
@@ -266,7 +267,23 @@ class HolderSocket extends EventEmitter {
                CACHE_FIX_HELD_HOST: this._host || "127.0.0.1",
                CACHE_FIX_HOLDER_TREE: undefined, CACHE_FIX_HELD_BY: undefined },
       });
-      this._gap.on("exit", () => { this._gap = null; });
+      // IDENTITY, NOT STATE — the rule openStandby spells out below, which both
+      // of these handlers were breaking. Each fires for the gap it was attached
+      // to, and by then `this._gap` may be a NEWER one: openGap runs on every
+      // proxy restart, so a late exit or error from the previous gap would null
+      // a live successor. The holder then opens a second gap on the same
+      // descriptor, and two acceptors on one socket is the shape this file
+      // already measured at 60 of 125 requests reset.
+      const gap = this._gap;
+      const gone = () => { if (this._gap === gap) this._gap = null; };
+      gap.on("exit", gone);
+      // AND "error" AT ALL, for the reason openStandby states below and this
+      // call was never swept for: an async spawn failure (EAGAIN under the fork
+      // pressure this whole file is about, or ENOENT if GAP_RELAY_PATH moves) is
+      // EMITTED on the ChildProcess, not thrown — so the try/catch around it
+      // cannot see it, and an unhandled 'error' on a ChildProcess takes the
+      // holder down with it.
+      gap.on("error", gone);
     } catch {
       this._gap = null;
     }
@@ -409,6 +426,63 @@ function probe(cmd, args, stderr = "ignore") {
   });
 }
 
+// BEST-EFFORT DIAGNOSTICS, and that is the whole of it.
+//
+// An earlier version of this block claimed the try/catch was load-bearing —
+// that process.stderr is synchronous on a file, so ENOSPC/EBADF throws at the
+// write and a caller's catch would then reclassify a healthy holder as a
+// stranger. MEASURED on node v24.11.1, stderr redirected to a file with fd 2
+// closed, both polarities: `process.stderr.write()` RETURNED NORMALLY
+// ("sync result: no-throw") and the failure surfaced afterwards as an
+// asynchronous 'error' event — uncaught without a listener, delivered to the
+// listener with one. So the catch here has never caught anything, and the
+// consequence chain that paragraph described could not occur through it.
+//
+// The actual protection is the pair of stream 'error' listeners installed at the
+// top of holdPort() — see the block there, which spells out why a dead reader
+// must not take the supervisor with it. Not at module scope, and NOT in this
+// file's other modes: the interactive wrapper deliberately has no such listener,
+// so on that path a write to a dead pipe still ends the process, which for a
+// foreground producer is correct.
+//
+// The try stays because it costs nothing and covers the one shape that DOES
+// throw synchronously: a non-string argument from a future caller
+// (ERR_INVALID_ARG_TYPE). A destroyed stream does NOT — measured,
+// `process.stderr.destroy(); process.stderr.write("x")` returns normally. And
+// because losing a diagnostic line must never end a decision.
+function warn(msg) {
+  try { process.stderr.write(msg); } catch { /* never worth the decision */ }
+}
+
+// ONE TEMPLATE FOR BOTH CALLERS. The same four lines lived in holderVerdict and
+// otherHolderOn, differing only in how they named the pid, and both are the
+// operator's ONLY signal that a deploy silently no-opped. The test asserts on
+// the shared substring, so an edit to one copy would leave the other's guard
+// green while the two logs disagreed about the same event.
+//
+// NAME BOTH SIDES of the unknown: `null` means the comparison could not be made,
+// and that is EITHER end of it — no usable record in tmp, or our own SERVER_PATH
+// unreadable. Blaming the record sent an operator to /tmp for a broken install;
+// measured, a valid record plus a missing server.mjs printed "no record in /tmp".
+function warnUncomparable(port, pid, treatedAs) {
+  warn(`[cache-fix] ${port}: cannot compare builds — no usable fingerprint record in ` +
+       `${tmpdir()}, or ${SERVER_PATH} is unreadable. Treating pid ${pid} as ${treatedAs}; ` +
+       `if this was a deploy, it has NOT taken effect.\n`);
+}
+
+// "It names run-service" is settled; what remains is whether it runs OUR code.
+// `true` and `null` both answer "holder" — we do not signal a process we cannot
+// rule ours — but the two are not equally informative, and the null was silent
+// at all three call sites while `otherHolderOn` warns loudly on the very same
+// value. So a swept /tmp turned a deploy into a no-op that read as a success:
+// takeOver() saw "holder", exited 0, and nothing said the new code had not
+// started. Same uncertainty, same volume.
+function holderVerdict(port, pid) {
+  const same = runningOurCode(port);
+  if (same === null) warnUncomparable(port, pid, "a holder of ours");
+  return same !== false ? "holder" : pid;
+}
+
 // Returns "holder" when the owner is a holder of ours (nothing to do), a pid
 // when it is something else we may ask to stop, or null when we cannot tell —
 // and NULL MEANS LEAVE IT ALONE. Signalling a pid we did not identify is how a
@@ -433,11 +507,28 @@ function holderPidOn(port) {
   // list, so this loop always returned before the fingerprint branch below.
   // Measured: a deploy printed "this one is surplus", exited 0, and left the OLD
   // code serving — every upgrade a no-op.
+  // ASKED ONCE PER PID, and the answer kept. The loop below and the gap-relay
+  // filter under it ran the IDENTICAL `ps -p <pid> -o command=` for the same
+  // pids — two execs and two 2s timeout windows each, on a path polled every
+  // 500 ms by release()'s retry loop and re-entered by takeOver()'s confirm
+  // loop. That is the cost this file is trying to cut, paid twice. (The deploy
+  // watcher does NOT reach here — it calls codeFingerprint() only; an earlier
+  // version of this sentence said it did.)
+  //
+  // A miss stays a miss: `ps` failing for a pid means it went away between lsof
+  // and now, and the cache records that as "" so the second reader draws the
+  // same conclusion instead of re-asking a question already answered.
+  const cmdOf = new Map();
+  const psOf = (pid) => {
+    if (!cmdOf.has(pid)) {
+      let c = "";
+      try { c = probe("ps", ["-p", String(pid), "-o", "command="]); } catch { c = ""; }
+      cmdOf.set(pid, c);
+    }
+    return cmdOf.get(pid);
+  };
   for (const p of pids) {
-    try {
-      const c = probe("ps", ["-p", String(p), "-o", "command="]);
-      if (/\brun-service\b/.test(c)) return runningOurCode(port) !== false ? "holder" : p;
-    } catch { /* gone between lsof and ps */ }
+    if (/\brun-service\b/.test(psOf(p))) return holderVerdict(port, p);
   }
   // NOT THE STANDBY, unless it is all there is. lsof returns ascending pid order
   // and the standby is spawned at bind — before the first proxy child — so it is
@@ -447,11 +538,9 @@ function holderPidOn(port) {
   // the child that actually held the port. The one process whose job is to
   // survive a dead holder was destroyed by the recovery path. A LONE armed
   // standby must still be releasable, so it stays eligible when nothing else is.
-  const real = pids.filter((p) => {
-    try {
-      return !/gap-relay/.test(probe("ps", ["-p", String(p), "-o", "command="]));
-    } catch { return false; }
-  });
+  // An empty answer means the pid is gone, which is not "a real proxy" — the
+  // old code reached the same verdict through its catch.
+  const real = pids.filter((p) => { const c = psOf(p); return c !== "" && !/gap-relay/.test(c); });
   const pid = (real.length ? real : pids)[0];
   // A holder of ours is running the `run-service` SUBCOMMAND. Nothing weaker
   // works: the rule was "names our launcher and is not server.mjs", and the
@@ -490,13 +579,12 @@ function holderPidOn(port) {
   // gating it costs one comparison. An earlier comment called the reachability
   // unestablished on the strength of a write-probe whose CONTROL also recorded
   // nothing — void, not negative. Reading settled it.
-  if (/\brun-service\b/.test(cmd)) return runningOurCode(port) !== false ? "holder" : pid;
+  if (/\brun-service\b/.test(cmd)) return holderVerdict(port, pid);
   const ppid = Number(cmd.trim().split(/\s+/)[0]);
   if (Number.isInteger(ppid) && ppid > 1) {
-    try {
-      const parent = probe("ps", ["-p", String(ppid), "-o", "command="]);
-      if (/\brun-service\b/.test(parent)) return runningOurCode(port) !== false ? "holder" : ppid;
-    } catch { /* parent gone: fall through and treat the listener on its own */ }
+    // Through the same cache: an empty answer is "parent gone", which falls
+    // through exactly as the old catch did.
+    if (/\brun-service\b/.test(psOf(ppid))) return holderVerdict(port, ppid);
   }
   return pid;
 }
@@ -535,7 +623,7 @@ function otherHolderOn(port) {
     // leave the address unserved. What changes is that it is no longer silent.
     const absent = e?.code === undefined && e?.status === 1
                    && !String(e?.stdout || "") && !String(e?.stderr || "");
-    if (!absent) process.stderr.write(
+    if (!absent) warn(
       `[cache-fix] ${port}: the ownership probe could not run ` +
       `(${e?.code || `exit ${e?.status}`}${e?.stderr ? `: ${String(e.stderr).trim().split("\n")[0]}` : ""}) — ` +
       `continuing as if no other holder is here, which can put a second one beside it\n`);
@@ -569,15 +657,7 @@ function otherHolderOn(port) {
     // needs the incumbent to stop listening between our lsof and our bind.
     // Unknown must change VISIBILITY, not the exit: "already held, this one is
     // surplus" reads as "the new code is running" — the reassuring wrong answer.
-    // NAME BOTH SIDES. `null` means the comparison could not be made, and that
-    // is EITHER end of it: no usable record in tmp, or our own SERVER_PATH
-    // unreadable. Blaming the record sent an operator to /tmp for a broken
-    // install — measured, a valid record plus a missing server.mjs printed
-    // "no record in /tmp".
-    if (same === null) process.stderr.write(
-      `[cache-fix] ${port}: cannot compare builds — no usable fingerprint record in ` +
-      `${tmpdir()}, or ${SERVER_PATH} is unreadable. Treating pid ${p} as ours; ` +
-      `if this was a deploy, it has NOT taken effect.\n`);
+    if (same === null) warnUncomparable(port, p, "ours");
     return p;
   }
   return 0;
@@ -651,6 +731,39 @@ function runningOurCode(port) {
 }
 
 function holdPort(rest) {
+  // A DEAD READER MUST NOT KILL THE SUPERVISOR — and only the supervisor.
+  //
+  // proxy/server.mjs took this in 94e1953 after a measured 27-minute outage: a
+  // leftover `… | tee <file>` was killed, that tee was the only reader of the
+  // pipe the proxy held as stdout/stderr, and the next write raised EPIPE. The
+  // launcher never got the same treatment, and it is the worse place to be
+  // missing it — the holder and its proxy child SHARE that pipe (the child is
+  // spawned stdio ["inherit","pipe","inherit", fd]), so one dead reader reaches
+  // both, and this process is the one whose entire job is to put the proxy back.
+  // EPIPE is an asynchronous 'error' event, not a throw, so no try/catch reaches
+  // it and Node promotes an unhandled one to uncaughtException.
+  //
+  // HERE, AT THE TOP OF THE SUPERVISOR, and not in a dispatch branch. An earlier
+  // cut installed it in the run-service branch alone — one of the TWO doors into
+  // this function; the other is the `server` subcommand with
+  // CACHE_FIX_HOLD_PORT=on, and that is the one most of the held-port suite
+  // drives. Measured with a FIFO whose reader was killed and a log line forced:
+  // via `server` the holder died, via run-service it survived. The same "fixed
+  // in one of two modes" shape this comment indicts in 94e1953, one layer up.
+  //
+  // The branch name is deliberately not written here as it appears in the code:
+  // proxy-server.test.mjs locates that branch by scanning this file for the
+  // literal, and prose carrying it becomes a false anchor — measured, this
+  // comment matched ahead of the real branch and the test read the wrong span.
+  //
+  // Still not the interactive wrapper: holdPort has exactly two call sites, both
+  // in the holder dispatch, so the wrapper never reaches this. That distinction
+  // is deliberate — a foreground producer whose consumer dies should end, and
+  // swallowing there would leave an interactive claude relaying into a dead pipe
+  // with no visible output.
+  for (const s of [process.stdout, process.stderr]) {
+    s.on("error", () => { /* the reader left; putting the proxy back is the job */ });
+  }
   // The proxy's own default: holding a different port than the proxy would have
   // served leaves nothing at the documented address.
   // `|| 9801` REWROTE PORT 0 to 9801. "0" is a truthy string so the run-service
@@ -739,8 +852,50 @@ function holdPort(rest) {
       // waiting to arm. The socket is never at risk in between — we and our
       // child are still holding it.
       try { holder.closeStandby(); } catch { }
+      // Set in the spawn gate below, once the successor exists and we have
+      // SIGHUP'd our child: from there the handover is announced and this holder
+      // is leaving, so a late 'error' has nothing to recover into and may only
+      // report.
+      let left = false;
+      // Recovery from a handover that did not happen, shared by both ways it can
+      // fail — the synchronous throw and the asynchronous 'error'. It used to
+      // live in the catch alone, which sees exactly one of them.
+      const handoverFailed = (why) => {
+        process.stderr.write(`[cache-fix] could not hand the port on: ${why}\n`);
+        if (left || !stopping) return;         // already gone, or already recovered
+        // We killed our standby on the way in and we are staying, so put one
+        // back. Without it a failed handover leaves the holder live and
+        // permanently unprotected, and says nothing about it.
+        stopping = false;
+        // AND THE LADDER BACK. clearTimeout above stops the pending restart but
+        // leaves the handle non-null, and spawnWhenReady() returns early on a
+        // non-null `restart` — so a holder that survives a failed handover could
+        // never start another proxy again, while looking healthy.
+        restart = null;
+        holder.openStandby();
+        // THROUGH THE LADDER, NOT PAST IT. Clearing `restart` only unblocks the
+        // next spawn; nothing here was climbing it, because the child-exit
+        // handler that normally schedules one had its timer cleared above. But
+        // calling spawnWhenReady() directly skips the backoff the ladder exists
+        // for — a proxy that cannot start plus a deploy watcher retrying SIGUSR2
+        // then burns one immediate respawn per signal, which is the shape
+        // measured at 51 respawns in 1.2s. So re-arm the timer instead and let
+        // it fire: a live child makes it a no-op, and a missing one gets a
+        // spawn one rung up.
+        if (!child) {
+          // THE RUNG WE ARE ON, not rung zero. The child-exit path climbs
+          // `base * 2 ** min(failures,5)`; re-arming at a flat `base` here reset
+          // the ladder on every failed handover, so sustained fork pressure plus
+          // a deploy watcher retrying SIGUSR2 would keep paying the shortest
+          // delay — a slower version of the 51-respawns-in-1.2s shape the ladder
+          // exists to prevent.
+          const base = Number(process.env.CACHE_FIX_RESTART_BASE_MS) || 250;
+          const wait = Math.min(base * 2 ** Math.min(failures, 5), base * 20);
+          restart = setTimeout(() => { restart = null; spawnWhenReady(); }, wait);
+        }
+      };
       try {
-        spawn(process.execPath, [LAUNCHER_PATH, "run-service"], {
+        const successor = spawn(process.execPath, [LAUNCHER_PATH, "run-service"], {
           detached: true,
           stdio: ["ignore", "inherit", "inherit", holder._handle.fd],
           // EXIT_WITH_PARENT is dropped, and this is the distinction cswap's
@@ -752,27 +907,49 @@ function holdPort(rest) {
           // measured, every request in the sampling window refused.
           env: { ...process.env, CACHE_FIX_HOLDER_HANDOVER: "1", LISTEN_FDS: "1",
                  CACHE_FIX_EXIT_WITH_PARENT: "0" },
-        }).unref();
+        });
+        // WE LEAVE WHEN THE SUCCESSOR EXISTS, not when we have asked for one.
+        //
+        // EAGAIN under fork pressure — the condition this handover exists to
+        // survive — is EMITTED on the ChildProcess, not thrown, so the catch
+        // below never sees it. Node's split is exact: EACCES, EAGAIN, EMFILE,
+        // ENFILE and ENOENT go to the 'error' event; every other errno, ENOMEM
+        // included, throws into the catch. Both routes reach handoverFailed,
+        // which is why the two doors exist rather than one. Unhandled, an 'error' on a
+        // ChildProcess is an uncaughtException and this process has no handler:
+        // the holder would die having already killed its standby, leaving the
+        // port to an orphaned proxy child with nobody supervising it.
+        //
+        // A LISTENER ALONE DOES NOT FIX THAT, and the first cut of this was
+        // exactly that mistake. 'error' arrives on a later tick, after this
+        // whole synchronous block — measured: a spawn of a missing binary
+        // printed "sync block done" first, with the departure flag already set.
+        // So recovery ran, saw we had announced our exit, and returned. The
+        // uncaughtException became a tidy log line and the port still ended up
+        // unowned.
+        //
+        // Node emits 'spawn' if and only if the exec succeeded (measured: the
+        // good child gets 'spawn' and no 'error', the bad child the reverse), so
+        // it is the honest gate. Everything that gives the address away moves
+        // behind it. `left` is then belt to that braces — the two events are
+        // mutually exclusive, so nothing reaches recovery after departure today;
+        // it is kept so a future reordering cannot quietly re-arm a holder that
+        // has already handed the address on.
+        successor.once("spawn", () => {
+          // The child under us keeps serving until IT is replaced by the
+          // successor's own child; nothing here interrupts the accept path.
+          if (child && child.exitCode === null && !child.signalCode) {
+            try { child.kill("SIGHUP"); } catch { }
+          }
+          left = true;
+          settle(0);
+        });
+        successor.once("error", (e) => handoverFailed(e?.code || e?.message || "spawn failed"));
+        successor.unref();
       } catch (e) {
-        process.stderr.write(`[cache-fix] could not hand the port on: ${e.message}\n`);
-        // We killed our standby on the way into this and we are staying, so put
-        // one back. Without it a failed handover leaves the holder live and
-        // permanently unprotected, and says nothing about it.
-        stopping = false;
-        // AND THE LADDER BACK. clearTimeout above stops the pending restart but
-        // leaves the handle non-null, and spawnWhenReady() returns early on a
-        // non-null `restart` — so a holder that survives a failed handover could
-        // never start another proxy again, while looking healthy.
-        restart = null;
-        holder.openStandby();
+        handoverFailed(e?.message || e);
         return;
       }
-      // The child under us keeps serving until IT is replaced by the successor's
-      // own child; nothing here interrupts the accept path.
-      if (child && child.exitCode === null && !child.signalCode) {
-        try { child.kill("SIGHUP"); } catch { }
-      }
-      settle(0);
     });
 
     // STOP WHEN NOBODY IS LEFT TO STOP US.

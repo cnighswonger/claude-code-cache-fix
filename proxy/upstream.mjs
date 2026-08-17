@@ -214,16 +214,47 @@ export const directLast = () => _directLast;
 //
 // It is wrong where the hop is a POLICY boundary rather than a cache.
 //
-// SCOPE, AND IT IS NOT THE WHOLE DOOR: this guards the two CONNECT paths in
-// forward-proxy.mjs only. forwardRequest() below — the relayed /v1/messages
-// path — still dials direct with the variable set, and that is recorded rather
-// than fixed because the obvious fix is worse. Throwing there IS caught by
-// handleMessages, but its catch begins `if (abortController.signal.aborted)
-// return`, and the abort fires on clientReq's own "close" — which Node emits
-// when the request BODY completes, not only when the client leaves. Measured:
-// hop="" requireHop=true, the throw caught with aborted=true and
-// writableEnded=false, and the client got no response at all, timing out after
-// 10s. A leak that is honest beats a hang that reads as a refusal.
+// THE THREE CREDENTIAL-BEARING DOORS, and for most of this file's life it was
+// only two: the two CONNECT paths in forward-proxy.mjs refused, while
+// forwardRequest() below — the relayed /v1/messages path, i.e. the primary API
+// route — never consulted this variable at all and dialled direct with it set.
+//
+// NOT EVERY EGRESS, and the exemptions are named rather than assumed. THREE
+// other sites call getAgent() without asking:
+//
+//   forward-proxy.mjs storageAgent()      — a bucket URL, no client headers
+//   forward-proxy.mjs fallbackToOrigin()  — FORWARDS THE CLIENT'S HEADERS
+//   server.mjs        update-channel probe — our own request, no client headers
+//
+// The middle one is the reason this list is spelled out. An earlier version of
+// this comment counted two and concluded "neither carries the caller's API
+// key" — true of the two it named, and never established for the one it
+// missed, which is precisely the one defined by passing the client's headers
+// through verbatim. It reaches downloads.claude.ai only, on the opt-in
+// download-rewrite path, and it is the honest place to look first if that path
+// ever carries anything authenticating. Counted, not covered.
+//
+// THE ARGUMENT FOR LEAVING IT OPEN OUTLIVED ITS FACTS. It was: throwing in
+// forwardRequest would HANG the client, because handleMessages' catch begins
+// `if (abortController.signal.aborted) return` and the abort fired on
+// clientReq's own "close", which Node emits when the request BODY completes —
+// not only when the client leaves. Measured at the time: throw caught with
+// aborted=true, writableEnded=false, no response, client timed out at 10 s.
+//
+// At HEAD the abort is keyed off clientRes' "close" gated by writableEnded
+// (server.mjs), which separates "we answered" from "client gone" and never
+// fires on a finished body. So the throw reaches the same catch and becomes the
+// 502 that catch already writes, on all three forwardRequest call sites. The
+// hang the argument rested on is unreachable, and with it the reason to keep an
+// egress hole open on the route that carries the credentials.
+//
+// Refusal now lives at the top of forwardRequest(). A bypassed host is still
+// exempt here: NO_PROXY is an operator saying "this one is direct on purpose".
+// The CONNECT paths do NOT consult shouldBypassProxy, so a NO_PROXY'd host is
+// refused there and exempt here. Left as it is because the two answer different
+// questions — CONNECT is asked to tunnel an arbitrary host, this is asked to
+// relay to the configured upstream — but it is an asymmetry, not a symmetry,
+// and an earlier version of this comment claimed the opposite.
 export const requireHop = () => process.env.CACHE_FIX_REQUIRE_HOP === "1";
 export async function resolveHop(isHTTPS) {
   const primary = selectProxyUrl(isHTTPS);
@@ -402,6 +433,27 @@ export async function forwardRequest(clientReq, body, signal) {
   const hop = fallbackProxyUrls().length && !shouldBypassProxy(upstreamUrl0.hostname)
     ? await resolveHop(upstreamUrl0.protocol === "https:")
     : undefined;
+  // REFUSE RATHER THAN LEAK, the same answer the two CONNECT paths give.
+  //
+  // This is where CACHE_FIX_REQUIRE_HOP was not honoured: forwardRequest never
+  // consulted it, so with the variable set and no hop reachable the relayed
+  // /v1/messages request dialled api.anthropic.com directly, carrying the
+  // caller's credentials past the boundary the variable exists to enforce.
+  //
+  // ASK THE QUESTION getAgent WILL ASK, not a paraphrase of it: `hop` is
+  // undefined when nothing was resolved, and getAgent then falls back to the
+  // configured proxy — so testing `!hop` alone would refuse a perfectly good
+  // configured hop. A bypassed host stays exempt because NO_PROXY is the
+  // operator saying "this one is direct on purpose".
+  if (requireHop() && !shouldBypassProxy(upstreamUrl0.hostname)) {
+    const effective = hop !== undefined
+      ? hop : selectProxyUrl(upstreamUrl0.protocol === "https:");
+    if (!effective) {
+      throw new Error(
+        `no chain hop reachable and CACHE_FIX_REQUIRE_HOP=1 — refusing to dial ` +
+        `${upstreamUrl0.hostname} directly`);
+    }
+  }
   return new Promise((resolve, reject) => {
     const upstreamUrl = upstreamUrl0;
 

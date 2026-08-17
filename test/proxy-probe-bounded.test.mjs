@@ -27,7 +27,11 @@ import { join, dirname } from "node:path";
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
 describe("probe bounding", () => {
-  it("finishes even when lsof never returns", async (t) => {
+  // ONE CASE PER HANGING COMMAND, because they sit at different depths of the
+  // same decision and only the second one reaches past lsof. Parameterised so a
+  // future third probe is one row, not one more copy of the fixture.
+  for (const hang of ["ps", "lsof"]) {
+  it(`finishes even when ${hang} never returns`, async (t) => {
     // A port somebody else already owns, so the launcher takes the path that
     // asks "who has this?" — which is the path that shells out.
     const squatter = net.createServer(() => {});
@@ -35,12 +39,36 @@ describe("probe bounding", () => {
     const port = squatter.address().port;
 
     const dir = await mkdtemp(join(tmpdir(), "ccf-probe-"));
-    // `lsof` that hangs forever. `ps` too — both are on the same path and a fix
-    // that only bounds one of them still hangs.
+    // ONLY `ps` HANGS, and `lsof` answers with a pid list.
+    //
+    // Both hanging was the first cut, under a comment claiming "a fix that only
+    // bounds one of them still hangs". That claim was false and the fixture is
+    // why: holderPidOn opens `try { probe("lsof", …) } catch { return null }`,
+    // so a timing-out lsof returns before any `ps` runs — otherHolderOn takes
+    // the same shape and takeOver() then exits on `if (!incumbent)`. Measured:
+    // the whole run finished in 2.07s, i.e. two lsof timeouts and not one ps.
+    // The case passed while the `ps` sites it names were never executed, so an
+    // unbounded ps would have shipped under a green test.
+    //
+    // Answering lsof with pids is what carries execution INTO the ps call
+    // sites; hanging there is what this case is for. lsof stays bounded by the
+    // sibling case below, which is the one that hangs it.
+    const answers = {
+      // A pid list, so execution reaches the `ps` sites below it.
+      lsof: "#!/bin/sh\nprintf '%s\\n' 4241 4242\n",
+      // Reached ONLY in the `ps` row, where lsof answers and ps hangs. In the
+      // `lsof` row this is never executed: holderPidOn's `probe("lsof", …)` is
+      // inside a try whose catch returns, so a timing-out lsof ends the call
+      // before any ps runs — measured with touch markers, the lsof marker
+      // appears and the ps marker never does, and that row completes in 2.06 s,
+      // i.e. exactly two 1 s lsof timeouts. Kept as a real answer rather than a
+      // stub so the `ps` row exercises the fingerprint branch behind it.
+      ps: "#!/bin/sh\necho 'node /usr/local/bin/cache-fix-proxy run-service'\n",
+    };
     for (const name of ["lsof", "ps"]) {
-      const p = join(dir, name);
-      await writeFile(p, "#!/bin/sh\nexec sleep 600\n");
-      await chmod(p, 0o755);
+      const body = name === hang ? "#!/bin/sh\nexec sleep 600\n" : answers[name];
+      await writeFile(join(dir, name), body);
+      await chmod(join(dir, name), 0o755);
     }
     t.after(async () => {
       await new Promise((r) => squatter.close(r));
@@ -69,11 +97,12 @@ describe("probe bounding", () => {
 
     if (!settled) {
       child.kill("SIGKILL");
-      assert.fail(`the launcher was still running after ${DEADLINE}ms with a hanging lsof — ` +
+      assert.fail(`the launcher was still running after ${DEADLINE}ms with a hanging ${hang} — ` +
                   "the probe is unbounded, and on a sick machine it would block here for ever");
     }
     // WHAT it decided is not this test's business — only that it decided. A
     // probe it cannot answer must become "cannot tell", never "wait for ever".
     assert.ok(true);
   });
+  }
 });

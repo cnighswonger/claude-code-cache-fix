@@ -35,6 +35,44 @@ function startProxy(extraEnv = {}) {
   return { proc, port, stderr: () => stderr };
 }
 
+// Same, plus a real fd 3 that is NOT a servable socket, and the LISTEN_FDS
+// claim that makes the proxy try to serve it. `inheritedFd()` returns 3 when
+// LISTEN_FDS >= 1 and LISTEN_PID is unset or names us, so a plain pipe on fd 3
+// reproduces the handover-refused path exactly.
+function startProxyWithBadFd3(extraEnv = {}) {
+  const env = { ...process.env, CACHE_FIX_PROXY_PORT: "0", LISTEN_FDS: "1", ...extraEnv };
+  for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]) delete env[k];
+  // Unset, or the proxy skips the whole path and there is nothing to test.
+  delete env.LISTEN_PID;
+  // CLEARED, because a live holder suppresses the successor spawn on its own
+  // (`heldByLiveHolder`) and would hide the defect rather than fix it.
+  delete env.CACHE_FIX_HELD_BY;
+  // ITS OWN PROCESS GROUP, so the cleanup can reap what it spawns. On the
+  // unfixed code SIGTERM hands fd 3 to a SUCCESSOR with stdio "inherit" — that
+  // successor keeps our pipes open, is reparented to init when we exit, and the
+  // test runner then waits on streams that never close. Measured: two orphaned
+  // servers survived the run and hung `node --test` indefinitely. Killing the
+  // group makes the leak this test exists to detect collectable.
+  const proc = spawn(process.execPath, ["proxy/server.mjs"], {
+    env,
+    detached: true,
+    stdio: ["pipe", "pipe", "pipe", "pipe"],
+  });
+  let out = "";
+  let stderr = "";
+  proc.stdout.on("data", (c) => (out += c.toString()));
+  proc.stderr.on("data", (c) => (stderr += c.toString()));
+  const port = new Promise((resolve, reject) => {
+    const tick = setInterval(() => {
+      const m = out.match(/listening on [\d.]+:(\d+)/);
+      if (m) { clearInterval(tick); resolve(parseInt(m[1], 10)); }
+    }, 25);
+    proc.on("exit", (code) => { clearInterval(tick); reject(new Error(`Proxy exited ${code}`)); });
+    setTimeout(() => { clearInterval(tick); reject(new Error("Proxy start timeout")); }, 8000);
+  });
+  return { proc, port, stdout: () => out, stderr: () => stderr };
+}
+
 function exitOf(proc) {
   // Bounded: this file exists to assert HOW the proxy exits, so a proxy that
   // never exits must fail here rather than hang the whole run.
@@ -159,6 +197,68 @@ describe("SIGTERM exit code", () => {
     } finally {
       try { proc.kill("SIGKILL"); } catch {}
       await new Promise((r) => upstream.close(r));
+    }
+  });
+
+  // A REFUSED HANDOVER MUST NOT STILL CLAIM THE SOCKET.
+  //
+  // `inheritedSocket` decides `askForSuccessor`, which decides whether we exit
+  // 75 ("a successor is on the socket, do nothing") and hand fd 3 down to a
+  // child. It was computed from `listenFd`, which records that handover was
+  // ATTEMPTED — and the fallback at the listen site does not clear it. So a
+  // proxy that was refused fd 3 and bound a port of its own still advertised
+  // inheritedSocket:true.
+  //
+  // What that costs: on SIGTERM we spawn a successor pointed at the SAME
+  // unservable fd 3, announce "(handed off)", and exit 75. The supervisor reads
+  // 75 as covered and skips reclaim; the port we actually served is released
+  // with nobody on it, while the child re-falls-back onto a different port. The
+  // failure shape this whole branch exists to prevent, produced by the branch
+  // itself.
+  //
+  // Reproduced on the PR head before the fix: LISTEN_FDS=1 with an unservable
+  // fd 3 logged "socket handover refused (EINVAL); binding 127.0.0.1:0 instead"
+  // and still returned {"inheritedSocket":true}.
+  //
+  // Both product assertions below fail on the unfixed code, for that reason.
+  it("does not hand down a socket it was refused", async () => {
+    const { proc, port, stdout, stderr } = startProxyWithBadFd3();
+    try {
+      const p = await port;
+
+      // PREMISE, not product: without these the test would pass on a proxy that
+      // never took the fallback path at all, which is the one way this could
+      // certify nothing.
+      assert.match(stderr(), /socket handover refused/,
+        "premise: the fd-3 listen must have been refused, or nothing here is exercised");
+      assert.ok(p > 0, "premise: it must have bound a port of its own");
+
+      const exited = exitOf(proc);
+      proc.kill("SIGTERM");
+      const { code } = await exited;
+
+      assert.equal(code, 0,
+        `exited ${code}: 75 tells the supervisor a successor holds the socket, but the ` +
+        `handover was REFUSED — the port it served is released with nobody on it`);
+      const listens = (stdout().match(/proxy listening on/g) || []).length;
+      assert.equal(listens, 1,
+        `${listens} "proxy listening on" lines: a successor was spawned onto the same ` +
+        `unservable fd 3 (a successor inherits our stdout, which is how it shows up here)`);
+      // STDOUT, and the first cut of this read stderr — where the string never
+      // appears, so the assertion could not fail on the fixed code, the unfixed
+      // code, or any future regression. server.mjs writes it with
+      // say(process.stdout, ...), and the holder parses that same stdout line to
+      // decide whether a successor is already serving.
+      assert.doesNotMatch(stdout(), /\(handed off\)/,
+        "announced a handoff of a socket it never had — the holder reads this " +
+        "exact line as 'a successor is on the socket' and skips its own recovery");
+    } finally {
+      // The GROUP, not the pid: on the unfixed code the successor outlives its
+      // parent and is reparented to init, so killing `proc` alone leaves it
+      // holding these pipes for the rest of the run.
+      try { process.kill(-proc.pid, "SIGKILL"); } catch {}
+      try { proc.kill("SIGKILL"); } catch {}
+      for (const s of [proc.stdout, proc.stderr]) { try { s.destroy(); } catch {} }
     }
   });
 });

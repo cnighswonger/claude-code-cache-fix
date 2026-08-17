@@ -181,7 +181,26 @@ export function ensureCA() {
   const tmp = (n) => join(caDir, `.tmp.${process.pid}.${n}`);
   try {
     if (ready()) return publish();
-    const run = (args) => execFileSync("openssl", args, { stdio: ["ignore", "ignore", "pipe"] });
+    // BOUNDED, like every other shell-out onto a user's machine — and this was
+    // the last unbounded call in the tree, which made that invariant untrue
+    // while it was being stated. It is also the worst place to be missing one:
+    // this runs inside startProxy() BEFORE the proxy listens, and while holding
+    // the CA lock taken above, so a wedged openssl stalls every sibling waiting
+    // out config.caLockWaitMs too. SIGKILL because a stuck openssl is stuck.
+    //
+    // A FIXED CEILING, NO KNOB. An earlier cut reused CACHE_FIX_PROBE_TIMEOUT_MS
+    // and then added CACHE_FIX_OPENSSL_TIMEOUT_MS to escape it — but the second
+    // still fell back to the first, so an operator lowering the probe knob to
+    // bound a sick `lsof` went on capping CA minting, which is the coupling the
+    // new knob was added to remove. Measured, `openssl genrsa 2048` over 15
+    // runs: 19-88 ms. 10 s is a hundredfold headroom over the worst of those,
+    // so there is nothing here for an operator to tune.
+    const run = (args) => execFileSync("openssl", args, {
+      stdio: ["ignore", "ignore", "pipe"],
+      timeout: 10_000,
+      killSignal: "SIGKILL",
+      maxBuffer: 1 << 20,
+    });
 
     // Reuse an existing root CA; only mint a new one on first run. Regenerating
     // the root here is a bug: the client trusts the CA via a NODE_EXTRA_CA_CERTS

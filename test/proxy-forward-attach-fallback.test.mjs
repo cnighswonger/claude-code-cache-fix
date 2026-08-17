@@ -26,6 +26,12 @@ const ENV_KEYS = [
   "CACHE_FIX_HTTPS_PROXY", "HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy",
   "CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_FALLBACK_PROXIES", "CACHE_FIX_REQUIRE_HOP",
   "CACHE_FIX_CHAIN_GRACE_MS",
+  // NO_PROXY decides whether a host is exempt from the hop rules at all, so a
+  // case that does not control it inherits the developer's shell. Measured: the
+  // ambient value here is "localhost,127.0.0.1", which exempts every loopback
+  // fixture in this file — a REQUIRE_HOP case pointed at 127.0.0.1 therefore
+  // asserted against a code path that was never entered.
+  "NO_PROXY", "no_proxy",
   "PATH",
 ];
 
@@ -337,16 +343,23 @@ test("CONNECT falls open to a direct dial, unless CACHE_FIX_REQUIRE_HOP says oth
       "CACHE_FIX_REQUIRE_HOP=1 dialled the target directly anyway — the bypass " +
       `this variable exists to close; endpoints touched: ${JSON.stringify(trace)}`);
 
-    // THE RELAYED PATH IS NOT COVERED, and that is deliberate — asserted so the
-    // gap is a fact this suite states rather than one a reader has to discover.
-    // forwardRequest() still dials direct with the variable set. Throwing there
-    // hangs the client instead of refusing it: handleMessages' catch opens with
-    // `if (abortController.signal.aborted) return`, and the abort fires on
-    // clientReq's own "close", which Node emits when the request BODY completes
-    // — not only when the client leaves. Measured: the throw caught with
-    // aborted=true, writableEnded=false, no response, client timed out at 10s.
-    // Change this assertion the day that abort listener distinguishes "body
-    // done" from "client gone".
+    // THE RELAYED PATH IS COVERED NOW, and this assertion is what changed when
+    // it became so. It read 418 — the upstream fixture answering, i.e. the
+    // request leaving with the operator's key and no hop, under a comment that
+    // called the gap deliberate.
+    //
+    // The reason it was left open died before the gap did. That reason: throwing
+    // in forwardRequest would HANG the client, because handleMessages' catch
+    // opens `if (abortController.signal.aborted) return` and the abort fired on
+    // clientReq's own "close" — which Node emits when the request BODY
+    // completes, not only when the client leaves. True when written. At HEAD the
+    // listener keys off clientRes' "close" gated by writableEnded, so it
+    // separates "we answered" from "client gone" and never fires on a finished
+    // body; the throw now lands in the same catch and becomes the 502 asserted
+    // below. All three forwardRequest call sites in server.mjs do the same.
+    //
+    // So the CONNECT paths and the relayed path finally agree: with
+    // CACHE_FIX_REQUIRE_HOP=1 and no reachable hop, nothing leaves this process.
     // ITS OWN INSTANCE. Pointing config.upstream at loopback for the whole case
     // breaks the CONNECT half above — the forward proxy then reads the tunnel
     // target 127.0.0.1:<port> as the upstream host and stops blind-tunnelling
@@ -354,6 +367,14 @@ test("CONNECT falls open to a direct dial, unless CACHE_FIX_REQUIRE_HOP says oth
     // reason that had nothing to do with fail-open.
     await handle.close();
     process.env.CACHE_FIX_PROXY_UPSTREAM = `http://127.0.0.1:${upstream.address().port}`;
+    // NO_PROXY CLEARED, or this case tests nothing. The upstream fixture must be
+    // loopback to be controllable, and the ambient NO_PROXY on a dev box is
+    // "localhost,127.0.0.1" — so shouldBypassProxy() answers true, the request
+    // is exempt from the hop rules by design, and the refusal below never runs.
+    // The first cut of this assertion failed for exactly that reason and read as
+    // "the guard does not work".
+    delete process.env.NO_PROXY;
+    delete process.env.no_proxy;
     handle = await startProxy({ port: 0, watch: false });
     const relayed = await new Promise((resolve) => {
       const r = http.request({ host: "127.0.0.1", port: handle.port, method: "POST",
@@ -363,10 +384,28 @@ test("CONNECT falls open to a direct dial, unless CACHE_FIX_REQUIRE_HOP says oth
       r.setTimeout(4_000, () => { r.destroy(); resolve("TIMEOUT"); });
       r.end("{}");
     });
-    assert.equal(relayed, 418,
-      `the relayed path answered ${relayed} instead of reaching the upstream. 502 ` +
-      `means CACHE_FIX_REQUIRE_HOP now covers it — good, but the comment above and ` +
-      `this assertion both describe the OLD state, so update them together`);
+    // PREMISE, and this case had none: with the upstream exempt from the hop
+    // rules the refusal is correct to skip, so a 418 would mean "not applicable"
+    // while reading as "the guard failed".
+    assert.ok(!process.env.NO_PROXY && !process.env.no_proxy,
+      "premise: NO_PROXY must not exempt the loopback upstream, or the refusal " +
+      "below is never reached and this case asserts nothing");
+    assert.equal(process.env.CACHE_FIX_REQUIRE_HOP, "1",
+      "premise: the variable under test is not set");
+    assert.equal(relayed, 502,
+      `the relayed path answered ${relayed}. 418 is the upstream fixture, which ` +
+      `means the request LEFT this process carrying the caller's credentials with ` +
+      `CACHE_FIX_REQUIRE_HOP=1 and no hop reachable — the exact egress the variable ` +
+      `exists to forbid, and which the CONNECT paths above already refuse`);
+    await new Promise((r) => setTimeout(r, 100));
+    // `trace`, NOT `seen`: only the `direct` fixture pushes to seen, and the
+    // relayed request targets the `upstream` one — so asserting on seen here
+    // could not fail no matter what the proxy did. The upstream fixture records
+    // into trace, which is the log that can actually witness this dial.
+    assert.ok(!trace.some((t) => /UPSTREAM/i.test(String(t))),
+      `the relayed path reached the upstream before answering: ${JSON.stringify(trace)}. ` +
+      `A 502 that dialled first and failed later is not a refusal — the request ` +
+      `left this process carrying the caller's credentials`);
 
   } finally {
     restoreEnv(saved);

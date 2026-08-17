@@ -6,6 +6,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { readdirSync, readFileSync } from "node:fs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
@@ -842,4 +843,57 @@ describe("holder handover (SIGUSR2)", () => {
       }
     }
   });
+});
+
+// A LATE EVENT FROM A RETIRED GAP MUST NOT RETIRE THE LIVE ONE.
+//
+// openGap() refuses to open a second gap while `this._gap` is set, so that field
+// is the only thing between one acceptor on the descriptor and two. Its 'exit'
+// and 'error' handlers used to null it unconditionally — but each fires for the
+// gap it was attached to, and openGap runs again on every proxy restart, so a
+// late event from the PREVIOUS gap cleared a LIVE successor and the next open
+// stacked a second relay on the same socket. Two acceptors on one descriptor is
+// the shape this file's siblings measured at 60 of 125 requests reset.
+//
+// DRIVEN DIRECTLY, not observed in a running holder, and that is not a shortcut.
+// Measured: a real gap is unobservable by design — start() calls closeGap()
+// immediately before spawning the child, because two handles may BIND one port
+// but only one may LISTEN (holder.mjs:1124). Sampling `ps` at 10 ms intervals
+// through boot and through a child death found a gap exactly zero times, while
+// suppressing that one closeGap() made it appear at once. A property with no
+// observable window has to be asked of the object that owns it.
+describe("openGap identity", () => {
+  it("a retired gap's late exit does not clear the live one", () => {
+  const src = readFileSync(new URL("../bin/claude-via-proxy.mjs", import.meta.url), "utf8");
+  const body = /  openGap\(\) \{[\s\S]*?\n  \}/.exec(src)?.[0];
+  assert.ok(body, "openGap moved — this no longer tests it");
+
+  // The real method, lifted, with spawn() replaced by a fake that hands back a
+  // controllable EventEmitter. Everything else is the shipped code.
+  const spawned = [];
+  const fakeSpawn = () => { const p = new EventEmitter(); p.unref = () => {}; spawned.push(p); return p; };
+  const holder = { _handle: { fd: 3 }, _port: 9901, _host: "127.0.0.1", _gap: null };
+  holder.openGap = new Function("spawn", "GAP_RELAY_PATH", "process",
+    `return function openGap() {${body.slice(body.indexOf("{") + 1, body.lastIndexOf("}"))}}`
+  )(fakeSpawn, "/gap-relay.mjs", process);
+
+  holder.openGap();
+  const first = spawned[0];
+  assert.equal(spawned.length, 1, "premise: the first open did not spawn a gap");
+
+  holder._gap = null;                       // the holder retired it (closeGap)
+  holder.openGap();                         // ... and opened the next one
+  assert.equal(spawned.length, 2, "premise: the second open did not spawn a gap");
+  const second = spawned[1];
+
+  first.emit("exit");                       // the RETIRED gap's late event
+  assert.ok(holder._gap === second,
+    "a late 'exit' from the retired gap cleared the live one. openGap's re-entry " +
+    "guard now sees an empty field and stacks a second relay on the same " +
+    "descriptor — two acceptors on one socket, which is how a restart resets " +
+    "live requests");
+
+  first.emit("error", new Error("EAGAIN"));  // and the async spawn-failure door
+  assert.ok(holder._gap === second, "a late 'error' from the retired gap cleared the live one");
+});
 });

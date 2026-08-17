@@ -159,3 +159,49 @@ test("direct is the LAST resort, reached only when no hop will carry", async () 
     });
   } finally { origin.srv.close(); }
 });
+
+// A STANDBY THAT CANNOT KNOW ITS HOLDER MUST NOT PRETEND TO BE ONE.
+//
+// Arming is decided by comparing our holder's pid against the current parent:
+// once they differ, the holder is gone and we take the address. The pid we
+// compare against is HANDED to us in CACHE_FIX_STANDBY_PARENT, because
+// process.ppid is read tens of ms after spawn and a holder that died inside
+// that window has already been replaced by init — 1 vs 1 forever, never arming,
+// while still holding a listening socket. Accept-and-hang.
+//
+// `Number(env) || process.ppid` restores exactly that failure the moment the
+// variable is missing, and does it silently. The holder does set it today, so
+// this is not reachable now — it is reachable the first time someone adds a
+// second spawn site or renames the variable, and the symptom then is a port
+// that accepts and never answers, which is the hardest shape to diagnose.
+//
+// Refusing is louder AND safer: openStandby's `lost()` handler already prints
+// "standby relay gone; the port will not survive this holder" on our exit, so
+// the operator gets a sentence instead of a hang.
+test("a standby with no handed-down parent refuses to arm", async () => {
+  const sock = net.createServer(() => {});
+  await new Promise((r) => sock.listen(0, "127.0.0.1", r));
+  const env = { ...process.env, CACHE_FIX_STANDBY: "1" };
+  delete env.CACHE_FIX_STANDBY_PARENT;
+  for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                   "CACHE_FIX_UPSTREAM_PROXY", "ALL_PROXY", "all_proxy"]) delete env[k];
+  const relay = spawn(process.execPath, [relayPath],
+                      { env, stdio: ["ignore", "ignore", "pipe", sock._handle.fd] });
+  let err = "";
+  relay.stderr.on("data", (d) => (err += d));
+  const exited = await Promise.race([
+    new Promise((res) => relay.on("exit", (code) => res(code))),
+    new Promise((res) => setTimeout(() => res("STILL_RUNNING"), 4000)),
+  ]);
+  try {
+    assert.notEqual(exited, "STILL_RUNNING",
+      "the standby started with no CACHE_FIX_STANDBY_PARENT: it is now holding a " +
+      "listening socket it can never arm on, which accepts connections and answers none");
+    assert.notEqual(exited, 0, "refusing must be a failure exit, or nothing upstream notices");
+    assert.match(err, /CACHE_FIX_STANDBY_PARENT/,
+      `it refused without naming the variable: ${JSON.stringify(err)}`);
+  } finally {
+    try { relay.kill("SIGKILL"); } catch {}
+    await new Promise((r) => sock.close(r));
+  }
+});

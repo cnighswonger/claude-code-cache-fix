@@ -15,7 +15,21 @@
 // one, and straight to the origin by terminating CONNECT when there is not.
 // "Everything off" is a real state on these machines, and a session's
 // HTTPS_PROXY is fixed at exec — so this address has to finish the request.
+//
+// AND ITS OWN LOG MUST NOT BE ABLE TO KILL IT. openGap spawns this with stderr
+// "inherit", so it shares the holder's pipe — and it writes to that pipe on
+// every unusable hop, on a server error, and on arming. When the pipe's last
+// reader dies (the measured case: a `... | tee` killed during cleanup), the
+// next write raises EPIPE as an asynchronous 'error' event with no listener,
+// which Node promotes to uncaughtException. The one process whose entire job is
+// to keep this socket answering would then exit because a log line had nowhere
+// to go. proxy/server.mjs took this guard in 94e1953; this file and the
+// launcher were not swept for it at the time.
 import net from "node:net";
+
+for (const s of [process.stdout, process.stderr]) {
+  s.on("error", () => { /* the reader left; carrying the socket is the job */ });
+}
 
 // OUR OWN ADDRESS IS NEVER A HOP. `fallbackProxyUrls()` drops it for a reason
 // the fallback suite pins — a request routed there comes straight back — and the
@@ -211,7 +225,29 @@ const srv = net.createServer((client) => {
     tryHop();
   });
 });
-srv.on("error", (e) => { process.stderr.write(`[cache-fix] gap-relay: ${e.code}\n`); process.exit(1); });
+// WHICH ERROR IT IS DECIDES EVERYTHING, and the old handler treated them alike:
+// `process.exit(1)` on any server error at all.
+//
+//   still listening (EMFILE/ENFILE at accept time) — the descriptor is ours and
+//     the server keeps accepting after it; exiting here would surrender a live
+//     address because the machine briefly ran out of file handles, which is
+//     exactly when the gap we cover is most likely to be open. Stay.
+//
+//   not listening (the listen itself failed) — we have nothing to hold. MEASURED
+//     on this file, fd 3 a pipe so listen fails EINVAL: the child's /proc fd
+//     list comes back without 3, while the same spawn onto a real socket keeps
+//     it. Node closes the descriptor when the listen fails, so "keep the process
+//     alive to retain the fd" is a thing that cannot be done — an earlier draft
+//     of this handler said it did, and the /proc read is what disproved it.
+//     Leaving is then honest and lets openStandby's `lost()` say the port is
+//     unprotected; hanging on would only hide it behind a live pid.
+srv.on("error", (e) => {
+  const held = srv.listening;
+  process.stderr.write(`[cache-fix] gap-relay: ${e.code || e.message} — ` +
+    (held ? "still listening, keeping the socket\n"
+          : "the listen failed, so there is no descriptor left to keep\n"));
+  if (!held) process.exit(1);
+});
 
 const carry = () => srv.listen({ fd: 3 }, () => process.stderr.write("[cache-fix] gap-relay carrying\n"));
 
@@ -259,7 +295,27 @@ else {
   // of milliseconds after spawn, and a holder that died inside that window has
   // already been replaced by init — so this would compare 1 against 1 forever
   // and never arm, while still holding a listening socket. Accept-and-hang.
-  const bornOf = Number(process.env.CACHE_FIX_STANDBY_PARENT) || process.ppid;
+  // NO FALLBACK. `Number(env) || process.ppid` used to sit here, and that `||`
+  // reinstates the exact failure the paragraph above describes the moment the
+  // variable goes missing: ppid reads 1 for a holder already reaped, the compare
+  // is 1 against 1 forever, we never arm, and we go on holding a listening
+  // socket that accepts connections and answers none.
+  //
+  // The holder does set it today, so this is unreachable now — and that is the
+  // point: it becomes reachable at the first second spawn site or rename, and
+  // the symptom then is a hung address, which is the hardest shape to diagnose.
+  // Refusing is louder and safer. openStandby's `lost()` already prints "standby
+  // relay gone; the port will not survive this holder" when we exit, so the
+  // operator gets a sentence rather than a silence.
+  const bornOf = Number(process.env.CACHE_FIX_STANDBY_PARENT);
+  if (!Number.isInteger(bornOf) || bornOf <= 1) {
+    process.stderr.write(
+      "[cache-fix] gap-relay: refusing standby — CACHE_FIX_STANDBY_PARENT is unset or " +
+      `not a pid (${JSON.stringify(process.env.CACHE_FIX_STANDBY_PARENT)}). Arming ` +
+      "compares it against our parent, and without it we would hold this socket " +
+      "without ever arming on it.\n");
+    process.exit(1);
+  }
 
   // TAKE THE ADDRESS THE INSTANT OUR HOLDER IS GONE. No probe, no window, no
   // decision to wait for.

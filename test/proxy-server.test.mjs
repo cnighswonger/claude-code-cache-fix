@@ -753,7 +753,13 @@ describe("zero-downtime reload", () => {
     });
 
     it("run-service drops inherited wiring, and says so in the source", () => {
-      const src = readFileSync(new URL("../bin/claude-via-proxy.mjs", import.meta.url), "utf8");
+      // COMMENTS STRIPPED FIRST. This locates a branch by its literal text, so
+      // any prose elsewhere in the file that quotes the same literal becomes an
+      // earlier match and the span runs to the wrong `return holdPort` —
+      // measured, a comment added above this branch did exactly that and failed
+      // the case for a reason that had nothing to do with the branch.
+      const src = readFileSync(new URL("../bin/claude-via-proxy.mjs", import.meta.url), "utf8")
+        .replace(/\/\/[^\n]*/g, "");
       const branch = /SUBCOMMAND === "run-service"[\s\S]*?return holdPort/.exec(src)?.[0];
       assert.ok(branch, "the run-service branch moved — this no longer tests it");
       for (const k of ["HTTPS_PROXY", "ALL_PROXY", "HTTP_PROXY"]) {
