@@ -483,9 +483,9 @@ function productionSources() {
     for (const e of readdirSync(join(testDir, "..", dir), { withFileTypes: true })) {
       if (e.isDirectory()) { walk(join(dir, e.name)); continue; }
       if (!e.name.endsWith(".mjs")) continue;
-      // The suite writes and deletes bin/scratch-*.mjs while running under
-      // --test-concurrency=8, so a readdir/readFile pair can straddle a delete
-      // and fail these guards for a reason that is not about the tree. They are
+      // The suite writes and deletes bin/scratch-*.mjs while other files are
+      // still running, so a readdir/readFile pair can straddle a delete and fail
+      // these guards for a reason that is not about the tree. They are
       // also fixtures, not product — one is a 2,400-line copy of the launcher.
       if (e.name.startsWith("scratch-")) continue;
       try {
@@ -607,5 +607,232 @@ test("gap-relay keeps the socket on an error that left it listening", () => {
   assert.match(body, /if\s*\(\s*!\s*(held|srv\.listening)\b[^)]*\)[\s\S]{0,40}?process\.exit/,
     "the exit is not gated on the NOT-listening case — an inverted condition " +
     "surrenders a live socket and keeps a process that has no descriptor left");
+});
+
+// THE SUITE MUST ASK THE MACHINE HOW BIG IT IS, AND ASK CORRECTLY.
+//
+// This suite spawns real launchers, holders, relays and stand-in proxies, and
+// asserts on wall-clock windows — `refuses nothing when the proxy under it
+// dies` allows 2 refusals in 40 across one forced kill, which is a statement
+// about how fast the holder re-acquires. Oversubscribe the runner and those
+// windows widen until the bounds fail, somewhere different on each run. That is
+// why the failure looked like a flake: the bound is real, the load was not.
+//
+// TWO knobs were wrong. They are NOT the same defect and only one of them was
+// red on CI — keeping that straight matters, because the fix for the loud one
+// is a flag deleted from package.json and nothing else.
+//
+//   THE RED ONE. package.json pinned `--test-concurrency=8` — 8 test files in
+//   flight no matter what the runner is. Measured on Node v20.20.2 over two
+//   pinned cores, full suite: with the pin `# fail 5` in 85 s, without it
+//   `# fail 0` in ~265 s, and green on every run since across Node 18, 20 and
+//   24 (1890/1890/1896 passing, no `not ok`). CI's
+//   Node 20 leg was red on `refuses nothing when the proxy under it dies` while
+//   18 and 22 were green — same file, a different case each run. How many cores
+//   that runner has is not asserted anywhere here, on purpose; see the SCOPE
+//   note in proxy-held-port.test.mjs for the two attempts to pin it down that
+//   did not survive checking.
+//
+//   THE QUIET ONE, and it was NOT what made CI red. Two files sized their inner
+//   concurrency from `os.cpus().length`, which counts the machine and ignores
+//   this process's CPU affinity. Nothing suggests a GitHub-hosted VM carries an
+//   affinity mask (not measured — same caveat as the core count), so both calls
+//   agree there and that bound was already doing its job; under a mask they
+//   diverge hard and it stops bounding anything. Fixed because it is
+//   wrong wherever the process is pinned, not because it was red. The
+//   measurements, and what this does NOT fix, are in proxy-held-port.test.mjs
+//   beside the bound itself — not repeated here.
+//
+// node:test already derives its file concurrency the right way, and the formula
+// is exactly `availableParallelism() - 1` — measured with six files that each
+// sleep 1200 ms, counting how many start together: 1 at two visible cores, 2 at
+// three, 3 at four, 4 at five. Under the pin, four such files start within
+// 23 ms of each other on two cores; by default they span 3786 ms end to end.
+// A constant cannot know the runner.
+test("the suite derives its parallelism from the machine", () => {
+  const script = JSON.parse(readFileSync(join(testDir, "..", "package.json"), "utf8")).scripts?.test ?? "";
+  // Premise. A renamed or rewritten script must not let the assertion below
+  // pass by matching a string that no longer runs the suite. `--test` and not
+  // `--test\b`, because \b is satisfied by the hyphen: `--test-reporter=spec
+  // run-all.mjs` passed the first version of this while running nothing of the
+  // sort.
+  assert.match(script, /\bnode\b[^|&]*--test(?![\w-])/,
+    `the test script no longer runs \`node --test\`, so this guard is reading the ` +
+    `wrong string and its green means nothing: ${JSON.stringify(script)}`);
+  assert.doesNotMatch(script, /--test-concurrency/,
+    `the test script pins the runner's file concurrency (${JSON.stringify(script)}). ` +
+    `A constant cannot know how many cores CI gave us; node:test derives it from ` +
+    `availableParallelism().`);
+  // Not covered, and cheaper to say than to guard: .github/workflows/test.yml
+  // runs `npm test`, so this string is the whole story today. A workflow that
+  // grew its own `node --test --test-concurrency=8`, or a NODE_OPTIONS, would
+  // restore the failure with this test green.
+
+  // THE SAME MISTAKE ONE LAYER IN — anchored on the RIGHT answer, not on one
+  // spelling of the wrong one.
+  //
+  // Three scans were written before this one and every one of them was beaten.
+  // Matching "concurrency" near a `cpus()` named THIS FILE, because the prose
+  // above describes the defect in those words. Routing that through
+  // stripComments() still named this file, because the failure messages are
+  // string literals and a string literal is code. Narrowing to a declaration
+  // `const X = … cpus() …` stopped the self-match and then MISSED six real
+  // reintroductions — measured, one per row: the same line wrapped across lines
+  // by a reformat, `export const`, an aliased `import { cpus as coreCount }`,
+  // `let X;` with the assignment later, `const { length } = cpus()`, and a bare
+  // `const CONCURRENCY = 8` (which the package.json half of this very test
+  // forbids while that half permitted it).
+  //
+  // Every one of those fails the assertions below, because they ask what the
+  // bound IS rather than enumerating what it must not be. The roster is
+  // asserted first so a rename escapes as a LOUD failure instead of an empty
+  // scan — an empty roster is the one result that would make the checks vacuous.
+  //
+  // And a correct bound that nothing USES is the same defect with a clean
+  // declaration. Measured against this guard before the third assertion existed:
+  // swapping `{ concurrency: CONCURRENCY }` for `{ concurrency: true }` or
+  // `{ concurrency: 8 }` left it green while the describe went unbounded.
+  const bounded = readdirSync(testDir, { recursive: true })
+    .filter((f) => f.endsWith(".mjs"))
+    .filter((f) => /^\s*(?:export\s+)?const\s+CONCURRENCY\b/m
+      .test(readFileSync(join(testDir, f), "utf8")))
+    .sort();
+  assert.deepEqual(bounded, ["proxy-held-port.test.mjs", "proxy-wrapper.test.mjs"],
+    `the set of files declaring a CONCURRENCY bound changed: ${bounded.join(", ") || "(none)"}. ` +
+    `A new one is fine — add it here and make it derive from availableParallelism(). ` +
+    `A missing one means the bound was renamed, and this guard stopped watching it.`);
+  // WHAT THIS DOES NOT WATCH, said here because the test's name is broader than
+  // its reach: only files declaring a CONCURRENCY bound. proxy-update-sweep
+  // .test.mjs sizes its describe `{ concurrency: true }` over five cases, four
+  // of which spawn a proxy, and never enters this roster. Left alone
+  // deliberately — 8 runs, all green at ~2.1 s over two pinned cores in this
+  // worktree, so it is the same shape without the failure, and widening the
+  // roster to catch it would flag every cheap `concurrency: true` in the suite.
+  for (const f of bounded) {
+    // stripComments, because the paragraphs in those files quote `cpus().length`
+    // to explain why it is wrong. Recursive and `.mjs` rather than top-level
+    // `.test.mjs`: the runner collects nested files (measured, on 18 and 20),
+    // and this bound is duplicated in two files, so the obvious next refactor
+    // moves it to a non-test helper the old filter could not see.
+    //
+    // `{ recursive: true }` needs Node 18.17 while `engines` says >=18, and
+    // readdirSync IGNORES an option it does not know rather than throwing
+    // (measured on 18.20.8) — so on 18.0-18.16 the scan quietly stops recursing.
+    // Unreachable today: both roster files are top level, and CI's `18` resolves
+    // to the latest 18.x. Recorded so it is not diagnosed from scratch.
+    const src = stripComments(readFileSync(join(testDir, f), "utf8"));
+    // THE VALUE, not a mention of it. Two weaker versions came before, and the
+    // second is why this compares a whole string instead of searching one.
+    //
+    // A file-wide `match(/availableParallelism\(\)/)` was first, satisfied by any
+    // mention anywhere — `const NOTE = "sized by availableParallelism()";` beside
+    // a bare `const CONCURRENCY = 8;` left it green, and stripComments keeps
+    // strings on purpose, so the guard's own failure text was a copy-paste away
+    // from disabling it. Narrowing to the assignment's right-hand side fixed that
+    // and was still only a MENTION test: measured, 6 of 7 reintroductions passed
+    // it, one per row — `process.env.CI ? 8 : <good>` (the likeliest way anyone
+    // puts 8 back, and on exactly the machine this is about), `Math.max(8, …)`,
+    // `Number(process.env.TEST_JOBS) || <good>`, `= 8, PROBE = availableParallelism()`
+    // riding the `[^;]*` across a comma, `CONCURRENCY *= 4` after a correct
+    // declaration, and the use site re-pointed at a constant with another name.
+    //
+    // So: the expression must BE the bound, whitespace-normalised. That absorbs a
+    // reformat and an interior comment, and refuses everything above. It also
+    // pins the two files to the same expression and makes a deliberate change to
+    // it edit this line — the same contract the roster already imposes, and the
+    // reason `let` is not in the roster regex: a `let` bound leaves the roster and
+    // fails there instead, loudly.
+    const BOUND = "Math.max(2, Math.floor(availableParallelism() / 2))";
+    const assigns = [...src.matchAll(/\bCONCURRENCY\b\s*=\s*([^;]*);/g)]
+      .map((m) => m[1].replace(/\s+/g, " ").trim());
+    assert.deepEqual(assigns, [BOUND],
+      `${f} does not size CONCURRENCY as \`${BOUND}\`. A constant, an env override, ` +
+      `a CI-only branch or a later reassignment all read as "derived from the ` +
+      `machine" to a search and are not. Assignments seen: ${JSON.stringify(assigns)}`);
+    // The bound must be SPENT, not merely declared. A literal here is the
+    // unbounded state wearing a correct declaration.
+    //
+    // `1` is exempt and that is not a loophole: the defect class is
+    // oversubscription, and serial cannot oversubscribe. Forbidding it also
+    // forbade a remedy this repo already approved for ONE of these two files —
+    // docs/code-reviews/proxy-v3-implementation-rereview-8-2026-04-20.md:9,
+    // "Adding `{ concurrency: 1 }` to the wrapper test suite is appropriate here
+    // because these tests fork subprocesses". A guard that bans the conservative
+    // direction gets turned off by whoever next needs it.
+    // THE cpus() BAN IS BACK, and the round that deleted it is why it is
+    // written down. A ponytail pass removed it after proving the use-site
+    // assertion caught its one known mutant and both mutation tables stayed
+    // complete — which was true and still wrong. The tables did not contain the
+    // shape that beats everything else: a SECOND describe added as
+    // `{ concurrency: cpus().length }` while the first still spends CONCURRENCY.
+    // The use-site check is satisfied by the first describe, and `cpus().length`
+    // is not a literal, so the literal ban misses it too. Measured: green
+    // without this assertion, red with it.
+    //
+    // "Both tables still pass" measures the tables, not the guard. A deletion
+    // needs a fresh attempt to break the thing, not a re-run of the attempts
+    // that shaped it.
+    // `\bcpus\b`, not `cpus\s*\(` — the paren version is walked past by
+    // `import { cpus as coreCount }`, which this file's own history already
+    // lists as a reintroduction shape. Measured green on both files: comments
+    // are stripped and neither has `cpus` in a string literal.
+    //
+    // AS OF THE `uses` CHECK BELOW, THIS IS BELT AND BRACES, NOT LOAD-BEARING —
+    // said plainly because the last person to notice that deleted it and opened
+    // a hole. Re-measured with it removed: a nested describe, an `it()` option
+    // and a second describe are all caught by `uses`, and the ONLY thing left to
+    // this assertion is an unrelated `const FIXTURES = cpus().length;`, which is
+    // not a defect. Kept anyway: "these two files never read cpus()" is a
+    // simpler invariant than the three places that matter, and every round of
+    // this guard so far has been beaten by a shape nobody had thought of.
+    // Delete it if you like — but bring a mutant, not a re-run of the tables.
+    assert.doesNotMatch(src, /\bcpus\b/,
+      `${f} still reads os.cpus(), which counts the machine rather than the cores ` +
+      `this process may use — measured 48 against availableParallelism()'s 2 under ` +
+      `\`taskset -c 6,7\``);
+    // AND THE NAME MUST COME FROM node:os. Pinning the expression's TEXT pins
+    // nothing about what `availableParallelism` resolves to. Measured: a new
+    // `test/parallelism.mjs` exporting `() => cpus().length`, imported here
+    // instead of node:os, left every other assertion green while the bound went
+    // back to counting the machine. That is not a contrived shape — it is the
+    // refactor the comment above predicts, and the first thing anyone reaches
+    // for when this guard refuses their `?? cpus().length` fallback.
+    // EXACTLY ONE import line may introduce the name, and it must be node:os.
+    // Asserting merely that SOME node:os import mentions it is satisfied while
+    // the real binding comes from elsewhere: `import { availableParallelism }
+    // from "./parallelism.mjs"` next to `import { availableParallelism as _x }
+    // from "node:os"` is legal JS with no name clash, and passed the first
+    // version of this line.
+    const imports = src.split("\n").filter((l) => /^\s*import\b/.test(l) && /\bavailableParallelism\b/.test(l));
+    assert.equal(imports.length, 1,
+      `${f} has ${imports.length} import lines naming availableParallelism; exactly ` +
+      `one may, or the binding in the bound is not the one this guard checked: ` +
+      `${JSON.stringify(imports)}`);
+    assert.match(imports[0], /from "node:os"/,
+      `${f} imports availableParallelism from ${JSON.stringify(imports[0])}, not node:os — ` +
+      `the bound reads as correct while resolving to something that counts the machine`);
+    // EVERY use site, not one. `match(/concurrency: CONCURRENCY/)` is an
+    // EXISTENCE test: the first describe satisfies it forever, so a second one
+    // could be sized by anything that is not a bare literal. Measured, all green
+    // against the previous shape: `{ concurrency: coreCount().length }`,
+    // `{ concurrency: CONCURRENCY * 4 }`, `{ concurrency: availableParallelism() }`.
+    // `1` stays exempt — serial cannot oversubscribe, and this repo approved it
+    // for one of these files:
+    // docs/code-reviews/proxy-v3-implementation-rereview-8-2026-04-20.md:9,
+    // "Adding `{ concurrency: 1 }` to the wrapper test suite is appropriate here
+    // because these tests fork subprocesses".
+    //
+    // This one assertion replaces the literal ban AND the use-site existence
+    // check it grew out of; both were strictly weaker than asking what the full
+    // set of use sites is.
+    // The key may be quoted: `{ "concurrency": 8 }` is the same option and the
+    // unquoted-only pattern could not see it at all, so the set still came back
+    // as ["CONCURRENCY"] and the second describe was invisible. Measured.
+    const uses = [...new Set([...src.matchAll(/["']?concurrency["']?\s*:\s*([^,}]+)/g)]
+      .map((m) => m[1].trim()))].filter((u) => u !== "1").sort();
+    assert.deepEqual(uses, ["CONCURRENCY"],
+      `${f} sizes a describe by something other than CONCURRENCY (or a serial 1). ` +
+      `Concurrency values seen: ${JSON.stringify(uses)}`);
+  }
 });
 

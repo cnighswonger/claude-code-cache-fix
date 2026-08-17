@@ -4,7 +4,7 @@ import { withDeadline, exitWithin } from "./child-deadline.mjs";
 import { fork, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
-import { tmpdir, cpus } from "node:os";
+import { tmpdir, availableParallelism } from "node:os";
 import { chmodSync, closeSync, existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import tls from "node:tls";
@@ -158,11 +158,18 @@ async function runWrapper(script, overrides) {
 }
 
 // Concurrent, but BOUNDED BY CORES: each case boots a real proxy under its own
-// 10s startup budget, and unbounded concurrency blew that budget on CI's 2-core
+// 10s startup budget, and unbounded concurrency blew that budget on the CI
 // runner — measured, "Proxy failed to start within 10s" on every node, while a
 // 48-core box passed every time. Serial, the file pays the sum of the waits; at
-// cpus/2 it pays close to the longest one without starving any boot.
-const CONCURRENCY = Math.max(2, Math.floor(cpus().length / 2));
+// half the cores it pays close to the longest one without starving any boot.
+//
+// availableParallelism(), NOT cpus().length — see the same bound in
+// proxy-held-port.test.mjs for the measurement, for what this does and does not
+// fix, and for why the runner's core count is deliberately not claimed. Short
+// version: cpus() counts the machine and ignores this process's CPU affinity,
+// so under `--cpuset-cpus=0,1` it reports 48 and this bound stops bounding
+// anything. No change on CI, where there is no mask and both calls agree.
+const CONCURRENCY = Math.max(2, Math.floor(availableParallelism() / 2));
 
 describe("launch wrapper (claude-via-proxy)", { concurrency: CONCURRENCY }, () => {
   it("exits with error when claude command is not found", async () => {

@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { writeFile, rm } from "node:fs/promises";
 import { readdirSync, readFileSync, existsSync, mkdtempSync, writeFileSync, rmSync, utimesSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { tmpdir, cpus } from "node:os";
+import { tmpdir, availableParallelism } from "node:os";
 import { join, dirname } from "node:path";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
@@ -93,11 +93,55 @@ async function freePort() {
 // a mis-signalled pid or a stuck child aborts the whole runner process. Node
 // runs each test file in its own process, which keeps that blast radius here.
 // Concurrent, but BOUNDED BY CORES: each case boots a real proxy under its own
-// 10s startup budget, and unbounded concurrency blew that budget on CI's 2-core
+// 10s startup budget, and unbounded concurrency blew that budget on the CI
 // runner — measured, "Proxy failed to start within 10s" on every node, while a
 // 48-core box passed every time. Serial, the file pays the sum of the waits; at
-// cpus/2 it pays close to the longest one without starving any boot.
-const CONCURRENCY = Math.max(2, Math.floor(cpus().length / 2));
+// half the cores it pays close to the longest one without starving any boot.
+//
+// availableParallelism(), NOT cpus().length — the first version of this bound
+// counted the MACHINE, which is not the same as the cores this process may use.
+// Measured under `taskset -c 6,7`, this very expression: with cpus().length it
+// computes 24, with availableParallelism() it computes 2. So the file ran 24 of
+// these process-spawning cases at once on two cores, and ALONE there it failed
+// 3 of 6 runs with no --test-concurrency in play. Being bounded by the wrong
+// number looks exactly like being unbounded. An affinity mask is what
+// `docker --cpuset-cpus` sets too; taskset is how it was measured here.
+//
+// SCOPE, because the fix next door is the loud one and this should not borrow
+// its credit: the red Node 20 leg was the `--test-concurrency=8` pin in
+// package.json, alone. That rests on a GitHub-hosted VM carrying no affinity
+// mask, so both calls agree there and this bound was already doing its job —
+// which is NOT measured either, and is flagged rather than dropped because the
+// whole SCOPE claim hangs off it.
+//
+// HOW MANY CORES that runner has is deliberately NOT claimed here. Two attempts
+// to pin it down failed honestly: "2 vCPU" was asserted from habit and never
+// measured, and a later attempt to derive it from a green run's TAP timings
+// (sum of durations 83.7 s against a 58 s step) collapsed once the 39.8 s of
+// nested subtests counted twice inside their parents was removed — 43.9 s of
+// work in 58 s, which is what SEQUENTIAL looks like. The argument does not need
+// the number: a constant of 8 cannot be right on a machine nobody measured.
+//
+// Nor does this cover a cgroup CPU QUOTA (`docker --cpus=2`), which is a
+// different mechanism from a cpuset: measured by symbol presence in the shipped
+// binaries, `uv__get_cgroupv2_constrained_cpu` is absent from Node 18.20.8
+// (uv 1.44.2) and 20.20.2 (uv 1.46.0) and present in 24.11.1 (uv 1.51.0). So on
+// 18 and 20 availableParallelism() is no better than cpus() under a quota, and
+// on 24 it is — 22 was not checked. The mask is the case fixed here.
+//
+// THE COST, since nothing else in this diff records it: dropping the pin takes
+// the suite from 85 s to ~265 s over two pinned cores, about 3x. That is the
+// price of the only configuration measured green, and the post-fix CI step has
+// not been timed.
+//
+// VERSION FLOOR, which `engines` does not state: availableParallelism() landed
+// in Node 18.14, and a named import of it from node:os is a module-load
+// SyntaxError below that — this file and proxy-wrapper.test.mjs would die
+// before a single case ran. `engines` says >=18 and is deliberately NOT raised:
+// no shipped code uses this (it appears nowhere in bin/ or proxy/), and `files`
+// excludes test/, so raising it would constrain consumers for a dev-only need.
+// CI's `18` resolves to the latest 18.x. Recorded, not guarded.
+const CONCURRENCY = Math.max(2, Math.floor(availableParallelism() / 2));
 
 describe("held port (CACHE_FIX_HOLD_PORT)", { concurrency: CONCURRENCY }, () => {
 // The default is declared in proxy/config.mjs and repeated in the launcher.
@@ -628,7 +672,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
             .on("error", (e) => res(`ERR:${e.code}`));
         });
         // A pause between requests, and it is NOT politeness. This describe
-        // runs at `concurrency: cpus/2` IN ONE PROCESS, so a loop that fires
+        // runs at `concurrency: CONCURRENCY` IN ONE PROCESS, so a loop that fires
         // the next request the instant the last resolves starves every timer
         // its neighbours are waiting on. Measured: without it, "stops when
         // signalled" took 10,629 ms against its own 10,000 ms deadline and
