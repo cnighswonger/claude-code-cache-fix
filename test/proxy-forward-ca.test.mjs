@@ -129,6 +129,39 @@ test("ensureCA: returns a matching, chaining key/cert pair", () => {
   });
 });
 
+test("ensureCA: the minted CA carries keyUsage, or strict verifiers refuse it", () => {
+  // RFC 5280 4.2.1.3: a CA certificate SHOULD carry keyUsage with keyCertSign.
+  // Ours carried only SKI, AKI and basicConstraints, and verifiers have started
+  // enforcing the SHOULD. Measured through a live 9901 with our own CA as the
+  // trust anchor, one row per interpreter on three machines:
+  //   OpenSSL 3.0.2, 3.6.1, LibreSSL 2.8.3   VERIFIED
+  //   OpenSSL 3.5.5, 3.5.7, 3.6.3            FAILED
+  //     "CA cert does not include key usage extension"
+  // Every machine had at least one refusing interpreter, including the Linux
+  // box, so this is not a macOS or a version-ladder story — the same 3.5.5
+  // accepted on one host and refused on another. The peer proxy on the same
+  // boxes carries keyUsage and verifies everywhere, which is the control.
+  //
+  // This test asserts the EXTENSION, not any verifier's behaviour: the
+  // accept/reject split is a property of builds we do not control, and a test
+  // written against it would pass or fail by which python the runner has.
+  // Read the extension out of the certificate with openssl, NOT via node's
+  // X509Certificate.keyUsage — that property returns EXTENDED key usage
+  // (the EKU OIDs) and is `undefined` on a certificate whose basic keyUsage is
+  // present and correct. Measured: the first version of this test failed
+  // against a CA that already carried `Key Usage: critical, Certificate Sign,
+  // CRL Sign`, so it was reporting on the wrong extension entirely.
+  withCA({}, (dir) => {
+    ensureCA();
+    const text = spawnSync("openssl", ["x509", "-in", join(dir, "ca.pem"), "-noout", "-text"],
+                           { encoding: "utf8" }).stdout || "";
+    const block = text.split("X509v3 Key Usage")[1] || "";
+    assert.ok(text.includes("X509v3 Key Usage"), `minted CA declares no keyUsage:\n${text}`);
+    assert.match(block, /critical/, "keyUsage must be critical");
+    assert.match(block, /Certificate Sign/, "keyUsage must include keyCertSign");
+  });
+});
+
 test("ensureCA: reuses the CA across calls (does not rotate the root)", () => {
   withCA({}, (dir) => {
     ensureCA();

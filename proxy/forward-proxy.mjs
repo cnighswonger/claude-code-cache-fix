@@ -215,8 +215,29 @@ export function ensureCA() {
     const caPemSrc = haveCA ? caPem : tmp("ca.pem");
     const caKeySrc = haveCA ? caKey : tmp("ca.key");
     if (!haveCA) {
+      // keyUsage is not decoration. RFC 5280 4.2.1.3 says a CA certificate
+      // SHOULD carry keyUsage with keyCertSign, and verifiers have started
+      // enforcing that SHOULD: without it they refuse the chain with "CA cert
+      // does not include key usage extension" no matter which bundle names us.
+      //
+      // Measured through a live proxy with our own CA as the trust anchor, one
+      // row per python interpreter across three machines:
+      //   OpenSSL 3.0.2 / 3.6.1 / LibreSSL 2.8.3   verified
+      //   OpenSSL 3.5.5 / 3.5.7 / 3.6.3            refused
+      // Every machine had at least one refusing interpreter, and the SAME 3.5.5
+      // accepted on one host and refused on another — so this is not a platform
+      // or a version ladder, and there is no host we can call safe. The peer
+      // MITM on those same boxes ships keyUsage and verifies everywhere; that
+      // is the control that makes this ours rather than the verifier's.
+      //
+      // -addext, not an extfile: `req -x509` ignores extensions passed the way
+      // the leaf below passes them, and a silently-ignored extension is how this
+      // shipped unnoticed in the first place. The test asserts the extension is
+      // ON the minted certificate, not that the flag was passed.
       run(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", tmp("ca.key"), "-out", tmp("ca.pem"),
-           "-days", "3650", "-subj", "/CN=cache-fix forward-proxy CA"]);
+           "-days", "3650", "-subj", "/CN=cache-fix forward-proxy CA",
+           "-addext", "basicConstraints=critical,CA:TRUE",
+           "-addext", "keyUsage=critical,keyCertSign,cRLSign"]);
     }
     run(["genrsa", "-out", tmp("leaf.key"), "2048"]);
     const csr = tmp("leaf.csr");
