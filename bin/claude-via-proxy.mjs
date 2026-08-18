@@ -935,7 +935,22 @@ function holdPort(rest) {
           // to exit BY DESIGN, so a successor that inherited the orphan guard
           // reads our death as its own cue and takes the port down with it —
           // measured, every request in the sampling window refused.
+          // AND THE PORT, because the successor is `run-service` and run-service
+          // REFUSES without it — its own guard returns 2 with "a service must
+          // bind the port sessions were told to use, and that cannot be
+          // guessed". A `server`-mode holder reaches this handover and does NOT
+          // carry that variable (wrapper mode keeps the 9801 default on
+          // purpose), so its successor inherited nothing and died on that
+          // guard. Nothing upstream noticed: node fires 'spawn' on a successful
+          // EXEC, so the predecessor took its `left` path, SIGHUPed its child
+          // and exited — standby already closed, successor dead, nobody on the
+          // address. The exact shape this file already measured once: "a
+          // run-service started without it took 9801 while the fleet dialled
+          // 9901."
+          //
+          // We are bound to the number, so there is nothing to guess.
           env: { ...process.env, CACHE_FIX_HOLDER_HANDOVER: "1", LISTEN_FDS: "1",
+                 CACHE_FIX_PROXY_PORT: String(holder._port || port),
                  CACHE_FIX_EXIT_WITH_PARENT: "0" },
         });
         // WE LEAVE WHEN THE SUCCESSOR EXISTS, not when we have asked for one.

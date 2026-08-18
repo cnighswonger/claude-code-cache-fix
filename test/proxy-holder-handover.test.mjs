@@ -5,9 +5,10 @@ import net from "node:net";
 import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { readdirSync, readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { OURS, cmdOf, freePort as takePort, listeners } from "./proc-helpers.mjs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
@@ -704,6 +705,67 @@ describe("holder handover (SIGUSR2)", () => {
       await new Promise((r) => hop.close(r));
     }
   });
+  it("does not mistake a neighbour on the port for a successor", async () => {
+    const { successorServing } = await import("../proxy/server.mjs");
+
+    // MEASURED IN PRODUCTION, 2026-08-18 on <linux-host>: THREE of our own
+    // processes hold the same LISTEN inode on fd 3 at once —
+    //   claude-via-proxy.mjs run-service   the holder
+    //   gap-relay.mjs                      the standby
+    //   proxy/server.mjs                   the proxy
+    // and successorServing() excludes only process.pid. So the orphaned
+    // proxy's "keep serving until the successor is up" poll is satisfied on
+    // its FIRST 100 ms tick by the standby that was already there, and it
+    // exits while the replacement holder is still booting — reopening exactly
+    // the unowned-port window the wait was written to close.
+    //
+    // A foreign listener stands in for that here: the question the function
+    // must answer is "is a SUCCESSOR PROXY serving", and holding the socket is
+    // not the same claim. Both branches are checked, because they had the same
+    // defect and a fix to one leaves the other lying.
+    const port = await freePort();
+    const child = spawn(process.execPath,
+      ["-e", `require("net").createServer().listen(${port},"127.0.0.1",()=>console.log("up"))`],
+      { stdio: ["ignore", "pipe", "pipe"] });
+    try {
+      await new Promise((res, rej) => {
+        child.stdout.on("data", (d) => String(d).includes("up") && res());
+        setTimeout(() => rej(new Error("stand-in listener never came up")), 10_000);
+      });
+      // PREMISE: it really is holding the port, or both assertions below pass
+      // against an empty process table and prove nothing.
+      assert.ok(listeners(port).length === 0,
+        "premise: proc-helpers must NOT class this stand-in as ours — if it does, " +
+        "the fixture is a proxy and this case is asking the wrong question");
+      // ASK THE PORT, not the process table. A raw lsof here is what
+      // suite-collection's own guard forbids — and it is right: the question is
+      // "is something serving this address", and connect() answers it directly
+      // instead of through an instrument that is blind in another namespace.
+      const reachable = await new Promise((res) => {
+        const q = net.connect(port, "127.0.0.1");
+        q.on("connect", () => { q.destroy(); res(true); });
+        q.on("error", () => res(false));
+        setTimeout(() => { q.destroy(); res(false); }, 2_000);
+      });
+      assert.ok(reachable, `premise: the stand-in is not accepting on ${port}`);
+
+      assert.equal(successorServing(port), false,
+        "a process that merely HOLDS the port read as a successor. The standby " +
+        "relay holds the same inode on fd 3 for the whole handover, so the " +
+        "departing proxy leaves on its first tick and the port is unowned until " +
+        "the real successor finishes booting");
+
+      process.env.CACHE_FIX_NO_PROC = "1";
+      const viaLsof = successorServing(port);
+      delete process.env.CACHE_FIX_NO_PROC;
+      assert.equal(viaLsof, false,
+        "the lsof branch has the same defect — it filters only process.pid, so " +
+        "on a mac the standby answers for the successor there too");
+    } finally {
+      try { child.kill("SIGKILL"); } catch { }
+    }
+  });
+
   it("recognises a successor without /proc", async () => {
     const { successorServing } = await import("../proxy/server.mjs");
     if (typeof successorServing !== "function") {
@@ -755,9 +817,20 @@ describe("holder handover (SIGUSR2)", () => {
       // its own pid, so a self-owned listener answers false either way and the
       // case would pass against the hardcoded literal it exists to catch.
       const wildPort = await freePort();
-      const wild = spawn(process.execPath, ["-e",
-        `require("net").createServer(()=>{}).listen(${wildPort},"0.0.0.0",()=>process.stdout.write("up\\n"))`],
-        { stdio: ["ignore", "pipe", "ignore"] });
+      // AND IT MUST LOOK LIKE A PROXY, because successorServing now requires
+      // that: three of our processes hold one LISTEN inode at handover (holder,
+      // standby, proxy) and only the proxy can serve, so holding the socket is
+      // no longer the claim. The fixture is still a bare listener on 0.0.0.0 —
+      // the address question this case asks is untouched — it just declares
+      // what it stands in for, via the one thing the check reads. An `-e`
+      // script has no path in its argv, which is why this is a file.
+      const wildDir = join(mkdtempSync(join(tmpdir(), "ccf-wild-")), "proxy");
+      mkdirSync(wildDir, { recursive: true });
+      const wildScript = join(wildDir, "server.mjs");
+      writeFileSync(wildScript,
+        `import net from "node:net";\n` +
+        `net.createServer(()=>{}).listen(${wildPort},"0.0.0.0",()=>process.stdout.write("up\\n"));\n`);
+      const wild = spawn(process.execPath, [wildScript], { stdio: ["ignore", "pipe", "ignore"] });
       try {
         await Promise.race([
           new Promise((r) => wild.stdout.once("data", r)),
@@ -786,9 +859,17 @@ describe("holder handover (SIGUSR2)", () => {
       // NOT stubbed: a real IPv6 listener in a real other process, so the
       // blindness is the kernel's own and not a fixture's.
       const v6Port = await freePort();
-      const v6 = spawn(process.execPath, ["-e",
-        `require("net").createServer(()=>{}).listen(${v6Port},"::1",()=>process.stdout.write("up\\n"))`],
-        { stdio: ["ignore", "pipe", "ignore"] });
+      // A FILE, not `-e`, for the same reason as the wildcard fixture above:
+      // successorServing now requires the pid to BE a proxy, and an `-e`
+      // script carries no path in its argv. Still a real listener in a real
+      // other process — the kernel blindness this case measures is untouched.
+      const v6Dir = join(mkdtempSync(join(tmpdir(), "ccf-v6-")), "proxy");
+      mkdirSync(v6Dir, { recursive: true });
+      const v6Script = join(v6Dir, "server.mjs");
+      writeFileSync(v6Script,
+        `import net from "node:net";\n` +
+        `net.createServer(()=>{}).listen(${v6Port},"::1",()=>process.stdout.write("up\\n"));\n`);
+      const v6 = spawn(process.execPath, [v6Script], { stdio: ["ignore", "pipe", "ignore"] });
       try {
         await Promise.race([
           new Promise((r) => v6.stdout.once("data", r)),

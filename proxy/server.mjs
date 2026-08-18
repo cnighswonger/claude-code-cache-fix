@@ -1244,6 +1244,27 @@ function hopAddress(u) {
   } catch { return ""; }
 }
 
+// IS THIS PID A PROXY, or just something holding the same socket?
+//
+// Measured in production 2026-08-18: THREE of our processes hold one LISTEN
+// inode on fd 3 simultaneously — the holder (claude-via-proxy.mjs run-service),
+// the standby (gap-relay.mjs) and the proxy (proxy/server.mjs). successorServing
+// below excluded only process.pid, so the standby that was already there
+// answered for the successor that had not started yet.
+//
+// Holding the socket is not the claim being made. "A successor is serving" is,
+// and only a proxy can serve. Both branches of successorServing ask this, or
+// fixing one leaves the other lying on the platform it owns.
+function isProxyPid(pid) {
+  try {
+    return readFileSync(`/proc/${pid}/cmdline`, "utf8").includes("proxy/server.mjs");
+  } catch { /* no /proc, or it went away between listing and reading */ }
+  try {
+    return execFileSync("ps", ["-p", String(pid), "-o", "command="],
+                        { encoding: "utf8", timeout: 2_000 }).includes("proxy/server.mjs");
+  } catch { return false; }
+}
+
 export function successorServing(port) {
   // The /proc attempt is skippable so the lsof path below can be exercised on a
   // machine that HAS /proc. Without it the fallback is only reachable by running
@@ -1273,7 +1294,7 @@ export function successorServing(port) {
         let t;
         try { t = readlinkSync(`/proc/${p}/fd/${fd}`); } catch { continue; }
         const m = /^socket:\[(\d+)\]$/.exec(t);
-        if (m && inodes.has(m[1])) return true;
+        if (m && inodes.has(m[1]) && isProxyPid(p)) return true;
       }
     }
   } catch { /* no /proc: ask lsof below instead of waiting out the ceiling */ }
@@ -1319,7 +1340,7 @@ export function successorServing(port) {
                                killSignal: "SIGKILL", maxBuffer: 1 << 20 });
     for (const line of out.trim().split("\n")) {
       const pid = Number(line);
-      if (Number.isInteger(pid) && pid > 1 && pid !== process.pid) return true;
+      if (Number.isInteger(pid) && pid > 1 && pid !== process.pid && isProxyPid(pid)) return true;
     }
   } catch { /* lsof absent or nobody listening: the ceiling is the fallback */ }
   return false;

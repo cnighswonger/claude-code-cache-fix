@@ -364,6 +364,50 @@ function closesAt(src, open, mode = "brace") {
 // the word inside a nearby COMMENT and widened the slice to 1,587 chars of
 // unrelated code. A guard whose scope grows when its subject moves reports on
 // whatever happens to be nearby.
+test("the SIGUSR2 successor is told the port it must bind", () => {
+  const src = stripComments(readFileSync(join(testDir, "..", "bin", "claude-via-proxy.mjs"), "utf8"));
+  const at = src.indexOf("const successor = spawn(");
+  assert.ok(at > 0,
+    "the successor spawn is gone or renamed — this guard no longer watches " +
+    "anything, which is not the same as the defect being fixed");
+  const end = closesAt(src, src.indexOf("{", src.indexOf("], {", at)));
+  assert.ok(end > at, "the spawn options never close — the file did not parse as this guard assumes");
+  const opts = src.slice(at, end);
+
+  // THE SUCCESSOR IS SPAWNED AS `run-service`, AND run-service REFUSES WITHOUT
+  // A PORT. Its own guard returns 2 with "run-service needs
+  // CACHE_FIX_PROXY_PORT — a service must bind the port sessions were told to
+  // use, and that cannot be guessed."
+  //
+  // A `server`-mode holder reaches this handover (dispatch routes
+  // server + CACHE_FIX_HOLD_PORT=on + no LISTEN_FDS to holdPort) and does NOT
+  // require that variable — the comment on run-service's guard says so:
+  // "Wrapper mode keeps the default because it wires the client it launches."
+  // So the successor of a `server` holder inherits no port, prints that line
+  // and returns 2.
+  //
+  // And nothing upstream notices: node fires 'spawn' because the exec
+  // SUCCEEDED, so the predecessor takes its `left = true` path, SIGHUPs its
+  // child and exits — standby already closed, successor dead, nobody on the
+  // address. The predecessor's own measurement of the same class is recorded
+  // one screen away: "a run-service started without it took 9801 while the
+  // fleet dialled 9901."
+  //
+  // The predecessor knows the number — it is bound to it, and publishes it as
+  // holder._port two other places in this file. Passing it is the whole fix.
+  assert.match(opts, /CACHE_FIX_PROXY_PORT\s*:/,
+    "the successor is spawned without CACHE_FIX_PROXY_PORT. run-service refuses " +
+    "without it and returns 2, and the predecessor reads a successful exec as a " +
+    "successful handover — so a `server`-mode holder hands the port to a process " +
+    "that dies, after closing its own standby");
+
+  // PREMISE, or the assertion above could pass against an env block that names
+  // the variable while building it from something the predecessor does not know.
+  assert.match(opts, /CACHE_FIX_PROXY_PORT\s*:\s*String\(/,
+    "CACHE_FIX_PROXY_PORT is present but not built from a value — the successor " +
+    "needs the port this holder actually bound, not a literal or a passthrough");
+});
+
 test("a failed SIGUSR2 handover recovers, from both failure modes, through the ladder", () => {
   const src = stripComments(readFileSync(join(testDir, "..", "bin", "claude-via-proxy.mjs"), "utf8"));
   const at = src.indexOf("const handoverFailed = (why) =>");
