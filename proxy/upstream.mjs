@@ -274,7 +274,34 @@ export const directLast = () => _directLast;
 // relay to the configured upstream — but it is an asymmetry, not a symmetry,
 // and an earlier version of this comment claimed the opposite.
 export const requireHop = () => process.env.CACHE_FIX_REQUIRE_HOP === "1";
+// CONCURRENT CALLERS SHARE ONE WALK. Every /v1/messages goes through
+// forwardRequest, and every CONNECT through forward-proxy's hopFor(), so N
+// requests in flight meant N independent walks of the same chain — each opening
+// and destroying a TCP probe per hop, against a hop that is by definition
+// already unwell. Measured with a chain of two dead hops: 2616 ms, 2616 ms,
+// 2615 ms for three calls, every one paid in full.
+//
+// COALESCING ONLY, and deliberately nothing more. The 2500 ms grace is not
+// ours to shorten: it is matched to the pin's _CHAIN_HEAL_GRACE_S so the two
+// components wait the same amount, and the comment on it records why — a hop
+// that is restarting is back inside the window, and one component giving up
+// early abandons a request the other is still hopeful about. A negative cache
+// would change that shared contract unilaterally, so it is not here.
+//
+// Keyed by isHTTPS because the two answers can differ (selectProxyUrl reads a
+// different variable for each), and cleared in `finally` so a walk that threw
+// cannot pin every later caller to a rejected promise.
+const _walking = new Map();
 export async function resolveHop(isHTTPS) {
+  const key = isHTTPS ? "https" : "http";
+  const inflight = _walking.get(key);
+  if (inflight) return inflight;
+  const walk = _resolveHopUncoalesced(isHTTPS).finally(() => _walking.delete(key));
+  _walking.set(key, walk);
+  return walk;
+}
+
+async function _resolveHopUncoalesced(isHTTPS) {
   const primary = selectProxyUrl(isHTTPS);
   const chain = [primary, ...fallbackProxyUrls()].filter(Boolean);
   if (!chain.length) {
