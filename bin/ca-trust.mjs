@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { readFileSync, readdirSync } from "node:fs";
+import { X509Certificate } from "node:crypto";
 import { join } from "node:path";
 
 // Ask node what a CA bundle actually buys, instead of predicting it.
@@ -536,4 +537,64 @@ export function salvageBundle(trustDir, ourCaPem, leaf, writeTmp) {
   // narrowed trust on the wrong evidence.
   const path = writeTmp(kept.join("") + nl(ourText));
   return carriesOurCA(path, ourText) === false ? null : path;
+}
+
+// Would overwriting `existingPath` with `bundlePath` lose any trust?
+//
+// The launcher points SSL_CERT_FILE / REQUESTS_CA_BUNDLE at our merged bundle so
+// a session's python clients can verify the MITM we put in front of them. Each
+// of those names ONE file, so writing ours discards whatever they named before.
+//
+// On the fleet this was written against that is provably lossless: the file they
+// named is the same corporate store the external builder concatenates FIRST, so
+// ours is a strict superset (measured: ours 126 certs, theirs 124, theirs-minus-
+// ours 0). But this is a public fork and no operator's layout is ours to assume,
+// so the property is PROVED per run rather than believed. A third party whose
+// REQUESTS_CA_BUNDLE points somewhere our builder never reads would otherwise
+// have their trust silently narrowed by a launcher that only meant to widen it.
+//
+// Refusing on unparseable is deliberate. "Cannot read it" is not "nothing in
+// it": claiming no loss about a file we could not open is the exact silent
+// narrowing this exists to prevent, so an unreadable old file keeps its place
+// and the caller warns instead.
+export function subsumes(bundlePath, existingPath) {
+  if (!existingPath) return { ok: true, reason: "nothing was set" };
+  let existingText;
+  try { existingText = readFileSync(existingPath, "utf8"); }
+  catch { return { ok: true, reason: "no readable file was there to lose" }; }
+
+  const blocks = (t) => t.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g) || [];
+  // Fingerprints, not text: the same certificate re-wrapped at a different line
+  // width is the same trust, and a text compare would call that a loss.
+  const printsOf = (text) => {
+    const out = new Set();
+    for (const pem of blocks(text)) {
+      try { out.add(new X509Certificate(pem).fingerprint256); }
+      catch { return null; }
+    }
+    return out;
+  };
+
+  // Count BEGIN markers separately from parsed blocks. A file with a BEGIN and
+  // no END yields ZERO matches from the block regex, which the size-0 arm below
+  // would read as "it carried nothing to lose" — the exact silent narrowing this
+  // function exists to refuse. Caught by the unparseable test, which passed
+  // against the first draft for precisely that reason.
+  const begins = (existingText.match(/-----BEGIN CERTIFICATE-----/g) || []).length;
+  const theirs = printsOf(existingText);
+  if (theirs === null) return { ok: false, reason: `${existingPath} has a block we cannot parse` };
+  if (theirs.size !== begins) {
+    return { ok: false, reason: `${existingPath} has ${begins} BEGIN marker(s) but ${theirs.size} readable certificate(s)` };
+  }
+  if (theirs.size === 0) return { ok: true, reason: "it carried no certificates" };
+
+  let ours;
+  try { ours = printsOf(readFileSync(bundlePath, "utf8")); }
+  catch { return { ok: false, reason: `cannot read ${bundlePath}` }; }
+  if (ours === null) return { ok: false, reason: `${bundlePath} has a block we cannot parse` };
+
+  const missing = [...theirs].filter((f) => !ours.has(f)).length;
+  return missing === 0
+    ? { ok: true, reason: `all ${theirs.size} of its certificates are in ours` }
+    : { ok: false, reason: `${missing} of its ${theirs.size} certificates are not in ours` };
 }

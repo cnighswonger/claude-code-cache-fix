@@ -10,7 +10,7 @@ import http from "node:http";
 import net from "node:net";
 import { EventEmitter } from "node:events";
 import { getSystemErrorName } from "node:util";
-import { bundleUsable, carriesOurCA, salvageBundle } from "./ca-trust.mjs";
+import { bundleUsable, carriesOurCA, salvageBundle, subsumes } from "./ca-trust.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SERVER_PATH = resolve(__dirname, "../proxy/server.mjs");
@@ -2264,8 +2264,41 @@ if (remoteControl) {
       process.stderr.write(`cache-fix: could not evaluate ${caTrustBundle} (${e.message}); using our own CA only\n`);
     }
   }
-  if (caForClaude) claudeEnv.NODE_EXTRA_CA_CERTS = caForClaude;
-  else delete claudeEnv.NODE_EXTRA_CA_CERTS;
+  // NODE_EXTRA_CA_CERTS is read by node and by nothing else, but we point the
+  // whole SESSION at our MITM — so its python subprocesses (MCP servers, tool
+  // subprocesses, hooks) have to be able to verify it too. urllib reads only
+  // SSL_CERT_FILE; `requests` reads only REQUESTS_CA_BUNDLE and falls back to
+  // certifi, never to SSL_CERT_FILE. Naming one file in one of the three wires
+  // a session to a proxy half of it cannot trust.
+  //
+  // Measured on a Linux host, same proxy and same request, trust source the
+  // only variable:
+  //   via 9901, ambient store             CERTIFICATE_VERIFY_FAILED self-signed
+  //   via 9901, SSL_CERT_FILE=our bundle  HTTP 405 (TLS OK)
+  // and a live session carried SSL_CERT_FILE unset with REQUESTS_CA_BUNDLE
+  // pointing at the system store, which cannot hold our root by construction.
+  //
+  // Each of those names ONE file, so writing ours discards whatever it named
+  // before. On the fleet this was written against ours is provably a superset of
+  // that file — the builder concatenates the same corporate store first — but
+  // this is a public fork and an operator's layout is not ours to assume. So
+  // `subsumes` PROVES the replacement is lossless per run; when it cannot, the
+  // operator's file stays and we say so rather than silently narrowing trust to
+  // widen it. NODE_EXTRA_CA_CERTS is exempt: node MERGES it with its built-in
+  // store instead of replacing one, so it cannot lose anything.
+  //
+  // The no-CA arm deliberately does not touch the other two. We never set them
+  // in that case, so there is nothing of ours to withdraw.
+  if (caForClaude) {
+    claudeEnv.NODE_EXTRA_CA_CERTS = caForClaude;
+    for (const key of ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"]) {
+      const verdict = subsumes(caForClaude, claudeEnv[key]);
+      if (verdict.ok) claudeEnv[key] = caForClaude;
+      else process.stderr.write(
+        `cache-fix: keeping your ${key}=${claudeEnv[key]} (${verdict.reason}); `
+        + `python clients in this session will not trust the proxy at ${caForClaude}\n`);
+    }
+  } else delete claudeEnv.NODE_EXTRA_CA_CERTS;
   // MAKE NODE ACTUALLY USE THE PROXY WE JUST POINTED IT AT.
   //
   // node has no implicit proxy support: HTTPS_PROXY is inert unless this is set

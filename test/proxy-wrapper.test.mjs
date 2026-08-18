@@ -341,6 +341,115 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: CONCURRENCY }, () =
     assert.ok(second.out.includes(`CA=${bundle}`), `NODE_EXTRA_CA_CERTS should be the merged bundle (${bundle}), got: ${second.out}`);
   });
 
+  it("--remote-control gives a python client the same trust file it gives node", async () => {
+    // NODE_EXTRA_CA_CERTS is read by node and by nothing else. We point EVERY
+    // client in the session at our MITM, so a session's python subprocesses —
+    // MCP servers, tool subprocesses, hooks — must be able to verify it too.
+    // urllib reads only SSL_CERT_FILE; `requests` reads only REQUESTS_CA_BUNDLE
+    // (it falls back to certifi, never to SSL_CERT_FILE). So the one file we
+    // validated has to be named by all three or the session is wired to a proxy
+    // half of it cannot trust.
+    //
+    // Measured on a Linux host before this test existed, same proxy and same
+    // request, trust source the only variable:
+    //   via 9901, ambient store            CERTIFICATE_VERIFY_FAILED self-signed
+    //   via 9901, SSL_CERT_FILE=our bundle HTTP 405 (TLS OK)
+    // A live session carried NODE_EXTRA_CA_CERTS=<bundle>, SSL_CERT_FILE unset,
+    // and REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt — the system
+    // store, which cannot contain our root by construction.
+    //
+    // Widening cannot shrink trust: the bundle is built by concatenating the
+    // ambient corp bundle with each ca-trust.d component, so it is a superset of
+    // the store REQUESTS_CA_BUNDLE otherwise names.
+    const configDir = tempDir("cfftrust-");
+    const bundle = join(configDir, "ca-trust.pem");
+    const script = 'process.stdout.write("CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")'
+      + '+"|SSL="+(process.env.SSL_CERT_FILE||"UNSET")'
+      + '+"|REQ="+(process.env.REQUESTS_CA_BUNDLE||"UNSET")+"\\n")';
+    const runOnce = () => runWrapper(script, { CLAUDE_CONFIG_DIR: configDir });
+
+    const first = await runOnce();
+    assert.equal(first.code, 0, `first run should exit 0, got ${first.code}. stderr: ${first.err}`);
+    const ourPem = readFileSync(join(configDir, "ca-trust.d", "ccf.pem"), "utf8");
+    writeFileSync(bundle, `# merged by the launcher\n${ourPem}`);
+    // A subsumed pre-existing value, written from the same pem the bundle holds.
+    // Without this the run inherits the HOST's REQUESTS_CA_BUNDLE and the result
+    // depends on whose machine the suite runs on.
+    const subsumed = join(configDir, "already-trusted.pem");
+    writeFileSync(subsumed, ourPem);
+
+    const second = await runWrapper(script, { CLAUDE_CONFIG_DIR: configDir, REQUESTS_CA_BUNDLE: subsumed });
+    assert.equal(second.code, 0, `Expected exit 0, got ${second.code}. stderr: ${second.err}`);
+    // The CONTRACT, not "all three are equal": an UNSET var is ours to set, and
+    // a var the operator already set is replaced only when we can prove no loss.
+    // Here REQUESTS_CA_BUNDLE names a file whose every certificate is in ours,
+    // so all three converge.
+    for (const key of ["CA", "SSL", "REQ"]) {
+      assert.ok(second.out.includes(`${key}=${bundle}`),
+        `${key} should name the validated bundle (${bundle}), got: ${second.out}`);
+    }
+  });
+
+  it("--remote-control keeps a python trust file it cannot prove it subsumes, and says so", async () => {
+    // The half that protects a THIRD PARTY. Pointing SSL_CERT_FILE at our bundle
+    // discards whatever it named, so on an operator whose file we do not carry,
+    // widening our own trust would narrow theirs. Refuse, keep theirs, and put
+    // the reason on stderr — a silent keep is as bad as a silent clobber,
+    // because the session then cannot verify the proxy and nothing says why.
+    const configDir = tempDir("cfftrust-");
+    const bundle = join(configDir, "ca-trust.pem");
+    const foreign = join(configDir, "operator-roots.pem");
+    const script = 'process.stdout.write("SSL="+(process.env.SSL_CERT_FILE||"UNSET")+"\\n")';
+
+    const first = await runWrapper(script, { CLAUDE_CONFIG_DIR: configDir });
+    assert.equal(first.code, 0, `first run should exit 0, got ${first.code}. stderr: ${first.err}`);
+    writeFileSync(bundle, `# merged by the launcher\n${readFileSync(join(configDir, "ca-trust.d", "ccf.pem"), "utf8")}`);
+    // A root the bundle does NOT carry: our own CA from an unrelated config dir.
+    const otherDir = tempDir("cffother-");
+    await runWrapper('process.stdout.write("x")', { CLAUDE_CONFIG_DIR: otherDir });
+    writeFileSync(foreign, readFileSync(join(otherDir, "ca-trust.d", "ccf.pem"), "utf8"));
+
+    const res = await runWrapper(script, { CLAUDE_CONFIG_DIR: configDir, SSL_CERT_FILE: foreign });
+    assert.equal(res.code, 0, `Expected exit 0, got ${res.code}. stderr: ${res.err}`);
+    assert.ok(res.out.includes(`SSL=${foreign}`),
+      `an unsubsumed SSL_CERT_FILE must be kept, got: ${res.out}`);
+    assert.match(res.err, /keeping your SSL_CERT_FILE/,
+      `the refusal must be announced, stderr was: ${res.err}`);
+  });
+
+  it("--remote-control leaves the ambient python trust vars alone when it has no usable CA", async () => {
+    // The other half of the contract. With no usable CA we hand claude nothing
+    // and let it fall back to the ambient store — so we must not have pointed
+    // python at a file we then refused to vouch for, and equally must not have
+    // deleted a REQUESTS_CA_BUNDLE the user configured. Whatever came in, comes
+    // out.
+    const configDir = tempDir("cfftrust-");
+    const ambient = join(configDir, "operator-configured.pem");
+    writeFileSync(ambient, "# the user's own bundle\n");
+    // An UNPARSEABLE ca.pem is the only reachable way to make caForClaude null;
+    // the sibling test at "does not hand claude a ca.pem that failed to parse"
+    // uses the same fixture. An absent CA dir does NOT work — the launcher mints
+    // into it and then correctly wires all three. Measured: that first draft of
+    // this test asserted UNSET and got the freshly minted ca.pem, i.e. it was
+    // encoding a premise that does not exist rather than the contract.
+    const caDir = tempDir("cffca-");
+    writeFileSync(join(caDir, "ca.key"), "-----BEGIN PRIVATE KEY-----\nplaceholder\n-----END PRIVATE KEY-----\n");
+    writeFileSync(join(caDir, "ca.pem"), "-----BEGIN CERTIFICATE-----\ntruncated\n");
+    const script = 'process.stdout.write("SSL="+(process.env.SSL_CERT_FILE||"UNSET")'
+      + '+"|REQ="+(process.env.REQUESTS_CA_BUNDLE||"UNSET")+"\\n")';
+
+    const res = await runWrapper(script, {
+      CLAUDE_CONFIG_DIR: configDir,
+      CACHE_FIX_CA_DIR: caDir,
+      SSL_CERT_FILE: ambient,
+      REQUESTS_CA_BUNDLE: ambient,
+    });
+
+    assert.equal(res.code, 0, `Expected exit 0, got ${res.code}. stderr: ${res.err}`);
+    assert.ok(res.out.includes(`SSL=${ambient}`), `SSL_CERT_FILE must survive untouched, got: ${res.out}`);
+    assert.ok(res.out.includes(`REQ=${ambient}`), `REQUESTS_CA_BUNDLE must survive untouched, got: ${res.out}`);
+  });
+
   it("--remote-control never writes the merged bundle and never touches a sibling component's pem", async () => {
     // Single-writer invariant. Two launchers both "helpfully" rebuilding the
     // merged file race one output, and a component that rewrites a sibling's pem

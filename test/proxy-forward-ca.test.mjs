@@ -20,7 +20,7 @@ const REPO = new URL("..", import.meta.url).pathname;
 const FWD = join(REPO, "proxy/forward-proxy.mjs");
 
 // The launcher's own trust decision, imported rather than re-implemented.
-import { bundleUsable, carriesOurCA, salvageBundle } from "../bin/ca-trust.mjs";
+import { bundleUsable, carriesOurCA, salvageBundle, subsumes } from "../bin/ca-trust.mjs";
 
 // The oracle judges a FILE, because that is what NODE_EXTRA_CA_CERTS names. The
 // shape table below is written in bundle TEXT, so it goes through a temp file.
@@ -1623,4 +1623,79 @@ test("ca-trust: …and still rebuilds from a healthy publisher it cannot judge",
     const blocks = (readFileSync(got, "utf8").match(/-----BEGIN CERTIFICATE-----/g) || []).length;
     assert.equal(blocks, 2, `expected the peer plus our CA, got ${blocks}`);
   });
+});
+
+// --- subsumes: may we overwrite a trust file the operator already set? ------
+//
+// The launcher points SSL_CERT_FILE / REQUESTS_CA_BUNDLE at our merged bundle so
+// a session's python clients can verify the MITM we put in front of them. Those
+// two vars name ONE file each, so pointing them at ours discards whatever they
+// named before. On this operator's fleet that is provably lossless — the file
+// they named is the same corp store our builder concatenates first — but this is
+// a public fork and nothing in the repo can assume that. So we prove it per-run
+// instead of assuming it: replace only when every certificate the old file
+// carried is also in ours.
+const bundleOf = (dir, name, pems) => {
+  const p = join(dir, name);
+  writeFileSync(p, pems.join(""));
+  return p;
+};
+// Two unrelated roots, minted the way the proxy mints its own.
+const twoRoots = () => {
+  let a, b;
+  withCA({}, (dir) => { ensureCA(); a = readFileSync(join(dir, "ca.pem"), "utf8"); });
+  withCA({}, (dir) => { ensureCA(); b = readFileSync(join(dir, "ca.pem"), "utf8"); });
+  assert.notEqual(a, b, "premise: the two fixtures must be different roots");
+  return [a, b];
+};
+
+test("subsumes: says yes when ours carries everything the old file did", () => {
+  const d = scratchDir("subsumes-");
+  const [ours, theirs] = twoRoots();
+  const bundle = bundleOf(d, "ca-trust.pem", [theirs, ours]);
+  const existing = bundleOf(d, "corp.pem", [theirs]);
+  assert.equal(subsumes(bundle, existing).ok, true);
+});
+
+test("subsumes: says NO when the old file carries a root ours does not — the trust-narrowing case", () => {
+  const d = scratchDir("subsumes-");
+  const [ours, theirs] = twoRoots();
+  const bundle = bundleOf(d, "ca-trust.pem", [ours]);
+  const existing = bundleOf(d, "corp.pem", [theirs]);
+  const r = subsumes(bundle, existing);
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /1 /, `reason should count what would be lost, got: ${r.reason}`);
+});
+
+test("subsumes: says yes when there was no old file to lose", () => {
+  const d = scratchDir("subsumes-");
+  const [ours] = twoRoots();
+  assert.equal(subsumes(bundleOf(d, "ca-trust.pem", [ours]), join(d, "absent.pem")).ok, true);
+  assert.equal(subsumes(bundleOf(d, "ca-trust.pem", [ours]), undefined).ok, true);
+});
+
+test("subsumes: says NO on a WELL-FORMED block whose body is not a certificate", () => {
+  // Distinct from the truncated case above, and the mutation table is why it
+  // exists: a BEGIN with no END is caught by the marker-count guard before the
+  // parse ever runs, so the parse-failure arm had no test reaching it and a
+  // mutant that made it fail open survived the whole subsumes table. This block
+  // has both markers and a body X509Certificate rejects, which is the only
+  // shape that lands there.
+  const d = scratchDir("subsumes-");
+  const [ours] = twoRoots();
+  const garbage = join(d, "garbage.pem");
+  writeFileSync(garbage, "-----BEGIN CERTIFICATE-----\nbm90IGEgY2VydGlmaWNhdGU=\n-----END CERTIFICATE-----\n");
+  const r = subsumes(bundleOf(d, "ca-trust.pem", [ours]), garbage);
+  assert.equal(r.ok, false, `a block that does not parse must refuse, got: ${JSON.stringify(r)}`);
+  assert.match(r.reason, /cannot parse/, `reason should name the parse failure, got: ${r.reason}`);
+});
+
+test("subsumes: says NO when the old file cannot be parsed, rather than guessing", () => {
+  // Unreadable is not the same as empty. We cannot show no loss, so we must
+  // not claim it — the whole point of the check is to refuse silent narrowing.
+  const d = scratchDir("subsumes-");
+  const [ours] = twoRoots();
+  const torn = join(d, "torn.pem");
+  writeFileSync(torn, "-----BEGIN CERTIFICATE-----\ntruncated\n");
+  assert.equal(subsumes(bundleOf(d, "ca-trust.pem", [ours]), torn).ok, false);
 });
