@@ -561,7 +561,17 @@ export function subsumes(bundlePath, existingPath) {
   if (!existingPath) return { ok: true, reason: "nothing was set" };
   let existingText;
   try { existingText = readFileSync(existingPath, "utf8"); }
-  catch { return { ok: true, reason: "no readable file was there to lose" }; }
+  catch (err) {
+    // ABSENT is safe; UNREADABLE is not, and they arrive at the same catch.
+    // A path that is not there displaces nothing, so widening onto it loses
+    // nothing. A file that EXISTS and that WE cannot open — mode, ACL, a path
+    // only root can read — may be exactly what the client is using, and calling
+    // our own failure to look "nothing to lose" replaces a working store. This
+    // function's contract is prove-it-or-keep-theirs, so anything that is not
+    // a plain ENOENT is a refusal.
+    if (err?.code === "ENOENT") return { ok: true, reason: "no file was there to lose" };
+    return { ok: false, reason: `cannot read ${existingPath} (${err?.code || err?.message}) — refusing to replace a store we could not inspect` };
+  }
 
   const blocks = (t) => t.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g) || [];
   // Fingerprints, not text: the same certificate re-wrapped at a different line

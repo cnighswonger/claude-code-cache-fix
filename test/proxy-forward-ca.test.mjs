@@ -1707,6 +1707,33 @@ test("subsumes: says yes when there was no old file to lose", () => {
   assert.equal(subsumes(bundleOf(d, "ca-trust.pem", [ours]), undefined).ok, true);
 });
 
+// ABSENT AND UNREADABLE ARE NOT THE SAME ANSWER, and this function's whole
+// contract is "prove it or keep theirs". A path that does not exist displaces
+// nothing, so widening onto it is safe. A file that EXISTS and that WE cannot
+// read is a store the client may well be using — mode, ACL, or a path only root
+// can open — and treating that as "nothing there to lose" replaces a working
+// trust store on the strength of our own failure to look. That is the exact
+// silent-narrowing shape the function exists to refuse, reached through the
+// error path instead of through a size check.
+//
+// Raised by cswap's trust-store audit on 2026-08-18: every replace-class
+// assignment needs a PROVEN subsumption, and a default-allow on an unreadable
+// file is not a proof.
+test("subsumes: says NO when the old file exists but we cannot read it", (t) => {
+  if (process.getuid?.() === 0) return t.skip("root reads everything; the mode cannot be tested");
+  const d = scratchDir("subsumes-");
+  const [ours, theirs] = twoRoots();
+  const existing = bundleOf(d, "unreadable.pem", [theirs]);
+  chmodSync(existing, 0o000);
+  try {
+    const r = subsumes(bundleOf(d, "ca-trust.pem", [ours]), existing);
+    assert.equal(r.ok, false,
+      `an unreadable store was treated as nothing to lose: ${JSON.stringify(r)}`);
+    assert.match(r.reason, /cannot read/i,
+      `the refusal must say WHY, got: ${JSON.stringify(r.reason)}`);
+  } finally { chmodSync(existing, 0o600); }
+});
+
 test("subsumes: a store that lists one certificate TWICE is still accepted", () => {
   // Real stores do this. Debian's /etc/ssl/certs/ca-certificates.crt carries 125
   // BEGIN markers and 124 distinct certificates. Comparing the marker count

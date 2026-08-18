@@ -10,7 +10,7 @@ import http from "node:http";
 import net from "node:net";
 import { EventEmitter } from "node:events";
 import { getSystemErrorName } from "node:util";
-import { ambientStorePath, bundleUsable, carriesOurCA, salvageBundle, subsumes } from "./ca-trust.mjs";
+import { bundleUsable, carriesOurCA, salvageBundle } from "./ca-trust.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SERVER_PATH = resolve(__dirname, "../proxy/server.mjs");
@@ -2278,54 +2278,39 @@ if (remoteControl) {
   // and a live session carried SSL_CERT_FILE unset with REQUESTS_CA_BUNDLE
   // pointing at the system store, which cannot hold our root by construction.
   //
-  // Each of those names ONE file, so writing ours discards whatever it named
-  // before. On the fleet this was written against ours is provably a superset of
-  // that file — the builder concatenates the same corporate store first — but
-  // this is a public fork and an operator's layout is not ours to assume. So
-  // `subsumes` PROVES the replacement is lossless per run; when it cannot, the
-  // operator's file stays and we say so rather than silently narrowing trust to
-  // widen it. NODE_EXTRA_CA_CERTS is exempt: node MERGES it with its built-in
-  // store instead of replacing one, so it cannot lose anything.
-  //
-  // The no-CA arm deliberately does not touch the other two. We never set them
-  // in that case, so there is nothing of ours to withdraw.
+  // Each of those names ONE file, so writing ours would discard whatever it
+  // named before. We do not write them at all — see the block below for why the
+  // per-run proof that used to guard them was itself the wrong shape.
+  // NODE_EXTRA_CA_CERTS is the only one we set, and it is safe by construction:
+  // node MERGES it with its built-in store rather than replacing one.
   if (caForClaude) {
     claudeEnv.NODE_EXTRA_CA_CERTS = caForClaude;
-    // GATED ON THE MERGED BUNDLE, not on having any CA. node MERGES
-    // NODE_EXTRA_CA_CERTS with its built-in store, so handing it our own CA
-    // alone only ADDS trust. urllib does not merge SSL_CERT_FILE, it REPLACES
-    // the default — so naming a one-certificate file there leaves a python
-    // client trusting our proxy and nothing else on the internet. That is the
-    // standalone fallback (no bundle builder on the box), which is exactly what
-    // a third party running this fork gets, so it is the common case, not an
-    // edge one.
+    // WE DO NOT WRITE SSL_CERT_FILE / REQUESTS_CA_BUNDLE. NOT GATED — ABSENT.
     //
-    // The merged bundle is safe because of how it is built: the ambient corp
-    // store first, then every ca-trust.d component. A superset by construction.
-    // Our own CA is a superset of nothing.
-    // The gate is a PROOF, not a shape. "The merged bundle is a superset by
-    // construction" is false: it is a superset of the ambient corporate store
-    // only when the builder found one. Measured across one fleet, same file:
-    //   a Linux box     127 certs, 2 components, 125 ambient
-    //   a work Mac      168 certs, 2 components, 166 ambient
-    //   a personal Mac    2 certs, 2 components,   0 ambient
-    // On the last, pointing SSL_CERT_FILE at the "merged" bundle leaves a python
-    // client trusting our two proxies and nothing else.
+    // node MERGES NODE_EXTRA_CA_CERTS with its built-in store, so handing it our
+    // CA only ADDS trust. urllib and requests do the opposite: SSL_CERT_FILE and
+    // REQUESTS_CA_BUNDLE REPLACE the default store, so naming any file there is
+    // a bet that the file is a superset of what it displaces.
     //
-    // No ambient file to name (macOS keychain) means we cannot prove it, so we
-    // do not write. The fix lands where it is provable and never narrows a box
-    // where it is not.
-    const ambient = ambientStorePath();
-    for (const key of ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"]) {
-      const existing = claudeEnv[key] || ambient;
-      const verdict = existing
-        ? subsumes(caForClaude, existing)
-        : { ok: false, reason: "no ambient trust store to compare against on this platform" };
-      if (verdict.ok) claudeEnv[key] = caForClaude;
-      else if (claudeEnv[key]) process.stderr.write(
-        `cache-fix: keeping your ${key}=${claudeEnv[key]} (${verdict.reason}); `
-        + `python clients in this session will not trust the proxy at ${caForClaude}\n`);
-    }
+    // This used to write both behind a fingerprint-set subsumption proof. The
+    // proof worked and was still the wrong design, and the reason is worth
+    // keeping: A PROOF CAN GO STALE. It holds at launch and the variable
+    // outlives it — the store it proved against can be rotated, revoked, made
+    // unreadable, or replaced by MDM, and the session keeps pointing at a bundle
+    // that no longer subsumes anything. On a corporate laptop the failure is
+    // total: system roots gone means no internet and every enterprise function
+    // dead, while our own proxy keeps working, so everything looks fine from
+    // inside the tool.
+    //
+    // Two independent implementations of that gate (this one and cswap-pin's)
+    // each shipped a default-ALLOW arm — ours returned ok on an UNREADABLE
+    // store, theirs passed when the ambient roots were a capath with no cafile.
+    // That is the shape of the class, not two bugs, and it is why the answer is
+    // "never write a replace-class variable" rather than "gate it better".
+    //
+    // A python client that needs to trust this proxy should ADD the CA in code:
+    //   ctx = ssl.create_default_context(); ctx.load_verify_locations(<ca>)
+    // which cannot narrow trust on any platform and needs no per-machine proof.
   } else delete claudeEnv.NODE_EXTRA_CA_CERTS;
   // MAKE NODE ACTUALLY USE THE PROXY WE JUST POINTED IT AT.
   //

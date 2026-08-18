@@ -127,7 +127,8 @@ function cleanEnv(overrides) {
   // is not testing the thing under test.
   for (const k of ["CACHE_FIX_PROXY_PORT", "CACHE_FIX_PROXY_UPSTREAM", "NO_PROXY", "no_proxy",
                    "CACHE_FIX_CA_PROBE_UNANSWERABLE",
-                   "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS"]) delete env[k];
+                   "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
+                   "CURL_CA_BUNDLE"]) delete env[k];
   env.CACHE_FIX_PROXY_BIND = "127.0.0.1";
   // A config dir per invocation, by DEFAULT — not opt-in per test. Forward mode
   // publishes our CA into <config>/ca-trust.d/ccf.pem, so any test that forgot to
@@ -379,78 +380,64 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: CONCURRENCY }, () =
     return pyTrust;
   };
 
-  it("--remote-control gives a python client the same trust file it gives node", async () => {
-    // NODE_EXTRA_CA_CERTS is read by node and by nothing else. We point EVERY
-    // client in the session at our MITM, so a session's python subprocesses —
-    // MCP servers, tool subprocesses, hooks — must be able to verify it too.
-    // urllib reads only SSL_CERT_FILE; `requests` reads only REQUESTS_CA_BUNDLE
-    // (it falls back to certifi, never to SSL_CERT_FILE). So the one file we
-    // validated has to be named by all three or the session is wired to a proxy
-    // half of it cannot trust.
-    //
-    // Measured on a Linux host before this test existed, same proxy and same
-    // request, trust source the only variable:
-    //   via 9901, ambient store            CERTIFICATE_VERIFY_FAILED self-signed
-    //   via 9901, SSL_CERT_FILE=our bundle HTTP 405 (TLS OK)
-    // A live session carried NODE_EXTRA_CA_CERTS=<bundle>, SSL_CERT_FILE unset,
-    // and REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt — the system
-    // store, which cannot contain our root by construction.
-    //
-    // Widening cannot shrink trust: the bundle is built by concatenating the
-    // ambient corp bundle with each ca-trust.d component, so it is a superset of
-    // the store REQUESTS_CA_BUNDLE otherwise names.
-    const { configDir, bundle, ourPem } = await pythonTrustFixture();
+  // THE REPLACE-CLASS VARIABLES ARE NOT OURS TO WRITE — not gated, ABSENT.
+  //
+  // These two cases used to assert the opposite: that we set SSL_CERT_FILE and
+  // REQUESTS_CA_BUNDLE whenever a fingerprint-set subsumption proof passed, and
+  // kept the operator's value when it did not. The proof worked. It was still
+  // the wrong design, because a proof taken at launch outlives the thing it
+  // proved: the store can be rotated, revoked, made unreadable, or replaced by
+  // MDM, and the variable stays behind naming a bundle that no longer subsumes
+  // anything. On a corporate laptop that is total — system roots gone, no
+  // internet, every enterprise function dead, while our proxy keeps working so
+  // the tool still looks healthy.
+  //
+  // Two independent implementations of that gate each shipped a default-ALLOW
+  // arm (ours said ok on an UNREADABLE store; cswap-pin's passed when the
+  // ambient roots were a capath with no cafile), which is the shape of the
+  // class rather than two bugs.
+  //
+  // A python client that must trust this proxy adds the CA in code —
+  // ssl.create_default_context() then load_verify_locations() — which cannot
+  // narrow trust on any platform.
+  it("--remote-control never writes a replace-class trust variable", async () => {
+    const { configDir, bundle } = await pythonTrustFixture();
     const script = 'process.stdout.write("CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")'
       + '+"|SSL="+(process.env.SSL_CERT_FILE||"UNSET")'
+      + '+"|REQ="+(process.env.REQUESTS_CA_BUNDLE||"UNSET")'
+      + '+"|CURL="+(process.env.CURL_CA_BUNDLE||"UNSET")+"\\n")';
+
+    // Nothing inherited, so anything that appears was written by the launcher.
+    const clean = await runWrapper(script, { CLAUDE_CONFIG_DIR: configDir });
+    assert.equal(clean.code, 0, `Expected exit 0, got ${clean.code}. stderr: ${clean.err}`);
+    assert.ok(clean.out.includes(`CA=${bundle}`),
+      `the ADD-class variable is still ours to set, got: ${clean.out}`);
+    for (const key of ["SSL", "REQ", "CURL"]) {
+      assert.ok(clean.out.includes(`${key}=UNSET`),
+        `${key} is replace-class and must never be written; got: ${clean.out}`);
+    }
+  });
+
+  it("--remote-control leaves an operator's replace-class values exactly as it found them", async () => {
+    const { configDir, ourPem } = await pythonTrustFixture();
+    const script = 'process.stdout.write("SSL="+(process.env.SSL_CERT_FILE||"UNSET")'
       + '+"|REQ="+(process.env.REQUESTS_CA_BUNDLE||"UNSET")+"\\n")';
-    // A subsumed pre-existing value, written from the same pem the bundle holds.
-    // Without this the run inherits the HOST's REQUESTS_CA_BUNDLE and the result
-    // depends on whose machine the suite runs on.
-    const subsumed = join(configDir, "already-trusted.pem");
-    writeFileSync(subsumed, ourPem);
+    // A value we COULD prove we subsume — under the old design this is exactly
+    // the input that got overwritten. It must now survive untouched, which is
+    // what separates "we deleted the write" from "the proof happens to refuse".
+    const theirs = join(configDir, "operator-trust.pem");
+    writeFileSync(theirs, ourPem);
 
-    const second = await runWrapper(script, { CLAUDE_CONFIG_DIR: configDir, REQUESTS_CA_BUNDLE: subsumed });
-    assert.equal(second.code, 0, `Expected exit 0, got ${second.code}. stderr: ${second.err}`);
-    // The CONTRACT, not "all three are equal": an UNSET var is ours to set, and
-    // a var the operator already set is replaced only when we can prove no loss.
-    // Here REQUESTS_CA_BUNDLE names a file whose every certificate is in ours,
-    // so all three converge.
-    for (const key of ["CA", "SSL", "REQ"]) {
-      assert.ok(second.out.includes(`${key}=${bundle}`),
-        `${key} should name the validated bundle (${bundle}), got: ${second.out}`);
-    }
-  });
-
-  it("--remote-control keeps a python trust file it cannot prove it subsumes, and says so", async () => {
-    // The half that protects a THIRD PARTY. Pointing SSL_CERT_FILE at our bundle
-    // discards whatever it named, so on an operator whose file we do not carry,
-    // widening our own trust would narrow theirs. Refuse, keep theirs, and put
-    // the reason on stderr — a silent keep is as bad as a silent clobber,
-    // because the session then cannot verify the proxy and nothing says why.
-    const { configDir } = await pythonTrustFixture();
-    const foreign = join(configDir, "operator-roots.pem");
-    const script = 'process.stdout.write("SSL="+(process.env.SSL_CERT_FILE||"UNSET")+"\\n")';
-    // A root the bundle does NOT carry. Minted in-process rather than by running
-    // a second launcher: this file already runs concurrently with the timing
-    // cases in proxy-held-port.test.mjs, and an extra spawned launcher+proxy is
-    // load those cases lose their windows to. Same fixture, none of the cost.
-    const { ensureCA } = await import(resolve(__dirname, "../proxy/forward-proxy.mjs"));
-    const otherCaDir = tempDir("cffother-");
-    const savedCaDir = process.env.CACHE_FIX_CA_DIR;
-    process.env.CACHE_FIX_CA_DIR = otherCaDir;
-    try { ensureCA(); } finally {
-      if (savedCaDir === undefined) delete process.env.CACHE_FIX_CA_DIR;
-      else process.env.CACHE_FIX_CA_DIR = savedCaDir;
-    }
-    writeFileSync(foreign, readFileSync(join(otherCaDir, "ca.pem"), "utf8"));
-
-    const res = await runWrapper(script, { CLAUDE_CONFIG_DIR: configDir, SSL_CERT_FILE: foreign });
+    const res = await runWrapper(script, {
+      CLAUDE_CONFIG_DIR: configDir,
+      SSL_CERT_FILE: theirs,
+      REQUESTS_CA_BUNDLE: theirs,
+    });
     assert.equal(res.code, 0, `Expected exit 0, got ${res.code}. stderr: ${res.err}`);
-    assert.ok(res.out.includes(`SSL=${foreign}`),
-      `an unsubsumed SSL_CERT_FILE must be kept, got: ${res.out}`);
-    assert.match(res.err, /keeping your SSL_CERT_FILE/,
-      `the refusal must be announced, stderr was: ${res.err}`);
+    assert.ok(res.out.includes(`SSL=${theirs}`), `SSL_CERT_FILE was modified: ${res.out}`);
+    assert.ok(res.out.includes(`REQ=${theirs}`), `REQUESTS_CA_BUNDLE was modified: ${res.out}`);
   });
+
 
   it("--remote-control leaves the python vars alone when the bundle carries no ambient roots", async () => {
     // "The merged bundle is a superset by construction" is FALSE. It is a
