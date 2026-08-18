@@ -1401,7 +1401,12 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
     // three environments, and reads the value the child would receive.
     it("hands the child the bind it actually holds, not a hardcoded loopback", () => {
       const src = readFileSync(launcherPath, "utf8");
-      const bindFn = /const bindAddr = [^\n]*\n/.exec(src)?.[0];
+      // THROUGH lsofAddr, not just bindAddr. holderPidOn() calls both, and
+      // lifting one left the other a free variable — the fourth time this
+      // harness has died on exactly the step its own comment below warns about.
+      // Capturing the pair as one block means the next helper added beside them
+      // arrives here automatically instead of via a ReferenceError.
+      const bindFn = /const bindAddr = [\s\S]*?const lsofAddr = [^\n]*\n/.exec(src)?.[0];
       const envLit = /env: \{ \.\.\.process\.env, CACHE_FIX_PROXY_PORT[\s\S]*?LISTEN_FDS: "1" \}/.exec(src)?.[0];
       assert.ok(bindFn && envLit,
         "the holder's child-spawn env literal moved — this no longer tests what the child is told");
@@ -1440,7 +1445,12 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       // 127.0.0.1 — the two disagreed under CACHE_FIX_PROXY_BIND and the probe
       // then matched nothing. Lifted from source rather than stubbed, so this
       // keeps failing if the real one stops honouring the variable.
-      const bindFn = /const bindAddr = [^\n]*\n/.exec(src)?.[0];
+      // THROUGH lsofAddr, not just bindAddr. holderPidOn() calls both, and
+      // lifting one left the other a free variable — the fourth time this
+      // harness has died on exactly the step its own comment below warns about.
+      // Capturing the pair as one block means the next helper added beside them
+      // arrives here automatically instead of via a ReferenceError.
+      const bindFn = /const bindAddr = [\s\S]*?const lsofAddr = [^\n]*\n/.exec(src)?.[0];
       // probe() too, LIFTED not stubbed, for the same reason as bindAddr: it is
       // what bounds every shell-out onto a user's machine, and a rule that
       // stopped going through it would keep passing against an injected
@@ -1621,7 +1631,12 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       const src = readFileSync(launcherPath, "utf8");
       const rule = /function otherHolderOn[\s\S]*?\n}/.exec(src)?.[0];
       const fpFns = /function codeFingerprint[\s\S]*?\nfunction runningOurCode[\s\S]*?\n}/.exec(src)?.[0];
-      const bindFn = /const bindAddr = [^\n]*\n/.exec(src)?.[0];
+      // THROUGH lsofAddr, not just bindAddr. holderPidOn() calls both, and
+      // lifting one left the other a free variable — the fourth time this
+      // harness has died on exactly the step its own comment below warns about.
+      // Capturing the pair as one block means the next helper added beside them
+      // arrives here automatically instead of via a ReferenceError.
+      const bindFn = /const bindAddr = [\s\S]*?const lsofAddr = [^\n]*\n/.exec(src)?.[0];
       // probe() too, LIFTED not stubbed, for the same reason as bindAddr: it is
       // what bounds every shell-out onto a user's machine, and a rule that
       // stopped going through it would keep passing against an injected
@@ -1894,6 +1909,77 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
     //   child told CACHE_FIX_HELD_PORT=0, so its self-heal would respawn on a
     //     DIFFERENT ephemeral port and strand every session on the served one,
     //     and successorServing("0") can never answer
+    it("binds an IPv6 address instead of dying on the family", async () => {
+      // THE WHOLE IPv6 PATH WAS UNREACHABLE, and everything downstream of it was
+      // already written: gap-relay's [::1] self-exclusion, the
+      // `listening on [::1]:PORT` parse, successorServing's tcp6 fallthrough.
+      // None of it could run, because the bind one layer up could not succeed.
+      //
+      // THREE LAYERS, all measured, and the third is why this test spawns a
+      // real launcher instead of unit-testing the first:
+      //   h.bind("::1")      -> -22 EINVAL   (TCPWrap::Bind calls uv_ip4_addr;
+      //                                       bind6 is the IPv6 entry point)
+      //   lsof -iTCP@::1:0   -> exit 1 "unacceptable Internet address", so the
+      //                         ownership probe died and the launcher carried on
+      //                         "as if no other holder is here"
+      //   the RE-BIND, 45 lines below the first, still called bind() — and -22
+      //                         is truthy, so it was reported as EADDRINUSE,
+      //                         routed to takeOver(), which found nobody on
+      //                         [::1]:port and settled 0. A silent,
+      //                         successful-looking exit for a bind that never
+      //                         happened. Fixing only the first two left THAT.
+      //
+      // So the assertion is end-to-end on purpose: each layer alone looked
+      // fixed while the launcher still refused to serve.
+      const v6ok = await new Promise((r) => {
+        const s = net.createServer();
+        s.once("error", () => r(false));
+        s.listen(0, "::1", () => s.close(() => r(true)));
+      });
+      if (!v6ok) return;   // no IPv6 loopback on this box; nothing to measure
+
+      const port = await freePort();
+      const env = { ...process.env, CACHE_FIX_PROXY_BIND: "::1",
+                    CACHE_FIX_PROXY_PORT: String(port),
+                    CACHE_FIX_FORWARD_PROXY: "on", CACHE_FIX_SELF_HEAL: "off" };
+      for (const k of [...HOP_ENV, "LISTEN_FDS", "LISTEN_PID", "CACHE_FIX_HOLD_PORT",
+                       "CACHE_FIX_HELD_PORT"]) delete env[k];
+      const p = spawn(process.execPath, [launcherPath, "run-service"],
+                      { env, stdio: ["ignore", "pipe", "pipe"] });
+      let out = "";
+      p.stdout.on("data", (d) => { out += d; });
+      p.stderr.on("data", (d) => { out += d; });
+      try {
+        const listening = await Promise.race([
+          new Promise((r) => {
+            const tick = setInterval(() => {
+              if (/listening on \[?::1\]?:/.test(out)) { clearInterval(tick); r(true); }
+              if (p.exitCode !== null) { clearInterval(tick); r(false); }
+            }, 100);
+          }),
+          new Promise((r) => setTimeout(() => r(false), 25_000)),
+        ]);
+        assert.ok(listening,
+          `an IPv6 bind never came up. exit=${p.exitCode}, output: ${JSON.stringify(out.slice(0, 300))}`);
+        // AND IT MUST NOT HAVE EXITED QUIETLY. The third layer's whole signature
+        // was a zero exit with no output at all, which reads as success to
+        // anything that checks a status code.
+        assert.equal(p.exitCode, null,
+          "the launcher exited while claiming to listen — the silent takeOver() path");
+        // AND THE OWNERSHIP PROBE MUST HAVE RUN. Layer 2 survived this case's
+        // first mutation check: an unbracketed lsof address kills the probe with
+        // "unacceptable Internet address" and the launcher CARRIES ON — the
+        // banner still appears, so every assertion above still passed while
+        // duplicate detection was silently off and a second holder could land
+        // beside this one. A fix nothing kills is a fix the next edit removes.
+        assert.doesNotMatch(out, /ownership probe could not run/,
+          "the ownership probe died on the IPv6 address, so the launcher ran " +
+          "with duplicate detection disabled — it says so itself and comes up anyway");
+      } finally {
+        try { p.kill("SIGKILL"); } catch { }
+      }
+    });
+
     it("hands the BOUND port downstream when asked for an ephemeral one", async () => {
       // A PRIVATE TMPDIR. fingerprintPath() writes under os.tmpdir(), which is
       // shared with every other test in this run and with the whole box — the

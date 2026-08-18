@@ -169,7 +169,21 @@ class HolderSocket extends EventEmitter {
     }
 
     const h = new TCP(constants.SOCKET);
-    const err = h.bind(host, port);
+    // bind() IS IPv4-ONLY. TCPWrap::Bind calls uv_ip4_addr, so an IPv6 literal
+    // returns -22 (EINVAL) and never reaches a socket — measured here,
+    // bind("::1",0) = -22 while bind6("::1",0) = 0 on the same handle. The
+    // net.Server this replaced picked the family itself, so replacing it moved
+    // the choice here without moving the logic.
+    //
+    // It stranded a whole feature quietly: CACHE_FIX_PROXY_BIND=::1 died at
+    // this line with "cannot bind ::1:0 — EINVAL" while everything downstream
+    // was already IPv6-aware — gap-relay's [::1] self-exclusion, the
+    // `listening on [::1]:PORT` parse, successorServing's tcp6 fallthrough.
+    // All of it unreachable because the bind one layer up could not succeed.
+    //
+    // A COLON IS THE TEST, not a parse: bind6 takes the literal, and a hostname
+    // (which has no colon) belongs on bind() where libuv resolves it.
+    const err = host.includes(":") ? h.bind6(host, port) : h.bind(host, port);
     if (err) {
       try { h.close(); } catch { /* never bound */ }
       const e = new Error(`bind ${host}:${port} failed`);
@@ -199,7 +213,13 @@ class HolderSocket extends EventEmitter {
       // there. Closing this listen is what keeps libuv out of the accept path.
       h.close();
       const h2 = new TCP(constants.SOCKET);
-      if (h2.bind(host, port)) {
+      // THE SAME FAMILY CHOICE AS THE FIRST BIND, 45 lines up. Fixing that one
+      // alone left this twin calling IPv4 bind() on an IPv6 literal, and the
+      // failure is worse here than there: -22 is truthy, so it is reported as
+      // EADDRINUSE, which routes to takeOver(), which finds nobody on
+      // [::1]:port and settles 0. A silent, successful-looking exit for a bind
+      // that never happened.
+      if (host.includes(":") ? h2.bind6(host, port) : h2.bind(host, port)) {
         const e = new Error(`re-bind ${host}:${port} failed`);
         e.code = "EADDRINUSE";
         queueMicrotask(() => this.emit("error", e));
@@ -405,6 +425,15 @@ class HolderSocket extends EventEmitter {
 // matched nothing, holderPidOn() answered null, and takeOver() took "cannot
 // identify it: leave it alone" and exited 0 beside a live proxy of ours.
 const bindAddr = () => process.env.CACHE_FIX_PROXY_BIND || "127.0.0.1";
+// THE SAME ADDRESS, SPELLED THE WAY lsof DEMANDS IT. An IPv6 literal must be
+// bracketed there or the whole probe dies, not the one address:
+//   lsof: unacceptable Internet address in: -i TCP@::1:0     exit 1
+// and the caller then reports "the ownership probe could not run — continuing
+// as if no other holder is here, which can put a second one beside it". So an
+// IPv6 bind silently disabled duplicate detection for the entire launcher.
+// Both probe sites build this string; one of them fixed is the other still
+// lying.
+const lsofAddr = () => { const a = bindAddr(); return a.includes(":") ? `[${a}]` : a; };
 
 // EVERY SHELL-OUT ONTO A USER'S MACHINE IS BOUNDED.
 //
@@ -501,7 +530,7 @@ function holderVerdict(port, pid) {
 function holderPidOn(port) {
   let out = "";
   try {
-    out = probe("lsof", ["-nP", "-t", `-iTCP@${bindAddr()}:${port}`, "-sTCP:LISTEN"]);
+    out = probe("lsof", ["-nP", "-t", `-iTCP@${lsofAddr()}:${port}`, "-sTCP:LISTEN"]);
   } catch { return null; }
   // EVERY owner, not the first line. The holder keeps a bound descriptor AND a
   // gap listener on the same port while its child serves, so lsof returns more
@@ -610,7 +639,7 @@ function otherHolderOn(port) {
   try {
     // stderr PIPED, not ignored — it is the only field that separates "found
     // nothing" from "could not look". See the catch.
-    pids = probe("lsof", ["-nP", "-t", `-iTCP@${bindAddr()}:${port}`, "-sTCP:LISTEN"], "pipe")
+    pids = probe("lsof", ["-nP", "-t", `-iTCP@${lsofAddr()}:${port}`, "-sTCP:LISTEN"], "pipe")
       .trim().split("\n").map(Number).filter((n) => Number.isInteger(n) && n > 1 && n !== process.pid);
   } catch (e) {
     // ABSENCE AND FAILURE EXIT ALIKE, and this used to translate the second
