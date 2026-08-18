@@ -4,7 +4,12 @@ import { withDeadline } from "./child-deadline.mjs";
 import net from "node:net";
 import http from "node:http";
 import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { forcedCloseLine } from "../proxy/server.mjs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+const serverPath = join(dirname(fileURLToPath(import.meta.url)), "..", "proxy", "server.mjs");
 
 // A supervised stop must exit 0 whichever path it takes. server.close() waits
 // for in-flight requests, and a live session always has one (the streaming
@@ -429,6 +434,53 @@ describe("SIGTERM exit code", () => {
       try { proc.kill("SIGKILL"); } catch {}
       await new Promise((r) => target.close(r));
     }
+  });
+
+  // THE 5s IS AN OUTAGE BUDGET, AND A HANDOVER IS NOT AN OUTAGE.
+  //
+  // A supervised stop is SERIAL — stop, wait for exit, start — so a longer grace
+  // there extends a real outage; at 120s against DefaultTimeoutStopSec=90s the
+  // stop was SIGKILLed and restart downtime went 5.0s -> 53.9s. That reasoning
+  // is sound and this case keeps it.
+  //
+  // On the handedOff path nothing waits: the successor was spawned detached with
+  // fd 3 and is serving, and the holder reads "(handed off)" as "do nothing".
+  // The same 5s applied there cut real replies on every deploy — measured on
+  // <linux-host>, cut 4 / 14 / 17 / 14 / 16, every one 100% mid-response.
+  //
+  // LIFTED AND EVALUATED, not grepped: the whole point is which VALUE comes out
+  // for which arm, and a grep for "handedOff" passes on the comment above it.
+  it("spends the 5s outage budget only where something waits on our exit", () => {
+    const src = readFileSync(serverPath, "utf8");
+    const expr = /const budgetMs = handedOff\n?[\s\S]*?;\n/.exec(src)?.[0];
+    assert.ok(expr, "the drain budget is no longer chosen here — this tests nothing");
+
+    const pick = (handedOff, env) => {
+      // eslint-disable-next-line no-new-func
+      return Function("handedOff", "process", `${expr} return budgetMs;`)(handedOff, { env });
+    };
+    assert.equal(pick(false, {}), 5_000,
+      "a SUPERVISED stop no longer uses the 5s it was measured for — systemd waits " +
+      "serially there, so a longer grace is downtime");
+    assert.ok(pick(true, {}) >= 600_000,
+      `a HANDOVER got ${pick(true, {})}ms — nothing waits on that path and the ` +
+      `short budget is what cut 16 mid-response replies on the last deploy`);
+    assert.equal(pick(true, { CACHE_FIX_DRAIN_MS: "90000" }), 90_000,
+      "CACHE_FIX_DRAIN_MS does not move the handover budget");
+    assert.equal(pick(false, { CACHE_FIX_DRAIN_MS: "90000" }), 5_000,
+      "CACHE_FIX_DRAIN_MS moved the SUPERVISED budget too — that one is bounded by " +
+      "the unit's TimeoutStopSec and is not the operator's to raise from here");
+  });
+
+  // AND THE LINE MUST NAME THE BUDGET IT ACTUALLY USED. The two diverged the
+  // moment the handover path got its own, and a log that says "after 5s" about a
+  // 1800s wait reads like it was checked.
+  it("reports the budget it actually spent, not the one it was written against", () => {
+    assert.match(forcedCloseLine(1, 0, 0, 5_000), /after 5s/);
+    assert.match(forcedCloseLine(1, 0, 0, 1_800_000), /after 1800s/,
+      "the forced-close line still hardcodes 5s, so an operator reading it cannot " +
+      "tell a handover drain from a supervised stop");
+    assert.match(forcedCloseLine(0, 0, 3, 1_800_000), /after 1800s, cut no responses/);
   });
 
   it("says it cut nothing when it cut nothing, and never calls that idle", () => {

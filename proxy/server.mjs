@@ -590,10 +590,15 @@ export const liveResponses = new Set();
  * truncations, not a count of them. Measured: after writeHead and before the
  * first chunk, headersSent=true with socket.bytesWritten=0.
  */
-export function forcedCloseLine(ended, destroyed, held) {
+export function forcedCloseLine(ended, destroyed, held, budgetMs = 5_000) {
   const cut = ended + destroyed;
+  // THE BUDGET IT ACTUALLY USED, not the constant this line was written against.
+  // The two diverged the moment the handover path got its own, and a log that
+  // says "after 5s" about a 1800s wait is the kind of wrong that survives for
+  // months because it reads like it was checked.
+  const after = budgetMs % 1000 === 0 ? `${budgetMs / 1000}s` : `${budgetMs}ms`;
   if (cut > 0) {
-    return `[cache-fix] shutdown: forcing close, cut ${cut} in-flight request(s) after 5s `
+    return `[cache-fix] shutdown: forcing close, cut ${cut} in-flight request(s) after ${after} `
          + `(${ended} mid-response, ${destroyed} before headers)\n`;
   }
   // Not "idle": we did not measure idleness, we measured that no RESPONSE was
@@ -607,7 +612,7 @@ export function forcedCloseLine(ended, destroyed, held) {
   // reading "3 connections held, tunnels not counted" would infer three
   // non-tunnel things PLUS an unknown number of tunnels — the opposite of what
   // the number says, and the number is the only thing this redesign added.
-  return `[cache-fix] shutdown: forcing close after 5s, cut no responses`
+  return `[cache-fix] shutdown: forcing close after ${after}, cut no responses`
        + `${held === null ? "" : `, ${held} connection(s) still held`}`
        + ` (kind unknown; may include CONNECT tunnels and upgrades)\n`;
 }
@@ -1623,11 +1628,42 @@ if (invokedAsScript) {
     say(process.stdout,
         `proxy releasing the listening socket${handedOff ? " (handed off)" : ""}\n`);
     active.close().finally(() => process.exit(handedOff ? 75 : 0));
-    // The 5 s grace is DELIBERATELY UNCHANGED. A supervised stop is SERIAL
-    // (stop, wait for exit, start), so a longer grace only extends the outage:
-    // measured at 120 s against `DefaultTimeoutStopSec=90s`, the stop was
-    // SIGKILLed at the cap and restart downtime went 5.0 s -> 53.9 s. Any future
-    // increase has to move the unit's TimeoutStopSec with it.
+    const budgetMs = handedOff
+      ? (Number(process.env.CACHE_FIX_DRAIN_MS) || 1_800_000)
+      : 5_000;
+    // THE BUDGET IS 5 s ONLY WHERE SOMETHING IS WAITING ON OUR EXIT.
+    //
+    // The 5 s is right for a SUPERVISED STOP and the measurement behind it is
+    // sound: that path is SERIAL (stop, wait for exit, start), so a longer grace
+    // only extends the outage — at 120 s against `DefaultTimeoutStopSec=90s` the
+    // stop was SIGKILLed at the cap and restart downtime went 5.0 s -> 53.9 s.
+    // Any increase THERE still has to move the unit's TimeoutStopSec with it.
+    //
+    // It is wrong for a HANDOVER, and it was applied to both. On the handedOff
+    // path the successor was already spawned detached with fd 3 and is serving,
+    // and the holder reads "(handed off)" as "a successor is already serving, do
+    // nothing" — it skips reclaim() AND spawnWhenReady(), and its `retired` flag
+    // makes our exit a no-op. Nothing waits on us. We cut anyway, on every
+    // deploy: measured on <linux-host> across four of them,
+    //     cut 4 -> cut 14 -> cut 17 -> cut 14 -> cut 16
+    // every one 100% mid-response, 0 before headers — so every cut was a reply
+    // whose headers the client already had and whose body stopped mid-stream.
+    //
+    // WHY A LONGER CLOCK AND NOT A DRAIN PREDICATE. `active.close()` cannot
+    // express "nothing is owed" here: measured on 18.20.8 / 20.20.2 / 24.11.1,
+    // one live CONNECT tunnel leaves close() unresolved with liveResponses 0,
+    // and closeIdleConnections() neither frees it nor unblocks close(). A
+    // byte-rate test cannot separate a slow reply from a keepalive either — a
+    // cross-component peer measured content at 490 B/s and heartbeat at 35 B/s
+    // on the same stream. So there is no predicate available that is honest;
+    // what IS available is the fact that nobody is waiting, which turns the
+    // number from an outage budget into a leak bound.
+    //
+    // A lingering predecessor costs RAM and nothing else — it holds no listener
+    // (we released it above) and the successor is serving. The default is 30
+    // minutes because that is well past any reply this proxy relays and still
+    // bounded; CACHE_FIX_DRAIN_MS moves it for an operator who knows their own
+    // traffic. It applies to the handover path ONLY.
     setTimeout(() => {
       // End the laggards rather than destroying them. `closeAllConnections()`
       // destroys the socket, and the kernel answers RST — measured, a client
@@ -1666,7 +1702,7 @@ if (invokedAsScript) {
       // must not print as "0 connections still held", which is the one reading
       // that would wrongly clear the stop.
       const finish = (held) => {
-        process.stderr.write(forcedCloseLine(ended, destroyed, held));
+        process.stderr.write(forcedCloseLine(ended, destroyed, held, budgetMs));
         // Then force whatever did not take the FIN. Node >=18.2; package.json
         // engines allows 18.0/18.1, where exiting without forcing is the only
         // option.
@@ -1678,6 +1714,6 @@ if (invokedAsScript) {
       };
       try { active.server.getConnections((err, n) => finish(err ? null : n)); }
       catch { finish(null); }
-    }, 5000).unref();
+    }, budgetMs).unref();
   };
 }
