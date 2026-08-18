@@ -686,6 +686,67 @@ test("gap-relay keeps the socket on an error that left it listening", () => {
 // bin/ or proxy/; every test file runs one under test/, and the node binary is
 // not a .mjs. Validated against 10 real command lines: 10/10 for the anchored
 // form, and the substring form wrong on 1 of the same 10.
+// A SUCCESSOR THAT CANNOT SPEAK IS A SUCCESSOR NOBODY CAN DEBUG.
+//
+// When the holder dies, the proxy spawns a replacement holder DETACHED and then
+// exits. That spawn used `stdio: "ignore"`, which is /dev/null on all three fds
+// — so the new holder, every proxy it supervises, and every successor of a later
+// handover (those inherit) are silent forever. The line immediately after the
+// spawn writes "[cache-fix] holder died; started a new one" to the DYING
+// process's stderr, which is exactly the wrong way round: the departing one
+// reports, the arriving one cannot.
+//
+// MEASURED, and it is why this is a guard and not a preference: on both Macs the
+// live 9901 launcher and proxy have fd1 AND fd2 on /dev/null, so the forced-close
+// drain line this PR added has been written into the void there since it landed.
+// On <linux-host> the same fds are /tmp/cc-restore-9901.log and the numbers are readable.
+// Same code, same fleet — the difference is only which spawn started the lineage.
+//
+// fd2 ONLY. stdin stays closed and stdout stays discarded: the holder's stdout
+// carries the child's "proxy listening" chatter, which the launcher already
+// parses over a pipe, and inheriting it would duplicate that into whatever the
+// operator was looking at. Errors are the half that has to survive.
+//
+// INHERITING A BROKEN PIPE IS SAFE HERE. proxy/server.mjs already swallows EPIPE
+// and ERR_STREAM_DESTROYED on stdio rather than letting them reach
+// uncaughtException, so a successor whose inherited stderr later closes keeps
+// serving instead of dying with the fd.
+test("the self-heal successor keeps a way to report", () => {
+  const src = stripComments(readFileSync(join(testDir, "..", "proxy", "server.mjs"), "utf8"));
+  // ANCHORED ON THE CALL, not on the word "stdio" anywhere in the file: this
+  // must fail when the OPTIONS change, and a file-wide search is satisfied by
+  // any other spawn.
+  const at = src.indexOf('"claude-via-proxy.mjs"), "run-service"]');
+  assert.ok(at > 0, "the self-heal spawn moved — re-anchor this guard");
+  // TO THE END OF THE OPTIONS OBJECT, not a fixed character window: a comment
+  // added inside the call pushed the option past a 400-char slice and the guard
+  // reported "no stdio named" about a spawn that names it two lines down.
+  // `.unref()` closes the call in the source and cannot appear inside it.
+  const close = src.indexOf(".unref()", at);
+  assert.ok(close > at, "the self-heal spawn's call no longer ends in .unref() — re-anchor this guard");
+  const opts = src.slice(at, close);
+  const stdio = /stdio:\s*("[^"]*"|\[[^\]]*\])/.exec(opts);
+  assert.ok(stdio, "the self-heal spawn no longer names its stdio at all");
+  assert.notEqual(stdio[1], '"ignore"',
+    'the self-heal successor is spawned with stdio "ignore", so the holder it ' +
+    'becomes — and every proxy and handover successor below it — writes every ' +
+    'diagnostic, including the forced-close drain count, to /dev/null');
+  // BOTH CLAIMS THE COMMENT MAKES, and only those two. A first cut asserted
+  // only that the LAST fd was "inherit", which left `["ignore","inherit",
+  // "inherit"]` passing — so the "stdout stays closed" half was a sentence no
+  // test could kill. Pinning the whole triple instead would break on a future
+  // ipc channel for no safety gain.
+  const fds = stdio[1].startsWith("[")
+    ? stdio[1].slice(1, -1).split(",").map((x) => x.trim().replace(/"/g, ""))
+    : [stdio[1].replace(/"/g, "")];
+  assert.equal(fds[2], "inherit",
+    `the self-heal successor's stderr must be inherited, not discarded; got ${stdio[1]}`);
+  assert.notEqual(fds[1], "inherit",
+    "the successor's STDOUT is inherited, so the child's 'proxy listening' chatter " +
+    "— which the launcher already parses over a pipe of its own — is duplicated " +
+    `into whatever the operator was looking at; got ${stdio[1]}`);
+});
+
 test("no test file signals a pid it knows only by port", () => {
   const WANT = "/\\/(?:bin|proxy)\\/[\\w.-]+\\.mjs\\b/";
   const FILTER = ".filter((p) => OURS.test(cmdOf(p)))";

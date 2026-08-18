@@ -1363,7 +1363,28 @@ function exitWithParent() {
     if (advertised && process.env.CACHE_FIX_SELF_HEAL !== "off") {
       try {
         spawn(process.execPath, [join(__dirname, "..", "bin", "claude-via-proxy.mjs"), "run-service"], {
-          detached: true, stdio: "ignore",
+          // fd2 INHERITED, NOT DISCARDED. `stdio: "ignore"` sent all three to
+          // /dev/null, which silences the holder this becomes, every proxy it
+          // supervises, and every handover successor below it — those inherit,
+          // so one self-heal makes the whole lineage mute permanently. Measured
+          // on both Macs: the live 9901 launcher and proxy sit on /dev/null and
+          // the forced-close drain count has been written into the void there
+          // since it landed, while <linux-host>'s identical code writes a readable log.
+          // The only difference was which spawn started the lineage.
+          //
+          // The very next line reports this spawn on OUR stderr, which is the
+          // wrong way round on its own: the departing process speaks and the
+          // arriving one cannot.
+          //
+          // fd0 and fd1 stay closed. The holder parses its child's "proxy
+          // listening" chatter over a pipe of its own, so inheriting stdout
+          // would duplicate it into whatever the operator was looking at.
+          // Errors are the half that has to survive.
+          //
+          // Inheriting a pipe that later breaks is safe: the EPIPE /
+          // ERR_STREAM_DESTROYED swallower above keeps a write to a dead
+          // stderr out of uncaughtException.
+          detached: true, stdio: ["ignore", "ignore", "inherit"],
           // HELD_BY is cleared with HELD_PORT. It named OUR holder, which is the
           // one that just died; carrying it into the replacement makes a live
           // holder look "held" by a pid that is not its parent. Nothing acts on
