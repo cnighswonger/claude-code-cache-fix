@@ -142,6 +142,106 @@ describe("SIGTERM exit code", () => {
     }
   });
 
+  // A DEPARTING PROXY MUST STOP TAKING NEW WORK, NOT JUST NEW CONNECTIONS.
+  //
+  // server.close() unbinds the listener, so nothing NEW can connect — but a
+  // client already holding a keep-alive goes on sending requests down it, and we
+  // go on answering them. From the client's side nothing is wrong with the
+  // socket, so it never reconnects, so it never reaches the successor that is
+  // already serving on the inherited fd. The peer daemon measured the same shape
+  // from the other side: eleven of twelve sessions held a stream to a process
+  // that had stopped being the front door and was still answering the mail.
+  //
+  // `Connection: close` on the responses we complete during the drain is the
+  // HTTP-native answer and it needs no constant: the in-flight reply finishes
+  // normally, the client then opens a fresh connection, and that lands on the
+  // successor. Sessions migrate one completed reply at a time.
+  //
+  // Driven on a RAW socket, because an http.Agent hides exactly the thing under
+  // test — it would open a second connection and the assertion would pass
+  // against a proxy that never sent the header.
+  //
+  // AND THE CONNECTION MUST BE BUSY WHEN THE DRAIN STARTS. An IDLE keep-alive is
+  // closed by node itself at server.close(), so a fixture that signals between
+  // requests measures nothing — its socket is simply gone and the second request
+  // gets no answer at all. Measured on 18.20.8 / 20.20.2 / 24.11.1 with a
+  // request in flight across close():
+  //     after r1, socket destroyed = false
+  //     r1 headers  ... Connection: keep-alive
+  //     r2 answer   HTTP/1.1 200 OK ... Connection: keep-
+  //     requests served after close(): 1
+  // So the exposure is exactly the busy connection, on every supported major.
+  it("tells a keep-alive client to close once it is draining", async () => {
+    // A slow upstream, so request 1 is still in flight when SIGTERM lands.
+    const slow = http.createServer((_q, r) => {
+      setTimeout(() => { r.writeHead(200, { "content-length": "2" }); r.end("ok"); }, 900);
+    });
+    await new Promise((r) => slow.listen(0, "127.0.0.1", r));
+    const { proc, port } = startProxy({
+      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${slow.address().port}`,
+    });
+    const p = await port;
+    const sock = net.connect(p, "127.0.0.1");
+    // The 5s force-close RSTs this socket, and an unhandled 'error' on a
+    // net.Socket takes the whole runner down rather than failing this case.
+    sock.on("error", () => {});
+    await new Promise((r) => sock.once("connect", r));
+    // Sends, and returns the reply headers. `path` picks the route: /health is
+    // instant, anything else is relayed to the slow upstream above.
+    const ask = (path) => new Promise((resolve) => {
+      let buf = "";
+      const onData = (d) => {
+        buf += d.toString();
+        if (buf.includes("\r\n\r\n")) { sock.off("data", onData); resolve(buf); }
+      };
+      sock.on("data", onData);
+      sock.write(`GET ${path} HTTP/1.1\r\nHost: x\r\n\r\n`);
+      setTimeout(() => { sock.off("data", onData); resolve(buf); }, 4000);
+    });
+    try {
+      // PREMISE: while healthy we keep the connection, or the assertion below
+      // would pass against a proxy that closes every connection always.
+      const before = await ask("/health");
+      assert.match(before, /^HTTP\/1\.1 200/, `healthy /health did not answer 200: ${before.slice(0, 80)}`);
+      assert.ok(!/^connection:\s*close/im.test(before),
+        "a HEALTHY proxy already asks the client to close — then the drain header " +
+        "proves nothing and every request pays a new connection");
+
+      // A RELAYED POST, not a GET on a made-up path: /v1/slow is a 404 the proxy
+      // answers instantly, so the connection would be idle again when the signal
+      // lands and node would close it for us — the fixture would then measure
+      // node, not us. Measured that way first, and it is why this is a POST.
+      const body = JSON.stringify({ model: "claude-3", messages: [{ role: "user", content: "x" }] });
+      const inflight = new Promise((resolve) => {
+        let buf = "";
+        const onData = (d) => {
+          buf += d.toString();
+          if (buf.includes("\r\n\r\n")) { sock.off("data", onData); resolve(buf); }
+        };
+        sock.on("data", onData);
+        sock.write(`POST /v1/messages HTTP/1.1\r\nHost: x\r\ncontent-type: application/json\r\n`
+                 + `content-length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
+        setTimeout(() => { sock.off("data", onData); resolve(buf); }, 6000);
+      });
+      await new Promise((r) => setTimeout(r, 250));
+      proc.kill("SIGTERM");
+      const midflight = await inflight;                // completes normally
+      assert.match(midflight, /^HTTP\/1\.1 200/,
+        `premise: the in-flight reply must FINISH, not be cut: ${midflight.slice(0, 60)}`);
+      const after = await ask("/health");
+      assert.match(after, /^HTTP\/1\.1 \d\d\d/,
+        `the draining proxy answered nothing on the held keep-alive: ${JSON.stringify(after.slice(0, 80))}`);
+      assert.match(after, /^connection:\s*close/im,
+        "a draining proxy served a new request on a held keep-alive and told the " +
+        "client to keep it — so that client never reconnects and never reaches the " +
+        "successor already serving on the inherited fd");
+    } finally {
+      sock.destroy();
+      try { proc.kill("SIGKILL"); } catch {}
+      await new Promise((r) => slow.close(r));
+    }
+  });
+
   it("exits 0 when nothing is in flight", async () => {
     const { proc, port } = startProxy();
     await port;

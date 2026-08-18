@@ -612,10 +612,33 @@ export function forcedCloseLine(ended, destroyed, held) {
        + ` (kind unknown; may include CONNECT tunnels and upgrades)\n`;
 }
 
+// SHUTTING DOWN, read by the request handler. server.close() stops ACCEPTS; it
+// does not stop a client that already holds a connection from sending more
+// requests down it, and we answer them. Measured against this proxy, SIGTERM
+// sent while a POST /v1/messages was in flight:
+//     the in-flight reply completes   200 ... Connection: keep-alive
+//     a SECOND request after it       200 ... Connection: keep-alive
+// so the client is told to keep a connection to a process that has stopped being
+// the front door. It never reconnects, so it never reaches the successor already
+// serving on the inherited fd. A peer daemon measured the same shape from the
+// other side: eleven of twelve sessions stranded on a departing process.
+//
+// An IDLE keep-alive is not affected — node closes those itself at close(),
+// measured on 18.20.8 / 20.20.2 / 24.11.1. The exposure is exactly the
+// connection that was BUSY when the drain began, which on those same three
+// majors goes on to serve another request.
+let _draining = false;
+
 export function createProxyServer() {
   return http.createServer((req, res) => {
     liveResponses.add(res);
     res.on("close", () => liveResponses.delete(res));
+    // BEFORE the handler, so a writeHead() that names its own headers keeps this
+    // one — setHeader values survive writeHead unless writeHead repeats the name.
+    // The in-flight reply still finishes normally; this only stops the NEXT
+    // request from entering a process on its way out, and the client's fresh
+    // connection lands on the successor through the shared listener.
+    if (_draining) res.setHeader("Connection", "close");
     // Async IIFE: handleMessages/handleBootstrap return promises, so we have
     // to await them inside the try/catch — a bare return would let rejections
     // escape to unhandledRejection and (on Node 15+) crash the process.
@@ -1496,6 +1519,9 @@ if (invokedAsScript) {
   const shutdown = () => {
     if (shuttingDown) return;
     shuttingDown = true;
+    // Set BEFORE anything else in this function: every request that arrives from
+    // here on is arriving at a process that is leaving, and must be told so.
+    _draining = true;
     if (!active) {
       process.exit(0);
       return;
