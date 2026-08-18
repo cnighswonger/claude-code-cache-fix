@@ -1269,7 +1269,14 @@ function holdPort(rest) {
           spawnWhenReady();
         }
         if (childPort) return;
-        const m = /listening on [\d.]+:(\d+)$/.exec(line);
+        // THE PORT, NOT THE ADDRESS. `[\d.]+` is IPv4-only, so a child bound to
+        // ::1 announces "proxy listening on ::1:9901", nothing matches, and
+        // `served` below never goes true — the CA is never published and every
+        // later exit counts as a pre-service failure until the holder gives up
+        // after five, on a proxy that was serving the whole time. Anchored at
+        // the end and taking the last colon-group, which is the port in every
+        // address family including the bracketed [::1]:9901 form.
+        const m = /listening on \S*?:(\d+)$/.exec(line);
         if (m) {
           childPort = Number(m[1]); served = true; failures = 0;
           // The proxy has generated its CA by the time it says this, so publish
@@ -1962,7 +1969,10 @@ function waitForReady() {
     let output = "";
     proxyProc.stdout.on("data", (chunk) => {
       output += chunk.toString();
-      const match = output.match(/listening on ([\d.]+):(\d+)/);
+      // Same IPv4-only defect as the child-ready pattern above: the address is
+      // whatever precedes the final colon, and for ::1 that contains colons of
+      // its own. Captured non-greedily so the LAST group is the port.
+      const match = output.match(/listening on (\S*?):(\d+)(?:\s|$)/);
       if (match) resolve(parseInt(match[2], 10));
     });
     proxyProc.on("exit", (code) => {

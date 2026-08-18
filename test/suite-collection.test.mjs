@@ -787,6 +787,50 @@ test("every file that spawns our binaries scrubs the hop gates", () => {
     `the code: ${missing.join(", ")}`);
 });
 
+// THE CHILD-READY LINE MUST PARSE FOR EVERY ADDRESS FAMILY.
+//
+// The launcher marks its proxy SERVED by matching the child's announcement, and
+// the pattern was `[\d.]+:(\d+)` — IPv4 only. With CACHE_FIX_PROXY_BIND=::1 the
+// child announces `proxy listening on ::1:9901`, nothing matches, so `served`
+// stays false and the CA is never published. Every later exit then counts as a
+// pre-service failure and the holder gives up after five, on a proxy that was
+// serving the whole time.
+//
+// ASSERTED BY RUNNING THE PATTERNS, not by reading them: a regex is exactly the
+// kind of thing that looks right and is not. The literals are lifted from the
+// source so the guard cannot drift from what ships.
+test("the launcher parses a child-ready line from any address family", () => {
+  const src = readFileSync(join(testDir, "..", "bin", "claude-via-proxy.mjs"), "utf8");
+  const pats = [...src.matchAll(/\/listening on[^/\n]*\/[a-z]*/g)].map((m) => m[0]);
+  assert.ok(pats.length >= 2,
+    `expected at least 2 child-ready patterns in the launcher, found ${pats.length} — ` +
+    `either they moved or this detector broke`);
+  const lines = {
+    ipv4:      "proxy listening on 127.0.0.1:9901",
+    wildcard:  "proxy listening on 0.0.0.0:9901",
+    ipv6:      "proxy listening on ::1:9901",
+    ipv6full:  "proxy listening on [::1]:9901",
+  };
+  const bad = [];
+  for (const src2 of pats) {
+    const body = src2.slice(1, src2.lastIndexOf("/"));
+    const flags = src2.slice(src2.lastIndexOf("/") + 1);
+    for (const [name, line] of Object.entries(lines)) {
+      let re;
+      try { re = new RegExp(body, flags); } catch { bad.push(`${src2} does not compile`); continue; }
+      const m = re.exec(line);
+      if (!m) { bad.push(`${src2} does not match ${name}: ${JSON.stringify(line)}`); continue; }
+      // AND THE PORT MUST COME OUT. Matching but capturing the wrong group is
+      // the failure that keeps `served` true while childPort is garbage.
+      const port = m.slice(1).map(Number).filter((n) => n === 9901);
+      if (!port.length) bad.push(`${src2} matched ${name} but captured no 9901: ${JSON.stringify(m.slice(1))}`);
+    }
+  }
+  assert.deepEqual(bad, [],
+    `a proxy bound to one of these announces a line the launcher cannot read, so it ` +
+    `never marks the child served:\n  ${bad.join("\n  ")}`);
+});
+
 test("no test file signals a pid it knows only by port", () => {
   const WANT = "/\\/(?:bin|proxy)\\/[\\w.-]+\\.mjs\\b/";
   const FILTER = ".filter((p) => OURS.test(cmdOf(p)))";

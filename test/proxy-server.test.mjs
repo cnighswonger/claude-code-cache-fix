@@ -924,6 +924,38 @@ describe("close() after an external server.close()", () => {
 // further and said pin READS this field, which is measured false — their check
 // dials pin's own :36301. A good review point does not make the reviewer a
 // consumer, and this comment turned one into the other.
+// TWO SERVERS IN ONE PROCESS MUST NOT SHARE ONE PORT.
+//
+// startProxy() is an embeddable API — package.json exports "./proxy/server" —
+// so a consumer may run more than one. `_listenPort` was a module global written
+// by whichever start ran last, and /health reads it for `listen_port` AND for
+// `upstream_is_self`. Measured before the fix, two starts in one process:
+//     A real port=32845  /health says listen_port=41851   WRONG
+//     B real port=41851  /health says listen_port=41851   ok
+// So the FIRST server reports the SECOND's port, and computes whether its
+// upstream points at itself against a port that is not its own — the observability
+// this branch added, answering about the wrong socket.
+it("reports its own port when a second proxy runs in the same process", async () => {
+  const a = await startProxy({ port: 0, bind: "127.0.0.1", watch: false });
+  const b = await startProxy({ port: 0, bind: "127.0.0.1", watch: false });
+  try {
+    const get = (port) => new Promise((res, rej) => {
+      http.get({ host: "127.0.0.1", port, path: "/health" }, (r) => {
+        let x = ""; r.on("data", (d) => (x += d)); r.on("end", () => res(JSON.parse(x)));
+      }).on("error", rej);
+    });
+    const [ha, hb] = [await get(a.port), await get(b.port)];
+    assert.equal(ha.listen_port, a.port,
+      `the first proxy reported ${ha.listen_port} while listening on ${a.port} — ` +
+      `a second start overwrote its port, so upstream_is_self is computed against ` +
+      `the wrong socket too`);
+    assert.equal(hb.listen_port, b.port,
+      `the second proxy reported ${hb.listen_port} while listening on ${b.port}`);
+  } finally {
+    await Promise.allSettled([a.close?.(), b.close?.()]);
+  }
+});
+
 describe("/health hop reporting", () => {
   const ENV = ["CACHE_FIX_FORWARD_PROXY", "CACHE_FIX_CA_DIR", "CACHE_FIX_FALLBACK_PROXIES",
                "CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_REQUIRE_HOP", "HTTPS_PROXY", "https_proxy",

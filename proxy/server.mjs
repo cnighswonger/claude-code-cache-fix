@@ -379,9 +379,19 @@ let _sourceTree = null;
 // for the same reason: it describes what is SERVING, not what is declared.
 let _gates = {};
 // The port actually bound, set once listen() resolves. 0 until then.
-let _listenPort = 0;
 
-function handleHealth(_req, res) {
+// THE PORT THIS REQUEST ARRIVED ON, not a module global. startProxy() is an
+// embeddable API (package.json exports "./proxy/server"), so a consumer may run
+// more than one — and `_listenPort` was written by whichever start ran last.
+// Measured with two starts in one process:
+//     A real port=32845  /health says listen_port=41851   WRONG
+//     B real port=41851  /health says listen_port=41851   ok
+// The FIRST server reported the SECOND's port, and computed upstream_is_self
+// against a socket that was not its own — the observability this branch added,
+// answering about the wrong proxy. req.socket.localPort needs no state and
+// cannot go stale.
+function handleHealth(req, res) {
+  const listenPort = req?.socket?.localPort ?? 0;
   // Surface extension-load failures so callers (operators, monitoring) see
   // a degraded proxy state instead of a misleading "ok". See #196: a Node
   // ESM cache stale-import race silently broke thinking-block-sanitize v2
@@ -479,14 +489,14 @@ function handleHealth(_req, res) {
     // 9801 while the fleet dialled 9901, and `status: ok` was true of it the
     // whole time. A checker cannot compare an address to the one sessions were
     // given unless we say which one we took.
-    listen_port: _listenPort,
+    listen_port: listenPort,
     // Whether our own upstream points back at us — the other outage, where the
     // chain looped and never reached the internet with every field still green.
     // Refused at startup now, so this should always be false; it is here so a
     // checker can prove that rather than assume it.
     upstream_is_self: Boolean(
-      upstreamPointsAtSelf(config.httpsProxy, _listenPort, config.bind)
-      || upstreamPointsAtSelf(config.httpProxy, _listenPort, config.bind)),
+      upstreamPointsAtSelf(config.httpsProxy, listenPort, config.bind)
+      || upstreamPointsAtSelf(config.httpProxy, listenPort, config.bind)),
   }));
 }
 
@@ -1007,7 +1017,6 @@ export async function startProxy(options = {}) {
   // What we BOUND, not what was asked for: with port 0 (the holder hands us an
   // ephemeral one) the configured value says nothing, and an inherited fd means
   // the number came from a supervisor we cannot see.
-  _listenPort = addr?.port ?? 0;
   if (forwardProxyCA) {
     // Recipe only when the OPERATOR is wiring. Under --remote-control the
     // launcher already wired claude via ca-trust.d and relays this stderr, so
