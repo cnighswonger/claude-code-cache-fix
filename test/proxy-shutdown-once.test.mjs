@@ -224,7 +224,19 @@ describe("shutdown runs once per stop", () => {
 
     // Everything the watchdog can exit with: either the expression inline, or a
     // local it assigns from. Both forms must trace back to the same one.
-    const watchdogRegion = src.slice(src.indexOf("forcing close"));
+    // ANCHOR AT THE START OF THE WATCHDOG BODY. This used to slice from the
+    // literal "forcing close", which moved into forcedCloseLine() near the top
+    // of the file when the forced path started reporting what it cut — so the
+    // slice then covered the graceful close too and compared it against itself.
+    // Anchoring on the ANNOUNCE instead fixed that and opened a new hole:
+    // measured, an `if (...) process.exit(0)` inserted BEFORE the announce went
+    // undetected. Anchoring on the first STATEMENT moved the hole rather than
+    // closing it — also measured, a bail inserted above `let ended` stayed
+    // green. Only the callback's opening brace is above everything the body can
+    // contain, so that is where the region has to start.
+    const anchor = src.indexOf("setTimeout(() => {", src.indexOf("active.close().finally"));
+    assert.ok(anchor > 0, "the watchdog callback moved — re-anchor this test");
+    const watchdogRegion = src.slice(anchor);
     const assigned = /const code = ([^;]+);/.exec(watchdogRegion)?.[1];
     const exits = [...watchdogRegion.matchAll(/process\.exit\(([^)]*)\)/g)].map((m) => m[1].trim());
     assert.ok(exits.length, "the watchdog no longer exits — this tests nothing");

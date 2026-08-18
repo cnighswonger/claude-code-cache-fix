@@ -4,6 +4,7 @@ import { withDeadline } from "./child-deadline.mjs";
 import net from "node:net";
 import http from "node:http";
 import { spawn } from "node:child_process";
+import { forcedCloseLine } from "../proxy/server.mjs";
 
 // A supervised stop must exit 0 whichever path it takes. server.close() waits
 // for in-flight requests, and a live session always has one (the streaming
@@ -103,7 +104,7 @@ describe("SIGTERM exit code", () => {
     const upSockets = [];
     const hung = net.createServer((s) => upSockets.push(s));
     await new Promise((r) => hung.listen(0, "127.0.0.1", r));
-    const { proc, port } = startProxy({
+    const { proc, port, stderr } = startProxy({
       CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${hung.address().port}`,
     });
     try {
@@ -121,6 +122,14 @@ describe("SIGTERM exit code", () => {
       await exited;
       await new Promise((r) => setTimeout(r, 300));
       c.destroy();
+
+      // AND THAT THE COUNT SAW IT. This is the only fixture that drives the
+      // destroy arm — headers never sent, because upstream never answered — so
+      // without this assertion `destroyed++` is untested end to end. Measured:
+      // deleting `destroyed++`, and folding the destroy branch into `ended`,
+      // both left the suite green before this line existed.
+      assert.match(stderr(), /cut 1 in-flight request\(s\) after 5s \(0 mid-response, 1 before headers\)/,
+        `the forced close miscounted the never-answered request; stderr was:\n${stderr()}`);
 
       assert.ok(firstLine === null || !/^HTTP\/1\.[01] 2\d\d/.test(firstLine),
         `the shutdown answered a never-started response with ${JSON.stringify(firstLine)} — ` +
@@ -188,6 +197,15 @@ describe("SIGTERM exit code", () => {
       assert.equal(code, 0, "watchdog shutdown must exit 0, not 1");
       assert.ok(elapsed >= 4500, `expected the 5s watchdog path, exited after ${elapsed}ms`);
       assert.match(stderr(), /forcing close/, "the forced path must stay visible on stderr");
+      // AND SAY HOW MANY IT CUT. "forcing close" alone carries no number, so a
+      // recycle that ended a live /v1/messages stream and one that merely
+      // outwaited an idle socket print the same string. This fixture has
+      // exactly one streaming response open, so the count is knowable: 1, and
+      // it is mid-response because bytes already reached the client above.
+      assert.match(stderr(), /cut 1 in-flight request\(s\)/,
+        `the forced close did not report what it cut; stderr was:\n${stderr()}`);
+      assert.match(stderr(), /1 mid-response/,
+        "a response that had already sent bytes must be counted as mid-response");
 
       const deadline = Date.now() + 5000;
       while (outcome === null && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
@@ -260,5 +278,92 @@ describe("SIGTERM exit code", () => {
       try { proc.kill("SIGKILL"); } catch {}
       for (const s of [proc.stdout, proc.stderr]) { try { s.destroy(); } catch {} }
     }
+  });
+
+  // THE 5s TIMER CAN FIRE WITH NOTHING IN FLIGHT, and it must not then claim it
+  // cut something. On Node 18 an IDLE keep-alive socket keeps server.close()
+  // unresolved, so the watchdog fires having cut nothing — the per-version table
+  // lives beside the code, in proxy/server.mjs forcedCloseLine(). One string for
+  // both cases is a string whose MEANING changes with the interpreter. Unit
+  // rather than a spawn precisely because the branch is unreachable on the Node
+  // this suite usually runs.
+  // THE HELD COUNT MUST COME FROM THE SERVER, not from anything that agrees with
+  // liveResponses. The unit case above proves the WORDING; only a live tunnel
+  // proves the WIRING, and without this `finish(err ? null : n)` -> `finish(0)`
+  // passed 5/5 while printing "0 connection(s) still held" with a tunnel open —
+  // the one reading the code comment says must never appear.
+  //
+  // Forward mode, because that is the mode that has tunnels: attachForwardProxy
+  // binds `connect` to the same server the watchdog closes, so a blind-tunnelled
+  // CONNECT holds close() open while contributing nothing to liveResponses.
+  it("reports connections it still held when it cut no responses", async () => {
+    const target = net.createServer((s) => s.on("data", () => {}));
+    await new Promise((r) => target.listen(0, "127.0.0.1", r));
+    const { proc, port, stderr } = startProxy({ CACHE_FIX_FORWARD_PROXY: "on" });
+    try {
+      const p = await port;
+      const c = net.connect(p, "127.0.0.1", () => c.write(
+        `CONNECT 127.0.0.1:${target.address().port} HTTP/1.1\r\nHost: x\r\n\r\n`));
+      const established = await new Promise((resolve) => {
+        c.once("data", (d) => resolve(String(d).split("\r\n")[0]));
+        c.once("error", () => resolve(null));
+      });
+      assert.match(established ?? "", /^HTTP\/1\.[01] 200/,
+        `premise: the tunnel must be up before the stop, got ${JSON.stringify(established)}`);
+
+      const exited = exitOf(proc);
+      const started = Date.now();
+      proc.kill("SIGTERM");
+      const { code } = await exited;
+      const elapsed = Date.now() - started;
+
+      assert.ok(elapsed >= 4500, `expected the 5s watchdog path, exited after ${elapsed}ms`);
+      assert.equal(code, 0, "the watchdog must still exit 0 on this path");
+      // No RESPONSE was open, so the cut count is zero and the held count is
+      // what carries the information. A hardcoded or liveResponses-derived
+      // number reads 0 here.
+      assert.match(stderr(), /cut no responses, [1-9]\d* connection\(s\) still held/,
+        `the held count did not come from the server; stderr was:\n${stderr()}`);
+      c.destroy();
+    } finally {
+      try { proc.kill("SIGKILL"); } catch {}
+      await new Promise((r) => target.close(r));
+    }
+  });
+
+  it("says it cut nothing when it cut nothing, and never calls that idle", () => {
+    const idle = forcedCloseLine(0, 0, 1);
+    const unknown = forcedCloseLine(0, 0, null);
+
+    // POSITIVE FIRST. Three negative assertions passed against a branch that
+    // returned "" — measured — so the headline behaviour of this whole change
+    // had no assertion that it says anything at all.
+    assert.match(idle, /cut no responses/, `the zero branch said: ${JSON.stringify(idle)}`);
+    assert.ok(idle.endsWith("\n"), "every stderr line must terminate itself");
+
+    // AND IT MUST NOT CLAIM IDLENESS. liveResponses is filled by the request
+    // handler only, so a blind-tunnelled CONNECT — forward mode's normal
+    // traffic — holds the server open while counting zero. Measured on
+    // 18.20.8 / 20.20.2 / 24.11.1: close unresolved, liveResponses 0,
+    // server connections 1. A line saying "idle" there is false in the mode
+    // we ship, so the held count is what has to appear.
+    assert.match(idle, /1 connection\(s\) still held/,
+      "the zero branch must name what was still held, or it is guessing");
+    assert.doesNotMatch(idle, /\bidle\b/,
+      "we measured that no RESPONSE was open, which is not the same as idle");
+
+    // An UNKNOWN count must not read as zero — that is the one reading that
+    // would wrongly clear a stop that severed something.
+    assert.doesNotMatch(unknown, /0 connection/,
+      `an unavailable count printed as zero: ${JSON.stringify(unknown)}`);
+
+    assert.doesNotMatch(idle, /forcing close, cut \d/,
+      "an idle expiry must not trip a grep written for a real cut");
+
+    const mixed = forcedCloseLine(2, 3, 9);
+    assert.match(mixed, /cut 5 in-flight request\(s\) /,
+      "the total must be ended + destroyed, not one of them");
+    assert.match(mixed, /\(2 mid-response, 3 before headers\)/,
+      "both halves of the split must appear, and anchored");
   });
 });

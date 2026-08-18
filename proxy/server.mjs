@@ -553,6 +553,55 @@ async function handlePassthrough(clientReq, clientRes) {
 // Responses still open, so a forced shutdown can FIN them instead of RST.
 export const liveResponses = new Set();
 
+/**
+ * What the 5s force-close actually cut, and what it could not see.
+ *
+ * `liveResponses` is filled by the request handler ONLY (see below), so it is
+ * blind to the two things forward mode — our production mode — actually holds
+ * open: blind-tunnelled CONNECTs and upgrades, both attached to this same
+ * server by attachForwardProxy(). Measured 2026-08-18 with one live CONNECT,
+ * on every supported major:
+ *     18.20.8 / 20.20.2 / 24.11.1   close resolved: FALSE
+ *                                   liveResponses: 0   server connections: 1
+ * So a zero count does NOT mean nothing was in flight, and a line that says
+ * "idle" on the strength of it is lying in the mode we ship. `held` is the
+ * server's own connection count and is what keeps the zero case honest: we
+ * report that we cut no responses AND that N connections were still held,
+ * without pretending to know which kind they were.
+ *
+ * The same shape covers the Node 18 keep-alive case — there close() also stays
+ * unresolved with liveResponses 0 and one connection held — which is why this
+ * needs no separate wording.
+ *
+ * Split by headersSent because the close path below splits on it: a response
+ * that has written headers is FIN'd, one that has not is destroyed. NOTE that
+ * headersSent goes true at writeHead(), which handleMessages calls as soon as
+ * upstream headers arrive — so `mid-response` is an UPPER BOUND on user-visible
+ * truncations, not a count of them. Measured: after writeHead and before the
+ * first chunk, headersSent=true with socket.bytesWritten=0.
+ */
+export function forcedCloseLine(ended, destroyed, held) {
+  const cut = ended + destroyed;
+  if (cut > 0) {
+    return `[cache-fix] shutdown: forcing close, cut ${cut} in-flight request(s) after 5s `
+         + `(${ended} mid-response, ${destroyed} before headers)\n`;
+  }
+  // Not "idle": we did not measure idleness, we measured that no RESPONSE was
+  // open. Naming the held count is what stops a reader concluding the stop was
+  // clean when it severed a tunnel.
+  //
+  // THE PARENTHETICAL QUALIFIES `held`, SO IT MUST DESCRIBE `held`. It read
+  // "CONNECT tunnels and upgrades are not counted", which is true of
+  // liveResponses and FALSE of this number: attachForwardProxy binds connect and
+  // upgrade to this same server, so getConnections counts them. An operator
+  // reading "3 connections held, tunnels not counted" would infer three
+  // non-tunnel things PLUS an unknown number of tunnels — the opposite of what
+  // the number says, and the number is the only thing this redesign added.
+  return `[cache-fix] shutdown: forcing close after 5s, cut no responses`
+       + `${held === null ? "" : `, ${held} connection(s) still held`}`
+       + ` (kind unknown; may include CONNECT tunnels and upgrades)\n`;
+}
+
 export function createProxyServer() {
   return http.createServer((req, res) => {
     liveResponses.add(res);
@@ -1524,9 +1573,6 @@ if (invokedAsScript) {
     // SIGKILLed at the cap and restart downtime went 5.0 s -> 53.9 s. Any future
     // increase has to move the unit's TimeoutStopSec with it.
     setTimeout(() => {
-      process.stderr.write(
-        "[cache-fix] shutdown: in-flight connections still open after 5s — forcing close\n",
-      );
       // End the laggards rather than destroying them. `closeAllConnections()`
       // destroys the socket, and the kernel answers RST — measured, a client
       // that had already received every byte still surfaced ECONNRESET and
@@ -1542,12 +1588,15 @@ if (invokedAsScript) {
       // retry. The FIN-not-RST argument only ever applied to a response that had
       // bytes to finish; for one that has sent nothing, a reset is the honest
       // answer and the only retryable one.
-      for (const res of liveResponses) {
-        try { if (res.headersSent) res.end(); else res.destroy(); } catch {}
+      // COUNT OFF THE SNAPSHOT, NEVER OFF THE LIVE SET: `res.on("close")`
+      // deletes from liveResponses. Latent today — the delete lands a tick
+      // later, measured before=1 afterSync=1 afterTick=0 on 18/20/24 — and
+      // lying the moment anything drains the set synchronously. Do not
+      // "simplify" the spread away.
+      let ended = 0, destroyed = 0;
+      for (const res of [...liveResponses]) {
+        try { if (res.headersSent) { res.end(); ended++; } else { res.destroy(); destroyed++; } } catch {}
       }
-      // Then force whatever did not take the FIN. Node >=18.2; package.json
-      // engines allows 18.0/18.1, where exiting without forcing is the only
-      // option.
       // THE SAME EXIT CODE THE GRACEFUL PATH USES. It exits
       // `askForSuccessor ? 75 : 0`, and the comment above it says the two paths
       // must not disagree about what our exit means — but this one exited 0
@@ -1556,11 +1605,23 @@ if (invokedAsScript) {
       // reported EX_OK, and a supervisor keyed on 75 read "nothing to succeed
       // to" for a lineage that had a successor waiting.
       const code = handedOff ? 75 : 0;
-      if (typeof active.server.closeAllConnections === "function") {
-        setImmediate(() => { active.server.closeAllConnections(); process.exit(code); });
-      } else {
-        setImmediate(() => process.exit(code));
-      }
+      // getConnections is async, so the announce and the exit both live in its
+      // callback. Its error arm passes null rather than 0 — an unknown count
+      // must not print as "0 connections still held", which is the one reading
+      // that would wrongly clear the stop.
+      const finish = (held) => {
+        process.stderr.write(forcedCloseLine(ended, destroyed, held));
+        // Then force whatever did not take the FIN. Node >=18.2; package.json
+        // engines allows 18.0/18.1, where exiting without forcing is the only
+        // option.
+        if (typeof active.server.closeAllConnections === "function") {
+          setImmediate(() => { active.server.closeAllConnections(); process.exit(code); });
+        } else {
+          setImmediate(() => process.exit(code));
+        }
+      };
+      try { active.server.getConnections((err, n) => finish(err ? null : n)); }
+      catch { finish(null); }
     }, 5000).unref();
   };
 }

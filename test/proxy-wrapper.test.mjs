@@ -114,8 +114,20 @@ function cleanEnv(overrides) {
   // direction: it is a seam ONE test sets, and a leak would make every later
   // test's CA probe answer "could not ask" — silently turning the assertions
   // that follow into measurements of the fallback rather than of the guard.
+  // The TRUST vars are here for the third reason, and it is the sharpest one:
+  // OUR OWN PRODUCT SETS THEM. A machine running the launcher exports
+  // SSL_CERT_FILE / REQUESTS_CA_BUNDLE / NODE_EXTRA_CA_CERTS into the developer's
+  // shell, so the cases that assert "this must stay UNSET" or "this must point at
+  // the bundle WE built" were reading the host's wiring instead of the fixture's.
+  // Measured 2026-08-18 at 6d20f0c: 7 of 44 red on a developer machine, green on
+  // CI, entirely because CI's shell has no trust wiring. All three were set —
+  // one to a chained proxy's bundle, one to the distro store, one to the merged
+  // ca-trust.pem this launcher itself publishes.
+  // A suite that only passes on a machine that does NOT run the thing under test
+  // is not testing the thing under test.
   for (const k of ["CACHE_FIX_PROXY_PORT", "CACHE_FIX_PROXY_UPSTREAM", "NO_PROXY", "no_proxy",
-                   "CACHE_FIX_CA_PROBE_UNANSWERABLE"]) delete env[k];
+                   "CACHE_FIX_CA_PROBE_UNANSWERABLE",
+                   "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS"]) delete env[k];
   env.CACHE_FIX_PROXY_BIND = "127.0.0.1";
   // A config dir per invocation, by DEFAULT — not opt-in per test. Forward mode
   // publishes our CA into <config>/ca-trust.d/ccf.pem, so any test that forgot to
@@ -969,7 +981,18 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: CONCURRENCY }, () =
     writeFileSync(join(caDir, "ca.pem"), "-----BEGIN CERTIFICATE-----\ntruncated\n");
 
     const script = 'process.stdout.write("CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")+"\\n")';
-    const { out } = await runWrapper(script, { CLAUDE_CONFIG_DIR: configDir, CACHE_FIX_CA_DIR: caDir });
+    // AN EXPLICIT AMBIENT VALUE, because cleanEnv strips this from the base env.
+    // The contract under test is the launcher's `else delete
+    // claudeEnv.NODE_EXTRA_CA_CERTS` arm — "no usable CA means claude gets none,
+    // so node falls back to its built-in store". With the var merely ABSENT,
+    // CA=UNSET is the fixture's own starting state and the assertion cannot fail
+    // on that arm: measured, replacing the delete with `{ }` still passed 44/44.
+    // Setting it first makes UNSET something the launcher had to DO.
+    const { out } = await runWrapper(script, {
+      CLAUDE_CONFIG_DIR: configDir,
+      CACHE_FIX_CA_DIR: caDir,
+      NODE_EXTRA_CA_CERTS: "/nonexistent/ambient-ca.pem",
+    });
 
     assert.match(out, /CA=UNSET/,
       `claude must not be pointed at an unparseable CA; got: ${out.trim()}`);
