@@ -17,7 +17,7 @@ import { publishableGates } from "./gate-allowlist.mjs";
 // CACHE_FIX_DEBUG_LOG). Self-gated on CACHE_FIX_DEBUG=1; a no-op otherwise.
 // Env is read on every call so tests (and operators flipping the flag at
 // runtime) see live behavior — same pattern as image-strip's #98 gate.
-import { appendFileSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync } from "node:fs";
+import { appendFileSync, fstatSync, ftruncateSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, writeSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -1216,6 +1216,12 @@ if (invokedAsScript) {
   for (const s of [process.stdout, process.stderr]) {
     s.on("error", () => { /* the reader left; serving requests is the job */ });
   }
+  // ONCE, AT STARTUP, and only when the descriptor is a real file — see
+  // capOwnLog. A deploy restarts this process, so "at startup" is the natural
+  // cadence: the check costs one fstat and the file cannot outgrow the cap by
+  // more than one proxy lifetime. Doing it on a timer would mean truncating a
+  // file underneath a reader who is tailing it.
+  capOwnLog();
 }
 
 // A proxy started by the port holder must not outlive it. SIGKILL cannot be
@@ -1242,6 +1248,45 @@ function hopAddress(u) {
     const x = new URL(u);
     return x.protocol === "http:" || x.protocol === "https:" ? `${x.protocol}//${x.host}` : "";
   } catch { return ""; }
+}
+
+// BOUND OUR OWN LOG, because a default install has nothing else bounding it.
+//
+// The launchd plist this repo ships sends both streams to files
+// ({LOG_DIR}/cache-fix-proxy.log and .err) and nothing here ever truncates
+// them. Measured on this fleet: 8.3 MB over 37 days on one Mac (~224 KB/day),
+// 968 KB over 47 days on another. The rate tracks traffic, so the bound is the
+// disk. The systemd unit sets no Standard* at all and goes to journald, which
+// the system already caps — this is the macOS path only, and it is the DEFAULT
+// one, not a debug opt-in.
+//
+// THROUGH fd 2 ALONE, because launchd hands us a descriptor and not a path, and
+// there is no portable way back (Linux has /proc/self/fd, macOS needs fcntl
+// F_GETPATH, which node does not expose). Measured what that leaves:
+//     fstatSync(2)      works — isFile and size
+//     readSync(2, ...)  EBADF: the fd is write-only (O_WRONLY|O_APPEND)
+//     ftruncateSync(2)  works, and later writes land at 0
+// So a tail cannot be preserved and the cap is a truncate. It keeps the NEWEST
+// lines, which is the half worth keeping — after this fires the file holds
+// everything since, bounded, rather than everything ever, unbounded.
+//
+// NON-FILES NEED NO GUARD OF THEIR OWN, and I wrote one before checking.
+// Two of the three machines here have fd 2 on /dev/null, one has a socket, and
+// a pipe is what the test runner gives — so an isFile() check looked obviously
+// required. Measured: ftruncate throws EINVAL on /dev/null and /dev/zero, and
+// their fstat size is 0 anyway, so BOTH the size arm and the catch already
+// return false. No input exists that the isFile() check could decide, which is
+// why no mutation could kill it — and a guard nothing can kill is a guard the
+// next reader deletes without knowing what it was for. The catch is the guard.
+export function capOwnLog(fd = 2, cap = Number(process.env.CACHE_FIX_LOG_CAP_BYTES) || 4 * 1024 * 1024) {
+  try {
+    if (fstatSync(fd).size <= cap) return false;
+    ftruncateSync(fd, 0);
+    // SAY IT, or the file reads as one that was never written — which is the
+    // exact misreading this session spent the day on from the other side.
+    writeSync(fd, `[cache-fix] log passed ${cap} bytes and was truncated; older lines are gone\n`);
+    return true;
+  } catch { return false; }   // unwritable, or a platform that refuses: not a reason to fail startup
 }
 
 // IS THIS PID A PROXY, or just something holding the same socket?
