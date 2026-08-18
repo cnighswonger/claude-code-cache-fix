@@ -247,13 +247,32 @@ describe("SIGTERM exit code", () => {
     }
   });
 
-  it("exits 0 when nothing is in flight", async () => {
-    const { proc, port } = startProxy();
+  it("exits 0 when nothing is in flight, and says how long the drain took", async () => {
+    const { proc, port, stderr } = startProxy();
     await port;
     const exited = exitOf(proc);
     proc.kill("SIGTERM");
     const { code } = await exited;
     assert.equal(code, 0, "clean shutdown must exit 0");
+
+    // MEASURE THE PATIENCE THAT WAS ENOUGH, not only the patience that ran out.
+    // 6d6f01d set an 1800s handover budget and gave nobody a way to see how
+    // close a real drain comes to it: the forced-close line fires only when the
+    // budget is SPENT, so it reports what was still open when we gave up and
+    // never how long a drain that FINISHED actually needed. Those are the
+    // numbers a future ceiling has to be chosen from.
+    //
+    // Folded into this case rather than given its own, because it needs exactly
+    // what this one already builds — a spawned proxy, SIGTERM, clean exit — and
+    // a second spawn is pure load. node:test runs FILES concurrently and CI
+    // runners have two cores; an extra proxy here reddens a readiness assertion
+    // somewhere else in the run.
+    //
+    // A SUPERVISED STOP, so the budget named must be 5s: printing the 1800s
+    // handover budget here would misreport the path as badly as the old
+    // hardcoded "after 5s" misreported a handover.
+    assert.match(stderr(), /\[cache-fix\] shutdown: drained clean in \d+\.\d+s of 5s budget/,
+      `no clean-drain measurement on the supervised path: ${JSON.stringify(stderr().slice(-200))}`);
   });
 
   // One shutdown, both questions. A streaming response holds server.close()
@@ -587,27 +606,4 @@ describe("SIGTERM exit code", () => {
     }
   });
 
-  // MEASURE THE PATIENCE THAT WAS ENOUGH, not only the patience that ran out.
-  //
-  // 6d6f01d set a 1800 s handover budget and gave nobody a way to see how close
-  // a real drain comes to it. The forced-close line fires only when the budget
-  // is SPENT, so it reports what was still open when we gave up — never how
-  // long a drain that finished actually needed. Those are the numbers a
-  // threshold has to be chosen from, and without them the next revision of the
-  // budget is another guess. The neighbour layer measured one legitimate drain
-  // at 1126.2 s, so the range is not hypothetical.
-  it("reports how long a clean drain actually took, and against which budget", async () => {
-    const { proc, port, stderr } = startProxy();
-    await port;
-    const exited = new Promise((r) => proc.on("exit", r));
-    proc.kill("SIGTERM");
-    await exited;
-
-    const line = stderr();
-    // A SUPERVISED STOP, so the budget named must be 5s — printing the 1800s
-    // handover budget here would misreport the path as badly as the old
-    // hardcoded "after 5s" misreported a handover.
-    assert.match(line, /\[cache-fix\] shutdown: drained clean in \d+\.\d+s of 5s budget/,
-      `no clean-drain measurement on the supervised path: ${JSON.stringify(line.slice(-200))}`);
-  });
 });
