@@ -164,6 +164,31 @@ const srv = net.createServer((client) => {
     const direct = () => {
       const c = /^CONNECT\s+([^\s:]+):(\d+)/i.exec(line);
       if (!c) return void client.destroy();
+      // REQUIRE_HOP=1 OVERRIDES THE FALL-THROUGH ABOVE, and this is the one
+      // place that can enforce it: both callers reach direct() unconditionally,
+      // so a guard at either would leave the other open — and the next caller
+      // written would have to remember it too.
+      //
+      // The fall-through is deliberate and argued at the top of this file: not
+      // carrying "trades an invisible fall-open for an invisible outage, and
+      // this tunnel is the most expensive place to take one". That holds while
+      // nobody has said otherwise. This flag IS the operator saying otherwise —
+      // for them the fall-open is the worse half — and the live proxy already
+      // honours it in two places (forward-proxy.mjs:319,372; upstream.mjs:453).
+      //
+      // We carry the address only during holder transitions, i.e. every deploy,
+      // so unguarded this was a policy hole that opened exactly while the
+      // zero-downtime path did its work and closed before anyone looked.
+      //
+      // 502 AND NOT A SILENT CLOSE: pin reads a non-200 CONNECT reply as
+      // "refused BY this hop, walk past us", which is the behaviour a refusal
+      // owes its client. The same status the live proxy answers with.
+      if (process.env.CACHE_FIX_REQUIRE_HOP === "1") {
+        process.stderr.write(
+          `[gap-relay] no chain hop reachable and CACHE_FIX_REQUIRE_HOP=1 — ` +
+          `refusing ${c[1]}:${c[2]}\n`);
+        return void client.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+      }
       up = net.connect(Number(c[2]), c[1]);
       up.on("error", bail);
       up.on("close", () => client.destroy());

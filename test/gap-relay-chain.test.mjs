@@ -44,7 +44,7 @@ const endpoint = async (name, touched) => {
   return { srv: s, port: s.address().port };
 };
 
-async function withRelay(chain, fn) {
+async function withRelay(chain, fn, extraEnv = {}) {
   // THE RELAY LISTENS ON fd 3 — `srv.listen({ fd: 3 })` — because the holder
   // hands it an already-bound socket. A fixture that spawns it without one
   // produces a process that never listens, and every probe then reads as "the
@@ -57,9 +57,13 @@ async function withRelay(chain, fn) {
   const carrierPort = carrier.address().port;
   const env = { ...process.env, CACHE_FIX_HELD_PORT: String(carrierPort),
                 CACHE_FIX_FALLBACK_PROXIES: chain };
+  // CACHE_FIX_REQUIRE_HOP joins the scrub list for the reason the others are on
+  // it: an operator who exported it while debugging would silently change what
+  // every case here measures. The one case that needs it passes it explicitly.
   for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
                    "CACHE_FIX_UPSTREAM_PROXY", "ALL_PROXY", "all_proxy",
-                   "CACHE_FIX_STANDBY"]) delete env[k];
+                   "CACHE_FIX_STANDBY", "CACHE_FIX_REQUIRE_HOP"]) delete env[k];
+  Object.assign(env, extraEnv);
   const relay = spawn(process.execPath, [relayPath],
                       { env, stdio: ["ignore", "ignore", "pipe", carrier._handle.fd] });
   // THE PARENT MUST STOP ACCEPTING once the child has the fd. Both processes are
@@ -104,6 +108,43 @@ const connectThrough = (port, target) => new Promise((resolve) => {
   c.on("data", (d) => { c.destroy(); resolve(String(d).split("\r\n")[0]); });
   c.on("error", (e) => resolve(`ERR:${e.code}`));
   setTimeout(() => { c.destroy(); resolve("TIMEOUT"); }, 6_000);
+});
+
+// REQUIRE_HOP=1 IS THE OPERATOR OVERRIDING THIS FILE'S OWN DEFAULT.
+//
+// The fall-through to direct is deliberate and argued 60 lines up: closing when
+// no hop carries "trades an invisible fall-open for an invisible outage, and
+// this tunnel is the most expensive place to take one". That reasoning holds
+// when nobody has said otherwise. CACHE_FIX_REQUIRE_HOP=1 IS saying otherwise —
+// it is the operator declaring that for them the fall-open is the worse half.
+//
+// The live proxy already honours it in two places (forward-proxy.mjs:319,372
+// and upstream.mjs:453) and refuses with a 502. The relay carries the address
+// only during holder transitions — which is every deploy — so this was a policy
+// hole that opened exactly while the zero-downtime path was doing its work, and
+// closed again before anyone looked.
+//
+// ASSERTED ON THE ORIGIN, not on the reply line. A relay that answers non-200
+// and still dials would pass a reply-only check; `touched` is what proves no
+// credential-bearing TLS left the box unproxied.
+test("refuses rather than dialling direct when CACHE_FIX_REQUIRE_HOP=1", async () => {
+  const touched = [];
+  const origin = await endpoint("ORIGIN", touched);
+  const dead = await freePort();
+  try {
+    await withRelay(`http://127.0.0.1:${dead}`, async ({ port, stderr }) => {
+      const reply = await connectThrough(port, `127.0.0.1:${origin.port}`);
+      await new Promise((r) => setTimeout(r, 400));
+      assert.deepEqual(touched, [],
+        `no hop would carry and REQUIRE_HOP=1, yet the relay dialled the origin ` +
+        `itself — a session that set that flag just sent its credentials ` +
+        `unproxied. reply=${JSON.stringify(reply)} stderr=${JSON.stringify(stderr().slice(-300))}`);
+      assert.doesNotMatch(reply, /\s200\s/,
+        `the relay told the client the tunnel was established; pin reads a non-200 ` +
+        `on this line as "walk past us", which is the behaviour a refusal owes. ` +
+        `reply=${JSON.stringify(reply)}`);
+    }, { CACHE_FIX_REQUIRE_HOP: "1" });
+  } finally { origin.srv.close(); }
 });
 
 test("a refused first hop falls to the SECOND, not straight to a direct dial", async () => {

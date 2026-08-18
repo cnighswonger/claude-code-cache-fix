@@ -384,7 +384,13 @@ export function getAgent(isHTTPS, hostname, hop) {
     if (proxyUrl && !_loggedProxies.has(`${proxyUrl}|${isHTTPS}`)) {
       _loggedProxies.add(`${proxyUrl}|${isHTTPS}`);
       process.stderr.write(
-        `[upstream] using proxy ${proxyUrl} for ${isHTTPS ? "https" : "http"} upstream ` +
+        // addrOf(), NOT the raw URL. CACHE_FIX_FALLBACK_PROXIES supports
+        // userinfo, so proxyUrl can be `user:pass@host` — and this was the one
+        // site printing it raw while the three hop lines above already route
+        // through addrOf(), which returns URL.host and drops credentials.
+        // Measured: stderr on this fleet is a mode-644 file, so the password
+        // landed somewhere every account on the box can read.
+        `[upstream] using proxy ${addrOf(proxyUrl)} for ${isHTTPS ? "https" : "http"} upstream ` +
         `(rejectUnauthorized=${config.rejectUnauthorized}, ca=${config.caFile || "default"})\n`
       );
     }

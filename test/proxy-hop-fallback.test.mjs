@@ -17,6 +17,43 @@ const freePort = () => new Promise((res) => {
 });
 
 describe("hop fallback", () => {
+  // A HOP URL MAY CARRY CREDENTIALS, AND stderr IS WORLD-READABLE.
+  //
+  // CACHE_FIX_FALLBACK_PROXIES explicitly supports userinfo, so `user:pass@host`
+  // is a supported value — and this line printed the URL raw while its three
+  // siblings 90 lines down already route through addrOf(), which returns
+  // URL.host and therefore drops credentials. Guard written, one sibling missed.
+  //
+  // NOT COSMETIC. Measured on <linux-host>: the proxy's stderr is
+  // /tmp/cc-restore-9901.log at mode -rw-r--r--, so the password lands in a file
+  // every account on the box can read, and stays there for the file's life.
+  //
+  // Asserted on the SECRET, not on the shape of the masking. A test that pins
+  // "127.0.0.1:8118" passes on any rewrite that happens to produce it; this one
+  // fails for exactly one reason.
+  it("never writes a hop's credentials to stderr", async () => {
+    const { getAgent } = await import("../proxy/upstream.mjs");
+    const SECRET = "s3cr3t-token";
+    const USER = "alice";
+    const write = process.stderr.write.bind(process.stderr);
+    let said = "";
+    process.stderr.write = (x, ...rest) => { said += x; return write(x, ...rest); };
+    try {
+      getAgent(true, "api.anthropic.com", `http://${USER}:${SECRET}@127.0.0.1:8118`);
+    } finally {
+      process.stderr.write = write;
+    }
+    assert.ok(!said.includes(SECRET),
+      `the hop's password reached stderr, which on this fleet is a mode-644 file:\n${said}`);
+    assert.ok(!said.includes(`${USER}:`),
+      `the hop's userinfo reached stderr:\n${said}`);
+    // AND THE LINE STILL SAYS SOMETHING USEFUL — a masker that logs nothing
+    // would pass the two assertions above and lose the diagnostic entirely.
+    assert.match(said, /127\.0\.0\.1:8118/,
+      `the hop was masked out of existence rather than redacted:\n${said}`);
+  });
+
+
   // A HEALTHY START MUST NOT REPORT A FAULT.
   //
   // The shipped wiring sets CACHE_FIX_FALLBACK_PROXIES and nothing else, so
