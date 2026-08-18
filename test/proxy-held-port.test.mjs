@@ -21,7 +21,7 @@ const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", 
 // that is the hostname-port class its hygiene rule bans.
 const HOP_ENV = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
                  "ALL_PROXY", "all_proxy",
-                 "CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_FALLBACK_PROXIES"];
+                 "CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_REQUIRE_HOP", "CACHE_FIX_FALLBACK_PROXIES"];
 
 // WHAT A PROBE RESULT MEANS. One definition, because four hand-rolled ones is
 // how the same lesson gets learned once per case and then goes red again in the

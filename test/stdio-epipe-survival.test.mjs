@@ -36,7 +36,7 @@ const reap = (p) => { try { process.kill(-p.pid, "SIGKILL"); } catch {} try { p.
 const cleanEnv = () => {
   const env = { ...process.env };
   for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
-                   "ALL_PROXY", "all_proxy", "CACHE_FIX_UPSTREAM_PROXY",
+                   "ALL_PROXY", "all_proxy", "CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_REQUIRE_HOP",
                    "CACHE_FIX_STANDBY", "LISTEN_FDS", "LISTEN_PID"]) delete env[k];
   return env;
 };

@@ -219,6 +219,38 @@ const srv = net.createServer((client) => {
       const u = hopUrls[i++];
       dial(u);
     };
+    // A HOP URL'S userinfo IS CREDENTIALS FOR THE HOP, and nothing was
+    // presenting them. We write the CLIENT'S CONNECT bytes through verbatim, so
+    // an authenticated hop answered 407 — and `carried` is already true by then
+    // (set on TCP connect, before any hop reply), so the 407 went straight back
+    // to a client whose chain was configured correctly.
+    //
+    // REPLACED, not appended: a Proxy-Authorization the client sent was
+    // addressed to US, not to the hop behind us, so forwarding it would present
+    // the wrong identity and a duplicate header.
+    //
+    // decodeURIComponent because URL percent-encodes userinfo, so a password
+    // containing `@` or `:` arrives escaped and must be sent raw.
+    //
+    // NEVER LOGGED. This function returns bytes and reports nothing; the sibling
+    // finding in this same round was a hop password reaching a mode-644 file,
+    // and the fix for it is worth nothing if the fix beside it re-leaks.
+    //
+    // latin1 round-trips arbitrary bytes; the header block is ASCII by spec and
+    // the body after CRLFCRLF is copied through untouched.
+    const withHopAuth = (chunk, u) => {
+      if (!u.username && !u.password) return chunk;
+      const text = chunk.toString("latin1");
+      const end = text.indexOf("\r\n\r\n");
+      if (end < 0) return chunk;      // headers not complete in this chunk
+      const cred = Buffer.from(
+        `${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`).toString("base64");
+      const head = text.slice(0, end).split("\r\n")
+        .filter((l) => !/^proxy-authorization:/i.test(l));
+      head.push(`Proxy-Authorization: Basic ${cred}`);
+      return Buffer.from(head.join("\r\n") + text.slice(end), "latin1");
+    };
+
     const dial = (u) => {
     const hopSock = net.connect(portOf(u), u.hostname);
     up = hopSock;
@@ -243,7 +275,7 @@ const srv = net.createServer((client) => {
     hopSock.on("connect", () => {
       carried = true;
       hopSock.setTimeout(0);          // an established tunnel is allowed to idle
-      hopSock.write(first);
+      hopSock.write(withHopAuth(first, u));
       client.pipe(hopSock); hopSock.pipe(client);
     });
     };

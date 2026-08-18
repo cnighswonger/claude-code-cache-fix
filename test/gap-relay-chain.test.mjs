@@ -44,6 +44,27 @@ const endpoint = async (name, touched) => {
   return { srv: s, port: s.address().port };
 };
 
+// A HOP THAT DEMANDS Proxy-Authorization, which is what a corp proxy does.
+// Answers 407 without it and 200 with the right one, so the assertion can be
+// "the client got through", not "we found the header somewhere".
+const authHop = async (user, pass, seen) => {
+  const want = "Basic " + Buffer.from(`${user}:${pass}`).toString("base64");
+  const s = net.createServer((c) => {
+    c.once("data", (d) => {
+      const req = String(d);
+      const got = /^proxy-authorization:[ \t]*(.+)$/im.exec(req);
+      seen.push(got ? got[1].trim() : null);
+      c.write(got && got[1].trim() === want
+        ? "HTTP/1.1 200 Connection Established\r\n\r\n"
+        : "HTTP/1.1 407 Proxy Authentication Required\r\n" +
+          "Proxy-Authenticate: Basic realm=\"x\"\r\n\r\n");
+    });
+    c.on("error", () => {});
+  });
+  await new Promise((r) => s.listen(0, "127.0.0.1", r));
+  return { srv: s, port: s.address().port };
+};
+
 async function withRelay(chain, fn, extraEnv = {}) {
   // THE RELAY LISTENS ON fd 3 — `srv.listen({ fd: 3 })` — because the holder
   // hands it an already-bound socket. A fixture that spawns it without one
@@ -147,6 +168,100 @@ test("refuses rather than dialling direct when CACHE_FIX_REQUIRE_HOP=1", async (
   } finally { origin.srv.close(); }
 });
 
+// A HOP URL MAY CARRY CREDENTIALS AND WE NEVER SEND THEM.
+//
+// CACHE_FIX_FALLBACK_PROXIES supports userinfo — that support is the whole
+// reason the "using proxy" line had a password in it to leak. But the relay
+// dials with net.connect(portOf(u), u.hostname) and then writes the CLIENT'S
+// original CONNECT bytes verbatim, so the userinfo in the hop URL reaches
+// nothing. Nowhere in bin/ or proxy/ derives Proxy-Authorization from a hop
+// URL; the only related line strips credentials (server.mjs:822).
+//
+// So an authenticated hop answers 407, and `carried` is already true by then —
+// it is set on TCP connect, before any hop reply — so the 407 is piped straight
+// back and the client sees it. That is a silent failure precisely during a
+// holder transition, on a chain the operator configured correctly.
+//
+// ASSERTED ON THE CLIENT GETTING THROUGH, plus what the hop actually received,
+// so a fix that sends a malformed or wrong-user header fails rather than
+// passing on the presence of the word "Basic".
+// Same as connectThrough, plus headers the CLIENT chose to send. Needed because
+// a Proxy-Authorization from the client is addressed to US, not to the hop.
+const connectWithHeaders = (port, target, headers) => new Promise((resolve) => {
+  const c = net.connect(port, "127.0.0.1");
+  c.on("connect", () => c.write(
+    `CONNECT ${target} HTTP/1.1\r\nHost: x\r\n${headers}\r\n`));
+  c.on("data", (d) => { c.destroy(); resolve(String(d).split("\r\n")[0]); });
+  c.on("error", (e) => resolve(`ERR:${e.code}`));
+  setTimeout(() => { c.destroy(); resolve("TIMEOUT"); }, 6_000);
+});
+
+test("sends Proxy-Authorization derived from a hop URL's userinfo", async () => {
+  const seen = [];
+  const hop = await authHop("alice", "s3cr3t-token", seen);
+  try {
+    await withRelay(`http://alice:s3cr3t-token@127.0.0.1:${hop.port}`, async ({ port, stderr }) => {
+      const reply = await connectThrough(port, "example.invalid:443");
+      assert.match(reply, /\s200\s/,
+        `an authenticated hop refused us, so a correctly configured chain fails ` +
+        `during every holder transition. hop saw Proxy-Authorization=` +
+        `${JSON.stringify(seen[0])} reply=${JSON.stringify(reply)} ` +
+        `stderr=${JSON.stringify(stderr().slice(-200))}`);
+      assert.equal(seen[0], "Basic " + Buffer.from("alice:s3cr3t-token").toString("base64"),
+        `the hop received ${JSON.stringify(seen[0])}`);
+    });
+  } finally { hop.srv.close(); }
+});
+
+// A PASSWORD WITH RESERVED CHARACTERS MUST ARRIVE RAW.
+//
+// Written because the mutation table said it was needed: dropping
+// decodeURIComponent passed the case above, whose credentials contain nothing
+// URL escapes. `new URL()` percent-encodes userinfo, so `p@ss:w#rd` reaches us
+// as `p%40ss%3Aw%23rd` and a hop comparing against the real password refuses.
+// This is the shape an operator hits first, because a generated proxy password
+// is exactly where reserved characters live.
+test("sends a hop password that URL-escaped, decoded back to its real bytes", async () => {
+  const seen = [];
+  const USER = "al ice";
+  const PASS = "p@ss:w#rd";
+  const hop = await authHop(USER, PASS, seen);
+  try {
+    const enc = `${encodeURIComponent(USER)}:${encodeURIComponent(PASS)}`;
+    await withRelay(`http://${enc}@127.0.0.1:${hop.port}`, async ({ port }) => {
+      const reply = await connectThrough(port, "example.invalid:443");
+      assert.match(reply, /\s200\s/,
+        `the hop refused: it wants ${JSON.stringify(USER + ":" + PASS)} and we sent ` +
+        `something else. The percent-encoding URL applied to userinfo was passed ` +
+        `through instead of decoded. hop saw ${JSON.stringify(seen[0])}`);
+    });
+  } finally { hop.srv.close(); }
+});
+
+// A CLIENT'S OWN Proxy-Authorization IS ADDRESSED TO US, NOT TO THE HOP.
+//
+// Also written because a mutation survived: turning the replace into an append
+// passed every case above, since no fixture had a client that sends one. A
+// forwarded client header presents the wrong identity to the hop, and two
+// Proxy-Authorization headers in one request is a shape a strict proxy rejects
+// outright.
+test("replaces a client's own Proxy-Authorization rather than forwarding it", async () => {
+  const seen = [];
+  const hop = await authHop("alice", "s3cr3t-token", seen);
+  try {
+    await withRelay(`http://alice:s3cr3t-token@127.0.0.1:${hop.port}`, async ({ port }) => {
+      const reply = await connectWithHeaders(port, "example.invalid:443",
+        "Proxy-Authorization: Basic " + Buffer.from("mallory:not-ours").toString("base64") + "\r\n");
+      assert.match(reply, /\s200\s/,
+        `the hop saw ${JSON.stringify(seen[0])} — the client's credentials were ` +
+        `forwarded instead of ours`);
+      assert.equal(seen.length, 1, "the hop was dialled more than once");
+      assert.equal(seen[0], "Basic " + Buffer.from("alice:s3cr3t-token").toString("base64"),
+        `the hop received ${JSON.stringify(seen[0])}, not the hop's own credentials`);
+    });
+  } finally { hop.srv.close(); }
+});
+
 test("a refused first hop falls to the SECOND, not straight to a direct dial", async () => {
   const touched = [];
   const origin = await endpoint("ORIGIN", touched);
@@ -225,7 +340,7 @@ test("a standby with no handed-down parent refuses to arm", async () => {
   const env = { ...process.env, CACHE_FIX_STANDBY: "1" };
   delete env.CACHE_FIX_STANDBY_PARENT;
   for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
-                   "CACHE_FIX_UPSTREAM_PROXY", "ALL_PROXY", "all_proxy"]) delete env[k];
+                   "CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_REQUIRE_HOP", "ALL_PROXY", "all_proxy"]) delete env[k];
   const relay = spawn(process.execPath, [relayPath],
                       { env, stdio: ["ignore", "ignore", "pipe", sock._handle.fd] });
   let err = "";

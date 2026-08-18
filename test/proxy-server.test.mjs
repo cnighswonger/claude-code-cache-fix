@@ -926,7 +926,7 @@ describe("close() after an external server.close()", () => {
 // consumer, and this comment turned one into the other.
 describe("/health hop reporting", () => {
   const ENV = ["CACHE_FIX_FORWARD_PROXY", "CACHE_FIX_CA_DIR", "CACHE_FIX_FALLBACK_PROXIES",
-               "CACHE_FIX_UPSTREAM_PROXY", "HTTPS_PROXY", "https_proxy",
+               "CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_REQUIRE_HOP", "HTTPS_PROXY", "https_proxy",
                "HTTP_PROXY", "http_proxy", "CACHE_FIX_CHAIN_GRACE_MS"];
 
   const health = (port) => new Promise((resolve, reject) => {
@@ -1012,7 +1012,7 @@ describe("/health hop reporting", () => {
 // sockets.
 describe("client-abandon abort", () => {
   const ENV = ["CACHE_FIX_PROXY_UPSTREAM", "CACHE_FIX_FORWARD_PROXY", "CACHE_FIX_CA_DIR",
-               "CACHE_FIX_FALLBACK_PROXIES", "CACHE_FIX_UPSTREAM_PROXY",
+               "CACHE_FIX_FALLBACK_PROXIES", "CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_REQUIRE_HOP",
                "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"];
   const save = () => Object.fromEntries(ENV.map((k) => [k, process.env[k]]));
   const restore = (s) => { for (const [k, v] of Object.entries(s)) {

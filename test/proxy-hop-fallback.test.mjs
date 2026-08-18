@@ -73,7 +73,7 @@ describe("hop fallback", () => {
     const srv = net.createServer();
     await new Promise((r) => srv.listen(0, "127.0.0.1", r));
     const live = `http://127.0.0.1:${srv.address().port}`;
-    const PRIMARY_ENV = ["CACHE_FIX_UPSTREAM_PROXY", "HTTPS_PROXY", "https_proxy",
+    const PRIMARY_ENV = ["CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_REQUIRE_HOP", "HTTPS_PROXY", "https_proxy",
                          "HTTP_PROXY", "http_proxy", "CACHE_FIX_FALLBACK_PROXIES"];
     const prior = Object.fromEntries(PRIMARY_ENV.map((k) => [k, process.env[k]]));
     const write = process.stderr.write.bind(process.stderr);
@@ -215,7 +215,7 @@ describe("hop fallback", () => {
     // Every name in BOTH getters: selectProxyUrl(true) falls through to
     // config.httpProxy, so scrubbing only the https ones left the live proxy on
     // :9901 as the primary and this case measured the operator's box.
-    const PRIMARY_ENV = ["CACHE_FIX_UPSTREAM_PROXY", "HTTPS_PROXY", "https_proxy",
+    const PRIMARY_ENV = ["CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_REQUIRE_HOP", "HTTPS_PROXY", "https_proxy",
                          "HTTP_PROXY", "http_proxy",
                          "CACHE_FIX_FALLBACK_PROXIES", "CACHE_FIX_CHAIN_GRACE_MS"];
     const prior = Object.fromEntries(PRIMARY_ENV.map((k) => [k, process.env[k]]));

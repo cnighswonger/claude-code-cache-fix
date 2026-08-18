@@ -747,6 +747,46 @@ test("the self-heal successor keeps a way to report", () => {
     `into whatever the operator was looking at; got ${stdio[1]}`);
 });
 
+// A GATE THE CHILD READS MUST BE SCRUBBED BY WHOEVER SPAWNS THE CHILD.
+//
+// CACHE_FIX_REQUIRE_HOP became load-bearing in bin/gap-relay.mjs: with it set,
+// the relay refuses to dial direct instead of falling through. That is the
+// point of the flag — but it also means an operator who exported it while
+// debugging changes what every case that spawns a launcher, a relay, or a
+// holder measures, and the failure looks like a broken relay rather than a
+// dirty environment.
+//
+// Five files reach that code (they spawn claude-via-proxy.mjs, gap-relay.mjs,
+// or hold a port) and exactly one of them scrubbed the flag when this was
+// written. That is the same shape as the ours-only predicate and the deploy
+// announce earlier on this branch: a guard added in one place, siblings left.
+//
+// THE ROSTER IS DERIVED, NOT LISTED. A hardcoded set of filenames goes stale
+// the first time a file is renamed or a sixth one starts spawning — which is
+// exactly how the misses above happened. Membership is computed from what the
+// file actually does.
+test("every file that spawns our binaries scrubs the hop gates", () => {
+  const files = readdirSync(testDir).filter((f) => f.endsWith(".test.mjs"));
+  const spawners = files.filter((f) => {
+    const src = readFileSync(join(testDir, f), "utf8");
+    // Only files that also manage hop config: a spawner that never touches
+    // CACHE_FIX_UPSTREAM_PROXY has no scrub list for this to belong to.
+    if (!src.includes("CACHE_FIX_UPSTREAM_PROXY")) return false;
+    return src.includes("claude-via-proxy.mjs")
+        || src.includes("gap-relay.mjs")
+        || src.includes("CACHE_FIX_HOLD_PORT");
+  });
+  assert.ok(spawners.length >= 5,
+    `only ${spawners.length} file(s) both spawn our binaries and manage hop config — ` +
+    `this guard covered 5 when written, so either a file moved or this detector broke`);
+  const missing = spawners.filter((f) =>
+    !readFileSync(join(testDir, f), "utf8").includes("CACHE_FIX_REQUIRE_HOP"));
+  assert.deepEqual(missing, [],
+    `these spawn a process that honours CACHE_FIX_REQUIRE_HOP and never scrub it, ` +
+    `so an operator who exported it turns them red for a reason that is not in ` +
+    `the code: ${missing.join(", ")}`);
+});
+
 test("no test file signals a pid it knows only by port", () => {
   const WANT = "/\\/(?:bin|proxy)\\/[\\w.-]+\\.mjs\\b/";
   const FILTER = ".filter((p) => OURS.test(cmdOf(p)))";
