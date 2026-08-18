@@ -561,7 +561,17 @@ async function handlePassthrough(clientReq, clientRes) {
  * shelling out to the `cache-fix-proxy` bin.
  */
 // Responses still open, so a forced shutdown can FIN them instead of RST.
-export const liveResponses = new Set();
+// PER SERVER, not per module. Both of these were module state, and
+// handleHealth was moved off a `_listenPort` global earlier in this same PR
+// for the reason written above it: a consumer may run more than one. Two
+// instances sharing one Set means a forced close in A ends B's in-flight
+// responses and reports B's cuts as A's; sharing one flag means draining A
+// stamps Connection: close on B's replies, telling B's clients to reconnect
+// away from a proxy that is not leaving.
+//
+// Hung off the server object rather than threaded through, because shutdown
+// already holds `active.server` and the handler already closes over the one it
+// belongs to — no new plumbing, and no way to reach the wrong instance's set.
 
 /**
  * What the 5s force-close actually cut, and what it could not see.
@@ -636,18 +646,17 @@ export function forcedCloseLine(ended, destroyed, held, budgetMs = 5_000) {
 // one of those majors goes on to serve another request. That is node's
 // behaviour, not ours, so a test asserts it rather than a comment claiming it
 // — see "relies on node closing idle keep-alives at close()".
-let _draining = false;
-
 export function createProxyServer() {
-  return http.createServer((req, res) => {
-    liveResponses.add(res);
-    res.on("close", () => liveResponses.delete(res));
+  const live = new Set();
+  const srv = http.createServer((req, res) => {
+    live.add(res);
+    res.on("close", () => live.delete(res));
     // BEFORE the handler, so a writeHead() that names its own headers keeps this
     // one — setHeader values survive writeHead unless writeHead repeats the name.
     // The in-flight reply still finishes normally; this only stops the NEXT
     // request from entering a process on its way out, and the client's fresh
     // connection lands on the successor through the shared listener.
-    if (_draining) res.setHeader("Connection", "close");
+    if (srv._draining) res.setHeader("Connection", "close");
     // Async IIFE: handleMessages/handleBootstrap return promises, so we have
     // to await them inside the try/catch — a bare return would let rejections
     // escape to unhandledRejection and (on Node 15+) crash the process.
@@ -717,6 +726,12 @@ export function createProxyServer() {
       }
     })();
   });
+  // The two pieces of per-instance state the drain path needs. `_live` is read
+  // off a SNAPSHOT at force-close time (see there), `_draining` is set by
+  // shutdown() the moment it begins.
+  srv._live = live;
+  srv._draining = false;
+  return srv;
 }
 
 // The forward-mode self-heal swallowers are process-wide, so they are
@@ -1623,7 +1638,7 @@ if (invokedAsScript) {
     shuttingDown = true;
     // Set BEFORE anything else in this function: every request that arrives from
     // here on is arriving at a process that is leaving, and must be told so.
-    _draining = true;
+    active.server._draining = true;
     if (!active) {
       process.exit(0);
       return;
@@ -1803,7 +1818,7 @@ if (invokedAsScript) {
       // lying the moment anything drains the set synchronously. Do not
       // "simplify" the spread away.
       let ended = 0, destroyed = 0;
-      for (const res of [...liveResponses]) {
+      for (const res of [...(active.server?._live ?? [])]) {
         try { if (res.headersSent) { res.end(); ended++; } else { res.destroy(); destroyed++; } } catch {}
       }
       // THE SAME EXIT CODE THE GRACEFUL PATH USES. It exits
