@@ -11,9 +11,20 @@ import net from "node:net";
 import { EventEmitter } from "node:events";
 import { getSystemErrorName } from "node:util";
 import { bundleUsable, carriesOurCA, salvageBundle } from "./ca-trust.mjs";
+import { sourceFingerprintSync } from "../proxy/source-fingerprint.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SERVER_PATH = resolve(__dirname, "../proxy/server.mjs");
+// THE TREE THE PROXY LOADS, not the one file it is entered through. See
+// codeFingerprint() below for what hashing server.mjs alone cost.
+//
+// DERIVED FROM SERVER_PATH, not resolved a second time from __dirname. A
+// harness that points the launcher at a stand-in proxy rewrites SERVER_PATH and
+// nothing else; an independently-resolved PROXY_DIR then kept hashing the REAL
+// proxy/ while the stand-in changed under it, so the deploy watcher never fired
+// and two cases hung to their 40s ceiling. One source of truth means the
+// redirect moves both.
+const PROXY_DIR = dirname(SERVER_PATH);
 // Our own path, so a holder can spawn its successor from the file AS IT IS ON
 // DISK rather than from the bytes it booted with — which is the only reason
 // anyone asks it to hand the port on.
@@ -466,7 +477,7 @@ function warn(msg) {
 // measured, a valid record plus a missing server.mjs printed "no record in /tmp".
 function warnUncomparable(port, pid, treatedAs) {
   warn(`[cache-fix] ${port}: cannot compare builds — no usable fingerprint record in ` +
-       `${tmpdir()}, or ${SERVER_PATH} is unreadable. Treating pid ${pid} as ${treatedAs}; ` +
+       `${tmpdir()}, or ${PROXY_DIR} is unreadable. Treating pid ${pid} as ${treatedAs}; ` +
        `if this was a deploy, it has NOT taken effect.\n`);
 }
 
@@ -695,9 +706,21 @@ function otherHolderOn(port) {
 // so it cannot outlive the fact — and if it does (a holder killed -9 mid-write,
 // a stale file from a previous boot), the fallback below is "leave it alone",
 // which is the safe direction.
-function codeFingerprint(file) {
+// THE WHOLE TREE THE PROXY LOADS. This hashed `proxy/server.mjs` alone, and
+// server.mjs is one of 67 files under proxy/ — every extension, upstream.mjs,
+// pipeline.mjs, the CA helpers. A deploy that changed any of them left
+// server.mjs byte-identical, so runningOurCode() answered TRUE and the incoming
+// launcher declined the takeover: holderVerdict() said "holder", takeOver()
+// exited 0, and the OLD code kept serving with nothing saying so. That is
+// precisely the failure the fingerprint was added to prevent, reached through
+// every file except the one it watched.
+//
+// sourceFingerprintSync() is the SAME function /health publishes as
+// `proxy_tree`, not a second one — see the note at the top of that file about
+// two hashes of one tree. 6-9 ms over proxy/, measured.
+function codeFingerprint(root) {
   try {
-    return createHash("sha256").update(readFileSync(file)).digest("hex");
+    return sourceFingerprintSync(root);
   } catch { return ""; }
 }
 
@@ -708,7 +731,7 @@ function fingerprintPath(port) {
 // Temp + rename: a reader that opens this mid-write would compare against a
 // truncated hash and retire a healthy proxy.
 function publishFingerprint(port) {
-  const fp = codeFingerprint(SERVER_PATH);
+  const fp = codeFingerprint(PROXY_DIR);
   if (!fp) return;
   const path = fingerprintPath(port);
   try {
@@ -725,7 +748,7 @@ function runningOurCode(port) {
   let theirs = "";
   try { theirs = readFileSync(fingerprintPath(port), "utf8").trim(); } catch { return null; }
   if (!theirs) return null;                       // no record: cannot tell
-  const ours = codeFingerprint(SERVER_PATH);
+  const ours = codeFingerprint(PROXY_DIR);
   if (!ours) return null;                         // cannot read our own: same
   return theirs === ours;
 }
@@ -1137,7 +1160,7 @@ function holdPort(rest) {
       // because a restart really did change the running code and that is the
       // fact worth logging. Two writers to one variable is what hid this; now
       // both of them say the same thing when the answer moves.
-      const spawningHash = codeFingerprint(SERVER_PATH);
+      const spawningHash = codeFingerprint(PROXY_DIR);
       // watchMs > 0 GATES THIS TOO. The announcement is part of the deploy
       // watcher, not a free fact about the spawn, so `SELF_HEAL=off` and an
       // unset WATCH_DEPLOY_MS have to silence it the same way they silence the
@@ -1597,7 +1620,7 @@ function holdPort(rest) {
     if (watchMs > 0) {
       const watcher = setInterval(() => {
         if (stopping || !child || !bootedHash) return;
-        const onDisk = codeFingerprint(SERVER_PATH);
+        const onDisk = codeFingerprint(PROXY_DIR);
         // An UNREADABLE file and an UNCHANGED one are different facts, and
         // folding them together hides the first: a watcher that can never read
         // its own source looks exactly like one with nothing to do. Say it once
@@ -1606,7 +1629,7 @@ function holdPort(rest) {
           if (!warnedUnreadable) {
             warnedUnreadable = true;
             process.stderr.write(
-              `[cache-fix] deploy watcher cannot read ${SERVER_PATH}; it will never fire\n`);
+              `[cache-fix] deploy watcher cannot read ${PROXY_DIR}; it will never fire\n`);
           }
           return;
         }

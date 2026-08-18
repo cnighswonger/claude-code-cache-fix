@@ -31,20 +31,20 @@
 // explain.
 
 import { createHash } from "node:crypto";
-import { readdir, readFile } from "node:fs/promises";
+import { readdirSync, readFileSync } from "node:fs";
 import { join, relative, sep, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const SKIP_DIRS = new Set(["node_modules"]);
 
-async function collect(root, dir, out) {
-  const entries = await readdir(dir, { withFileTypes: true });
+function collect(root, dir, out) {
+  const entries = readdirSync(dir, { withFileTypes: true });
   for (const e of entries) {
     if (e.name.startsWith(".")) continue;
     const full = join(dir, e.name);
     if (e.isDirectory()) {
       if (SKIP_DIRS.has(e.name)) continue;
-      await collect(root, full, out);
+      collect(root, full, out);
     } else if (e.isFile()) {
       out.push(relative(root, full).split(sep).join("/"));
     }
@@ -52,17 +52,32 @@ async function collect(root, dir, out) {
   return out;
 }
 
-export async function sourceFingerprint(root) {
-  const files = (await collect(root, root, [])).sort();
+// SYNC, and the async export below is a wrapper over it rather than a second
+// walk. The launcher needs this answer on paths that cannot await — the deploy
+// watcher's interval, the spawn site, and runningOurCode() inside holderPidOn()
+// — and it was hashing `proxy/server.mjs` ALONE for want of a sync tree hash.
+// That is the whole defect: a deploy touching any other file under proxy/ left
+// server.mjs byte-identical, so the incoming launcher read "same bytes as mine"
+// and declined the takeover. The upgrade was a no-op that exited 0.
+//
+// One algorithm, because the file's own rule at the top holds: two hashes of
+// one tree drift silently and report a mismatch nobody can explain. Measured
+// 6-9 ms over proxy/ (67 files, 856 KB), which is why sync is affordable here.
+export function sourceFingerprintSync(root) {
+  const files = collect(root, root, []).sort();
   const h = createHash("sha256");
   for (const rel of files) {
-    const bytes = await readFile(join(root, rel));
+    const bytes = readFileSync(join(root, rel));
     h.update(rel);
     h.update("\n");
     h.update(createHash("sha256").update(bytes).digest("hex"));
     h.update("\n");
   }
   return h.digest("hex").slice(0, 12);
+}
+
+export async function sourceFingerprint(root) {
+  return sourceFingerprintSync(root);
 }
 
 export const PROXY_ROOT = dirname(fileURLToPath(import.meta.url));
