@@ -10,7 +10,7 @@ import http from "node:http";
 import net from "node:net";
 import { EventEmitter } from "node:events";
 import { getSystemErrorName } from "node:util";
-import { bundleUsable, carriesOurCA, salvageBundle, subsumes } from "./ca-trust.mjs";
+import { ambientStorePath, bundleUsable, carriesOurCA, salvageBundle, subsumes } from "./ca-trust.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SERVER_PATH = resolve(__dirname, "../proxy/server.mjs");
@@ -2303,10 +2303,26 @@ if (remoteControl) {
     // The merged bundle is safe because of how it is built: the ambient corp
     // store first, then every ca-trust.d component. A superset by construction.
     // Our own CA is a superset of nothing.
-    for (const key of caForClaude === caTrustBundle ? ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"] : []) {
-      const verdict = subsumes(caForClaude, claudeEnv[key]);
+    // The gate is a PROOF, not a shape. "The merged bundle is a superset by
+    // construction" is false: it is a superset of the ambient corporate store
+    // only when the builder found one. Measured across one fleet, same file:
+    //   a Linux box     127 certs, 2 components, 125 ambient
+    //   a work Mac      168 certs, 2 components, 166 ambient
+    //   a personal Mac    2 certs, 2 components,   0 ambient
+    // On the last, pointing SSL_CERT_FILE at the "merged" bundle leaves a python
+    // client trusting our two proxies and nothing else.
+    //
+    // No ambient file to name (macOS keychain) means we cannot prove it, so we
+    // do not write. The fix lands where it is provable and never narrows a box
+    // where it is not.
+    const ambient = ambientStorePath();
+    for (const key of ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"]) {
+      const existing = claudeEnv[key] || ambient;
+      const verdict = existing
+        ? subsumes(caForClaude, existing)
+        : { ok: false, reason: "no ambient trust store to compare against on this platform" };
       if (verdict.ok) claudeEnv[key] = caForClaude;
-      else process.stderr.write(
+      else if (claudeEnv[key]) process.stderr.write(
         `cache-fix: keeping your ${key}=${claudeEnv[key]} (${verdict.reason}); `
         + `python clients in this session will not trust the proxy at ${caForClaude}\n`);
     }

@@ -1,6 +1,7 @@
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { withDeadline, exitWithin } from "./child-deadline.mjs";
+import { ambientStorePath } from "../bin/ca-trust.mjs";
 import { fork, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
@@ -355,7 +356,13 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: CONCURRENCY }, () =
     const first = await runWrapper('process.stdout.write("x")', { CLAUDE_CONFIG_DIR: configDir });
     assert.equal(first.code, 0, `fixture run should exit 0, got ${first.code}. stderr: ${first.err}`);
     const ourPem = readFileSync(join(configDir, "ca-trust.d", "ccf.pem"), "utf8");
-    writeFileSync(bundle, `# merged by the launcher\n${ourPem}`);
+    // Built the way the real builder builds it: the AMBIENT store first, then
+    // each component. A components-only fixture is a different machine — the one
+    // the "carries no ambient roots" case covers — and the launcher now
+    // correctly refuses to point python at it.
+    const ambient = ambientStorePath();
+    assert.ok(ambient, "this platform has no ambient CA file, so this case cannot establish its premise");
+    writeFileSync(bundle, `${readFileSync(ambient, "utf8")}\n${ourPem}`);
     pyTrust = { configDir, bundle, ourPem };
     return pyTrust;
   };
@@ -431,6 +438,38 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: CONCURRENCY }, () =
       `an unsubsumed SSL_CERT_FILE must be kept, got: ${res.out}`);
     assert.match(res.err, /keeping your SSL_CERT_FILE/,
       `the refusal must be announced, stderr was: ${res.err}`);
+  });
+
+  it("--remote-control leaves the python vars alone when the bundle carries no ambient roots", async () => {
+    // "The merged bundle is a superset by construction" is FALSE. It is a
+    // superset of the ambient corporate store only when the builder found one.
+    // Measured across this fleet, ~/.claude/ca-trust.pem:
+    //   a Linux box     127 certs, 2 components, 125 ambient
+    //   a work Mac      168 certs, 2 components, 166 ambient
+    //   a personal Mac    2 certs, 2 components,   0 ambient   <- no corp store
+    // On the last one the merged bundle IS the two component CAs, so pointing
+    // SSL_CERT_FILE at it leaves a python client trusting our proxies and
+    // nothing else — the lone-CA bug again, through the door we had just
+    // declared safe.
+    //
+    // So the gate is a PROOF, not a shape: the bundle must subsume the ambient
+    // store. A bundle of components only cannot, and the vars stay untouched.
+    const configDir = tempDir("cffnoamb-");
+    const bundle = join(configDir, "ca-trust.pem");
+    const script = 'process.stdout.write("CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")'
+      + '+"|SSL="+(process.env.SSL_CERT_FILE||"UNSET")+"\\n")';
+
+    const first = await runWrapper(script, { CLAUDE_CONFIG_DIR: configDir });
+    assert.equal(first.code, 0, `first run should exit 0, got ${first.code}. stderr: ${first.err}`);
+    // A components-only bundle: exactly what that Mac has.
+    writeFileSync(bundle, readFileSync(join(configDir, "ca-trust.d", "ccf.pem"), "utf8"));
+
+    const res = await runWrapper(script, { CLAUDE_CONFIG_DIR: configDir });
+    assert.equal(res.code, 0, `Expected exit 0, got ${res.code}. stderr: ${res.err}`);
+    assert.ok(res.out.includes(`CA=${bundle}`),
+      `NODE_EXTRA_CA_CERTS should still take the bundle (node merges), got: ${res.out}`);
+    assert.ok(res.out.includes("SSL=UNSET"),
+      `SSL_CERT_FILE must stay unset when the bundle carries no ambient roots, got: ${res.out}`);
   });
 
   it("--remote-control never makes its own CA the whole python trust world", async () => {

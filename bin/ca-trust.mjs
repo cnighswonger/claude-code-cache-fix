@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { readFileSync, readdirSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { X509Certificate } from "node:crypto";
 import { join } from "node:path";
 
@@ -566,13 +566,20 @@ export function subsumes(bundlePath, existingPath) {
   const blocks = (t) => t.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g) || [];
   // Fingerprints, not text: the same certificate re-wrapped at a different line
   // width is the same trust, and a text compare would call that a loss.
+  // Returns { prints, parsed } — the UNIQUE fingerprints and how many blocks
+  // were read. They differ whenever a store lists the same certificate twice,
+  // which real ones do: Debian's ca-certificates.crt carries 125 blocks and 124
+  // distinct certs. Comparing the marker count against the SET size then reads
+  // that duplicate as unaccounted content and refuses a perfectly good store —
+  // measured, it made the launcher skip the whole ambient comparison on Linux.
   const printsOf = (text) => {
     const out = new Set();
+    let parsed = 0;
     for (const pem of blocks(text)) {
-      try { out.add(new X509Certificate(pem).fingerprint256); }
+      try { out.add(new X509Certificate(pem).fingerprint256); parsed++; }
       catch { return null; }
     }
-    return out;
+    return { prints: out, parsed };
   };
 
   // Count BEGIN markers separately from parsed blocks. A file with a BEGIN and
@@ -581,20 +588,44 @@ export function subsumes(bundlePath, existingPath) {
   // function exists to refuse. Caught by the unparseable test, which passed
   // against the first draft for precisely that reason.
   const begins = (existingText.match(/-----BEGIN CERTIFICATE-----/g) || []).length;
-  const theirs = printsOf(existingText);
-  if (theirs === null) return { ok: false, reason: `${existingPath} has a block we cannot parse` };
-  if (theirs.size !== begins) {
-    return { ok: false, reason: `${existingPath} has ${begins} BEGIN marker(s) but ${theirs.size} readable certificate(s)` };
+  const theirsRead = printsOf(existingText);
+  if (theirsRead === null) return { ok: false, reason: `${existingPath} has a block we cannot parse` };
+  if (theirsRead.parsed !== begins) {
+    return { ok: false, reason: `${existingPath} has ${begins} BEGIN marker(s) but ${theirsRead.parsed} readable certificate(s)` };
   }
+  const theirs = theirsRead.prints;
   if (theirs.size === 0) return { ok: true, reason: "it carried no certificates" };
 
-  let ours;
-  try { ours = printsOf(readFileSync(bundlePath, "utf8")); }
+  let oursRead;
+  try { oursRead = printsOf(readFileSync(bundlePath, "utf8")); }
   catch { return { ok: false, reason: `cannot read ${bundlePath}` }; }
-  if (ours === null) return { ok: false, reason: `${bundlePath} has a block we cannot parse` };
+  if (oursRead === null) return { ok: false, reason: `${bundlePath} has a block we cannot parse` };
+  const ours = oursRead.prints;
 
   const missing = [...theirs].filter((f) => !ours.has(f)).length;
   return missing === 0
     ? { ok: true, reason: `all ${theirs.size} of its certificates are in ours` }
     : { ok: false, reason: `${missing} of its ${theirs.size} certificates are not in ours` };
+}
+
+// Where this platform keeps the trust store an unset SSL_CERT_FILE falls back
+// to. Returns null when there is no FILE to compare against — macOS keeps it in
+// the keychain, which is not enumerable this cheaply, and "cannot name it" must
+// read as "cannot prove", never as "nothing to lose".
+export function ambientStorePath() {
+  // NOT process.env.SSL_CERT_FILE: that is the CLIENT's value, which the caller
+  // already compares against separately. Reading it here would compare a value
+  // to itself and always answer yes.
+  for (const p of [
+    "/etc/ssl/certs/ca-certificates.crt",   // debian, ubuntu, most containers
+    "/etc/pki/tls/certs/ca-bundle.crt",     // rhel, fedora
+    "/etc/ssl/cert.pem",                    // alpine, AND macOS: the system roots
+                                            // exported in OpenSSL form. Measured 128
+                                            // certs on two Macs — so macOS is provable
+                                            // here, not a platform we have to skip.
+  ]) {
+    if (!p) continue;
+    try { if (statSync(p).size > 0) return p; } catch { /* next */ }
+  }
+  return null;
 }

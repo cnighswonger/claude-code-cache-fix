@@ -1674,6 +1674,21 @@ test("subsumes: says yes when there was no old file to lose", () => {
   assert.equal(subsumes(bundleOf(d, "ca-trust.pem", [ours]), undefined).ok, true);
 });
 
+test("subsumes: a store that lists one certificate TWICE is still accepted", () => {
+  // Real stores do this. Debian's /etc/ssl/certs/ca-certificates.crt carries 125
+  // BEGIN markers and 124 distinct certificates. Comparing the marker count
+  // against the SET size read that duplicate as unaccounted content and refused
+  // the store — measured, the launcher then skipped the ambient comparison
+  // entirely on Linux and left SSL_CERT_FILE unset on the one platform where it
+  // is provable. Count PARSED BLOCKS, not unique fingerprints.
+  const d = scratchDir("subsumes-");
+  const [ours, theirs] = twoRoots();
+  const bundle = bundleOf(d, "ca-trust.pem", [theirs, ours]);
+  const dup = bundleOf(d, "with-duplicate.pem", [theirs, theirs]);
+  const r = subsumes(bundle, dup);
+  assert.equal(r.ok, true, `a duplicated certificate must not read as unaccounted, got: ${JSON.stringify(r)}`);
+});
+
 test("subsumes: says NO on a WELL-FORMED block whose body is not a certificate", () => {
   // Distinct from the truncated case above, and the mutation table is why it
   // exists: a BEGIN with no END is caught by the marker-count guard before the
