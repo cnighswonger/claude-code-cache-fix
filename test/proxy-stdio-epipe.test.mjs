@@ -21,21 +21,13 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import net from "node:net";
 import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { join, dirname } from "node:path";
+import { freePort } from "./proc-helpers.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const childPath = join(here, "fixtures", "stdio-epipe-child.mjs");
-
-async function freePort() {
-  const s = net.createServer();
-  await new Promise((r) => s.listen(0, "127.0.0.1", r));
-  const p = s.address().port;
-  await new Promise((r) => s.close(r));
-  return p;
-}
 
 // Cumulative CPU seconds. A wedged proxy spins; a healthy one is ~0. Parsed for
 // both shapes `ps` uses: MM:SS.ss (macOS) and MM:SS / HH:MM:SS (Linux).

@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import https from "node:https";
 import { pathToFileURL, URL } from "node:url";
 import config from "./config.mjs";
-import { forwardRequest, parseAbsoluteForm, getAgent, fallbackProxyUrls, lastHop, directLast } from "./upstream.mjs";
+import { forwardRequest, parseAbsoluteForm, getAgent, fallbackProxyUrls, lastHop, directLast, defaultPort } from "./upstream.mjs";
 import { streamResponse, createTelemetryRecord } from "./stream.mjs";
 import { loadExtensions, snapshotRegistry, runOnRequest, runOnResponseStart, runOnResponse, getFailedExtensions } from "./pipeline.mjs";
 import { startWatcher } from "./watcher.mjs";
@@ -819,7 +819,7 @@ export function upstreamPointsAtSelf(upstream, port, bind) {
   if (!upstream) return "";
   let u;
   try { u = new URL(upstream); } catch { return ""; }
-  const theirPort = Number(u.port) || (u.protocol === "https:" ? 443 : 80);
+  const theirPort = defaultPort(u);
   if (theirPort !== Number(port)) return "";
   const local = new Set(["127.0.0.1", "::1", "localhost", "0.0.0.0", ""]);
   const host = u.hostname.replace(/^\[|\]$/g, "");

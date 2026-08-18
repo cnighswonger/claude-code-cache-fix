@@ -12,20 +12,15 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { exitWithin } from "./child-deadline.mjs";
 import http from "node:http";
-import net from "node:net";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { mkdtempSync, writeFileSync, existsSync, mkdirSync, symlinkSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
+import { freePort } from "./proc-helpers.mjs";
 
 const serverPath = join(dirname(fileURLToPath(import.meta.url)), "..", "proxy", "server.mjs");
 const DELAY_MS = 300;
-
-const freePort = () => new Promise((res) => {
-  const s = net.createServer();
-  s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => res(p)); });
-});
 
 // A stand-in release channel, so the test never depends on the network or on
 // what the real channel happens to say today.

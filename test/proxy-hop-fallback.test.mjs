@@ -10,11 +10,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
-
-const freePort = () => new Promise((res) => {
-  const s = net.createServer();
-  s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => res(p)); });
-});
+import { freePort } from "./proc-helpers.mjs";
 
 describe("hop fallback", () => {
   // A HOP URL MAY CARRY CREDENTIALS, AND stderr IS WORLD-READABLE.
@@ -52,7 +48,6 @@ describe("hop fallback", () => {
     assert.match(said, /127\.0\.0\.1:8118/,
       `the hop was masked out of existence rather than redacted:\n${said}`);
   });
-
 
   // A HEALTHY START MUST NOT REPORT A FAULT.
   //
@@ -168,14 +163,17 @@ describe("hop fallback", () => {
       // catches.
       const readFileSync = (await import("node:fs")).readFileSync;
       for (const [file, re] of [
-        ["../proxy/upstream.mjs", /netConnect\(\{ host: u\.hostname, port: (Number\(u\.port\)[^}]*?) \}\)/],
-        ["../proxy/forward-proxy.mjs", /port: (Number\(u\.port\)[^}]*?) \};/],
-        // THREE copies, not two. bin/gap-relay.mjs carries its own because it
-        // imports node:net and nothing else — it is what runs when the proxy is
-        // DOWN, so depending on proxy/ modules would let a broken one take the
-        // relay with it. The duplication is deliberate; leaving it unchecked was
-        // not, and it was already correct here, which is why the other two read
-        // as a regression against it.
+        // TWO SOURCES, not three. proxy/upstream.mjs owns the one every proxy
+        // caller reaches through defaultPort(); the expression used to be
+        // written out at three sites and TWO of them were fixed for this bug
+        // separately, which is what a single definition prevents.
+        ["../proxy/upstream.mjs", /export const defaultPort = \(u\) => (Number\(u\.port\)[^;]*?);/],
+        // bin/gap-relay.mjs carries its own because it imports node:net and
+        // node:tls and nothing else — it is what runs when the proxy is DOWN, so
+        // depending on proxy/ modules would let a broken one take the relay with
+        // it. The duplication is deliberate; leaving it unchecked was not, and it
+        // was already correct here, which is why the others read as a regression
+        // against it.
         ["../bin/gap-relay.mjs", /const portOf = \(u\) => (Number\(u\.port\)[^;]*?);/],
       ]) {
         const src = readFileSync(new URL(file, import.meta.url), "utf8");

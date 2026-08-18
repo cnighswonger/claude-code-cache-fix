@@ -14,44 +14,16 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import net from "node:net";
-import { execFileSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { OURS, cmdOf, freePort, listeners } from "./proc-helpers.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const launcherPath = join(here, "..", "bin", "claude-via-proxy.mjs");
 const serverPath = join(here, "..", "proxy", "server.mjs");
 
-// NEVER SIGNAL A PID WE KNOW ONLY BY PORT. freePort() binds 0, reads the number
-// and CLOSES, so the OS can hand it to a NEIGHBOURING TEST FILE — node:test runs
-// files concurrently and several of them listen in-process. Every caller below
-// signals or counts what this returns, so an unfiltered answer kills another
-// runner: measured, and it is CI run 32087202771. Filtered HERE and not at the
-// call sites, because it already existed at some of them and the rest never got
-// it. suite-collection.test.mjs pins the expression, pins that this is the only
-// lsof call in the file, and carries the measurements and the two ways the
-// predicate was got wrong before.
-const OURS = /\/(?:bin|proxy)\/[\w.-]+\.mjs\b/;
-const listeners = (port) => {
-  try {
-    return execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN"],
-                        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
-      .trim().split("\n").filter(Boolean)
-      .filter((p) => OURS.test(cmdOf(p)));
-  } catch { return []; }
-};
-const cmdOf = (pid) => {
-  try { return execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" }); }
-  catch { return ""; }
-};
-async function freePort() {
-  const s = net.createServer();
-  await new Promise((r) => s.listen(0, "127.0.0.1", r));
-  const p = s.address().port;
-  await new Promise((r) => s.close(r));
-  return p;
-}
 const probe = (port) => new Promise((res) => {
   const r = http.get({ host: "127.0.0.1", port, path: "/health", agent: false, timeout: 8_000 },
                      (s) => { s.resume(); s.on("end", () => res(s.statusCode === 200 ? "ok" : `ERR:${s.statusCode}`)); });

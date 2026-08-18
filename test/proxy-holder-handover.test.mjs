@@ -8,6 +8,7 @@ import { dirname, join } from "node:path";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { readdirSync, readFileSync } from "node:fs";
+import { OURS, cmdOf, freePort as takePort, listeners } from "./proc-helpers.mjs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
@@ -16,47 +17,19 @@ const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", 
 // running — inside the held-port file it starved a neighbour into failing 4 of
 // 5 runs, and node gives each FILE its own process. One case here, alone.
 
-// NEVER SIGNAL A PID WE KNOW ONLY BY PORT. freePort() binds 0, reads the number
-// and CLOSES, so the OS can hand it to a NEIGHBOURING TEST FILE — node:test runs
-// files concurrently and several of them listen in-process. Every caller below
-// signals or counts what this returns, so an unfiltered answer kills another
-// runner: measured, and it is CI run 32087202771. Filtered HERE and not at the
-// call sites, because it already existed at some of them and the rest never got
-// it. suite-collection.test.mjs pins the expression, pins that this is the only
-// lsof call in the file, and carries the measurements and the two ways the
-// predicate was got wrong before.
-const OURS = /\/(?:bin|proxy)\/[\w.-]+\.mjs\b/;
-function listeners(port) {
-  try {
-    return execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN"],
-                        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
-      .trim().split("\n").filter(Boolean)
-      .filter((p) => OURS.test(cmdOf(p)));
-  } catch { return []; }
-}
-
 // Every port this file hands out, so the sweep at the bottom knows where to
 // look. A standby that has not armed yet holds a socket nobody ever listened
 // on, so `lsof -sTCP:LISTEN` cannot see it while a case is finishing — it
 // becomes visible a couple of seconds later, by which time the case's own
 // cleanup has run and moved on.
 const usedPorts = [];
+// The shared allocator plus this file's own cleanup registry — the registry is
+// file-local (its after() hook sweeps it), the allocation is not.
 async function freePort() {
-  const s = net.createServer();
-  await new Promise((r) => s.listen(0, "127.0.0.1", r));
-  const p = s.address().port;
-  await new Promise((r) => s.close(r));
+  const p = await takePort();
   usedPorts.push(p);
   return p;
 }
-
-// The command line of a pid, or "" if it is gone. Every case here has to tell
-// a holder from a proxy from a standby relay, and they are only distinguishable
-// by what they are running.
-const cmdOf = (pid) => {
-  try { return execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" }); }
-  catch { return ""; }
-};
 
 const probe = (port) => new Promise((res) => {
   const r = http.get({ host: "127.0.0.1", port, path: "/health", agent: false, timeout: 8_000 },

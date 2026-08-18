@@ -325,6 +325,15 @@ export async function resolveHop(isHTTPS) {
 
 const addrOf = (u) => { try { return new URL(u).host; } catch { return u || "direct"; } };
 
+// THE PORT A URL MEANS, defaulted from its scheme. `|| 80` sent an `https://hop`
+// carrying no explicit port to :80, which refuses — so a live TLS hop read as
+// dead and the chain fell through past it. Three call sites had the expression
+// written out by hand and TWO of them were fixed for that bug separately, which
+// is the whole argument for one definition. bin/gap-relay.mjs keeps its own on
+// purpose: it imports node:net and node:tls and nothing else, because it is what
+// runs when the proxy is DOWN.
+export const defaultPort = (u) => Number(u.port) || (u.protocol === "https:" ? 443 : 80);
+
 // Is a hop answering right now? A refused dial is the cheap, immediate signal —
 // measured across a holder restart, a hop that is down REFUSES rather than
 // accepting and hanging, so this costs a syscall and never a timeout.
@@ -335,7 +344,7 @@ export function hopAlive(proxyUrl, timeoutMs = 700) {
     // Default from the SCHEME. `|| 80` dialled :80 for an `https://hop` with no
     // explicit port, which refuses, so a perfectly live TLS hop read as dead and
     // the chain fell through past it — to a fallback, or to a direct dial.
-    const sock = netConnect({ host: u.hostname, port: Number(u.port) || (u.protocol === "https:" ? 443 : 80) });
+    const sock = netConnect({ host: u.hostname, port: defaultPort(u) });
     const done = (ok) => { sock.destroy(); res(ok); };
     sock.on("connect", () => done(true));
     sock.on("error", () => done(false));
@@ -481,11 +490,10 @@ export async function forwardRequest(clientReq, body, signal) {
 
     const isHTTPS = upstreamUrl.protocol === "https:";
     const transport = isHTTPS ? https : http;
-    const defaultPort = isHTTPS ? 443 : 80;
 
     const options = {
       hostname: upstreamUrl.hostname,
-      port: upstreamUrl.port || defaultPort,
+      port: defaultPort(upstreamUrl),
       path: upstreamUrl.pathname + upstreamUrl.search,
       method: clientReq.method,
       headers,

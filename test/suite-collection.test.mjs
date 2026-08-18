@@ -144,8 +144,8 @@ test("every hop-bearing env the relay reads is scrubbed by the fixtures", () => 
     .map((m) => m[1]))];
   assert.ok(reads.length >= 3, `expected the relay to read several hop vars, found ${reads.length}`);
 
-  const src = readFileSync(join(testDir, "proxy-held-port.test.mjs"), "utf8");
-  const list = /const HOP_ENV = \[([\s\S]*?)\];/.exec(src)?.[1];
+  const src = readFileSync(join(testDir, "proc-helpers.mjs"), "utf8");
+  const list = /HOP_ENV = \[([\s\S]*?)\];/.exec(src)?.[1];
   assert.ok(list, "HOP_ENV moved — the fixtures' scrub list is no longer readable from here");
   const scrubbed = new Set([...list.matchAll(/"([A-Za-z_]+)"/g)].map((m) => m[1]));
 
@@ -157,7 +157,8 @@ test("every hop-bearing env the relay reads is scrubbed by the fixtures", () => 
 
   // And the fixtures must go through the shared list, or the next var added to
   // it reaches only the sites someone remembered.
-  assert.equal(/for \(const k of \["HTTPS_PROXY"/.test(src), false,
+  const fixture = readFileSync(join(testDir, "proxy-held-port.test.mjs"), "utf8");
+  assert.equal(/for \(const k of \["HTTPS_PROXY"/.test(fixture), false,
     "a fixture still scrubs a hand-written proxy list instead of ...HOP_ENV");
 });
 
@@ -831,43 +832,28 @@ test("the launcher parses a child-ready line from any address family", () => {
     `never marks the child served:\n  ${bad.join("\n  ")}`);
 });
 
-test("no test file signals a pid it knows only by port", () => {
-  const WANT = "/\\/(?:bin|proxy)\\/[\\w.-]+\\.mjs\\b/";
-  const FILTER = ".filter((p) => OURS.test(cmdOf(p)))";
+test("no test file asks lsof who holds a port", () => {
   // ASSEMBLED, so the needle never appears whole in THIS file. Spelled out, the
-  // detector matched its own source and reported the guard as the violation —
-  // and the obvious repair, excluding this filename, is the worse one: a roster
-  // built from a name list stops covering whatever gets renamed or added. Built
-  // this way the roster stays name-free, and a real lsof call landing HERE would
-  // still be caught.
+  // detector matched its own source and reported the guard as the violation.
   const NEEDLE = 'execFileSync("' + 'lsof"';
-  const files = readdirSync(testDir).filter((f) => f.endsWith(".test.mjs"));
-  const asks = files.filter((f) =>
-    stripComments(readFileSync(join(testDir, f), "utf8")).includes(NEEDLE));
-  // The roster is asserted non-empty because a rename of the helper, or of the
-  // tool it shells out to, would otherwise empty this list and leave the guard
-  // reporting success over nothing.
-  assert.ok(asks.length >= 4,
-    `only ${asks.length} file(s) shell out to lsof — this guard used to cover 4, so ` +
-    `either the helper moved or this detector stopped detecting`);
+  // The ONE legitimate call lives in proc-helpers.mjs, which is not a .test.mjs
+  // — so any hit here is a cleanup that went around listeners() and its OURS
+  // filter. Four files did exactly that once, and two of them then walked UP to
+  // the listener's parent and sent SIGTERM; a stranger's parent is this runner.
+  //
+  // This used to also pin a copy of the OURS regex in every file that had one.
+  // There are no copies now: one definition cannot drift from itself, so the
+  // only thing left to police is a NEW inline call.
+  const helper = stripComments(readFileSync(join(testDir, "proc-helpers.mjs"), "utf8"));
+  assert.ok(helper.includes(NEEDLE) && helper.split(NEEDLE).length - 1 === 1,
+    "proc-helpers.mjs no longer holds the single lsof call — either it moved, in " +
+    "which case this guard now polices nothing, or the detector broke");
 
-  const bad = [];
-  for (const f of asks) {
-    const src = stripComments(readFileSync(join(testDir, f), "utf8"));
-    const decl = /\bconst OURS = (\/(?:\\.|[^/\\\n])+\/[a-z]*);/.exec(src);
-    if (!decl) { bad.push(`${f}: asks lsof who holds a port and declares no OURS predicate`); continue; }
-    if (decl[1] !== WANT) { bad.push(`${f}: OURS is ${decl[1]}, not the pinned ${WANT}`); continue; }
-    if (!src.includes(FILTER)) { bad.push(`${f}: declares OURS but never puts the lsof result through it`); continue; }
-    // AND NOTHING MAY GO AROUND IT. Filtering listeners() is worthless while a
-    // cleanup asks lsof inline, which is what four of them did — two then walked
-    // UP to the listener's PARENT and sent SIGTERM, and a stranger's parent is
-    // this runner. One call per file, inside the guarded helper, is the only
-    // form that cannot be bypassed by the next cleanup somebody writes.
-    const n = src.split(NEEDLE).length - 1;
-    if (n !== 1) bad.push(`${f}: ${n} lsof calls — every one outside listeners() skips OURS`);
-  }
+  const bad = readdirSync(testDir).filter((f) => f.endsWith(".test.mjs"))
+    .filter((f) => stripComments(readFileSync(join(testDir, f), "utf8")).includes(NEEDLE));
   assert.deepEqual(bad, [],
-    `these files can hand a stranger's pid to process.kill():\n  ${bad.join("\n  ")}`);
+    `these files ask lsof directly instead of going through listeners(), so nothing ` +
+    `filters the pid before it reaches process.kill():\n  ${bad.join("\n  ")}`);
 });
 
 test("the suite derives its parallelism from the machine", () => {

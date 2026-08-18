@@ -11,40 +11,16 @@ import { join, dirname } from "node:path";
 import { startProxy, upstreamPointsAtSelf } from "../proxy/server.mjs";
 import { startWatcher } from "../proxy/watcher.mjs";
 import { loadExtensions, getRegistry } from "../proxy/pipeline.mjs";
+import { OURS, cmdOf, freePort as takePort, listeners } from "./proc-helpers.mjs";
 
 const serverPath = join(dirname(fileURLToPath(import.meta.url)), "..", "proxy", "server.mjs");
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
-// NEVER SIGNAL A PID WE KNOW ONLY BY PORT. freePort() binds 0, reads the number
-// and CLOSES, so the OS can hand it to a NEIGHBOURING TEST FILE — node:test runs
-// files concurrently and several of them listen in-process. Every caller below
-// signals or counts what this returns, so an unfiltered answer kills another
-// runner: measured, and it is CI run 32087202771. Filtered HERE and not at the
-// call sites, because it already existed at some of them and the rest never got
-// it. suite-collection.test.mjs pins the expression, pins that this is the only
-// lsof call in the file, and carries the measurements and the two ways the
-// predicate was got wrong before.
-const OURS = /\/(?:bin|proxy)\/[\w.-]+\.mjs\b/;
-function listeners(port) {
-  try {
-    return execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN"],
-                        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
-      .trim().split("\n").filter(Boolean)
-      .filter((p) => OURS.test(cmdOf(p)));
-  } catch { return []; }
-}
-
-const cmdOf = (pid) => {
-  try { return execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" }); }
-  catch { return ""; }
-};
-
 const usedPorts = [];
+// The shared allocator plus this file's own cleanup registry — the registry is
+// file-local (its after() hook sweeps it), the allocation is not.
 async function freePort() {
-  const s = net.createServer();
-  await new Promise((r) => s.listen(0, "127.0.0.1", r));
-  const p = s.address().port;
-  await new Promise((r) => s.close(r));
+  const p = await takePort();
   usedPorts.push(p);
   return p;
 }
@@ -631,7 +607,6 @@ describe("zero-downtime reload", () => {
       }
     }
   });
-
 
   // `LISTEN_FDS` reaches every descendant, so a proxy can be handed a claim for
   // a socket it does not have. Both doors: named for another pid, and named for

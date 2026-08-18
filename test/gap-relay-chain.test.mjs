@@ -19,16 +19,9 @@ import net from "node:net";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { freePort } from "./proc-helpers.mjs";
 
 const relayPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "gap-relay.mjs");
-
-const freePort = async () => {
-  const s = net.createServer();
-  await new Promise((r) => s.listen(0, "127.0.0.1", r));
-  const p = s.address().port;
-  await new Promise((r) => s.close(r));
-  return p;
-};
 
 // An endpoint that records being reached and answers a CONNECT. Every one of
 // them records, so a failure names which was touched instead of leaving an

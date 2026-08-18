@@ -11,19 +11,9 @@ import { tmpdir, availableParallelism } from "node:os";
 import { join, dirname } from "node:path";
 
 import { sourceFingerprintSync } from "../proxy/source-fingerprint.mjs";
+import { HOP_ENV, OURS, cmdOf, freePort as takePort, listeners } from "./proc-helpers.mjs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
-
-// EVERY variable that can give a child an outbound hop, in one list because six
-// fixtures scrub it and a per-fixture copy is how one gets missed. It was: five
-// of them dropped the four *_PROXY names and none dropped the two CACHE_FIX
-// ones, which the relay reads FIRST (bin/gap-relay.mjs) — so a maintainer behind
-// a corp proxy ran the suite, the relay carried to it, and its host:port went
-// into the 503 body that a failure message now prints. This repo is public and
-// that is the hostname-port class its hygiene rule bans.
-const HOP_ENV = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
-                 "ALL_PROXY", "all_proxy",
-                 "CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_REQUIRE_HOP", "CACHE_FIX_FALLBACK_PROXIES"];
 
 // WHAT A PROBE RESULT MEANS. One definition, because four hand-rolled ones is
 // how the same lesson gets learned once per case and then goes red again in the
@@ -62,42 +52,11 @@ function classify(body) {
   return OUTAGE.RESET;
 }
 
-// Whoever is LISTENING on a port, by port rather than by parentage. The
-// self-heal spawns a DETACHED successor, so it is nobody's child and `pgrep -P`
-// cannot see it — the only durable handle on it is the address it took.
-// NEVER SIGNAL A PID WE KNOW ONLY BY PORT. freePort() binds 0, reads the number
-// and CLOSES, so the OS can hand it to a NEIGHBOURING TEST FILE — node:test runs
-// files concurrently and several of them listen in-process. Every caller below
-// signals or counts what this returns, so an unfiltered answer kills another
-// runner: measured, and it is CI run 32087202771. Filtered HERE and not at the
-// call sites, because it already existed at some of them and the rest never got
-// it. suite-collection.test.mjs pins the expression, pins that this is the only
-// lsof call in the file, and carries the measurements and the two ways the
-// predicate was got wrong before.
-const OURS = /\/(?:bin|proxy)\/[\w.-]+\.mjs\b/;
-function listeners(port) {
-  try {
-    return execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN"],
-                        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
-      .trim().split("\n").filter(Boolean)
-      .filter((p) => OURS.test(cmdOf(p)));
-  } catch { return []; }
-}
-
-// The command line of a pid, or "" if it is gone. Every case here has to tell
-// a holder from a proxy from a standby relay, and they are only distinguishable
-// by what they are running.
-const cmdOf = (pid) => {
-  try { return execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" }); }
-  catch { return ""; }
-};
-
 const usedPorts = [];
+// The shared allocator plus this file's own cleanup registry — the registry is
+// file-local (its after() hook sweeps it), the allocation is not.
 async function freePort() {
-  const s = net.createServer();
-  await new Promise((r) => s.listen(0, "127.0.0.1", r));
-  const p = s.address().port;
-  await new Promise((r) => s.close(r));
+  const p = await takePort();
   usedPorts.push(p);
   return p;
 }

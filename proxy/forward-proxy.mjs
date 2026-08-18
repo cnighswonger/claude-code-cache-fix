@@ -25,7 +25,7 @@ import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { randomBytes, X509Certificate, createPublicKey } from "node:crypto";
 import config from "./config.mjs";
-import { getAgent, resolveHop, requireHop } from "./upstream.mjs";
+import { getAgent, resolveHop, requireHop, defaultPort } from "./upstream.mjs";
 import { discoverBucket } from "./downloads-bucket.mjs";
 
 function upstreamHost() {
@@ -295,7 +295,7 @@ function parseProxy(url) {
   // HttpsProxyAgent, which reads the scheme itself. So one chain was dialled
   // correctly by one caller and in the clear by two others.
   try { const u = new URL(url); return { host: u.hostname, secure: u.protocol === "https:",
-                                         port: Number(u.port) || (u.protocol === "https:" ? 443 : 80) }; }
+                                         port: defaultPort(u) }; }
   catch { return null; }
 }
 
