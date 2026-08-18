@@ -404,10 +404,19 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: CONCURRENCY }, () =
     const first = await runWrapper(script, { CLAUDE_CONFIG_DIR: configDir });
     assert.equal(first.code, 0, `first run should exit 0, got ${first.code}. stderr: ${first.err}`);
     writeFileSync(bundle, `# merged by the launcher\n${readFileSync(join(configDir, "ca-trust.d", "ccf.pem"), "utf8")}`);
-    // A root the bundle does NOT carry: our own CA from an unrelated config dir.
-    const otherDir = tempDir("cffother-");
-    await runWrapper('process.stdout.write("x")', { CLAUDE_CONFIG_DIR: otherDir });
-    writeFileSync(foreign, readFileSync(join(otherDir, "ca-trust.d", "ccf.pem"), "utf8"));
+    // A root the bundle does NOT carry. Minted in-process rather than by running
+    // a second launcher: this file already runs concurrently with the timing
+    // cases in proxy-held-port.test.mjs, and an extra spawned launcher+proxy is
+    // load those cases lose their windows to. Same fixture, none of the cost.
+    const { ensureCA } = await import(resolve(__dirname, "../proxy/forward-proxy.mjs"));
+    const otherCaDir = tempDir("cffother-");
+    const savedCaDir = process.env.CACHE_FIX_CA_DIR;
+    process.env.CACHE_FIX_CA_DIR = otherCaDir;
+    try { ensureCA(); } finally {
+      if (savedCaDir === undefined) delete process.env.CACHE_FIX_CA_DIR;
+      else process.env.CACHE_FIX_CA_DIR = savedCaDir;
+    }
+    writeFileSync(foreign, readFileSync(join(otherCaDir, "ca.pem"), "utf8"));
 
     const res = await runWrapper(script, { CLAUDE_CONFIG_DIR: configDir, SSL_CERT_FILE: foreign });
     assert.equal(res.code, 0, `Expected exit 0, got ${res.code}. stderr: ${res.err}`);

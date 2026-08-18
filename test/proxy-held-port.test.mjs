@@ -1847,6 +1847,15 @@ describe("deploy watcher (CACHE_FIX_WATCH_DEPLOY_MS)", () => {
   // change for reasons this suite is not about. Measured: under full-suite load
   // the pid moved at 625 ms while the announcement had not been written yet, so
   // asserting on the log straight after a pid change failed a working watcher.
+  //
+  // THE WINDOW IS A LOAD BUDGET, NOT A LATENCY BOUND. The watcher ticks every
+  // 300 ms, so the old 10 s allowed 33 ticks and still went red on CI once —
+  // node:test runs FILES concurrently, and this file competes with suites that
+  // spawn launchers and proxies of their own. Missing 33 consecutive ticks means
+  // this launcher went ~10 s without the CPU to run a setInterval callback,
+  // which says nothing about the watcher. Widened rather than left to flake: a
+  // working watcher failing under a neighbour's load is a false red, and a
+  // broken one still never announces at any window.
   const saidWithin = async (stderr, ms) => {
     const until = Date.now() + ms;
     while (Date.now() < until) {
@@ -1865,7 +1874,7 @@ describe("deploy watcher (CACHE_FIX_WATCH_DEPLOY_MS)", () => {
       // different process serving. The log alone would pass on a watcher that
       // announces and does nothing; the pid alone counts any restart, including
       // ones this case is not about.
-      assert.ok(await saidWithin(stderr, 10_000),
+      assert.ok(await saidWithin(stderr, 30_000),
         "the watcher never noticed a deploy that landed on disk. Launcher stderr: " +
         JSON.stringify(stderr().slice(-400)));
       const after = await settleFor(launcher, before, 8_000);
