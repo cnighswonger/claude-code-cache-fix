@@ -1108,11 +1108,17 @@ function holdPort(rest) {
     const reclaim = () => {
       if (stopping || bound) return;
       clearTimeout(reclaiming);
+      // OFF ON EITHER OUTCOME. `again` used to remove itself only when it
+      // FIRED, so the listen that finally SUCCEEDS left it attached for the life
+      // of the process — pointed at state from an attempt that is over. Both
+      // ladders in this file had it; fixing one leaves the other.
+      const settled = () => { holder.off("error", again); holder.off("listening", settled); };
       const again = () => {
-        holder.off("error", again);
+        settled();
         reclaiming = setTimeout(reclaim, ++tries < 100 ? 1 : 20);
       };
       holder.on("error", again);
+      holder.on("listening", settled);
       holder.listen({ port, host: bind });
     };
 
@@ -1655,8 +1661,15 @@ function holdPort(rest) {
             `[cache-fix] could not take port ${port} from pid ${incumbent} within 20s\n`);
           return settle(1);
         }
-        const again = () => { holder.off("error", again); setTimeout(retry, 50); };
+        // OFF ON EITHER OUTCOME, for the reason spelled out at the other ladder.
+        // Here it is worse than a leak: `deadline` was captured 20 s before the
+        // winning bind, so a later 'error' on this holder re-enters retry(),
+        // reads Date.now() > deadline, prints "could not take port within 20s"
+        // and settles 1 — on a holder that is live and serving.
+        const settled = () => { holder.off("error", again); holder.off("listening", settled); };
+        const again = () => { settled(); setTimeout(retry, 50); };
         holder.on("error", again);
+        holder.on("listening", settled);
         holder.listen({ port, host: bind });
       };
       retry();

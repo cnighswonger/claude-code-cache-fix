@@ -364,6 +364,37 @@ function closesAt(src, open, mode = "brace") {
 // the word inside a nearby COMMENT and widened the slice to 1,587 chars of
 // unrelated code. A guard whose scope grows when its subject moves reports on
 // whatever happens to be nearby.
+test("a retry's error listener leaves when the bind succeeds", () => {
+  const src = stripComments(readFileSync(join(testDir, "..", "bin", "claude-via-proxy.mjs"), "utf8"));
+
+  // COUNTED, NOT WINDOWED. The first cut matched a few lines after `const again`
+  // and broke the moment the fix made one of the two arrows multi-line — the
+  // third time today a guard of mine was defeated by its own byte window rather
+  // than by the code. Pairing the counts asks the question directly: every
+  // ladder that ARMS an error listener must also arm the success handler that
+  // takes it off again.
+  const armed = (src.match(/holder\.on\("error", again\)/g) || []).length;
+  const disarmed = (src.match(/holder\.on\("listening", settled\)/g) || []).length;
+
+  // BOTH LADDERS. release()'s is the live one; reclaim()'s is unreachable today
+  // (its `bound` guard never resets — measured), which is exactly why it must
+  // not be left as a trap for whoever revives it.
+  assert.equal(armed, 2,
+    `expected two retry ladders arming holder.on("error", again), found ${armed} — ` +
+    `they moved, and this guard no longer describes them`);
+
+  // `again` removes itself only when it FIRES. The listen that SUCCEEDS never
+  // emits 'error', so without a success handler it stays attached for the life
+  // of the process — and in release() it points at a `deadline` captured 20 s
+  // before the winning bind, so a later 'error' re-enters retry(), reads
+  // Date.now() > deadline, prints "could not take port within 20s" and settles
+  // 1 on a holder that is live and serving.
+  assert.equal(disarmed, armed,
+    `${armed} ladders arm an 'error' listener but only ${disarmed} remove it on the ` +
+    `SUCCESS path — the winning listen leaves one attached, pointed at a deadline ` +
+    `that has already passed`);
+});
+
 test("the SIGUSR2 successor is told the port it must bind", () => {
   const src = stripComments(readFileSync(join(testDir, "..", "bin", "claude-via-proxy.mjs"), "utf8"));
   const at = src.indexOf("const successor = spawn(");
