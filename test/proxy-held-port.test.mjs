@@ -1379,6 +1379,52 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
     // faked tree because the surrounding rule is a pure function of what `ps`
     // reports, and the two-real-deploys version of this case starved two
     // timing-sensitive cases elsewhere by load alone.
+    // A FAILED SPAWN MUST REACH THE RESTART LADDER, NOT END THE HOLDER.
+    //
+    // The child's 'error' handler called settle(1), so ONE spawn error ended the
+    // holder outright while the close handler beside it exists to retry exactly
+    // this — five times, with backoff. And the errnos that arrive on 'error' are
+    // the transient ones by construction: node routes EACCES, EAGAIN, EMFILE,
+    // ENFILE and ENOENT there and throws the rest, so this path is fork pressure
+    // and descriptor exhaustion, which is what a supervisor is FOR.
+    //
+    // Worse in context: closeGap() SIGKILLs the gap immediately before the spawn,
+    // so settling here left the socket to the detached standby alone — the
+    // address answers 503 forever with no supervisor to put a proxy back.
+    //
+    // Measured on 18.20.8 / 20.20.2 / 24.11.1, spawning a missing binary:
+    //     with a listener      ["error:ENOENT", "close:-2/null"]
+    //     without one          uncaughtException, the process dies
+    // `close` fires on this path too, which is why reporting and returning is
+    // the whole fix: the ladder already knows what to do with a child that died
+    // before serving.
+    //
+    // LIFTED AND RUN, not grepped. `settle` is a spy, so a handler that calls it
+    // fails here for the reason it would fail in production.
+    it("routes a failed proxy spawn into the restart ladder instead of settling", () => {
+      const src = readFileSync(launcherPath, "utf8");
+      const handler = /me\.on\("error", \(err\) => \{[\s\S]*?\n      \}\);/.exec(src)?.[0];
+      assert.ok(handler,
+        "the child's error handler moved — this no longer tests what a failed spawn does");
+
+      const settled = [], said = [];
+      let onError = null;
+      const me = { on: (ev, fn) => { if (ev === "error") onError = fn; } };
+      const proc = { stderr: { write: (x) => said.push(x) } };
+      // eslint-disable-next-line no-new-func
+      Function("me", "settle", "process", handler)(me, (c) => settled.push(c), proc);
+      assert.ok(onError, "the lifted handler registered nothing");
+
+      onError(Object.assign(new Error("spawn EAGAIN"), { code: "EAGAIN" }));
+      assert.deepEqual(settled, [],
+        "a transient spawn failure settled the holder — the ladder below would have " +
+        "retried it, and the gap was already killed, so this hands the address to the " +
+        "standby with nobody left to put a proxy back");
+      assert.match(said.join(""), /EAGAIN/,
+        "the errno was not reported, so the one line that says WHY the proxy is not " +
+        "starting is missing from the log a reader would open");
+    });
+
     // THE CHILD MUST BE TOLD THE ADDRESS THE HOLDER ACTUALLY HOLDS.
     //
     // The spawn env pinned CACHE_FIX_PROXY_BIND to the literal "127.0.0.1"

@@ -1785,4 +1785,39 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: CONCURRENCY }, () =
       `reported keeping a merge it did not keep. got stderr: ${err}`);
   });
 
+
+  // A fork() THAT NEVER STARTS MUST STILL CLEAN UP AND SAY WHY.
+  //
+  // fork() reports EACCES, EAGAIN, EMFILE, ENFILE and ENOENT by EMITTING
+  // 'error' on the ChildProcess rather than throwing, and an 'error' with no
+  // listener is an uncaughtException. This site had only an 'exit' handler, and
+  // 'exit' does NOT fire on a failed spawn — measured on 18.20.8 / 20.20.2 /
+  // 24.11.1, the events are ["error:ENOENT", "close:-2/null"]. So a proxy that
+  // could not be forked printed a node stack instead of this file's own message
+  // and skipped cleanup() entirely.
+  //
+  // Lifted and run rather than grepped: a grep for `proxyProc.on("error"` passes
+  // on a handler that does nothing, and doing nothing here is the failure.
+  it("reports a proxy that could not be forked, and still cleans up", () => {
+    const src = readFileSync(WRAPPER_PATH, "utf8");
+    const handler = /proxyProc\.on\("error", \(err\) => \{[\s\S]*?\n\}\);/.exec(src)?.[0];
+    assert.ok(handler, "the fork error handler is gone — a failed fork is an uncaughtException again");
+
+    const said = [], exits = [];
+    let cleaned = 0, onError = null;
+    const proxyProc = { on: (ev, fn) => { if (ev === "error") onError = fn; } };
+    const proc = { stderr: { write: (x) => said.push(x) }, exit: (c) => exits.push(c) };
+    // eslint-disable-next-line no-new-func
+    Function("proxyProc", "cleanup", "process", handler)(proxyProc, () => cleaned++, proc);
+    assert.ok(onError, "the lifted handler registered nothing");
+
+    onError(Object.assign(new Error("spawn EAGAIN"), { code: "EAGAIN" }));
+    assert.match(said.join(""), /EAGAIN/,
+      "the errno was not reported, so the only clue why the proxy never started is missing");
+    assert.equal(cleaned, 1,
+      "cleanup() was skipped on a failed fork — the exit path this file relies on never ran");
+    assert.deepEqual(exits, [1],
+      "a wrapper whose proxy never started must not exit 0; a caller reads that as success");
+  });
+
 });

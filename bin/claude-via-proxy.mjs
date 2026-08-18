@@ -1338,9 +1338,26 @@ function holdPort(rest) {
         // without bound; keep only enough tail to finish a split announcement.
         if (buf.length > 4096) buf = buf.slice(-256);
       });
+      // A FAILED SPAWN IS A FAILED START, AND THE LADDER OWNS THOSE.
+      //
+      // This settled — so ONE transient spawn error ended the holder outright,
+      // while the close handler right below exists to retry exactly this, five
+      // times, with backoff. The errnos that arrive here are the transient ones
+      // by construction: node routes EACCES, EAGAIN, EMFILE, ENFILE and ENOENT
+      // to 'error' and throws the rest, so this path is fork pressure and
+      // descriptor exhaustion — the conditions a supervisor is for, not ones to
+      // give the address up over. closeGap() ran just before the spawn, so
+      // settling here also left the socket to the detached standby alone: the
+      // address answers 503 forever with no supervisor to put a proxy back.
+      //
+      // Measured on 18.20.8 / 20.20.2 / 24.11.1, spawning a missing binary:
+      // the events are ["error:ENOENT", "close:-2/null"] — `close` fires on this
+      // path too, so doing nothing but reporting hands the case to the ladder
+      // with no extra wiring. Giving up is still reachable and still bounded:
+      // five failures with nothing served reaches settle() there.
       me.on("error", (err) => {
-        process.stderr.write(`Failed to start proxy server: ${err.message}\n`);
-        settle(1);
+        process.stderr.write(
+          `[cache-fix] proxy spawn failed (${err?.code || err?.message}); retrying through the restart ladder\n`);
       });
       me.on("close", (code, sig) => {
         // NOBODY IS SERVING FROM HERE UNTIL THE NEXT CHILD BINDS. Put the gap
@@ -1986,6 +2003,17 @@ function cleanup() {
   if (claudeProc && !claudeProc.killed) claudeProc.kill("SIGTERM");
   if (proxyProc && !proxyProc.killed) proxyProc.kill("SIGTERM");
 }
+
+// Same class as the holder's spawn: fork() reports EAGAIN/EMFILE/ENOENT on the
+// ChildProcess, not by throwing, and an unhandled 'error' is an uncaughtException.
+// Here it would print a stack instead of this file's own message and skip
+// cleanup() entirely. 'exit' does not fire on a failed spawn (measured: error
+// then close, no exit), so this listener is the only thing on that path.
+proxyProc.on("error", (err) => {
+  process.stderr.write(`proxy failed to start (${err?.code || err?.message})\n`);
+  cleanup();
+  process.exit(1);
+});
 
 proxyProc.on("exit", (code) => {
   if (!exiting) {
