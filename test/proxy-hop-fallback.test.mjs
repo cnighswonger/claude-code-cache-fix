@@ -290,6 +290,53 @@ describe("hop fallback", () => {
     }
   });
 
+  // A REFUSAL IS NOT A FALL-OPEN, AND direct_last MUST NOT SAY IT WAS.
+  //
+  // resolveHop stamps _directLast when nothing in the chain answered, and that
+  // is right when the caller then dials. Under CACHE_FIX_REQUIRE_HOP=1 no caller
+  // does: forward-proxy.mjs:318 and :372 answer 502 unconditionally, and
+  // forwardRequest throws. The one host exempt from that gate is a NO_PROXY host,
+  // and forwardRequest does not call resolveHop for one at all — so there is no
+  // path from here to an actual direct dial while the flag is set.
+  //
+  // /health published direct_last anyway. An operator sets REQUIRE_HOP precisely
+  // to guarantee no unpinned egress; the field that would tell them the guarantee
+  // broke was reporting a break on every failed resolve.
+  //
+  // BOTH POLARITIES, in one case and in this order: the refusing arm proves the
+  // stamp is withheld, and the control arm right after proves the instrument can
+  // still stamp at all. Without the control, deleting the stamp entirely would
+  // pass the first half.
+  it("does not stamp direct_last when CACHE_FIX_REQUIRE_HOP refuses the dial", async () => {
+    const { resolveHop, directLast } = await import("../proxy/upstream.mjs");
+    const dead = `http://127.0.0.1:${await freePort()}`;
+    const ENV = ["CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_REQUIRE_HOP", "HTTPS_PROXY", "https_proxy",
+                 "HTTP_PROXY", "http_proxy", "CACHE_FIX_FALLBACK_PROXIES", "CACHE_FIX_CHAIN_GRACE_MS"];
+    const prior = Object.fromEntries(ENV.map((k) => [k, process.env[k]]));
+    for (const k of ENV) delete process.env[k];
+    try {
+      process.env.CACHE_FIX_FALLBACK_PROXIES = dead;
+
+      process.env.CACHE_FIX_REQUIRE_HOP = "1";
+      const before = directLast();
+      assert.equal(await resolveHop(true), "", "premise: an unreachable chain must resolve to empty");
+      assert.equal(directLast(), before,
+        "direct_last was stamped while REQUIRE_HOP=1 refused every dial — /health now " +
+        "reports an unpinned egress that never happened, to the operator who set the " +
+        "flag to make sure one could not");
+
+      delete process.env.CACHE_FIX_REQUIRE_HOP;
+      assert.equal(await resolveHop(true), "", "premise: the same chain is still unreachable");
+      assert.notEqual(directLast(), before,
+        "control: with the flag off the caller DOES dial direct, so the stamp must land — " +
+        "if this fails the stamp is gone entirely rather than correctly withheld");
+    } finally {
+      for (const [k, v] of Object.entries(prior)) {
+        if (v === undefined) delete process.env[k]; else process.env[k] = v;
+      }
+    }
+  });
+
   it("refuses fast rather than waiting out a timeout", async () => {
     const { hopAlive } = await import("../proxy/upstream.mjs");
     const dead = `http://127.0.0.1:${await freePort()}`;

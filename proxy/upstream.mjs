@@ -305,10 +305,21 @@ export async function resolveHop(isHTTPS) {
   // Nothing in the chain answered. A direct dial is the pin's fail-open stance
   // too ("egress DIRECT — no chain hop reachable"), and it beats 502: the
   // request goes out unpinned rather than not at all.
-  const note = `hop ${addrOf(primary)} unusable — no chain hop reachable, dialling direct`;
+  //
+  // UNLESS THE OPERATOR FORBADE IT. requireHop() makes every caller refuse
+  // instead of dialling — forward-proxy.mjs:318 and :372 unconditionally, and
+  // forwardRequest below for every host that gets here at all (a NO_PROXY host
+  // never calls resolveHop, so the bypass exemption cannot reach this line).
+  // Stamping regardless reported an unpinned egress that did not happen, on
+  // /health's `direct_last`, to the one operator who set the flag precisely to
+  // guarantee it could not — and the stderr line said "dialling direct" about
+  // the same non-event. A field that cries wolf is worth less than no field.
+  const refusing = requireHop();
+  const note = `hop ${addrOf(primary)} unusable — no chain hop reachable, `
+             + (refusing ? "refusing (CACHE_FIX_REQUIRE_HOP=1)" : "dialling direct");
   if (note !== _lastHopReport) { _lastHopReport = note; process.stderr.write(`[upstream] ${note}\n`); }
   _lastHop = "";
-  _directLast = new Date().toISOString();
+  if (!refusing) _directLast = new Date().toISOString();
   return "";
 }
 
