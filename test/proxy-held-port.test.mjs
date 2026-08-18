@@ -1282,8 +1282,28 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
           })();
           setTimeout(() => {
             let kid = 0;
+            // THE PROXY, BY ROLE, NOT BY POSITION. `pgrep -P` lists in pid
+            // order and the holder spawns its STANDBY GAP RELAY before the
+            // proxy, so [0] is the relay — measured 3 for 3,
+            // children=[<pid>:gap-relay.mjs <pid>:scratch-fake-server-*]. This
+            // case is named "when THE PROXY under it dies" and was killing the
+            // standby, so it asserted nothing about a proxy death and was green
+            // for that reason.
+            //
+            // Third time this file has been bitten by taking a holder's first
+            // child, and the other two left their measurements in place:
+            // pidOn() ("taking the first one made every restart look like no
+            // restart") and countProxies() ("a holder also parents one standby
+            // relay, so counting children counts something else"). Neither
+            // swept here.
+            //
+            // NOT claimed as the fix for the CI 38-of-40 red. That failure was
+            // NOT reproduced with either selection under two cores and six
+            // burners, 5 reps each, both refused=0. This lands because the case
+            // did not test what its name says, which IS measured.
             try { kid = Number(execFileSync("pgrep", ["-P", String(launcher.pid)], { encoding: "utf8" })
-                                .trim().split("\n")[0]); } catch {}
+                                .trim().split("\n").filter(Boolean)
+                                .find((q) => /scratch-fake-server-/.test(cmdOf(q)))); } catch {}
             if (kid > 1) { try { process.kill(kid, "SIGKILL"); } catch {} }
           }, 250);
           await hammer;
@@ -2078,6 +2098,39 @@ describe("deploy watcher (CACHE_FIX_WATCH_DEPLOY_MS)", () => {
         "the watcher acted while self-heal was OFF — the one thing that switch " +
         "exists to prevent");
     }, { watchMs: 300, selfHeal: "off" });
+  });
+
+  // THE ANNOUNCE IS PART OF THE FEATURE, SO THE SWITCH HAS TO COVER IT TOO.
+  //
+  // The respawn-side announcement runs on the SPAWN path, not on the watcher's
+  // interval — so before it was gated on watchMs, a child that died while the
+  // bytes differed printed "source changed" with the feature OFF. The two cases
+  // below already forbid that string when it is off, and the SELF_HEAL one
+  // records in its own comment that a pid change IS reachable in its window
+  // ("the holder rebinding and spawning a successor ... red on two node
+  // versions"). So they caught this only when a respawn happened to land inside
+  // their sampling window — a coincidence, not a guard.
+  //
+  // This case removes the coincidence: kill the child OUTRIGHT with the bytes
+  // already changed and the feature off. Same shape the block above describes —
+  // a switch that predates a path, so the path looks covered and is not —
+  // reached this time through an announcement rather than through a restart.
+  it("says nothing on a restart into changed bytes when the watcher is off", async () => {
+    await withFakeProxy(serving, async ({ launcher, serverFile, stderr }) => {
+      const before = await settleFor(launcher, 0, 8_000);
+      assert.ok(before, "the stand-in proxy never started");
+      await writeFile(serverFile, serving + "\n// operator is editing\n");
+      try { process.kill(before, "SIGKILL"); } catch { }
+      const after = await settleFor(launcher, before, 8_000);
+      assert.ok(after && after !== before,
+        "no respawn happened, so this measured nothing — the case needs a real restart");
+      await new Promise((r) => setTimeout(r, 1_000));
+      assert.doesNotMatch(stderr(), /source changed/,
+        "a restart announced a deploy while the watcher was OFF. Nothing acted, so " +
+        "nothing is broken for the operator — but the switch is supposed to mean " +
+        "the feature is not running, and its own voice says otherwise. Launcher " +
+        "stderr: " + JSON.stringify(stderr().slice(-300)));
+    }, { selfHeal: "off" });
   });
 
   it("is off unless asked for", async () => {

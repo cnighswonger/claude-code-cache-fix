@@ -787,6 +787,13 @@ function holdPort(rest) {
     // The sha256 the CURRENT child booted from, so a deploy can reach the
     // running process without a human. See the watcher below.
     let bootedHash = "";
+    // HOISTED ABOVE THE SPAWN, because the respawn path announces and has to
+    // honour the same switch the watcher does. It reads only process.env, so it
+    // has no ordering constraint of its own; it used to sit beside the interval
+    // it gates, which put it AFTER the spawn site that now also needs it.
+    const watchMs = process.env.CACHE_FIX_SELF_HEAL === "off"
+      ? 0
+      : Number(process.env.CACHE_FIX_WATCH_DEPLOY_MS) || 0;
     // `run-service` is idempotent: re-running it must not put a second proxy
     // beside the first. Only the holder can answer that, because the bind is
     // the only thing that knows whether the port is already taken.
@@ -1131,7 +1138,18 @@ function holdPort(rest) {
       // fact worth logging. Two writers to one variable is what hid this; now
       // both of them say the same thing when the answer moves.
       const spawningHash = codeFingerprint(SERVER_PATH);
-      if (bootedHash && spawningHash && spawningHash !== bootedHash) {
+      // watchMs > 0 GATES THIS TOO. The announcement is part of the deploy
+      // watcher, not a free fact about the spawn, so `SELF_HEAL=off` and an
+      // unset WATCH_DEPLOY_MS have to silence it the same way they silence the
+      // interval. Without this it printed "source changed" with the feature off
+      // — measured, and the two cases that forbid that string when it is off
+      // caught it only when a respawn happened to land inside their sampling
+      // window, which is the coincidence the new case removes.
+      //
+      // This is the same shape as the defect the block below records: a switch
+      // that predates a path, so the path looks covered and is not. Second time
+      // in this file, reached through the announcement instead of the restart.
+      if (watchMs > 0 && bootedHash && spawningHash && spawningHash !== bootedHash) {
         process.stderr.write(
           `[cache-fix] proxy source changed (${bootedHash.slice(0, 12)} -> ` +
           `${spawningHash.slice(0, 12)}); this restart picks it up\n`);
@@ -1568,9 +1586,6 @@ function holdPort(rest) {
     //
     // cswap's pin had the identical defect and found it from this side of the
     // conversation. Same shape, both codebases, both added after the switch.
-    const watchMs = process.env.CACHE_FIX_SELF_HEAL === "off"
-      ? 0
-      : Number(process.env.CACHE_FIX_WATCH_DEPLOY_MS) || 0;
     let warnedUnreadable = false;
     if (watchMs > 0) {
       const watcher = setInterval(() => {

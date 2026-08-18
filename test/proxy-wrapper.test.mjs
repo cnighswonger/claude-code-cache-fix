@@ -1,7 +1,6 @@
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { withDeadline, exitWithin } from "./child-deadline.mjs";
-import { ambientStorePath } from "../bin/ca-trust.mjs";
 import { fork, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
@@ -159,6 +158,34 @@ const waitClose = (p) => new Promise((res) => {
   const t = setTimeout(() => { p.kill("SIGTERM"); res(null); }, 15_000);
   p.on("close", (c) => { clearTimeout(t); res(c); });
 });
+
+// LIVES HERE, NOT IN bin/. Its only caller is the fixture below, and
+// production stopped having one when the launcher's replace-class write was
+// deleted — shipping it in bin/ made it dead API on every install. Moved
+// rather than deleted: the fixture has to build its bundle the way the real
+// builder does, ambient store first, and inlining platform detection at the
+// call site is what this function exists to avoid.
+// Where this platform keeps the trust store an unset SSL_CERT_FILE falls back
+// to. Returns null when there is no FILE to compare against — macOS keeps it in
+// the keychain, which is not enumerable this cheaply, and "cannot name it" must
+// read as "cannot prove", never as "nothing to lose".
+function ambientStorePath() {
+  // NOT process.env.SSL_CERT_FILE: that is the CLIENT's value, which the caller
+  // already compares against separately. Reading it here would compare a value
+  // to itself and always answer yes.
+  for (const p of [
+    "/etc/ssl/certs/ca-certificates.crt",   // debian, ubuntu, most containers
+    "/etc/pki/tls/certs/ca-bundle.crt",     // rhel, fedora
+    "/etc/ssl/cert.pem",                    // alpine, AND macOS: the system roots
+                                            // exported in OpenSSL form. Measured 128
+                                            // certs on two Macs — so macOS is provable
+                                            // here, not a platform we have to skip.
+  ]) {
+    if (!p) continue;
+    try { if (statSync(p).size > 0) return p; } catch { /* next */ }
+  }
+  return null;
+}
 
 async function runWrapper(script, overrides) {
   const p = fork(WRAPPER_PATH, ["--remote-control", "--proxy-port", "0"], {
