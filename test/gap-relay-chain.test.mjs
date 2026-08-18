@@ -361,3 +361,82 @@ test("a standby with no handed-down parent refuses to arm", async () => {
     await new Promise((r) => sock.close(r));
   }
 });
+
+// HTTP_PROXY IS PART OF THE CHAIN, BECAUSE IT IS PART OF THE PROXY'S CHAIN.
+//
+// The relay's candidate list read CACHE_FIX_UPSTREAM_PROXY, HTTPS_PROXY and
+// https_proxy and stopped. proxy/config.mjs resolves an https upstream through
+// the same three, and proxy/upstream.mjs documents the fallback to HTTP_PROXY
+// when HTTPS_PROXY is unset — so an operator with only HTTP_PROXY set had a
+// proxy that used it and a relay that saw no chain at all and dialled direct.
+// The relay's own comment forbids exactly that ("one chain, two definitions"),
+// and the divergence fires on the path that only runs while the proxy is down.
+test("HTTP_PROXY alone is a chain hop, the way it is for the proxy itself", async () => {
+  const touched = [];
+  const origin = await endpoint("ORIGIN", touched);
+  const hop = await endpoint("HOP", touched);
+  try {
+    // No fallback list at all: HTTP_PROXY is the ONLY thing naming a hop, which
+    // is the whole configuration under test.
+    await withRelay("", async ({ port }) => {
+      const reply = await connectThrough(port, `127.0.0.1:${origin.port}`);
+      await new Promise((r) => setTimeout(r, 300));
+      assert.match(reply, /^HTTP\/1\.[01] 200\b/,
+        `the CONNECT reply was ${JSON.stringify(reply)}`);
+      assert.deepEqual(touched, ["HOP"],
+        `HTTP_PROXY was not treated as a hop; endpoints touched: ${JSON.stringify(touched)} ` +
+        `(ORIGIN means the relay went direct past a proxy the live code would have used)`);
+    }, { HTTP_PROXY: `http://127.0.0.1:${hop.port}` });
+  } finally { origin.srv.close(); hop.srv.close(); }
+});
+
+// Writes the request in two TCP segments with a gap between them, which is what
+// a real client can produce and what the relay used to be unable to read.
+const connectSplit = (port, target, headers = "") => new Promise((resolve) => {
+  const req = `CONNECT ${target} HTTP/1.1\r\nHost: x\r\n${headers}\r\n`;
+  const c = net.connect(port, "127.0.0.1");
+  c.on("connect", () => {
+    // FOUR BYTES, so the split lands INSIDE the method token. Splitting at a
+    // header boundary would still leave a parseable first line and prove
+    // nothing.
+    c.write(req.slice(0, 4));
+    setTimeout(() => c.write(req.slice(4)), 120);
+  });
+  c.on("data", (d) => { c.destroy(); resolve(String(d).split("\r\n")[0]); });
+  c.on("error", (e) => resolve(`ERR:${e.code}`));
+  setTimeout(() => { c.destroy(); resolve("TIMEOUT"); }, 8_000);
+});
+
+// A REQUEST LINE SPLIT ACROSS SEGMENTS MUST STILL ROUTE, AND STILL AUTHENTICATE.
+//
+// The handler ran on the first `data` event and parsed whatever had arrived, so
+// a CONNECT split mid-token matched neither /^GET \/health/ nor /^CONNECT/: it
+// fell to direct(), the regex failed there too, and the client was destroyed
+// with nothing written to any log. withHopAuth had the same dependency from the
+// other side — it returns the chunk unchanged when the header block is
+// incomplete — so even a split that happened to route reached an authenticated
+// hop with no credentials and got 407.
+//
+// Both halves are asserted here, through a hop that answers 407 without the
+// right header: a 200 means the line was parsed AND the credentials survived.
+test("a CONNECT split across TCP segments still routes, and still carries its hop auth", async () => {
+  const seen = [];
+  const touched = [];
+  const origin = await endpoint("ORIGIN", touched);
+  const hop = await authHop("al ice", "p@ss:w#rd", seen);
+  try {
+    await withRelay(
+      `http://${encodeURIComponent("al ice")}:${encodeURIComponent("p@ss:w#rd")}@127.0.0.1:${hop.port}`,
+      async ({ port }) => {
+        const reply = await connectSplit(port, `127.0.0.1:${origin.port}`);
+        await new Promise((r) => setTimeout(r, 300));
+        assert.match(reply, /^HTTP\/1\.[01] 200\b/,
+          `a CONNECT whose request line arrived in two segments got ${JSON.stringify(reply)} — ` +
+          `407 means the header block was incomplete when the auth was rewritten, and a ` +
+          `transport error means it was never parsed as a CONNECT at all`);
+        assert.deepEqual(seen, ["Basic " + Buffer.from("al ice:p@ss:w#rd").toString("base64")],
+          `the hop saw ${JSON.stringify(seen)}`);
+        assert.deepEqual(touched, [], `the relay dialled the origin directly: ${JSON.stringify(touched)}`);
+      });
+  } finally { origin.srv.close(); hop.srv.close(); }
+});

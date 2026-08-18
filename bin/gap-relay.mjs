@@ -76,8 +76,18 @@ const mine = new Set();
 // most expensive place to take one. Direct stays the last resort, and the
 // refusals are traced so it is not a silent one.
 const hopUrls = (() => {
+  // HTTP_PROXY IS PART OF THE CHAIN, in the order proxy/config.mjs reads it.
+  // This list omitted it while config.mjs resolves an https upstream as
+  // CACHE_FIX_UPSTREAM_PROXY -> HTTPS_PROXY -> https_proxy and upstream.mjs
+  // documents the fallback to HTTP_PROXY when HTTPS_PROXY is unset. An operator
+  // who sets only HTTP_PROXY -- the ordinary single-variable setup -- therefore
+  // had a proxy that used it and a relay that saw no chain at all and went
+  // direct. That is exactly the "one chain, two definitions" this block's own
+  // comment forbids, and it fires on the path that runs while the proxy is
+  // down.
   const candidates = [process.env.CACHE_FIX_UPSTREAM_PROXY,
                       process.env.HTTPS_PROXY, process.env.https_proxy,
+                      process.env.HTTP_PROXY, process.env.http_proxy,
                       ...(process.env.CACHE_FIX_FALLBACK_PROXIES || "").split(",")];
   const out = [], seen = new Set();
   for (const raw of candidates) {
@@ -127,7 +137,34 @@ const srv = net.createServer((client) => {
   // the socket and the ADDRESS would die, from the one process meant to be the
   // last line of defence.
   client.on("close", () => up?.destroy());
-  client.once("data", (first) => {
+  // THE HEADER BLOCK, NOT THE FIRST CHUNK. This routed off whatever bytes
+  // happened to arrive together, and a request line split across TCP segments
+  // then matched neither pattern: a /health probe read as not-health, and a
+  // CONNECT fell to direct() where the regex failed and the client was destroyed
+  // with nothing written anywhere. withHopAuth has the same dependency and
+  // already says so -- it returns the chunk unchanged when the block is
+  // incomplete, so a split CONNECT reached an authenticated hop with no
+  // credentials and got 407.
+  //
+  // The launcher's twin of this was fixed in this same branch ("reads the
+  // child's announcements as whole lines, at any chunk boundary"); this is the
+  // sibling that was left. Accumulate to the blank line, which is what BOTH the
+  // routing and the auth rewrite need, and keep the mute timer armed until then:
+  // a client that sends half a request and stops is stalled, not idle, and the
+  // 30s is the only thing that reclaims it.
+  //
+  // The ceiling is a bound on memory, not a protocol rule. Past it we route on
+  // what we have, which fails the patterns below and closes -- the same outcome
+  // as before, reached deliberately.
+  const HEAD_MAX = 64 * 1024;
+  let acc = Buffer.alloc(0);
+  const onHead = (chunk) => {
+    acc = Buffer.concat([acc, chunk]);
+    if (acc.indexOf("\r\n\r\n") < 0 && acc.length < HEAD_MAX) return;
+    client.off("data", onHead);
+    handleHead(acc);
+  };
+  const handleHead = (first) => {
     // PAUSE, or every byte after this chunk is lost. Removing the last `data`
     // listener does NOT stop a flowing stream, so whatever arrives between here
     // and the pipe below is emitted to nobody. Measured on this exact shape: a
@@ -280,7 +317,11 @@ const srv = net.createServer((client) => {
     });
     };
     tryHop();
-  });
+  };
+  // REGISTERED LAST, after handleHead exists. `onHead` closes over it, and a
+  // listener attached before the binding is initialised is a TDZ throw waiting
+  // on the first byte.
+  client.on("data", onHead);
 });
 // WHICH ERROR IT IS DECIDES EVERYTHING, and the old handler treated them alike:
 // `process.exit(1)` on any server error at all.
