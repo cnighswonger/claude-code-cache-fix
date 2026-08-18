@@ -1379,6 +1379,54 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
     // faked tree because the surrounding rule is a pure function of what `ps`
     // reports, and the two-real-deploys version of this case starved two
     // timing-sensitive cases elsewhere by load alone.
+    // THE CHILD MUST BE TOLD THE ADDRESS THE HOLDER ACTUALLY HOLDS.
+    //
+    // The spawn env pinned CACHE_FIX_PROXY_BIND to the literal "127.0.0.1"
+    // while every probe on the holder side (holderPidOn's lsof, otherHolderOn's)
+    // asks bindAddr(). The child normally serves the INHERITED socket and never
+    // binds, which is why this stayed invisible: it only surfaces on the
+    // handover-refused fallback, where server.mjs binds `${bind}:${port}` itself
+    // under a comment that says "binding our own port is degraded; no proxy at
+    // all is not". Under CACHE_FIX_PROXY_BIND=::1 or a LAN address that degraded
+    // proxy came up on an interface nothing dials, and the holder could not see
+    // it either. config.bind also feeds /health's upstream_is_self.
+    //
+    // EVALUATED, not grepped. A test that greps for `bindAddr()` passes on the
+    // comment above it; this lifts the real object literal, runs it against
+    // three environments, and reads the value the child would receive.
+    it("hands the child the bind it actually holds, not a hardcoded loopback", () => {
+      const src = readFileSync(launcherPath, "utf8");
+      const bindFn = /const bindAddr = [^\n]*\n/.exec(src)?.[0];
+      const envLit = /env: \{ \.\.\.process\.env, CACHE_FIX_PROXY_PORT[\s\S]*?LISTEN_FDS: "1" \}/.exec(src)?.[0];
+      assert.ok(bindFn && envLit,
+        "the holder's child-spawn env literal moved — this no longer tests what the child is told");
+
+      const childEnv = (bind) => {
+        const proc = { env: bind === null ? {} : { CACHE_FIX_PROXY_BIND: bind }, pid: 4242 };
+        // eslint-disable-next-line no-new-func
+        return Function("process", "holder", "port", "HOLDER_TREE",
+          `${bindFn}\nreturn (${envLit.slice("env: ".length)});`)(proc, { _port: 9901 }, 9901, "tree");
+      };
+
+      // The default is the whole safety argument for this change: unset means
+      // bindAddr() returns "127.0.0.1", so nothing moves for anyone who never
+      // set the variable.
+      assert.equal(childEnv(null).CACHE_FIX_PROXY_BIND, "127.0.0.1",
+        "the unconfigured default changed — this was supposed to be a no-op there");
+      for (const bind of ["::1", "10.0.0.5", "0.0.0.0"]) {
+        assert.equal(childEnv(bind).CACHE_FIX_PROXY_BIND, bind,
+          `the holder holds ${bind} but tells its child 127.0.0.1 — a handover-refused ` +
+          `fallback then binds an interface nothing dials, and the holder's own lsof ` +
+          `probes (which do honour the variable) cannot find it`);
+      }
+      // The port the child is told is a SEPARATE fact and stays 0 on purpose:
+      // the holder still owns the real port, so a fallback cannot rebind it.
+      // Asserted here so a future edit cannot quietly change one by touching
+      // the other.
+      assert.equal(childEnv("::1").CACHE_FIX_PROXY_PORT, "0");
+      assert.equal(childEnv("::1").CACHE_FIX_HELD_PORT, "9901");
+    });
+
     it("takes the port from a holder running an older deploy", async () => {
       const src = readFileSync(launcherPath, "utf8");
       const rule = /function holderPidOn[\s\S]*?\n}/.exec(src)?.[0];

@@ -1204,7 +1204,19 @@ function holdPort(rest) {
         // successorServing("0") can never answer, so the handover exit condition
         // is dead too. Measured with CACHE_FIX_PROXY_PORT=0 before this line
         // changed: bound 43557, child told 0.
-        env: { ...process.env, CACHE_FIX_PROXY_PORT: "0", CACHE_FIX_PROXY_BIND: "127.0.0.1",
+        // THE BIND WE ACTUALLY HOLD, not a hardcoded loopback. bindAddr() is
+        // "127.0.0.1" whenever CACHE_FIX_PROXY_BIND is unset, so the default
+        // case is byte-identical; what changes is the configured one. The child
+        // normally serves the INHERITED socket and never binds, so this value
+        // only surfaces where it matters most: the handover-refused fallback,
+        // which binds `${bind}:${port}` itself and whose own comment says
+        // "binding our own port is degraded; no proxy at all is not". Told
+        // 127.0.0.1 while the operator asked for ::1 or a LAN address, that
+        // degraded proxy came up on an interface nothing dials, and the
+        // holder's own lsof probes (which DO honour bindAddr) could not see it
+        // either. config.bind also feeds /health's upstream_is_self, so the
+        // loop check was answering about an address we do not serve.
+        env: { ...process.env, CACHE_FIX_PROXY_PORT: "0", CACHE_FIX_PROXY_BIND: bindAddr(),
                CACHE_FIX_HELD_PORT: String(holder._port || port), CACHE_FIX_HELD_BY: String(process.pid),
                // OUR OWN BYTES, so the holder's version is observable instead of
                // inferred. The proxy already publishes proxy_tree and a checker
