@@ -749,9 +749,26 @@ function installSelfHeal() {
   //
   // Losing a log reader is ordinary — a closed terminal, a rotated file, a
   // killed `tee`. It must cost the log line and nothing else.
+  // ONCE, AND NEVER FROM INSIDE ITSELF. say() catches a SYNCHRONOUS throw, and
+  // the premise of this whole block is that stream faults arrive as ASYNC
+  // 'error' events — so reporting a stderr fault by writing to stderr feeds the
+  // handler its own next event. Reproduced: one isolated ENOSPC re-enters once
+  // and stops, but a stderr whose every write raises ENOSPC (a full disk, the
+  // case worth surviving) ran past 50 re-entries in under 500 ms. That is the
+  // same self-feeding shape as the measured 22-minute 100% CPU
+  // TriggerUncaughtException loop this block was added to break, reached
+  // THROUGH the guard rather than around it.
+  //
+  // A latch, not a rate limit: the message is worth saying once, and after
+  // that the only useful behaviour is to keep serving in silence. EPIPE and
+  // ERR_STREAM_DESTROYED still return before it, so a departed reader does not
+  // even spend the latch.
+  let saidStreamError = false;
   const onStreamError = (err) => {
     if (err && (err.code === "EPIPE" || err.code === "ERR_STREAM_DESTROYED")) return;
-    say(process.stderr, `[cache-fix] stdio error (proxy stays up): ${(err && err.code) || err}\n`);
+    if (saidStreamError) return;
+    saidStreamError = true;
+    say(process.stderr, `[cache-fix] stdio error (proxy stays up, reported once): ${(err && err.code) || err}\n`);
   };
   process.stdout.on("error", onStreamError);
   process.stderr.on("error", onStreamError);
