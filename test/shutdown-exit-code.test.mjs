@@ -518,4 +518,67 @@ describe("SIGTERM exit code", () => {
     assert.match(mixed, /\(2 mid-response, 3 before headers\)/,
       "both halves of the split must appear, and anchored");
   });
+
+  // THE PREMISE ba2375b RESTS ON, AND IT IS NODE'S, NOT OURS.
+  //
+  // `Connection: close` is set in the request handler, so it only ever reaches
+  // a connection that sends another request. A connection that goes quiet at
+  // the drain and never speaks again never gets the header — nothing in our
+  // code closes it. Our whole coverage for that case is node closing idle
+  // keep-alives itself at server.close(), and until this test that assumption
+  // was load-bearing with nothing asserting it: a node release that stopped
+  // doing it would reopen the hole with the suite still green.
+  //
+  // Measured on 24.11.1 / 25.8.0 / 26.5.1 (the majors this actually deploys
+  // on, none of which CI runs): idle closed in 0-1 ms, busy still open after
+  // 2.5 s. CI's 18/20/22 agree on the idle half.
+  //
+  // THE BUSY CASE IS THE CONTROL, not decoration. Without it this test passes
+  // on a runtime that closes EVERYTHING at close() — which would equally make
+  // the first assertion true while destroying the in-flight replies the drain
+  // exists to protect. Two polarities, or the green means nothing.
+  it("relies on node closing idle keep-alives at close(), and says so if it stops", async () => {
+    const closeMs = async (busy) => {
+      const srv = http.createServer((req, res) => {
+        if (busy) setTimeout(() => res.end("ok"), 1_500);
+        else res.end("ok");
+      });
+      await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+      try {
+        const sock = net.connect(srv.address().port, "127.0.0.1");
+        sock.on("error", () => {});
+        let got = "", t0 = 0, ms = null;
+        sock.on("data", (d) => { got += d; });
+        sock.on("close", () => { if (t0) ms = Date.now() - t0; });
+        await new Promise((r) => sock.once("connect", r));
+        sock.write("GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n");
+
+        // Idle means the reply is IN and the socket is quiet. Waiting on the
+        // reply rather than a timer is what makes this not a race.
+        if (!busy) await new Promise((r) => {
+          const w = setInterval(() => { if (got.includes("ok")) { clearInterval(w); r(); } }, 10);
+        });
+        else await new Promise((r) => setTimeout(r, 200));   // still mid-request
+
+        t0 = Date.now();
+        srv.close();
+        await new Promise((r) => setTimeout(r, 1_000));
+        sock.destroy();
+        return ms;
+      } finally { srv.close(); }
+    };
+
+    const idle = await closeMs(false);
+    assert.notEqual(idle, null,
+      "node did NOT close an idle keep-alive at server.close(). ba2375b covers " +
+      "only connections that send another request, so this runtime leaves a " +
+      "quiet client pinned to a departing proxy. The header is no longer enough.");
+    assert.ok(idle < 500, `idle keep-alive took ${idle}ms to close, expected prompt`);
+
+    const busy = await closeMs(true);
+    assert.equal(busy, null,
+      "a BUSY connection was closed at server.close(), which would sever the " +
+      "in-flight replies the drain exists to protect — and would make the idle " +
+      "assertion above pass for the wrong reason");
+  });
 });
