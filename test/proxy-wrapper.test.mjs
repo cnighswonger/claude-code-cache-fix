@@ -341,6 +341,25 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: CONCURRENCY }, () =
     assert.ok(second.out.includes(`CA=${bundle}`), `NODE_EXTRA_CA_CERTS should be the merged bundle (${bundle}), got: ${second.out}`);
   });
 
+  // ONE launcher run for the two cases below. Each used to open with its own
+  // identical "run once so the proxy mints and publishes our CA" pass, which is
+  // two extra launcher+proxy pairs in a file node:test already runs concurrently
+  // with the timing cases in proxy-held-port.test.mjs. Those cases lose their
+  // windows to exactly this kind of neighbour load — measured, CI went red on a
+  // different one of them each run.
+  let pyTrust;
+  const pythonTrustFixture = async () => {
+    if (pyTrust) return pyTrust;
+    const configDir = tempDir("cfftrust-");
+    const bundle = join(configDir, "ca-trust.pem");
+    const first = await runWrapper('process.stdout.write("x")', { CLAUDE_CONFIG_DIR: configDir });
+    assert.equal(first.code, 0, `fixture run should exit 0, got ${first.code}. stderr: ${first.err}`);
+    const ourPem = readFileSync(join(configDir, "ca-trust.d", "ccf.pem"), "utf8");
+    writeFileSync(bundle, `# merged by the launcher\n${ourPem}`);
+    pyTrust = { configDir, bundle, ourPem };
+    return pyTrust;
+  };
+
   it("--remote-control gives a python client the same trust file it gives node", async () => {
     // NODE_EXTRA_CA_CERTS is read by node and by nothing else. We point EVERY
     // client in the session at our MITM, so a session's python subprocesses —
@@ -361,17 +380,10 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: CONCURRENCY }, () =
     // Widening cannot shrink trust: the bundle is built by concatenating the
     // ambient corp bundle with each ca-trust.d component, so it is a superset of
     // the store REQUESTS_CA_BUNDLE otherwise names.
-    const configDir = tempDir("cfftrust-");
-    const bundle = join(configDir, "ca-trust.pem");
+    const { configDir, bundle, ourPem } = await pythonTrustFixture();
     const script = 'process.stdout.write("CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")'
       + '+"|SSL="+(process.env.SSL_CERT_FILE||"UNSET")'
       + '+"|REQ="+(process.env.REQUESTS_CA_BUNDLE||"UNSET")+"\\n")';
-    const runOnce = () => runWrapper(script, { CLAUDE_CONFIG_DIR: configDir });
-
-    const first = await runOnce();
-    assert.equal(first.code, 0, `first run should exit 0, got ${first.code}. stderr: ${first.err}`);
-    const ourPem = readFileSync(join(configDir, "ca-trust.d", "ccf.pem"), "utf8");
-    writeFileSync(bundle, `# merged by the launcher\n${ourPem}`);
     // A subsumed pre-existing value, written from the same pem the bundle holds.
     // Without this the run inherits the HOST's REQUESTS_CA_BUNDLE and the result
     // depends on whose machine the suite runs on.
@@ -396,14 +408,9 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: CONCURRENCY }, () =
     // widening our own trust would narrow theirs. Refuse, keep theirs, and put
     // the reason on stderr — a silent keep is as bad as a silent clobber,
     // because the session then cannot verify the proxy and nothing says why.
-    const configDir = tempDir("cfftrust-");
-    const bundle = join(configDir, "ca-trust.pem");
+    const { configDir } = await pythonTrustFixture();
     const foreign = join(configDir, "operator-roots.pem");
     const script = 'process.stdout.write("SSL="+(process.env.SSL_CERT_FILE||"UNSET")+"\\n")';
-
-    const first = await runWrapper(script, { CLAUDE_CONFIG_DIR: configDir });
-    assert.equal(first.code, 0, `first run should exit 0, got ${first.code}. stderr: ${first.err}`);
-    writeFileSync(bundle, `# merged by the launcher\n${readFileSync(join(configDir, "ca-trust.d", "ccf.pem"), "utf8")}`);
     // A root the bundle does NOT carry. Minted in-process rather than by running
     // a second launcher: this file already runs concurrently with the timing
     // cases in proxy-held-port.test.mjs, and an extra spawned launcher+proxy is
