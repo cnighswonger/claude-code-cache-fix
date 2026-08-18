@@ -440,3 +440,49 @@ test("a CONNECT split across TCP segments still routes, and still carries its ho
       });
   } finally { origin.srv.close(); hop.srv.close(); }
 });
+
+// A https:// HOP MUST BE SPOKEN TO IN TLS.
+//
+// portOf() already defaults the port from the scheme, so an `https://hop` was
+// dialled on the RIGHT PORT with the WRONG PROTOCOL: net.connect sent an HTTP
+// request line to a TLS listener, which never answers one. The CONNECT then sat
+// until the 2s dial deadline and the walk moved on reporting the hop
+// "unusable" — a hop that was fine, blamed for a protocol we chose.
+// proxy/forward-proxy.mjs had the same defect at both of its CONNECT sites.
+//
+// ASSERTED ON THE WIRE, and by the first byte, because that is the only thing
+// that separates the two transports without needing a real certificate:
+// a TLS ClientHello starts 0x16, an HTTP request line starts 'C' (0x43).
+// BOTH POLARITIES, so a change that made everything TLS would fail the control.
+const firstByteHop = async (seen) => {
+  const s = net.createServer((c) => {
+    c.once("data", (d) => { seen.push(d[0]); c.destroy(); });
+    c.on("error", () => {});
+  });
+  await new Promise((r) => s.listen(0, "127.0.0.1", r));
+  return { srv: s, port: s.address().port };
+};
+
+test("dials an https:// hop over TLS, and an http:// hop in the clear", async () => {
+  for (const [scheme, want, name] of [["https", 0x16, "TLS ClientHello"], ["http", 0x43, "a plain CONNECT line"]]) {
+    const seen = [];
+    const touched = [];
+    const origin = await endpoint("ORIGIN", touched);
+    const hop = await firstByteHop(seen);
+    try {
+      await withRelay(`${scheme}://127.0.0.1:${hop.port}`, async ({ port }) => {
+        // The reply does not matter: this hop answers nothing and the relay
+        // walks past it. What is under test is what we SAID to it.
+        await connectThrough(port, `127.0.0.1:${origin.port}`);
+        const by = Date.now() + 5_000;
+        while (!seen.length && Date.now() < by) await new Promise((r) => setTimeout(r, 50));
+        assert.equal(seen.length, 1, `the ${scheme}:// hop was never dialled at all`);
+        assert.equal(seen[0], want,
+          `the ${scheme}:// hop's first byte was 0x${seen[0].toString(16)}, expected ` +
+          `0x${want.toString(16)} (${name}) — the transport does not follow the scheme, so ` +
+          `a TLS hop is sent an HTTP request line it will never answer and is then ` +
+          `blamed as unusable`);
+      });
+    } finally { origin.srv.close(); hop.srv.close(); }
+  }
+});

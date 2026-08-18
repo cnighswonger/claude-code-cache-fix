@@ -284,7 +284,18 @@ function parseProxy(url) {
   // Scheme-defaulted, like hopAlive(): `|| 80` sent the CONNECT for an
   // `https://hop` carrying no explicit port to :80, so the tunnel died against
   // a hop hopAlive() had just confirmed on :443.
-  try { const u = new URL(url); return { host: u.hostname, port: Number(u.port) || (u.protocol === "https:" ? 443 : 80) }; }
+  // AND THE SCHEME, not just the port it implies. Dropping it made an
+  // `https://hop` dialled in PLAINTEXT on :443 by both CONNECT sites below —
+  // the port was already right, which is exactly why this hid. The hop's TLS
+  // listener never answers an HTTP request line, so the tunnel hangs to its
+  // timeout, and hopAlive()'s TCP probe says the hop is fine the whole time, so
+  // the chain keeps picking it instead of falling through to the next one.
+  //
+  // forwardRequest's path had none of this: buildAgent hands proxyUrl to
+  // HttpsProxyAgent, which reads the scheme itself. So one chain was dialled
+  // correctly by one caller and in the clear by two others.
+  try { const u = new URL(url); return { host: u.hostname, secure: u.protocol === "https:",
+                                         port: Number(u.port) || (u.protocol === "https:" ? 443 : 80) }; }
   catch { return null; }
 }
 
@@ -331,8 +342,12 @@ async function blindTunnel(target, clientSocket, head) {
   };
   if (via) {
     // CONNECT target through the outbound proxy.
-    const r = http.request({ host: via.host, port: via.port, method: "CONNECT", path: target,
-                             headers: { host: target } });
+    // TLS TO THE HOP WHEN THE HOP IS https:// — see parseProxy(). servername is
+    // the hop's own name, not the target's: this handshake is with the proxy.
+    const r = (via.secure ? https : http).request({
+      host: via.host, port: via.port, method: "CONNECT", path: target,
+      headers: { host: target },
+      ...(via.secure ? { servername: via.host, rejectUnauthorized: config.rejectUnauthorized } : {}) });
     r.on("connect", (res, socket) => {
       // Node fires 'connect' even when the outbound proxy DENIES the tunnel
       // (403/407/502). Relaying our own "200 Connection Established" then would
@@ -371,8 +386,13 @@ async function connectUpstreamTLS(cb, onErr) {
   try { via = await hopFor(); } catch (err) { return onErr(err); }
   if (!via && requireHop()) return onErr(new Error("no chain hop reachable (CACHE_FIX_REQUIRE_HOP=1)"));
   if (via) {
-    const r = http.request({ host: via.host, port: via.port, method: "CONNECT",
-                             path: `${upHost}:${upPort}`, headers: { host: `${upHost}:${upPort}` } });
+    // Same as blindTunnel above: the transport to the HOP follows the hop's own
+    // scheme. The tls.connect in finish() is a second, independent handshake —
+    // that one is with the upstream host, through whatever this returns.
+    const r = (via.secure ? https : http).request({
+      host: via.host, port: via.port, method: "CONNECT",
+      path: `${upHost}:${upPort}`, headers: { host: `${upHost}:${upPort}` },
+      ...(via.secure ? { servername: via.host, rejectUnauthorized: config.rejectUnauthorized } : {}) });
     r.on("connect", (res, rawSocket) => {
       if (res.statusCode !== 200) { rawSocket.destroy(); onErr(new Error(`upstream CONNECT ${res.statusCode}`)); return; }
       finish(rawSocket);

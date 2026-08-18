@@ -26,6 +26,7 @@
 // to go. proxy/server.mjs took this guard in 94e1953; this file and the
 // launcher were not swept for it at the time.
 import net from "node:net";
+import tls from "node:tls";
 
 for (const s of [process.stdout, process.stderr]) {
   s.on("error", () => { /* the reader left; carrying the socket is the job */ });
@@ -289,7 +290,18 @@ const srv = net.createServer((client) => {
     };
 
     const dial = (u) => {
-    const hopSock = net.connect(portOf(u), u.hostname);
+    // TLS TO A https:// HOP. net.connect dialled it in PLAINTEXT on :443 —
+    // portOf() already defaulted the port from the scheme, so the address was
+    // right and only the transport was wrong, which is why this was invisible.
+    // A TLS listener never answers an HTTP request line, so the CONNECT sat
+    // until the 2s dial deadline below and the walk moved on, reporting the hop
+    // "unusable" when it was fine and we were speaking the wrong protocol to it.
+    // proxy/forward-proxy.mjs had the same defect at both of its CONNECT sites;
+    // this is the third copy of one chain.
+    const secure = u.protocol === "https:";
+    const hopSock = secure
+      ? tls.connect({ host: u.hostname, port: portOf(u), servername: u.hostname })
+      : net.connect(portOf(u), u.hostname);
     up = hopSock;
     let carried = false;
     // A DEADLINE ON THE DIAL. The measured fall-through case was a hop that
@@ -309,7 +321,16 @@ const srv = net.createServer((client) => {
       tryHop();
     });
     hopSock.on("close", () => { if (carried) client.destroy(); });
-    hopSock.on("connect", () => {
+    // READY MEANS THE HANDSHAKE, NOT THE TCP LEG. Measured: a TLSSocket emits
+    // `connect` when the TCP connection is up and only THEN fails verification —
+    //     connect fired (TCP)
+    //     error: DEPTH_ZERO_SELF_SIGNED_CERT
+    // so keying `carried` on `connect` would mark a hop that never completed as
+    // carrying, and the error handler above then destroys the CLIENT instead of
+    // walking to the next hop. `secureConnect` is the first moment a TLS hop can
+    // actually carry. (The write itself is safe either way: measured, bytes
+    // written before the handshake are buffered and delivered after it.)
+    hopSock.on(secure ? "secureConnect" : "connect", () => {
       carried = true;
       hopSock.setTimeout(0);          // an established tunnel is allowed to idle
       hopSock.write(withHopAuth(first, u));

@@ -181,6 +181,71 @@ test("attach failure: non-core paths 404 (not passthrough), no self-heal install
 //   claude.ai / console.anthropic.com via 9901 -> UNABLE_TO_GET_ISSUER_CERT
 //   the same two              via 8118 -> authorized=true, Let's Encrypt
 //
+// AND THE TRANSPORT TO THE HOP MUST FOLLOW THE HOP'S OWN SCHEME.
+//
+// parseProxy() returned only { host, port }. The port was already defaulted from
+// the scheme (443 for https), so an `https://hop` was dialled on the RIGHT PORT
+// with the WRONG PROTOCOL: http.request sent a plaintext CONNECT line to a TLS
+// listener, which never answers one. The tunnel then hung to its timeout while
+// hopAlive()'s TCP probe kept saying the hop was fine, so the chain went on
+// picking it instead of falling through.
+//
+// forwardRequest's path never had this — buildAgent hands proxyUrl to
+// HttpsProxyAgent, which reads the scheme itself. One chain, dialled correctly
+// by one caller and in the clear by two others.
+//
+// FIRST BYTE ON THE WIRE, because it separates the two transports without
+// needing a certificate: a TLS ClientHello starts 0x16, an HTTP request line
+// starts 'C' (0x43). Both polarities, so making everything TLS fails the control.
+for (const [scheme, want, name] of [["https", 0x16, "TLS ClientHello"], ["http", 0x43, "a plain CONNECT line"]]) {
+  test(`a ${scheme}:// hop is dialled with ${name}`, async () => {
+    const saved = saveEnv();
+    const caDir = mkdtempSync(join(tmpdir(), "ccf-hop-scheme-"));
+    const seen = [];
+    const hop = net.createServer((sock) => {
+      sock.once("data", (d) => { seen.push(d[0]); sock.destroy(); });
+      sock.on("error", () => {});
+    });
+    const hopPort = await listen(hop);
+    const direct = net.createServer((sock) => sock.destroy());
+    const directPort = await listen(direct);
+
+    let handle;
+    try {
+      process.env.CACHE_FIX_FORWARD_PROXY = "on";
+      process.env.CACHE_FIX_CA_DIR = caDir;
+      process.env.CACHE_FIX_FALLBACK_PROXIES = `${scheme}://127.0.0.1:${hopPort}`;
+      for (const k of ["CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_HTTPS_PROXY",
+                       "HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"]) delete process.env[k];
+      handle = await startProxy({ port: 0, watch: false });
+
+      const target = `127.0.0.1:${directPort}`;
+      await new Promise((resolve) => {
+        const req = http.request({ host: "127.0.0.1", port: handle.port, method: "CONNECT",
+                                   path: target, headers: { host: target } });
+        req.on("connect", (_res, socket) => { socket.destroy(); resolve(); });
+        req.on("error", () => resolve());
+        req.setTimeout(4_000, () => { req.destroy(); resolve(); });
+        req.end();
+      });
+      const by = Date.now() + 4_000;
+      while (!seen.length && Date.now() < by) await new Promise((r) => setTimeout(r, 50));
+
+      assert.equal(seen.length, 1, `the ${scheme}:// hop was never dialled at all`);
+      assert.equal(seen[0], want,
+        `the ${scheme}:// hop's first byte was 0x${seen[0].toString(16)}, expected ` +
+        `0x${want.toString(16)} (${name}) — the transport does not follow the scheme, so a ` +
+        `TLS hop is sent an HTTP request line it will never answer and the tunnel hangs ` +
+        `while hopAlive() still calls the hop healthy`);
+    } finally {
+      restoreEnv(saved);
+      if (handle) await handle.close();
+      hop.close(); direct.close();
+      try { rmSync(caDir, { recursive: true, force: true }); } catch {}
+    }
+  });
+}
+
 // A stand-in CONNECT proxy rather than a real hop: the assertion is WHICH
 // SOCKET the tunnel is opened on, and a listener that records the CONNECT line
 // answers that without TLS, a CA, or the network.
