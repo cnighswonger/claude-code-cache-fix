@@ -2291,7 +2291,19 @@ if (remoteControl) {
   // in that case, so there is nothing of ours to withdraw.
   if (caForClaude) {
     claudeEnv.NODE_EXTRA_CA_CERTS = caForClaude;
-    for (const key of ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"]) {
+    // GATED ON THE MERGED BUNDLE, not on having any CA. node MERGES
+    // NODE_EXTRA_CA_CERTS with its built-in store, so handing it our own CA
+    // alone only ADDS trust. urllib does not merge SSL_CERT_FILE, it REPLACES
+    // the default — so naming a one-certificate file there leaves a python
+    // client trusting our proxy and nothing else on the internet. That is the
+    // standalone fallback (no bundle builder on the box), which is exactly what
+    // a third party running this fork gets, so it is the common case, not an
+    // edge one.
+    //
+    // The merged bundle is safe because of how it is built: the ambient corp
+    // store first, then every ca-trust.d component. A superset by construction.
+    // Our own CA is a superset of nothing.
+    for (const key of caForClaude === caTrustBundle ? ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"] : []) {
       const verdict = subsumes(caForClaude, claudeEnv[key]);
       if (verdict.ok) claudeEnv[key] = caForClaude;
       else process.stderr.write(

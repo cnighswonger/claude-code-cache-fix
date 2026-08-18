@@ -433,6 +433,33 @@ describe("launch wrapper (claude-via-proxy)", { concurrency: CONCURRENCY }, () =
       `the refusal must be announced, stderr was: ${res.err}`);
   });
 
+  it("--remote-control never makes its own CA the whole python trust world", async () => {
+    // The standalone case, and the one that makes this dangerous rather than
+    // merely incomplete. With no merged bundle the launcher hands claude OUR CA
+    // ALONE — correct for NODE_EXTRA_CA_CERTS, which node MERGES with its
+    // built-in store, and catastrophic for SSL_CERT_FILE, which urllib does not
+    // merge but REPLACES. Naming a one-certificate file there leaves a python
+    // client trusting exactly our proxy and nothing else on the internet.
+    //
+    // So the two python vars are gated on handing over the MERGED bundle, not on
+    // having any CA at all. The bundle is the ambient store plus each component,
+    // hence a superset; our own CA is not a superset of anything.
+    //
+    // Found from the other side: a peer is about to write SSL_CERT_FILE too, and
+    // asking which of us wins surfaced that CCF's own fallback was the loser.
+    const configDir = tempDir("cffsolo-");
+    const script = 'process.stdout.write("CA="+(process.env.NODE_EXTRA_CA_CERTS||"UNSET")'
+      + '+"|SSL="+(process.env.SSL_CERT_FILE||"UNSET")+"\\n")';
+
+    // No ca-trust.pem is ever written here, so the launcher takes the fallback.
+    const res = await runWrapper(script, { CLAUDE_CONFIG_DIR: configDir });
+    assert.equal(res.code, 0, `Expected exit 0, got ${res.code}. stderr: ${res.err}`);
+    assert.match(res.out, /CA=\S*cache-fix-ca\/ca\.pem/,
+      `NODE_EXTRA_CA_CERTS should still be our own CA, got: ${res.out}`);
+    assert.ok(res.out.includes("SSL=UNSET"),
+      `SSL_CERT_FILE must NOT become our one-cert CA, got: ${res.out}`);
+  });
+
   it("--remote-control leaves the ambient python trust vars alone when it has no usable CA", async () => {
     // The other half of the contract. With no usable CA we hand claude nothing
     // and let it fall back to the ambient store — so we must not have pointed
