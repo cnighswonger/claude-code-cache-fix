@@ -16,11 +16,22 @@ const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", 
 // running — inside the held-port file it starved a neighbour into failing 4 of
 // 5 runs, and node gives each FILE its own process. One case here, alone.
 
+// NEVER SIGNAL A PID WE KNOW ONLY BY PORT. freePort() binds 0, reads the number
+// and CLOSES, so the OS can hand it to a NEIGHBOURING TEST FILE — node:test runs
+// files concurrently and several of them listen in-process. Every caller below
+// signals or counts what this returns, so an unfiltered answer kills another
+// runner: measured, and it is CI run 32087202771. Filtered HERE and not at the
+// call sites, because it already existed at some of them and the rest never got
+// it. suite-collection.test.mjs pins the expression, pins that this is the only
+// lsof call in the file, and carries the measurements and the two ways the
+// predicate was got wrong before.
+const OURS = /\/(?:bin|proxy)\/[\w.-]+\.mjs\b/;
 function listeners(port) {
   try {
     return execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN"],
                         { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
-      .trim().split("\n").filter(Boolean);
+      .trim().split("\n").filter(Boolean)
+      .filter((p) => OURS.test(cmdOf(p)));
   } catch { return []; }
 }
 
@@ -115,11 +126,6 @@ describe("holder handover (SIGUSR2)", () => {
       let any = false;
       for (const port of usedPorts) {
         for (const q of listeners(port)) {
-          // OURS ONLY. freePort() releases the port before handing it over, so by
-          // sweep time the OS may have given it to something unrelated — and
-          // signalling a stranger is exactly what holderPidOn's own comment
-          // refuses to do.
-          if (!/claude-via-proxy|gap-relay|server\.mjs|scratch-launcher-|scratch-fake-server-/.test(cmdOf(q))) continue;
           try { process.kill(Number(q), "SIGHUP"); any = true; } catch { }
         }
       }

@@ -15,11 +15,22 @@ import { loadExtensions, getRegistry } from "../proxy/pipeline.mjs";
 const serverPath = join(dirname(fileURLToPath(import.meta.url)), "..", "proxy", "server.mjs");
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
+// NEVER SIGNAL A PID WE KNOW ONLY BY PORT. freePort() binds 0, reads the number
+// and CLOSES, so the OS can hand it to a NEIGHBOURING TEST FILE — node:test runs
+// files concurrently and several of them listen in-process. Every caller below
+// signals or counts what this returns, so an unfiltered answer kills another
+// runner: measured, and it is CI run 32087202771. Filtered HERE and not at the
+// call sites, because it already existed at some of them and the rest never got
+// it. suite-collection.test.mjs pins the expression, pins that this is the only
+// lsof call in the file, and carries the measurements and the two ways the
+// predicate was got wrong before.
+const OURS = /\/(?:bin|proxy)\/[\w.-]+\.mjs\b/;
 function listeners(port) {
   try {
     return execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN"],
                         { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
-      .trim().split("\n").filter(Boolean);
+      .trim().split("\n").filter(Boolean)
+      .filter((p) => OURS.test(cmdOf(p)));
   } catch { return []; }
 }
 
@@ -597,12 +608,12 @@ describe("zero-downtime reload", () => {
       for (let i = 0; i < 5; i++) {
         let owners = [];
         for (const port of [PORT, defaultPort].filter(Boolean)) {
-          try {
-            owners = owners.concat(
-              execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN"],
-                           { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
-                .trim().split("\n").filter(Boolean));
-          } catch { /* nobody on that one */ }
+          // THROUGH listeners(), which is where the ours-only predicate lives.
+          // The ppid check below is a different question — never a LIVE fixture
+          // of ours — and it does not answer this one: a stranger reparented to
+          // init passes it, and on the DEFAULT port that stranger is whatever
+          // else on the box happens to run a proxy on 9801.
+          owners = owners.concat(listeners(port));
         }
         if (!owners.length) break;
         let signalled = 0;
@@ -856,11 +867,6 @@ after(async () => {
     let any = false;
     for (const port of usedPorts) {
       for (const q of listeners(port)) {
-        // OURS ONLY. freePort() releases the port before handing it over, so by
-        // sweep time the OS may have given it to something unrelated — and
-        // signalling a stranger is exactly what holderPidOn's own comment
-        // refuses to do.
-        if (!/claude-via-proxy|gap-relay|server\.mjs|scratch-launcher-|scratch-fake-server-/.test(cmdOf(q))) continue;
         try { process.kill(Number(q), "SIGHUP"); any = true; } catch { }
       }
     }

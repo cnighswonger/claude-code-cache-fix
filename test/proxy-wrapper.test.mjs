@@ -183,7 +183,13 @@ async function runWrapper(script, overrides) {
 // version: cpus() counts the machine and ignores this process's CPU affinity,
 // so under `--cpuset-cpus=0,1` it reports 48 and this bound stops bounding
 // anything. No change on CI, where there is no mask and both calls agree.
-const CONCURRENCY = Math.max(2, Math.floor(availableParallelism() / 2));
+//
+// THE FLOOR IS 1. `Math.max(2, ...)` used to defeat the halving on exactly the
+// machines it exists for — floor(2/2) is 1, so a two-core runner computed 2 and
+// booted two real proxies at once. Identical on any box with 4+ cores, which is
+// why it survived every local run. Arithmetic, not a CI fix: it was proposed as
+// one and suite-collection.test.mjs records that hypothesis REJECTED.
+const CONCURRENCY = Math.max(1, Math.floor(availableParallelism() / 2));
 
 describe("launch wrapper (claude-via-proxy)", { concurrency: CONCURRENCY }, () => {
   it("exits with error when claude command is not found", async () => {

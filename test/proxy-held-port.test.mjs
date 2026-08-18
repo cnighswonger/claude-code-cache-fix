@@ -63,11 +63,22 @@ function classify(body) {
 // Whoever is LISTENING on a port, by port rather than by parentage. The
 // self-heal spawns a DETACHED successor, so it is nobody's child and `pgrep -P`
 // cannot see it — the only durable handle on it is the address it took.
+// NEVER SIGNAL A PID WE KNOW ONLY BY PORT. freePort() binds 0, reads the number
+// and CLOSES, so the OS can hand it to a NEIGHBOURING TEST FILE — node:test runs
+// files concurrently and several of them listen in-process. Every caller below
+// signals or counts what this returns, so an unfiltered answer kills another
+// runner: measured, and it is CI run 32087202771. Filtered HERE and not at the
+// call sites, because it already existed at some of them and the rest never got
+// it. suite-collection.test.mjs pins the expression, pins that this is the only
+// lsof call in the file, and carries the measurements and the two ways the
+// predicate was got wrong before.
+const OURS = /\/(?:bin|proxy)\/[\w.-]+\.mjs\b/;
 function listeners(port) {
   try {
     return execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN"],
                         { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
-      .trim().split("\n").filter(Boolean);
+      .trim().split("\n").filter(Boolean)
+      .filter((p) => OURS.test(cmdOf(p)));
   } catch { return []; }
 }
 
@@ -143,7 +154,13 @@ async function freePort() {
 // no shipped code uses this (it appears nowhere in bin/ or proxy/), and `files`
 // excludes test/, so raising it would constrain consumers for a dev-only need.
 // CI's `18` resolves to the latest 18.x. Recorded, not guarded.
-const CONCURRENCY = Math.max(2, Math.floor(availableParallelism() / 2));
+//
+// THE FLOOR IS 1. `Math.max(2, ...)` used to defeat the halving on exactly the
+// machines it exists for — floor(2/2) is 1, so a two-core runner computed 2 and
+// booted two real proxies at once. Identical on any box with 4+ cores, which is
+// why it survived every local run. Arithmetic, not a CI fix: it was proposed as
+// one and suite-collection.test.mjs records that hypothesis REJECTED.
+const CONCURRENCY = Math.max(1, Math.floor(availableParallelism() / 2));
 
 describe("held port (CACHE_FIX_HOLD_PORT)", { concurrency: CONCURRENCY }, () => {
 // The default is declared in proxy/config.mjs and repeated in the launcher.
@@ -286,6 +303,45 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
 // The launcher holds the advertised port and relays, so a proxy that dies
 // never unbinds it — and a client that baked HTTPS_PROXY at exec, for which
 // one refusal is fatal for good, keeps reaching it.
+// A NEIGHBOUR ON OUR PORT IS NOT OURS TO SIGNAL.
+//
+// freePort() BINDS 0, READS THE NUMBER, THEN CLOSES, so the port is unowned from
+// that moment and the OS hands it out again — measured, two processes each
+// taking 3000 ephemeral ports collided on 855 of ~2400 distinct ones. node:test
+// runs FILES concurrently in their own processes, so the thing that took our
+// number can be another RUNNER, and several of them listen in-process. Every
+// caller of listeners() in this file turns its result into
+// `process.kill(pid, "SIGHUP")` — and node's default action for SIGHUP is to
+// terminate, so the neighbour dies with `signal: 'SIGHUP'`, `error: 'test
+// failed'`, and NO CASE FAILING INSIDE IT. That is CI run 32087202771 exactly.
+it("does not report a neighbouring test file that took our released port", async () => {
+  const port = await freePort();
+  const dir = mkdtempSync(join(tmpdir(), "ccf-neighbour-"));
+  // NAMED `gap-relay-chain.test.mjs` ON PURPOSE, and written OUTSIDE the repo so
+  // `node --test` cannot collect it. That is a real file in this suite, it
+  // listens in its own process at four sites, and the predicate three after()
+  // sweeps already carried was the SUBSTRING `gap-relay` — which that name
+  // matches. A stand-in called anything else stays green against a guard that
+  // still kills one of our own neighbours, so the name is the assertion.
+  const file = join(dir, "gap-relay-chain.test.mjs");
+  writeFileSync(file, `import net from "node:net";
+const s = net.createServer(() => {});
+s.listen(${port}, "127.0.0.1", () => console.log("up"));
+setInterval(() => {}, 1e9);
+`);
+  const victim = spawn(process.execPath, [file], { stdio: ["ignore", "pipe", "ignore"] });
+  try {
+    await new Promise((r) => victim.stdout.once("data", r));
+    assert.deepEqual(listeners(port), [],
+      `listeners() handed back pid ${victim.pid} — a test-runner process that does ` +
+      `nothing but hold the number freePort() let go. Every caller here signals what ` +
+      `this returns, so that is a whole neighbouring FILE killed by this one.`);
+  } finally {
+    try { victim.kill("SIGKILL"); } catch { }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 it("cuts nothing on the held port while the proxy restarts", async () => {
   await withHeldPort(async ({ get, killProxy }) => {
     killProxy();
@@ -886,8 +942,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         const ancestry = () => {
           let pid = 0;
           try {
-            pid = Number(execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN"],
-                                      { encoding: "utf8" }).trim().split("\n").filter(Boolean)[0]);
+            pid = Number(listeners(port)[0]);
           } catch { return false; }
           for (let hop = 0; Number.isInteger(pid) && pid > 1 && hop < 4; hop++) {
             let line = "";
@@ -922,11 +977,12 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         // has had time to create it.
         await new Promise((r) => setTimeout(r, 2_000));
         for (let i = 0; i < 3; i++) {
-          let owners = [];
-          try {
-            owners = execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN"],
-                                  { encoding: "utf8" }).trim().split("\n").filter(Boolean);
-          } catch { break; }                       // nobody owns it: done
+          // THROUGH listeners(), which is where the ours-only predicate lives.
+          // Asking lsof here got the raw answer, and the walk below then sent
+          // SIGTERM to the listener's PARENT — for a stranger that is the node
+          // test runner, so this reached further than the SIGHUP sites did.
+          const owners = listeners(port);
+          if (!owners.length) break;               // nobody of ours owns it: done
           for (const o of owners) {
             const pid = Number(o);
             if (!Number.isInteger(pid) || pid <= 1) continue;
@@ -1078,12 +1134,55 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
           "the port never came back after the takeover");
         // PROXIES, which is what the sentence says. A holder also parents one
         // standby relay, so counting children counts something else.
-        let kids = [];
-        try { kids = execFileSync("pgrep", ["-P", String(taker.pid)], { encoding: "utf8" })
-                       .trim().split("\n").filter(Boolean)
-                       .filter((q) => /server\.mjs/.test(cmdOf(q))); } catch {}
-        assert.equal(kids.length, 1,
-          `the holder supervises ${kids.length} proxies; a bind retry spawned one per attempt`);
+        // POLL, DO NOT SNAPSHOT. This read used to be a single pgrep taken the
+        // instant the previous assertion returned, which measures "how many
+        // proxies exist RIGHT NOW" when the claim is "the holder settles on
+        // exactly one". On a loaded machine the child has not finished exec'ing
+        // yet and the count is 0 — reproduced deterministically: this file alone,
+        // pinned to two cores with four busy-loops on the same cores, fails here
+        // with `supervises 0`, and passes with the burners removed and nothing
+        // else changed. CI shows the same case red on node 22.
+        //
+        // Polling is not "widening a window": it returns on the first satisfied
+        // read, so a fast machine pays nothing, and it still catches the case
+        // this assertion was written for — a bind-retry storm spawns one per
+        // attempt and never settles to 1, so it burns the whole budget and
+        // fails with the count it had.
+        const countProxies = () => {
+          try {
+            return execFileSync("pgrep", ["-P", String(taker.pid)], { encoding: "utf8" })
+              .trim().split("\n").filter(Boolean)
+              .filter((q) => /server\.mjs/.test(cmdOf(q))).length;
+          } catch { return 0; }
+        };
+        // TWO READS AT 1, NOT ONE. A storm's count RAMPS UP THROUGH 1 — the
+        // spawns persist (the work Mac ended at 100, 72 still holding ports),
+        // so under the same starvation this poll exists for they exec at spread
+        // times and a poll that returns on the FIRST 1 can exit inside the ramp
+        // and call a storm settled. Requiring the 1 to survive the next read is
+        // what makes this "settled on one" instead of "was one at some instant".
+        //
+        // 250ms, not 100. Each read is an execFileSync pgrep plus one ps per
+        // child and measured ~105ms under starvation, so a 100ms poll spends
+        // over half its wall clock inside a synchronous spawn — on THIS file's
+        // shared event loop, where a neighbour already once missed a 10,000ms
+        // deadline at 10,629ms for exactly that reason. Settle measured 1135ms,
+        // so 10s is 9x headroom and there is nothing to buy with more.
+        let kidCount = countProxies();
+        let stable = kidCount === 1 ? 1 : 0;
+        const settleBy = Date.now() + 10_000;
+        while (stable < 2 && Date.now() < settleBy) {
+          await new Promise((r) => setTimeout(r, 250));
+          kidCount = countProxies();
+          stable = kidCount === 1 ? stable + 1 : 0;
+        }
+        // 0 and >1 are DIFFERENT failures and the old message called both a
+        // retry storm, which sends the reader at the wrong mechanism.
+        assert.equal(kidCount, 1, kidCount === 0
+          ? `the holder supervises no proxy 10s after the takeover — it never spawned one, `
+            + `or the one it spawned died`
+          : `the holder supervises ${kidCount} proxies and never settled to one; `
+            + `a bind retry spawned one per attempt`);
         assert.ok(!/MaxListenersExceeded/.test(warned),
           "listen() is still being handed a callback per attempt");
       } finally {
@@ -1110,11 +1209,12 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         // has had time to create it.
         await new Promise((r) => setTimeout(r, 2_000));
         for (let i = 0; i < 3; i++) {
-          let owners = [];
-          try {
-            owners = execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN"],
-                                  { encoding: "utf8" }).trim().split("\n").filter(Boolean);
-          } catch { break; }                       // nobody owns it: done
+          // THROUGH listeners(), which is where the ours-only predicate lives.
+          // Asking lsof here got the raw answer, and the walk below then sent
+          // SIGTERM to the listener's PARENT — for a stranger that is the node
+          // test runner, so this reached further than the SIGHUP sites did.
+          const owners = listeners(port);
+          if (!owners.length) break;               // nobody of ours owns it: done
           for (const o of owners) {
             const pid = Number(o);
             if (!Number.isInteger(pid) || pid <= 1) continue;
@@ -1884,6 +1984,66 @@ describe("deploy watcher (CACHE_FIX_WATCH_DEPLOY_MS)", () => {
     }, { watchMs: 300, selfHeal: "on" });
   });
 
+  // A DEPLOY THAT ARRIVES DURING A RESTART IS STILL A DEPLOY.
+  //
+  // bootedHash is re-read on EVERY spawn — the launcher sets it immediately
+  // before spawning — so a child that dies for any reason after the bytes
+  // changed comes back ON THE NEW FILE, and the watcher then compares the new
+  // hash against itself: equal, nothing to say, and not for one tick but
+  // forever. The case above cannot see this, because it never restarts the
+  // child; it is the only reason that one passes.
+  //
+  // Measured standalone with a control arm: deploy alone announces, kill-then-
+  // deploy announces NOTHING and leaves stderr empty, and BOTH arms end with the
+  // new bytes serving. So the deploy is live either way and the only thing lost
+  // is the record that the running code changed — which is the whole point of a
+  // watcher whose reason for existing is "a deploy nobody relaunches never runs".
+  //
+  // That empty stderr is exactly what CI run 32103227341 printed: one line,
+  // "[cache-fix] gap-relay carrying", no "source changed", after burning the
+  // full 30s poll. At a 300ms tick that is 100 consecutive misses, which is not
+  // a load story — a starved watcher that gets ONE tick in 30s still announces.
+  it("still says a deploy landed when the proxy restarted into it", async () => {
+    await withFakeProxy(serving, async ({ launcher, serverFile, stderr }) => {
+      const before = await settleFor(launcher, 0, 8_000);
+      assert.ok(before, "the stand-in proxy never started, so this measures nothing");
+      // The race made deterministic: the child goes at the moment the new bytes
+      // land, so the respawn re-reads the file it is supposed to be announcing.
+      try { process.kill(before, "SIGKILL"); } catch { }
+      await writeFile(serverFile, serving + "\n// deployed mid-restart\n");
+      assert.ok(await saidWithin(stderr, 30_000),
+        "a deploy landed while the proxy was restarting and nothing said so. The new " +
+        "bytes ARE serving, so nothing is broken for a client — what is gone is the " +
+        "only record that the running code changed, on the one host where an " +
+        "operator would go looking. Launcher stderr: " +
+        JSON.stringify(stderr().slice(-400)));
+      const after = await settleFor(launcher, before, 8_000);
+      assert.notEqual(after, 0, "no proxy came back at all after the restart");
+    }, { watchMs: 300, selfHeal: "on" });
+  });
+
+  // AND A RESTART THAT CHANGED NOTHING SAYS NOTHING. The twin of the mtime case
+  // one below, reached through the RESPAWN path instead of the watcher's tick.
+  // Written because the mutation table said it was needed: dropping the hash
+  // comparison in the launcher — announcing on every respawn regardless of the
+  // bytes — passed every other case in this describe. Unguarded, a crash loop
+  // reports a deploy per bounce, which is both false and loudest exactly when
+  // something else is already wrong.
+  it("says nothing when a restart picks up the SAME bytes", async () => {
+    await withFakeProxy(serving, async ({ launcher, stderr }) => {
+      const before = await settleFor(launcher, 0, 8_000);
+      assert.ok(before, "the stand-in proxy never started");
+      try { process.kill(before, "SIGKILL"); } catch { }
+      const after = await settleFor(launcher, before, 8_000);
+      assert.ok(after && after !== before,
+        "no respawn happened, so this measured nothing — the case needs a real restart");
+      await new Promise((r) => setTimeout(r, 1_000));
+      assert.doesNotMatch(stderr(), /source changed/,
+        "a restart onto IDENTICAL bytes was announced as a deploy. Launcher stderr: " +
+        JSON.stringify(stderr().slice(-300)));
+    }, { watchMs: 300, selfHeal: "on" });
+  });
+
   it("leaves a healthy proxy alone when only the mtime moved", async () => {
     await withFakeProxy(serving, async ({ launcher, serverFile, stderr }) => {
       const before = await settleFor(launcher, 0, 8_000);
@@ -1945,11 +2105,6 @@ after(async () => {
     let any = false;
     for (const port of usedPorts) {
       for (const q of listeners(port)) {
-        // OURS ONLY. freePort() releases the port before handing it over, so by
-        // sweep time the OS may have given it to something unrelated — and
-        // signalling a stranger is exactly what holderPidOn's own comment
-        // refuses to do.
-        if (!/claude-via-proxy|gap-relay|server\.mjs|scratch-launcher-|scratch-fake-server-/.test(cmdOf(q))) continue;
         try { process.kill(Number(q), "SIGHUP"); any = true; } catch { }
       }
     }

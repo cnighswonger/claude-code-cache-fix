@@ -657,6 +657,74 @@ test("gap-relay keeps the socket on an error that left it listening", () => {
 // three, 3 at four, 4 at five. Under the pin, four such files start within
 // 23 ms of each other on two cores; by default they span 3786 ms end to end.
 // A constant cannot know the runner.
+// A PID FOUND BY PORT IS NOT A PID WE OWN.
+//
+// Four files here ask `lsof` who is LISTENING on a port and then signal the
+// answer — SIGHUP in six places, SIGKILL in one. The port came from a freePort()
+// that binds 0, reads the number and CLOSES, so it is unowned from that instant
+// and the OS hands it out again: measured, two processes each taking 3000
+// ephemeral ports collided on 855 of ~2400 distinct ones. node:test runs FILES
+// concurrently in their own processes and several of them listen IN-PROCESS, so
+// the answer can be another runner's own pid — measured, `lsof -t` returned it
+// and the kill line landed, `victim exited code=null signal=SIGHUP`. The victim
+// dies with `signal: 'SIGHUP'`, `error: 'test failed'` and no case failing
+// inside it, which is CI run 32087202771 (proxy-forward-attach-fallback, node
+// 18) to the letter.
+//
+// The predicate existed at three of the seven call sites, with its own measured
+// comment, and the four in-test cleanups never got it. So this pins it at the
+// SOURCE instead: inside each listeners(), where no later call site can forget
+// it. Pinned as an exact expression for the same reason the parallelism bound
+// below is — a MENTION test passes on a comment, and a per-file variant is how
+// four copies drift apart.
+//
+// PATH SEGMENT, NOT SUBSTRING, and that difference is a real defect this caught:
+// the version at those three sites was
+// /claude-via-proxy|gap-relay|server\.mjs|scratch-launcher-|scratch-fake-server-/
+// and `gap-relay` matches test/gap-relay-chain.test.mjs — a file in this very
+// directory that listens in-process at four sites. Ours all run a script under
+// bin/ or proxy/; every test file runs one under test/, and the node binary is
+// not a .mjs. Validated against 10 real command lines: 10/10 for the anchored
+// form, and the substring form wrong on 1 of the same 10.
+test("no test file signals a pid it knows only by port", () => {
+  const WANT = "/\\/(?:bin|proxy)\\/[\\w.-]+\\.mjs\\b/";
+  const FILTER = ".filter((p) => OURS.test(cmdOf(p)))";
+  // ASSEMBLED, so the needle never appears whole in THIS file. Spelled out, the
+  // detector matched its own source and reported the guard as the violation —
+  // and the obvious repair, excluding this filename, is the worse one: a roster
+  // built from a name list stops covering whatever gets renamed or added. Built
+  // this way the roster stays name-free, and a real lsof call landing HERE would
+  // still be caught.
+  const NEEDLE = 'execFileSync("' + 'lsof"';
+  const files = readdirSync(testDir).filter((f) => f.endsWith(".test.mjs"));
+  const asks = files.filter((f) =>
+    stripComments(readFileSync(join(testDir, f), "utf8")).includes(NEEDLE));
+  // The roster is asserted non-empty because a rename of the helper, or of the
+  // tool it shells out to, would otherwise empty this list and leave the guard
+  // reporting success over nothing.
+  assert.ok(asks.length >= 4,
+    `only ${asks.length} file(s) shell out to lsof — this guard used to cover 4, so ` +
+    `either the helper moved or this detector stopped detecting`);
+
+  const bad = [];
+  for (const f of asks) {
+    const src = stripComments(readFileSync(join(testDir, f), "utf8"));
+    const decl = /\bconst OURS = (\/(?:\\.|[^/\\\n])+\/[a-z]*);/.exec(src);
+    if (!decl) { bad.push(`${f}: asks lsof who holds a port and declares no OURS predicate`); continue; }
+    if (decl[1] !== WANT) { bad.push(`${f}: OURS is ${decl[1]}, not the pinned ${WANT}`); continue; }
+    if (!src.includes(FILTER)) { bad.push(`${f}: declares OURS but never puts the lsof result through it`); continue; }
+    // AND NOTHING MAY GO AROUND IT. Filtering listeners() is worthless while a
+    // cleanup asks lsof inline, which is what four of them did — two then walked
+    // UP to the listener's PARENT and sent SIGTERM, and a stranger's parent is
+    // this runner. One call per file, inside the guarded helper, is the only
+    // form that cannot be bypassed by the next cleanup somebody writes.
+    const n = src.split(NEEDLE).length - 1;
+    if (n !== 1) bad.push(`${f}: ${n} lsof calls — every one outside listeners() skips OURS`);
+  }
+  assert.deepEqual(bad, [],
+    `these files can hand a stranger's pid to process.kill():\n  ${bad.join("\n  ")}`);
+});
+
 test("the suite derives its parallelism from the machine", () => {
   const script = JSON.parse(readFileSync(join(testDir, "..", "package.json"), "utf8")).scripts?.test ?? "";
   // Premise. A renamed or rewritten script must not let the assertion below
@@ -752,7 +820,26 @@ test("the suite derives its parallelism from the machine", () => {
     // it edit this line — the same contract the roster already imposes, and the
     // reason `let` is not in the roster regex: a `let` bound leaves the roster and
     // fails there instead, loudly.
-    const BOUND = "Math.max(2, Math.floor(availableParallelism() / 2))";
+    // THE FLOOR IS 1, NOT 2, AND THAT IS THE WHOLE POINT OF THE FLOOR.
+    // `Math.max(2, ...)` defeated the halving on exactly the machines the
+    // halving exists for: floor(2/2) is 1, so on a two-core runner the bound
+    // computed 2 and two real proxies booted at once — the oversubscription
+    // this file's own comment two paragraphs down calls the defect class,
+    // while the bound looked derived-from-the-machine to any reader.
+    //   cores  1 2 3 4 8 48
+    //   max(2) 2 2 2 2 4 24
+    //   max(1) 1 1 1 2 4 24     <- differs ONLY at 1-3 cores
+    //
+    // ARITHMETIC ONLY. THIS FIXES NO CI FAILURE — it was written as the fix for
+    // PR #304's redness and that hypothesis is REJECTED, by measurement:
+    // proxy-held-port.test.mjs pinned to two cores with four busy-loops on the
+    // same cores fails IDENTICALLY under max(1) and under max(2) (rc=1, same
+    // case, same message). What that redness actually was is fixed in
+    // proxy-held-port.test.mjs and named there. How many cores CI's runner has
+    // is not asserted anywhere here, on purpose (see above), so the effect
+    // there is unmeasured in both directions. Keep the change because the bound
+    // is wrong on its own terms, and never because CI went green after it.
+    const BOUND = "Math.max(1, Math.floor(availableParallelism() / 2))";
     const assigns = [...src.matchAll(/\bCONCURRENCY\b\s*=\s*([^;]*);/g)]
       .map((m) => m[1].replace(/\s+/g, " ").trim());
     assert.deepEqual(assigns, [BOUND],

@@ -1116,7 +1116,27 @@ function holdPort(rest) {
       // collides on one record. The gap and standby two hundred lines up already
       // use this._port for the same reason.
       publishFingerprint(holder._port || port);
-      bootedHash = codeFingerprint(SERVER_PATH);
+      // A DEPLOY THAT ARRIVES DURING A RESTART IS STILL A DEPLOY, and this line
+      // used to swallow it. bootedHash is re-read on EVERY spawn, so a child
+      // that dies for any reason after the bytes changed comes back on the new
+      // file and the watcher below then compares the new hash against itself:
+      // equal, nothing to say, and not for one tick — forever. The upgrade IS
+      // running, which is why nothing looked wrong; what was lost is the only
+      // record that the running code changed, on the host where someone would
+      // go looking. Measured with a control: deploy alone announces, kill-then-
+      // deploy leaves stderr completely empty, and both end on the new bytes.
+      //
+      // Announced HERE rather than fixed by pinning bootedHash at first boot,
+      // because a restart really did change the running code and that is the
+      // fact worth logging. Two writers to one variable is what hid this; now
+      // both of them say the same thing when the answer moves.
+      const spawningHash = codeFingerprint(SERVER_PATH);
+      if (bootedHash && spawningHash && spawningHash !== bootedHash) {
+        process.stderr.write(
+          `[cache-fix] proxy source changed (${bootedHash.slice(0, 12)} -> ` +
+          `${spawningHash.slice(0, 12)}); this restart picks it up\n`);
+      }
+      bootedHash = spawningHash;
       // The gap listener must let go before the child can listen on the
       // inherited fd: two handles may BIND one port, but only one may LISTEN —
       // measured, holding it across the spawn gave "socket handover refused
