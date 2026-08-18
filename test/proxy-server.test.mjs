@@ -11,7 +11,7 @@ import { join, dirname } from "node:path";
 import { startProxy, upstreamPointsAtSelf } from "../proxy/server.mjs";
 import { startWatcher } from "../proxy/watcher.mjs";
 import { loadExtensions, getRegistry } from "../proxy/pipeline.mjs";
-import { OURS, cmdOf, freePort as takePort, listeners } from "./proc-helpers.mjs";
+import { OURS, cmdOf, freePort as takePort, listeners, onPort } from "./proc-helpers.mjs";
 
 const serverPath = join(dirname(fileURLToPath(import.meta.url)), "..", "proxy", "server.mjs");
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
@@ -841,7 +841,7 @@ after(async () => {
   for (let i = 0; i < 6; i++) {
     let any = false;
     for (const port of usedPorts) {
-      for (const q of listeners(port)) {
+      for (const q of onPort(port)) {
         try { process.kill(Number(q), "SIGHUP"); any = true; } catch { }
       }
     }

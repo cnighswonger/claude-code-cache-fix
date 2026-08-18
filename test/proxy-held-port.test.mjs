@@ -11,7 +11,7 @@ import { tmpdir, availableParallelism } from "node:os";
 import { join, dirname } from "node:path";
 
 import { sourceFingerprintSync } from "../proxy/source-fingerprint.mjs";
-import { HOP_ENV, OURS, cmdOf, freePort as takePort, listeners } from "./proc-helpers.mjs";
+import { HOP_ENV, OURS, cmdOf, freePort as takePort, listeners, onPort } from "./proc-helpers.mjs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
@@ -547,7 +547,7 @@ it("gives the port up when the proxy never starts", async () => {
       // AND THE ADDRESS STILL RETIRES, which is the other half of the same
       // harm: a standby that ignored the release word would hold every port a
       // failed launcher ever touched, forever.
-      for (const q of listeners(port)) { try { process.kill(Number(q), "SIGHUP"); } catch { } }
+      for (const q of onPort(port)) { try { process.kill(Number(q), "SIGHUP"); } catch { } }
       const gone = Date.now() + 5_000;
       while (await bound() && Date.now() < gone) await new Promise((r) => setTimeout(r, 100));
       assert.equal(await bound(), false, "the port survived SIGHUP, so it can never be reclaimed");
@@ -2358,7 +2358,7 @@ after(async () => {
   for (let i = 0; i < 6; i++) {
     let any = false;
     for (const port of usedPorts) {
-      for (const q of listeners(port)) {
+      for (const q of onPort(port)) {
         try { process.kill(Number(q), "SIGHUP"); any = true; } catch { }
       }
     }

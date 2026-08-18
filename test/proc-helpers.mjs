@@ -10,6 +10,7 @@
 // and an arrow function in a fourth, and freePort had three different shapes.
 
 import { execFileSync } from "node:child_process";
+import { readdirSync, readFileSync } from "node:fs";
 import net from "node:net";
 
 // NEVER SIGNAL A PID WE KNOW ONLY BY PORT. freePort() binds 0, reads the number
@@ -48,6 +49,53 @@ export function listeners(port) {
   } catch { return []; }
 }
 
+// EVERY FIXTURE ON A PORT, LISTENING OR NOT.
+//
+// listeners() is `lsof -sTCP:LISTEN`, so it finds a process only while it HOLDS
+// THE LISTEN. The standby's whole job is to hand the listen on and keep carrying
+// the address, so after a handover it is a live process no sweep can see.
+// Measured, two orphans side by side:
+//   pid=2404217 ppid=1 port=45855  lsof-sees-it=0   bin/gap-relay.mjs
+//   pid=2406768 ppid=1 port=41031  lsof-sees-it=1   bin/gap-relay.mjs
+// The invisible ones accumulate — ten at once here, the oldest 788 s, across
+// files and runs — and they hold ports and CPU that the NEXT file's readiness
+// assertions then time out on. Every "node 20 flake" on this branch has had that
+// shape, including a runner found at 414 s with zero CPU, wedged rather than slow.
+//
+// THE PORT A FIXTURE WAS GIVEN IS IN ITS ENVIRONMENT AND STAYS THERE. That is
+// the identifier that survives handing the listen on. Both markers are read
+// because the trio does not agree on one: measured on a live trio,
+//   claude-via-proxy.mjs  CACHE_FIX_PROXY_PORT=<port>   (no HELD_PORT)
+//   gap-relay.mjs         both
+//   proxy/server.mjs      CACHE_FIX_HELD_PORT=<port>, PROXY_PORT=0
+//
+// Still filtered by OURS, for the same reason listeners() is: a port number is
+// not ownership, and freePort() hands the same number to neighbouring files.
+export function ours(port) {
+  const want = new RegExp(`CACHE_FIX_(?:HELD|PROXY)_PORT=${Number(port)}(?:\\s|$)`);
+  const out = [];
+  try {
+    // Linux: /proc is authoritative and needs no shell-out.
+    for (const pid of readdirSync("/proc")) {
+      if (!/^\d+$/.test(pid)) continue;
+      let env = "";
+      try { env = readFileSync(`/proc/${pid}/environ`, "utf8").replace(/\0/g, " "); } catch { continue; }
+      if (want.test(env) && OURS.test(cmdOf(pid))) out.push(pid);
+    }
+    return out;
+  } catch { /* no /proc: ask ps below */ }
+  try {
+    // macOS: `ps -wwE` prints the environment after the command. Verified there.
+    const rows = execFileSync("ps", ["-wwEo", "pid=,command="],
+                              { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    for (const line of rows.split("\n")) {
+      const m = /^\s*(\d+)\s+(.*)$/.exec(line);
+      if (m && want.test(m[2]) && OURS.test(m[2])) out.push(m[1]);
+    }
+  } catch { /* no ps either: the caller falls back to listeners() */ }
+  return out;
+}
+
 // A port nobody is listening on RIGHT NOW. It is released before the caller
 // uses it — see the OURS note above for what that costs and how it is bounded.
 export async function freePort() {
@@ -69,3 +117,10 @@ export const HOP_ENV = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"
                         "ALL_PROXY", "all_proxy",
                         "CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_REQUIRE_HOP",
                         "CACHE_FIX_FALLBACK_PROXIES"];
+
+// THE CLEANUP SET: everything on this port, listening or not. listeners() alone
+// misses a standby that has handed its listen on — measured, ten such orphans at
+// once, the oldest 788 s, accumulating across files and runs until a later
+// file's readiness assertion times out on the CPU and ports they hold. See
+// ours() for the mechanism and the two markers it reads.
+export const onPort = (port) => [...new Set([...listeners(port), ...ours(port)])];
