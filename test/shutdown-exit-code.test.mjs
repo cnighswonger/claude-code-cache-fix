@@ -519,66 +519,95 @@ describe("SIGTERM exit code", () => {
       "both halves of the split must appear, and anchored");
   });
 
-  // THE PREMISE ba2375b RESTS ON, AND IT IS NODE'S, NOT OURS.
+  // THE OTHER HALF OF ba2375b, AND IT IS NOT COVERED BY THE HEADER.
   //
-  // `Connection: close` is set in the request handler, so it only ever reaches
-  // a connection that sends another request. A connection that goes quiet at
-  // the drain and never speaks again never gets the header — nothing in our
-  // code closes it. Our whole coverage for that case is node closing idle
-  // keep-alives itself at server.close(), and until this test that assumption
-  // was load-bearing with nothing asserting it: a node release that stopped
-  // doing it would reopen the hole with the suite still green.
+  // `Connection: close` rides a request. A client that goes QUIET at the drain
+  // and never sends another one never gets it, so something else has to close
+  // that socket or it stays pinned to a departing proxy.
   //
-  // Measured on 24.11.1 / 25.8.0 / 26.5.1 (the majors this actually deploys
-  // on, none of which CI runs): idle closed in 0-1 ms, busy still open after
-  // 2.5 s. CI's 18/20/22 agree on the idle half.
+  // ba2375b assumed node did that for us. It does from 19 on; 18.20.8 does NOT
+  // — measured directly, a bare http server's idle keep-alive never closes on
+  // 18 where 20.20.2 and 24.11.1 close it in 1-2 ms. Worse on the same major:
+  // that socket also keeps close() unresolved (see forcedCloseLine's note), so
+  // the handover spends its ENTIRE budget, which 6d6f01d just raised to 30
+  // minutes. A quiet client on Node 18 was pinned for all of it.
   //
-  // THE BUSY CASE IS THE CONTROL, not decoration. Without it this test passes
-  // on a runtime that closes EVERYTHING at close() — which would equally make
-  // the first assertion true while destroying the in-flight replies the drain
-  // exists to protect. Two polarities, or the green means nothing.
-  it("relies on node closing idle keep-alives at close(), and says so if it stops", async () => {
-    const closeMs = async (busy) => {
-      const srv = http.createServer((req, res) => {
-        if (busy) setTimeout(() => res.end("ok"), 1_500);
-        else res.end("ok");
+  // So this asserts OUR contract, not node's: a draining proxy leaves no idle
+  // keep-alive open, on every major engines admits. The busy half is already
+  // covered above ("tells a keep-alive client to close once it is draining"),
+  // which requires the in-flight reply to FINISH — so a fix that simply closed
+  // everything would fail there, and that is this test's control.
+  it("closes a keep-alive the client left idle, on every supported major", async () => {
+    const { proc, port } = startProxy();
+    const p = await port;
+    const sock = net.connect(p, "127.0.0.1");
+    sock.on("error", () => {});
+    let closed = false;
+    sock.on("close", () => { closed = true; });
+    await new Promise((r) => sock.once("connect", r));
+    try {
+      // One instant request, fully read, so the connection is genuinely IDLE
+      // when the signal lands -- not mid-request, which is the other case.
+      const reply = await new Promise((resolve) => {
+        let buf = "";
+        const onData = (d) => {
+          buf += d.toString();
+          if (/\r\n\r\n/.test(buf)) { sock.off("data", onData); resolve(buf); }
+        };
+        sock.on("data", onData);
+        sock.write("GET /health HTTP/1.1\r\nHost: x\r\n\r\n");
+        setTimeout(() => { sock.off("data", onData); resolve(buf); }, 4000);
       });
-      await new Promise((r) => srv.listen(0, "127.0.0.1", r));
-      try {
-        const sock = net.connect(srv.address().port, "127.0.0.1");
-        sock.on("error", () => {});
-        let got = "", t0 = 0, ms = null;
-        sock.on("data", (d) => { got += d; });
-        sock.on("close", () => { if (t0) ms = Date.now() - t0; });
-        await new Promise((r) => sock.once("connect", r));
-        sock.write("GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n");
+      // PREMISE: it answered and it kept the socket. Without this the assertion
+      // below passes against a proxy that was already dead or already closing.
+      assert.match(reply, /^HTTP\/1\.1 200/, `healthy /health did not answer: ${reply.slice(0, 80)}`);
+      assert.equal(closed, false, "the socket closed before we even signalled");
 
-        // Idle means the reply is IN and the socket is quiet. Waiting on the
-        // reply rather than a timer is what makes this not a race.
-        if (!busy) await new Promise((r) => {
-          const w = setInterval(() => { if (got.includes("ok")) { clearInterval(w); r(); } }, 10);
-        });
-        else await new Promise((r) => setTimeout(r, 200));   // still mid-request
+      proc.kill("SIGTERM");
+      // WAIT ON THE EVENT, not on a fixed 2s. A flat sleep held a spawned proxy
+      // alive for two seconds doing nothing, and node:test runs FILES
+      // concurrently — that load reddened a readiness assertion in
+      // proxy-held-port.test.mjs ("no proxy child to kill"), which is green at
+      // HEAD and green with this file's production change alone. Bisected.
+      // Cut the load rather than widen the victim's window: this now returns in
+      // milliseconds when the socket closes, and only spends the budget when it
+      // does not.
+      closed = closed || await new Promise((r) => {
+        const t = setTimeout(() => r(false), 2_000);
+        sock.once("close", () => { clearTimeout(t); r(true); });
+      });
+      assert.equal(closed, true,
+        "a draining proxy left an IDLE keep-alive open. That client never sends " +
+        "another request, so it never gets Connection: close and never reaches " +
+        "the successor -- and on Node 18 it also holds close() unresolved, so " +
+        "the handover burns its whole 30-minute budget with the client pinned.");
+    } finally {
+      sock.destroy();
+      try { proc.kill("SIGKILL"); } catch {}
+    }
+  });
 
-        t0 = Date.now();
-        srv.close();
-        await new Promise((r) => setTimeout(r, 1_000));
-        sock.destroy();
-        return ms;
-      } finally { srv.close(); }
-    };
+  // MEASURE THE PATIENCE THAT WAS ENOUGH, not only the patience that ran out.
+  //
+  // 6d6f01d set a 1800 s handover budget and gave nobody a way to see how close
+  // a real drain comes to it. The forced-close line fires only when the budget
+  // is SPENT, so it reports what was still open when we gave up — never how
+  // long a drain that finished actually needed. Those are the numbers a
+  // threshold has to be chosen from, and without them the next revision of the
+  // budget is another guess. The neighbour layer measured one legitimate drain
+  // at 1126.2 s, so the range is not hypothetical.
+  it("reports how long a clean drain actually took, and against which budget", async () => {
+    const { proc, port, stderr } = startProxy();
+    await port;
+    const exited = new Promise((r) => proc.on("exit", r));
+    proc.kill("SIGTERM");
+    await exited;
 
-    const idle = await closeMs(false);
-    assert.notEqual(idle, null,
-      "node did NOT close an idle keep-alive at server.close(). ba2375b covers " +
-      "only connections that send another request, so this runtime leaves a " +
-      "quiet client pinned to a departing proxy. The header is no longer enough.");
-    assert.ok(idle < 500, `idle keep-alive took ${idle}ms to close, expected prompt`);
-
-    const busy = await closeMs(true);
-    assert.equal(busy, null,
-      "a BUSY connection was closed at server.close(), which would sever the " +
-      "in-flight replies the drain exists to protect — and would make the idle " +
-      "assertion above pass for the wrong reason");
+    const line = stderr();
+    // A SUPERVISED STOP, so the budget named must be 5s — printing the 1800s
+    // handover budget here would misreport the path as badly as the old
+    // hardcoded "after 5s" misreported a handover.
+    assert.match(line, /\[cache-fix\] shutdown: drained clean in \d+\.\d+s of 5s budget/,
+      `no clean-drain measurement on the supervised path: ${JSON.stringify(line.slice(-200))}`);
   });
 });

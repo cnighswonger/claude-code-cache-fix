@@ -1106,6 +1106,16 @@ export async function startProxy(options = {}) {
         // unhandled-rejection report to it. Both callbacks fire on the same
         // 'close' event, after the drain, so resolving is the true answer.
         server.close((err) => (err && err.code !== "ERR_SERVER_NOT_RUNNING" ? reject(err) : resolve()));
+        // NODE 18 DOES NOT DO THIS FOR US, and ba2375b silently assumed it did.
+        // From 19 on, close() closes idle keep-alives itself; 18.20.8 does not —
+        // measured, close never fires where 20.20.2 and 24.11.1 report 1-2 ms.
+        // Three consequences and all of them are on 18: the quiet client never
+        // gets `Connection: close` (that header rides a request it will never
+        // send), its socket keeps this promise unresolved, and the handover then
+        // spends its ENTIRE budget — 30 minutes of a client pinned to a proxy
+        // that has stopped being the front door. Optional-call because engines
+        // is ">=18" and closeIdleConnections landed in 18.2.
+        server.closeIdleConnections?.();
       }),
   };
 }
@@ -1631,10 +1641,30 @@ if (invokedAsScript) {
     // PEAK CONCURRENT 4 and 3 still alive after 4 deploys.
     say(process.stdout,
         `proxy releasing the listening socket${handedOff ? " (handed off)" : ""}\n`);
-    active.close().finally(() => process.exit(handedOff ? 75 : 0));
     const budgetMs = handedOff
       ? (Number(process.env.CACHE_FIX_DRAIN_MS) || 1_800_000)
       : 5_000;
+    // TIME THE DRAIN THAT FINISHED, not only the one that was cut.
+    // 6d6f01d set a 1800s handover budget with no way to see how close anything
+    // comes to it — a threshold with no instrument, which is the same defect as
+    // the Node 18 assumption above. The forced-close line reports only what was
+    // open when patience ran out; it cannot say how much patience was NEEDED.
+    // A drain that COMPLETED in N seconds is evidence N was safe to wait, and
+    // that is the population a future threshold has to be chosen from. The
+    // neighbour layer measured one legitimate drain at 1126.2s, so the range
+    // this lives in is not hypothetical.
+    const drainStart = Date.now();
+    active.close().finally(() => {
+      const secs = ((Date.now() - drainStart) / 1000).toFixed(1);
+      // PREFIXED like its two siblings above, and NOT the bare phrase
+      // "drained clean": a neighbouring component logs its own drain with that
+      // exact wording, and its reader matches on it unanchored. It reads one
+      // explicit path today so nothing collides — but two components sharing a
+      // phrase across two logs is a wrong row that parses cleanly, which is the
+      // kind of defect that has no symptom. Renamed before it shipped anywhere.
+      say(process.stderr, `[cache-fix] shutdown: drained clean in ${secs}s of ${budgetMs / 1000}s budget\n`);
+      process.exit(handedOff ? 75 : 0);
+    });
     // THE BUDGET IS 5 s ONLY WHERE SOMETHING IS WAITING ON OUR EXIT.
     //
     // The 5 s is right for a SUPERVISED STOP and the measurement behind it is
