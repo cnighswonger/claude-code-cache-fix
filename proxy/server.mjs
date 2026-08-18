@@ -625,13 +625,17 @@ export function forcedCloseLine(ended, destroyed, held, budgetMs = 5_000) {
 //     a SECOND request after it       200 ... Connection: keep-alive
 // so the client is told to keep a connection to a process that has stopped being
 // the front door. It never reconnects, so it never reaches the successor already
-// serving on the inherited fd. A peer daemon measured the same shape from the
-// other side: eleven of twelve sessions stranded on a departing process.
+// serving on the inherited fd. A peer daemon in this stack shipped a fix for
+// the same phenomenon on its own layer; a count it first offered as
+// corroboration was withdrawn as unverifiable, so nothing here rests on it —
+// the reproduction above is this proxy's own.
 //
 // An IDLE keep-alive is not affected — node closes those itself at close(),
-// measured on 18.20.8 / 20.20.2 / 24.11.1. The exposure is exactly the
-// connection that was BUSY when the drain began, which on those same three
-// majors goes on to serve another request.
+// measured on 18.20.8 / 20.20.2 / 24.11.1 / 25.8.0 / 26.5.1. The exposure is
+// exactly the connection that was BUSY when the drain began, which on every
+// one of those majors goes on to serve another request. That is node's
+// behaviour, not ours, so a test asserts it rather than a comment claiming it
+// — see "relies on node closing idle keep-alives at close()".
 let _draining = false;
 
 export function createProxyServer() {
