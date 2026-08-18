@@ -162,7 +162,25 @@ export function fallbackProxyUrls() {
     for (const h of ["127.0.0.1", "localhost", "[::1]"]) mine.add(`${h}:${p}`);
   return (process.env.CACHE_FIX_FALLBACK_PROXIES || "")
     .split(",").map((s) => s.trim()).filter(Boolean)
-    .filter((u) => { try { return !mine.has(new URL(u).host); } catch { return false; } });
+    .filter((u) => {
+      try {
+        const parsed = new URL(u);
+        // THE SCHEME THIS CHAIN CAN ACTUALLY DIAL, which bin/gap-relay.mjs
+        // already required of the SAME list from the SAME variable, with a
+        // comment saying a value it rejects is not a hop here either. This end
+        // filtered only the self-address, so one chain had two definitions of a
+        // valid hop — measured on one string, upstream kept both entries and the
+        // relay kept one.
+        //
+        // It does not fail loudly, which is why it needs a filter rather than a
+        // reader who notices: hopAlive() is a plain TCP connect, so a socks5
+        // endpoint answers ALIVE, resolveHop selects it, getAgent hands it to
+        // HttpsProxyAgent — which cannot speak SOCKS — and /health goes on
+        // publishing it as the measured hop while every request through it dies.
+        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+        return !mine.has(parsed.host);
+      } catch { return false; }
+    });
 }
 
 // The chain grace, matched to the pin's _CHAIN_HEAL_GRACE_S / _CHAIN_HEAL_POLL_S

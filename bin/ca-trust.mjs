@@ -1,6 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { readFileSync, readdirSync, statSync } from "node:fs";
-import { X509Certificate } from "node:crypto";
+import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 // Ask node what a CA bundle actually buys, instead of predicting it.

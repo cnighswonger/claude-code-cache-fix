@@ -124,6 +124,33 @@ describe("hop fallback", () => {
     }
   });
 
+  it("drops a scheme this chain cannot dial, like the relay already does", async () => {
+    const { fallbackProxyUrls } = await import("../proxy/upstream.mjs");
+    const prior = process.env.CACHE_FIX_FALLBACK_PROXIES;
+    // ONE CHAIN, TWO DEFINITIONS OF A VALID HOP. bin/gap-relay.mjs builds the
+    // same list from the same variable and rejects anything that is not
+    // http:/https:, with a comment saying a value it rejects is not a hop here
+    // either. This filtered only the self-address.
+    //
+    // Measured on the same string: upstream returned both entries, the relay
+    // returned one. The cost is not a parse error — hopAlive() only does a
+    // plain TCP connect, so a socks5 endpoint reports ALIVE, resolveHop picks
+    // it, getAgent hands it to HttpsProxyAgent which cannot speak SOCKS, and
+    // /health publishes it as the measured hop while every request through it
+    // fails.
+    process.env.CACHE_FIX_FALLBACK_PROXIES =
+      "socks5://127.0.0.1:1080,http://127.0.0.1:8118,socks5h://127.0.0.1:1081";
+    try {
+      assert.deepEqual(fallbackProxyUrls(), ["http://127.0.0.1:8118"],
+        "a scheme this chain cannot dial was kept as a hop — it will pass the " +
+        "liveness probe, be selected, and fail every request while /health " +
+        "reports it as measured");
+    } finally {
+      if (prior === undefined) delete process.env.CACHE_FIX_FALLBACK_PROXIES;
+      else process.env.CACHE_FIX_FALLBACK_PROXIES = prior;
+    }
+  });
+
   it("reads an ordered list, trimming and dropping empties", async () => {
     const { fallbackProxyUrls } = await import("../proxy/upstream.mjs");
     const prior = process.env.CACHE_FIX_FALLBACK_PROXIES;
