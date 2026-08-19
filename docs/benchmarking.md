@@ -42,7 +42,7 @@ The proxy already emits this. `proxy/extensions/cache-telemetry.mjs:230` writes 
   "context_tokens": 51575,
   "request_count": 12,
   "first_seen": "2026-08-04T20:45:35.896Z",
-  "session_id": "04f9ae07-84ce-4a36-94b8-cb62d2c971ec"
+  "session_id": "00000000-0000-4000-8000-c4f1efb22203"
 }
 ```
 
