@@ -355,9 +355,24 @@ test("CONNECT falls open to a direct dial, unless CACHE_FIX_REQUIRE_HOP says oth
   upstream.on("connection", () => trace.push("UPSTREAM"));
   await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
   // A hop address with nothing behind it: the whole chain refuses.
-  const deadHop = net.createServer();
-  const deadPort = await listen(deadHop);
-  await new Promise((r) => deadHop.close(r));
+  // A PORT NOTHING CAN TAKE, not one we happened to let go of. Binding an
+  // ephemeral port and closing it leaves a number the kernel is free to hand to
+  // the next asker, and this file's own fixtures ask for ephemeral ports
+  // constantly — the suite allocates ~55 of them per run before counting the
+  // proxies and standbys each one spawns. A neighbour that lands on this exact
+  // number turns "the whole chain refuses" into "the chain has a live hop", and
+  // the case then measures something it never meant to.
+  //
+  // Not a theoretical worry: measured here by binding it deliberately, the case
+  // stopped failing cleanly and HUNG instead — `--test-timeout=0` means nothing
+  // ends it — where unoccupied it finishes in about four seconds.
+  //
+  // Port 1 cannot be taken by anything in this suite: binding below 1024 needs
+  // privilege and the runner is unprivileged (uid 1910859 here, and GitHub's
+  // runners do not run tests as root either). Connecting to it refuses in ~2ms,
+  // which is what a dead hop is supposed to do — so this is strictly more
+  // faithful than the port we used to free and hope stayed free.
+  const deadPort = 1;
 
   let handle;
   const connect = (port, target) => new Promise((resolve) => {
