@@ -435,8 +435,36 @@ describe("holder handover (SIGUSR2)", () => {
       // before this line existed.
       const held = net.connect({ host: "127.0.0.1", port });
       await new Promise((r) => held.on("connect", r));
-      holder.kill("SIGKILL");
+      // STOPPED, NOT KILLED, AND ONLY THEN THE RELEASE. The self-heal fires on
+      // exactly one condition (proxy/server.mjs): `heldBy !== String(ppid)`,
+      // which becomes true the instant the holder DIES and its child reparents
+      // to 1. Killing first and releasing second therefore opens a window in
+      // which the self-heal is armed and the release word has not landed —
+      // and a tick inside that window resurrects a supervisor LEGITIMATELY,
+      // because from the proxy's side an unexplained holder death is exactly
+      // what it must repair.
+      //
+      // That window was 50ms wide and it is what reddened CI. Measured on
+      // run 32186749592 (node 20): this case failed with two pids and no names.
+      // The mutation control here prints what a resurrection actually looks
+      // like — `run-service` PLUS `server.mjs`, two processes — and the CI
+      // failure had exactly two. A slow exit cannot produce that pair: the
+      // holder was killed outright, so a lingering `run-service` can only be a
+      // NEW one.
+      //
+      // SIGSTOP closes the window instead of narrowing it. A stopped holder
+      // cannot restart the child — which is why the kill had to come first at
+      // all — and its pid still exists, so `ppid` never moves and the self-heal
+      // cannot arm. The release lands against a quiet lineage, and only then
+      // does the kill arm the watcher, which now finds `releasingPort` already
+      // true. Widening the poll would only have made the race rarer; this
+      // removes the ordering the race needs.
+      holder.kill("SIGSTOP");
       try { process.kill(kid, "SIGHUP"); } catch { }
+      // The release word has to be PROCESSED before the watcher can arm, not
+      // merely delivered — the flag is set in the proxy's own SIGHUP handler.
+      await new Promise((r) => setTimeout(r, 250));
+      holder.kill("SIGKILL");
       await new Promise((r) => setTimeout(r, 6_000));
       held.destroy();
       await new Promise((r) => setTimeout(r, 2_000));
@@ -445,10 +473,36 @@ describe("holder handover (SIGUSR2)", () => {
       // must not come back is a supervisor. Asserting on the command line keeps
       // the mutation this case exists for — a self-heal that resurrects a holder
       // shows up as `run-service` or `server.mjs` and fails right here.
-      const lineage = listeners(port).filter((p) => /\brun-service\b|server\.mjs/.test(cmdOf(p)));
+      //
+      // THE 2s ABOVE IS THE DETECTION WINDOW AND STAYS. A self-heal polls every
+      // 50ms here, so a resurrection is back well inside it; shortening it would
+      // lose the mutation. What follows is NOT more detection time — it is the
+      // separate question of whether a doomed process has finished leaving.
+      //
+      // POLLED, because one sample after a fixed sleep cannot tell those two
+      // apart. Measured in CI (run 32186749592, node 20): this case failed at
+      // duration_ms 9007 — 6000 + 2000 of fixed sleep plus setup, so no deadline
+      // was exhausted and nothing had been waited FOR. It reported two bare pids
+      // and no command lines, which is why a run that reddens here has never
+      // been diagnosable after the fact: a proxy still draining and a supervisor
+      // that came back both print as a number that no longer exists.
+      //
+      // A doomed process leaves inside the deadline and the case passes. A
+      // resurrected supervisor is still there at the end of it, so the assertion
+      // fires exactly as before — the poll cannot mask the defect, it can only
+      // stop blaming a slow exit for it. The names go into the message so the
+      // NEXT red answers which one it was instead of posing the question again.
+      const settle = Date.now() + 20_000;
+      let lineage;
+      for (;;) {
+        lineage = listeners(port).filter((p) => /\brun-service\b|server\.mjs/.test(cmdOf(p)));
+        if (!lineage.length || Date.now() > settle) break;
+        await new Promise((r) => setTimeout(r, 250));
+      }
       assert.deepEqual(lineage, [],
         "a supervisor came back after the port was released — the lineage resurrected " +
-        "itself, so no port can ever be retired and every stray one is permanent");
+        "itself, so no port can ever be retired and every stray one is permanent: " +
+        lineage.map((p) => `${p}=${cmdOf(p) || "<gone>"}`).join(" | "));
       // AND THE ADDRESS STILL RETIRES. That is the other half of the same harm:
       // a standby that ignored the release word would make every stray port
       // permanent by a different route.
