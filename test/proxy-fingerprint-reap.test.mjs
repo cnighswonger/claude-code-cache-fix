@@ -39,6 +39,17 @@ function runReaper(dir) {
   )(readdirSync, statSync, rmSync, join, () => dir, net, () => "127.0.0.1");
 }
 
+// A FIXED PORT SITS INSIDE THE EPHEMERAL RANGE, so a sibling test's launcher can
+// be handed one and hold it for a whole run; portFree then answers false and the
+// reaper correctly keeps a record these cases expect reaped. A port the kernel
+// has just released is the last one it hands out again.
+function releasedPort() {
+  return new Promise((res) => {
+    const s = createServer();
+    s.listen(0, "127.0.0.1", () => { const port = s.address().port; s.close(() => res(port)); });
+  });
+}
+
 test("the launcher carries a reaper for its own fingerprint records", () => {
   assert.match(SRC, /const\s+recordAgeMs\s*=/,
                "no fingerprint reaper found in claude-via-proxy.mjs — this test guards nothing");
@@ -73,7 +84,8 @@ test("a record whose port still has a listener is kept however old it is", async
     await new Promise((r) => srv.listen(0, "127.0.0.1", r));
     const port = srv.address().port;
     const live = join(dir, `cache-fix-proxy-${port}.sha256`);
-    const dead = join(dir, "cache-fix-proxy-40404.sha256");
+    const deadPort = await releasedPort();
+    const dead = join(dir, `cache-fix-proxy-${deadPort}.sha256`);
     for (const p of [live, dead]) writeFileSync(p, "x");
     const old = Date.now() / 1000 - 30 * 86400;
     for (const p of [live, dead]) utimesSync(p, old, old);
@@ -83,7 +95,7 @@ test("a record whose port still has a listener is kept however old it is", async
     const left = readdirSync(dir);
     assert.ok(left.includes(`cache-fix-proxy-${port}.sha256`),
               `the reaper deleted a live holder's record: ${left}`);
-    assert.ok(!left.includes("cache-fix-proxy-40404.sha256"),
+    assert.ok(!left.includes(`cache-fix-proxy-${deadPort}.sha256`),
               `a record for a port nothing listens on survived: ${left}`);
   } finally {
     srv.close();
@@ -98,16 +110,13 @@ test("a launcher that binds reaps on the way up", { timeout: 30_000 }, async () 
   const dir = mkdtempSync(join(tmpdir(), "ccf-fpreap-e2e-"));
   let child = null, port = 0;
   try {
-    const stale = join(dir, "cache-fix-proxy-40808.sha256");
+    const stalePort = await releasedPort();
+    const stale = join(dir, `cache-fix-proxy-${stalePort}.sha256`);
     writeFileSync(stale, "x");
     const old = Date.now() / 1000 - 30 * 86400;
     utimesSync(stale, old, old);
 
-    port = await new Promise((res) => {
-      const s = createServer().listen(0, "127.0.0.1", () => {
-        const p = s.address().port; s.close(() => res(p));
-      });
-    });
+    port = await releasedPort();
     const env = { ...process.env, TMPDIR: dir, CACHE_FIX_PROXY_PORT: String(port),
                   CACHE_FIX_FORWARD_PROXY: "on", CACHE_FIX_SELF_HEAL: "off" };
     for (const k of ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"]) delete env[k];
@@ -151,17 +160,21 @@ test("a record whose port is not a number is kept", async () => {
 test("a stale record is removed, and anything a live holder may still own is kept", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ccf-fpreap-"));
   try {
-    const stale = join(dir, "cache-fix-proxy-40001.sha256");
-    const fresh = join(dir, "cache-fix-proxy-40002.sha256");
+    const stalePort = await releasedPort();
+    const stale = join(dir, `cache-fix-proxy-${stalePort}.sha256`);
+    // Fixed numbers, below the ephemeral floor so they cannot collide with the
+    // derived one above: none of these four reaches portFree, so only the name
+    // has to be distinct.
+    const fresh = join(dir, "cache-fix-proxy-30002.sha256");
     // A holder that merely lives long: nothing republishes, so its mtime is its
     // launch time and a short gate would reap a live proxy's own record.
-    const longLived = join(dir, "cache-fix-proxy-40003.sha256");
+    const longLived = join(dir, "cache-fix-proxy-30003.sha256");
     // Just inside the gate: pins the number, not merely its sign.
-    const nearGate = join(dir, "cache-fix-proxy-40005.sha256");
+    const nearGate = join(dir, "cache-fix-proxy-30005.sha256");
     // A concurrent launcher's in-flight write. publishFingerprint writes
     // `<record>.<pid>` and renames; that name carries RECORD_PREFIX, so only the
     // suffix check stands between this reaper and someone else's pending rename.
-    const inflight = join(dir, "cache-fix-proxy-40006.sha256.99999");
+    const inflight = join(dir, "cache-fix-proxy-30006.sha256.99999");
     // Ends in .sha256 on purpose: with any other suffix endsWith() alone saves
     // it and an empty prefix would pass.
     const alien = join(dir, "cache-fix-ca-scratch-keepme.sha256");
@@ -172,13 +185,13 @@ test("a stale record is removed, and anything a live holder may still own is kep
     await runReaper(dir);
 
     const left = readdirSync(dir).sort();
-    assert.ok(!left.includes("cache-fix-proxy-40001.sha256"), `the stale record survived: ${left}`);
-    assert.ok(left.includes("cache-fix-proxy-40002.sha256"), `the fresh record was removed: ${left}`);
-    assert.ok(left.includes("cache-fix-proxy-40003.sha256"),
+    assert.ok(!left.includes(`cache-fix-proxy-${stalePort}.sha256`), `the stale record survived: ${left}`);
+    assert.ok(left.includes("cache-fix-proxy-30002.sha256"), `the fresh record was removed: ${left}`);
+    assert.ok(left.includes("cache-fix-proxy-30003.sha256"),
               `a 3-day-old record was reaped: a holder up that long loses its own record — ${left}`);
-    assert.ok(left.includes("cache-fix-proxy-40005.sha256"),
+    assert.ok(left.includes("cache-fix-proxy-30005.sha256"),
               `a 6-day-old record was reaped: the gate is shorter than 7 days — ${left}`);
-    assert.ok(left.includes("cache-fix-proxy-40006.sha256.99999"),
+    assert.ok(left.includes("cache-fix-proxy-30006.sha256.99999"),
               `the reaper took a concurrent launcher's pending write — ${left}`);
     assert.ok(left.includes("cache-fix-ca-scratch-keepme.sha256"),
               `the reaper took a name that is not its own: ${left}`);
