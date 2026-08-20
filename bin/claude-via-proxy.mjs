@@ -809,6 +809,18 @@ async function reapFingerprintRecords() {
 // reap working on a host with no lsof — otherwise the leak fix is a silent
 // no-op exactly where nobody would look for it. A name whose port is not a
 // number is not ours to judge, so it is kept.
+//
+// It answers "is anything LISTENING", which is not the same as "is anyone using
+// this port": a holder in the bound-but-not-listening state this file creates on
+// purpose reads as free. That window is the ~80 ms before the gap relay boots,
+// and losing a record there ends in the announced exit 0 above rather than
+// anything silent.
+//
+// Serialized, and it does not yield: measured at 3,000 over-age records the loop
+// held the event loop for 176 ms. listen and close resolve on nextTick, so the
+// await never reaches the poll phase. It runs after the bind, so it delays no
+// listener — but budget roughly 60 ms per 1,000 eligible records before calling
+// it free.
 function portFree(port) {
   const n = Number(port);
   if (!Number.isInteger(n) || n < 1 || n > 65535) return Promise.resolve(false);
