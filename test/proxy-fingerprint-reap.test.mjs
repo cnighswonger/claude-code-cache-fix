@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { createServer } from "node:net";
 import { fileURLToPath } from "node:url";
 import { execFileSync, spawn } from "node:child_process";
+import { onPort } from "./proc-helpers.mjs";
 
 const LAUNCHER = fileURLToPath(new URL("../bin/claude-via-proxy.mjs", import.meta.url));
 const SRC = readFileSync(LAUNCHER, "utf-8");
@@ -96,14 +97,14 @@ test("a record whose port still has a listener is kept however old it is", async
 // This one spawns the real thing.
 test("a launcher that binds reaps on the way up", { timeout: 30_000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "ccf-fpreap-e2e-"));
-  let child = null;
+  let child = null, port = 0;
   try {
     const stale = join(dir, "cache-fix-proxy-40808.sha256");
     writeFileSync(stale, "x");
     const old = Date.now() / 1000 - 30 * 86400;
     utimesSync(stale, old, old);
 
-    const port = await new Promise((res) => {
+    port = await new Promise((res) => {
       const s = createServer().listen(0, "127.0.0.1", () => {
         const p = s.address().port; s.close(() => res(p));
       });
@@ -118,7 +119,13 @@ test("a launcher that binds reaps on the way up", { timeout: 30_000 }, async () 
     assert.ok(!existsSync(stale),
               "the launcher bound its port and never reaped — the call is unreachable");
   } finally {
+    // THE HOLDER IS NOT THE ONLY PROCESS THIS STARTED. run-service spawns a
+    // DETACHED standby gap-relay that only stands down for a claimant's SIGHUP,
+    // so killing the launcher reparents it to init still holding the port —
+    // measured, one per run. Holder first, then whatever is left on the port,
+    // the order proxy-held-port's own sweep documents.
     if (child) { try { child.kill("SIGKILL"); } catch { /* already gone */ } }
+    for (const p of onPort(port)) { try { process.kill(Number(p), "SIGKILL"); } catch { /* gone */ } }
     rmSync(dir, { recursive: true, force: true });
   }
 });

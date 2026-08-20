@@ -126,6 +126,27 @@ test("a test that SIGKILLs a holder reaps the successor, holder first", () => {
     "that a live holder immediately replaces");
 });
 
+// THE SAME DEBT, IN THE FILE THAT LEARNED IT SECOND. proxy-fingerprint-reap
+// spawns a run-service to prove the reaper is reachable, and a run-service
+// leaves a DETACHED standby that stands down only for a claimant's SIGHUP —
+// measured, one orphan per run holding an ephemeral port until something else
+// times out on it.
+//
+// Named rather than swept. A form-based sweep — every .test.mjs carrying both
+// "run-service" and SIGKILL — was tried and measured: it also flags
+// proxy-probe-bounded and stdio-epipe-survival, whose orphan delta over a full
+// run is 0. Those two spawn a holder that never reaches the standby, so the
+// predicate describes the shape of the code rather than the debt it incurs, and
+// a guard that reds two innocent files is a guard someone deletes.
+test("the fingerprint reaper's spawn case sweeps the port it leaves behind", () => {
+  const src = readFileSync(join(testDir, "proxy-fingerprint-reap.test.mjs"), "utf8");
+  const spawned = /test\("a launcher that binds reaps on the way up"[\s\S]*?\n\}\);/.exec(src)?.[0];
+  assert.ok(spawned, "the spawn case moved — this no longer guards anything");
+  assert.match(spawned, /onPort\(/,
+    "the launcher is SIGKILLed but nothing sweeps the port, so its detached " +
+    "standby survives every run");
+});
+
 // A FAILURE MESSAGE IS PUBLISHED OUTPUT. proxy-held-port's probes append the
 // 503 body to what they assert on, and the gap relay's 503 body carries the hop
 // it would forward to — so an env var that gives a child a hop and is not
