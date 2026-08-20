@@ -1,10 +1,18 @@
 import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import ext, {
+  ALWAYS_PASSTHROUGH,
+  betaEventsPath,
   betaSessionKey,
+  isStabilizablePath,
   planStableBetas,
   resetBetaSnapshots,
 } from "../proxy/extensions/beta-stabilize.mjs";
+
+// The token deferred-tool-rewrite adds on any turn it injects a tool_addition
+// block. Written out rather than read from ALWAYS_PASSTHROUGH so a regression
+// that empties the whitelist cannot also empty the test's expectation.
+const DTR_BETA = "mid-conversation-tool-changes-2026-07-01";
 
 // The four states measured on visits-01 (2026-08-08) across turns 821-825 of
 // ONE session, within ~5 minutes. cache-diagnosis flipped four times in 33
@@ -33,19 +41,42 @@ afterEach(() => {
 const SYSTEM = [{ type: "text", text: "You are a Claude agent." }];
 const CONV = [{ role: "user", content: [{ type: "text", text: "conversation A" }] }];
 
-function mkCtx({ beta = BASE, sid = SID, on = true, messages = CONV, system = SYSTEM } = {}) {
+// Captures the durable event rows instead of writing them. Tests that write
+// to the real snapshots dir leave residue in the operator's ~/.claude — the
+// same pollution class the persistent-stats isolation fixture exists to stop.
+function mkFs(sink) {
+  return {
+    mkdir: async () => {},
+    appendFile: async (file, line) => {
+      sink.push({ file, row: JSON.parse(line) });
+    },
+  };
+}
+
+function mkCtx({
+  beta = BASE, sid = SID, on = true, messages = CONV, system = SYSTEM,
+  path = "/v1/messages", events = [],
+} = {}) {
   if (on) process.env.CACHE_FIX_BETA_STABILIZE = "1";
   else delete process.env.CACHE_FIX_BETA_STABILIZE;
   const headers = { "anthropic-beta": beta };
   if (sid) headers["x-claude-code-session-id"] = sid;
-  return { headers, meta: {}, body: { messages, system, model: "test-model" } };
+  return {
+    headers,
+    meta: path === undefined ? {} : { path },
+    body: { messages, system, model: "test-model" },
+    __fs: mkFs(events),
+    __events: events,
+  };
 }
 
 // --- planStableBetas: the decision, in isolation ---
 
 test("planStableBetas: first sight adopts what CC sent", () => {
   const p = planStableBetas(null, ["a", "b"]);
-  assert.deepEqual(p, { tokens: ["a", "b"], action: "snapshot", added: [], removed: [] });
+  assert.deepEqual(p, {
+    tokens: ["a", "b"], action: "snapshot", added: [], removed: [], passthrough: [],
+  });
 });
 
 test("planStableBetas: same set → stable, no delta reported", () => {
@@ -188,7 +219,8 @@ test("onRequest: off by default", async () => {
   const before = ctx.headers["anthropic-beta"];
   await ext.onRequest(ctx);
   assert.equal(ctx.headers["anthropic-beta"], before);
-  assert.deepEqual(ctx.meta, {}, "a disabled extension must not annotate either");
+  assert.equal(ctx.meta._betaStabilize, undefined,
+    "a disabled extension must not annotate either");
 });
 
 test("onRequest: no session id → header untouched", async () => {
@@ -211,7 +243,10 @@ test("onRequest: absent or empty beta header is left alone", async () => {
 
 test("onRequest: case-insensitive header key is rewritten in place", async () => {
   process.env.CACHE_FIX_BETA_STABILIZE = "1";
-  const ctx = { headers: { "Anthropic-Beta": "a,b", "x-claude-code-session-id": SID }, meta: {}, body: {} };
+  const ctx = {
+    headers: { "Anthropic-Beta": "a,b", "x-claude-code-session-id": SID },
+    meta: { path: "/v1/messages" }, body: {},
+  };
   await ext.onRequest(ctx);
   assert.equal(ctx.headers["Anthropic-Beta"], "a, b");
   assert.equal(ctx.headers["anthropic-beta"], undefined, "must not add a second casing");
@@ -253,4 +288,189 @@ test("registration: declares its own order so extensions.json needs no edit", ()
   assert.equal(ext.name, "beta-stabilize");
   assert.equal(ext.order, 530, "must run after auto-1m-guard (520) — see the module header");
   assert.equal(typeof ext.onRequest, "function");
+});
+
+// --- The always-passthrough whitelist (directive Q1, R0 refinement) --------
+//
+// deferred-tool-rewrite (order 425) adds mid-conversation-tool-changes on ANY
+// turn it injects a tool_addition block, turn N > 1 included. A strict pin
+// strips it, Anthropic then ignores the addition for want of the beta, and
+// DTR is silently defeated — no error on either side. The whitelist is why
+// this ships as strict-pin-plus-exception rather than strict-pin.
+
+test("whitelist: the DTR contract token is FORWARDED on a post-snapshot turn", () => {
+  const p = planStableBetas(["a", "b"], ["a", "b", DTR_BETA]);
+  assert.ok(p.tokens.includes(DTR_BETA),
+    "stripping this token defeats deferred-tool-rewrite with no error surface");
+});
+
+test("whitelist: a forwarded token is accounted as passthrough, not as drift", () => {
+  const p = planStableBetas(["a"], ["a", DTR_BETA]);
+  assert.deepEqual(p.passthrough, [DTR_BETA]);
+  assert.deepEqual(p.added, [],
+    "counting it as `added` reports DTR's deliberate act as client drift");
+  assert.equal(p.action, "passthrough",
+    "and it is not a stabilization — nothing was withheld");
+});
+
+test("whitelist: passthrough does not soften the pin on anything else", () => {
+  const p = planStableBetas(["a"], ["a", DTR_BETA, "unrelated-beta"]);
+  assert.deepEqual(p.added, ["unrelated-beta"]);
+  assert.deepEqual(p.passthrough, [DTR_BETA]);
+  assert.equal(p.action, "stabilized");
+  assert.ok(p.tokens.includes(DTR_BETA));
+  assert.ok(!p.tokens.includes("unrelated-beta"),
+    "the non-whitelisted add is still withheld");
+});
+
+test("whitelist: a snapshot that already holds the token reports no passthrough", () => {
+  const p = planStableBetas(["a", DTR_BETA], ["a", DTR_BETA]);
+  assert.equal(p.action, "stable");
+  assert.deepEqual(p.passthrough, []);
+});
+
+test("whitelist: it is exactly one token, and that token is DTR's", () => {
+  assert.deepEqual([...ALWAYS_PASSTHROUGH], [DTR_BETA],
+    "widening this list widens what a client can force past the pin");
+});
+
+test("whitelist: the forwarded token reaches the WIRE header", async () => {
+  const events = [];
+  await ext.onRequest(mkCtx({ beta: "a, b", events }));
+  const ctx = mkCtx({ beta: `a, b, ${DTR_BETA}`, events });
+  await ext.onRequest(ctx);
+  assert.ok(ctx.headers["anthropic-beta"].includes(DTR_BETA),
+    "the planner forwarding it is worth nothing if onRequest drops it");
+});
+
+// --- Endpoint guard (directive Q3, settled across R0 -> R2) ---------------
+//
+// server.mjs sends every POST /v1/messages* to handleMessages, and the
+// pipeline's route filter cannot see subpaths. Without a path check a
+// count_tokens probe snapshots under the same tenant key the real turn uses.
+
+// Proof-of-run is the SPACING canonicalization ("a,b" -> "a, b"), not a
+// reorder: joinBetaTokens preserves token order by design, so a sorted
+// expectation would pass on a pass that never ran.
+test("path guard: exact /v1/messages runs", async () => {
+  const ctx = mkCtx({ beta: "a,b" });
+  await ext.onRequest(ctx);
+  assert.equal(ctx.headers["anthropic-beta"], "a, b", "canonicalized, so it ran");
+  assert.equal(ctx.meta._betaStabilize.beta_stabilize_action, "snapshot");
+});
+
+test("path guard: a query string does not stop it", async () => {
+  const ctx = mkCtx({ beta: "a,b", path: "/v1/messages?beta=true" });
+  await ext.onRequest(ctx);
+  assert.equal(ctx.headers["anthropic-beta"], "a, b");
+});
+
+test("path guard: /v1/messages/count_tokens is a no-op", async () => {
+  const ctx = mkCtx({ beta: "b, a", path: "/v1/messages/count_tokens" });
+  await ext.onRequest(ctx);
+  assert.equal(ctx.headers["anthropic-beta"], "b, a", "header untouched");
+  assert.equal(ctx.meta._betaStabilize, undefined);
+});
+
+test("path guard: /v1/messages/batches is a no-op", async () => {
+  const ctx = mkCtx({ beta: "b, a", path: "/v1/messages/batches" });
+  await ext.onRequest(ctx);
+  assert.equal(ctx.headers["anthropic-beta"], "b, a");
+});
+
+test("path guard: a missing path no-ops rather than guessing", async () => {
+  // Fail-safe. An older server, or a call site that forgets baseMeta, must not
+  // silently regain the unguarded behaviour.
+  const ctx = mkCtx({ beta: "b, a", path: undefined });
+  await ext.onRequest(ctx);
+  assert.equal(ctx.headers["anthropic-beta"], "b, a");
+});
+
+test("path guard: THE DEFECT — a count_tokens probe cannot seed the snapshot", async () => {
+  const events = [];
+  // Probe first, carrying a set the real turn does not have.
+  await ext.onRequest(mkCtx({
+    beta: "a, probe-only-beta", path: "/v1/messages/count_tokens", events,
+  }));
+  const real = mkCtx({ beta: "a, b", events });
+  await ext.onRequest(real);
+  assert.equal(real.headers["anthropic-beta"], "a, b",
+    "the real turn must snapshot ITSELF, not be stabilized against a probe");
+  assert.equal(real.meta._betaStabilize.beta_stabilize_action, "snapshot");
+});
+
+test("path guard: isStabilizablePath rejects everything but the one endpoint", () => {
+  for (const good of ["/v1/messages", "/v1/messages?x=1", "/v1/messages#frag"]) {
+    assert.equal(isStabilizablePath(good), true, good);
+  }
+  for (const bad of [
+    "/v1/messages/count_tokens", "/v1/messages/batches", "/v1/messages/",
+    "/v1/complete", "", null, undefined, 42, {},
+  ]) {
+    assert.equal(isStabilizablePath(bad), false, String(bad));
+  }
+});
+
+// --- Durable telemetry (directive R1, Codex-required) ---------------------
+
+test("events: a row is written per turn, in DTR's shape", async () => {
+  const events = [];
+  const ctx = mkCtx({ beta: "a, b", events });
+  await ext.onRequest(ctx);
+  assert.equal(events.length, 1);
+  const { row } = events[0];
+  assert.deepEqual(Object.keys(row).sort(),
+    ["action", "adds", "key", "passthrough", "pinned", "removes", "sid", "ts"]);
+  assert.equal(row.action, "snapshot");
+  assert.equal(row.sid, SID);
+  assert.deepEqual(row.pinned, ["a", "b"]);
+});
+
+test("events: a stabilized turn records what was withheld", async () => {
+  const events = [];
+  await ext.onRequest(mkCtx({ beta: "a", events }));
+  await ext.onRequest(mkCtx({ beta: "a, c", events }));
+  const { row } = events.at(-1);
+  assert.equal(row.action, "stabilized");
+  assert.deepEqual(row.adds, ["c"]);
+  assert.deepEqual(row.pinned, ["a"],
+    "the record must show what we SENT, not what CC asked for");
+});
+
+test("events: a passthrough turn is distinguishable from a stabilized one", async () => {
+  const events = [];
+  await ext.onRequest(mkCtx({ beta: "a", events }));
+  await ext.onRequest(mkCtx({ beta: `a, ${DTR_BETA}`, events }));
+  const { row } = events.at(-1);
+  assert.equal(row.action, "passthrough");
+  assert.deepEqual(row.passthrough, [DTR_BETA]);
+  assert.deepEqual(row.adds, []);
+});
+
+test("events: the file is per session key, beside DTR's own log", async () => {
+  const events = [];
+  const ctx = mkCtx({ beta: "a", events });
+  await ext.onRequest(ctx);
+  const key = betaSessionKey(ctx.headers, ctx.body);
+  assert.ok(events[0].file.endsWith(`${key}-anthropic-beta-events.jsonl`));
+});
+
+test("events: no row when the pass no-ops on endpoint", async () => {
+  const events = [];
+  await ext.onRequest(mkCtx({
+    beta: "a", path: "/v1/messages/count_tokens", events,
+  }));
+  assert.equal(events.length, 0,
+    "a probe must leave no trace in the session's record");
+});
+
+test("events: a telemetry failure cannot fail the request", async () => {
+  const ctx = mkCtx({ beta: "a,b" });
+  ctx.__fs = {
+    mkdir: async () => { throw new Error("disk full"); },
+    appendFile: async () => { throw new Error("disk full"); },
+  };
+  await ext.onRequest(ctx);   // must not throw
+  assert.equal(ctx.headers["anthropic-beta"], "a, b",
+    "the header decision still lands");
 });
