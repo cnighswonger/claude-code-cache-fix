@@ -811,10 +811,18 @@ async function reapFingerprintRecords() {
 // number is not ours to judge, so it is kept.
 //
 // It answers "is anything LISTENING", which is not the same as "is anyone using
-// this port": a holder in the bound-but-not-listening state this file creates on
-// purpose reads as free. That window is the ~80 ms before the gap relay boots,
-// and losing a record there ends in the announced exit 0 above rather than
-// anything silent.
+// this port". Two consequences, both narrow and neither silent:
+//
+// A holder in the bound-but-not-listening state this file creates on purpose
+// reads as free, so a record could be reaped during the window before its relay
+// takes over. The window has not been measured for the relay specifically; the
+// ~80 ms nearby belongs to the proxy child's boot, which is a larger spawn.
+// Losing a record there ends in the announced exit 0 above.
+//
+// And this probe IS a listener while it asks. A launcher starting concurrently
+// runs otherHolderOn(), which selects on a LISTEN socket plus a run-service
+// command line plus greater uptime — a peer mid-probe can satisfy those and be
+// read as an incumbent. Bounded by the bind lifetime, under 59 µs per record.
 //
 // Serialized, and it does not yield: measured at 3,000 over-age records the loop
 // held the event loop for 176 ms. listen and close resolve on nextTick, so the
