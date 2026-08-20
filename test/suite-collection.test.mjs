@@ -145,7 +145,7 @@ test("every test that SIGKILLs a launcher sweeps the port or says why not", () =
     const src = readFileSync(join(testDir, f), "utf8");
     if (!/claude-via-proxy\.mjs|launcherPath/.test(src)) continue;
     if (!/SIGKILL/.test(src)) continue;
-    if (/onPort\(|listeners\(|-iTCP/.test(src)) continue;
+    if (/onPort\(|listeners\(|process\.kill\(-/.test(src)) continue;
     if (/NO-STANDBY:/.test(src)) continue;
     offenders.push(f);
   }
