@@ -1,4 +1,5 @@
-// beta-stabilize — hold the outbound anthropic-beta header steady per session.
+// anthropic-beta-stabilize — hold the outbound anthropic-beta header steady
+// per session.
 //
 // Issue #326. CC toggles the beta set between consecutive turns of the SAME
 // session — same conversation, same model, same tools — and each toggle is a
@@ -205,7 +206,7 @@ export async function appendBetaEvent(dir, sessionKey, record, fs = DEFAULT_FS) 
 }
 
 export default {
-  name: "beta-stabilize",
+  name: "anthropic-beta-stabilize",
   description:
     "Hold the outbound anthropic-beta header at its first-seen value per session, so CC toggling " +
     "betas between turns cannot invalidate the cache prefix (#326). Deltas are reported, not " +
@@ -260,7 +261,7 @@ export default {
 
     if (plan.action === "stabilized") {
       process.stderr.write(
-        `[beta-stabilize] held session betas` +
+        `[anthropic-beta-stabilize] held session betas` +
           (plan.added.length ? ` +${plan.added.join(",")}` : "") +
           (plan.removed.length ? ` -${plan.removed.join(",")}` : "") +
           (plan.passthrough.length ? ` ->${plan.passthrough.join(",")}` : "") +

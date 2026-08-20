@@ -22,7 +22,7 @@
   "messages-cache-breakpoint": { "enabled": true, "order": 410 },
   "deferred-tool-rewrite": { "enabled": true, "order": 425 },
   "ttl-management": { "enabled": true, "order": 500 },
-  "beta-stabilize": { "enabled": true, "order": 530 },
+  "anthropic-beta-stabilize": { "enabled": true, "order": 530 },
   "cache-telemetry": { "enabled": true, "order": 600 },
   "overage-warning": { "enabled": true, "order": 610 },
   "upstream-error-log": { "enabled": true, "order": 670 },

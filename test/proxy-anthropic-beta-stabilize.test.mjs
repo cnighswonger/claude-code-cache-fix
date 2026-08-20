@@ -1,5 +1,6 @@
 import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import ext, {
   ALWAYS_PASSTHROUGH,
   betaEventsPath,
@@ -7,7 +8,7 @@ import ext, {
   isStabilizablePath,
   planStableBetas,
   resetBetaSnapshots,
-} from "../proxy/extensions/beta-stabilize.mjs";
+} from "../proxy/extensions/anthropic-beta-stabilize.mjs";
 
 // The token deferred-tool-rewrite adds on any turn it injects a tool_addition
 // block. Written out rather than read from ALWAYS_PASSTHROUGH so a regression
@@ -281,13 +282,26 @@ test("onRequest: the snapshot map is bounded", async () => {
   assert.equal(old.headers["anthropic-beta"], WITH_DIAG);
 });
 
-test("registration: declares its own order so extensions.json needs no edit", () => {
+test("registration: module declares its own order, and the registry agrees", () => {
   // loadExtensions resolves `cfg?.order ?? ext.order ?? 1000` and
-  // `cfg?.enabled ?? ext.enabled ?? true`, so a module-declared order is the
-  // default and the env gate is what keeps this inert until asked for.
-  assert.equal(ext.name, "beta-stabilize");
+  // `cfg?.enabled ?? ext.enabled ?? true`, so the module declaration stands
+  // alone and the env gate is what keeps this inert until asked for.
+  assert.equal(ext.name, "anthropic-beta-stabilize");
   assert.equal(ext.order, 530, "must run after auto-1m-guard (520) — see the module header");
   assert.equal(typeof ext.onRequest, "function");
+});
+
+test("registration: the extensions.json key matches the module name", async () => {
+  // The lookup is BY NAME. A key that drifts from ext.name does not error —
+  // cfg simply resolves undefined, the entry silently stops applying, and the
+  // module defaults take over as if the registration were never made. That is
+  // exactly what a rename does if only one side moves.
+  const registry = JSON.parse(
+    await readFile(new URL("../proxy/extensions.json", import.meta.url), "utf-8"),
+  );
+  assert.ok(registry[ext.name], `no extensions.json entry named ${ext.name}`);
+  assert.equal(registry[ext.name].order, ext.order,
+    "a registry order that disagrees with the module silently wins");
 });
 
 // --- The always-passthrough whitelist (directive Q1, R0 refinement) --------
