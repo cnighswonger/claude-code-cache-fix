@@ -753,11 +753,10 @@ function codeFingerprint(root) {
   } catch { return ""; }
 }
 
-// ONE CONSTANT, TWO SITES: the writer here and the reaper below. Deriving the
-// reaper's prefix from this path at runtime read `lastIndexOf("/")`, which is
-// -1 on Windows — the whole absolute path became the prefix, no basename from
-// readdirSync matched, and the reaper was a silent no-op there. Same reason
-// SCRATCH_PREFIX exists rather than two matching literals.
+// The writer and the reaper below must name the same thing, so they read one
+// constant. Deriving the reaper's prefix from this path instead is not
+// portable: the separator is not "/" everywhere, and readdirSync yields
+// basenames.
 const RECORD_PREFIX = "cache-fix-proxy-";
 
 function fingerprintPath(port) {
@@ -776,24 +775,20 @@ function publishFingerprint(port) {
   } catch { /* best effort: an unwritable tmpdir must not stop a proxy starting */ }
 }
 
-// ONE RECORD PER PORT, AND THE PORT IS EPHEMERAL, so every proxy start leaves a
-// `cache-fix-proxy-<port>.sha256` nothing removed. runningOurCode() below used
-// to call that ordinary because systemd-tmpfiles sweeps /tmp; that is a
-// deployment assumption, false in a container. Measured on one with zsh as PID
-// 1: 6,743 records, 461 a day. The cost is not the 284 KB — the scratch-CA
-// reaper walks readdirSync(tmpdir()) on every start, 117 ms at 74,493 entries,
-// and this litter is what fills it.
+// Nothing else removes these. The port is ephemeral wherever the OS picks one,
+// so without this a record accumulates per proxy start without bound, and the
+// scratch-CA reaper below pays for it — it walks the same tmpdir on every
+// launcher start.
 //
-// SEVEN DAYS, matching the scratch reaper, because nothing republishes a
-// record: publishFingerprint has one call site, the spawn path, so an
-// unrestarted holder's mtime is its launch time. A shorter gate deletes a live
-// holder's own record, runningOurCode() then answers null, and takeOver() exits
-// 0 — the "swept /tmp turned a deploy into a no-op that read as a success"
-// incident, caused by us this time. Age is still the only discriminator
-// available: the name says which PORT, never which process.
+// Seven days, matching that reaper. publishFingerprint has one call site, the
+// spawn path, and nothing republishes: an unrestarted holder's record mtime is
+// its launch time, so a shorter gate deletes a live holder's own record and
+// runningOurCode() then cannot tell a stale proxy from a healthy one. Age is
+// the only discriminator available — the name says which PORT, never which
+// process.
 //
-// Best effort throughout. A survivor is disk, not correctness — it is only read
-// by a proxy that hashes the same bytes anyway.
+// Best effort throughout: a survivor is disk, not correctness, since it is only
+// read by a proxy that hashes the same bytes anyway.
 function reapFingerprintRecords() {
   const recordAgeMs = 7 * 86_400_000;
   try {
@@ -854,17 +849,11 @@ function holdPort(rest) {
   for (const s of [process.stdout, process.stderr]) {
     s.on("error", () => { /* the reader left; putting the proxy back is the job */ });
   }
-  // ONCE PER LAUNCHER PROCESS, AND OFF THIS PATH. Inside publishFingerprint it
-  // sat behind that function's `if (!fp) return;` — reaping only while
-  // publishing works, the mistake the CA reaper below documents — and ran on
-  // every respawn, a full readdirSync(tmpdir()) per attempt on a ladder
-  // measured at 51 spawns in 1.2s.
-  //
-  // Deferred because the scan is not free and nothing waits on it: 135-193 ms
-  // at 68,533 tmpdir entries. Run inline here it delays the bind, and
-  // proxy-held-port.test.mjs then failed 2 of 10 interleaved runs against
-  // upstream/main's 0 of 14 — with the same diff's scan body disabled, 0 of 5.
-  // unref so it can never hold the process open.
+  // Here, not in publishFingerprint: that returns early when the fingerprint is
+  // unreadable, which would stop reaping exactly when publishing is broken, and
+  // it runs on every respawn. Deferred because the scan walks the whole tmpdir
+  // and would delay the bind; nothing waits on its result. unref so it cannot
+  // hold the process open.
   setTimeout(reapFingerprintRecords, 0).unref();
   // The proxy's own default: holding a different port than the proxy would have
   // served leaves nothing at the documented address.
