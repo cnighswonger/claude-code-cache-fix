@@ -779,43 +779,44 @@ function publishFingerprint(port) {
 // so without this a record accumulates per proxy start without bound, and every
 // later scan of tmpdir pays for the ones already there.
 //
-// A LISTENING PORT OUTRANKS THE CLOCK, because nothing republishes a record: one
-// call site, the spawn path, so the mtime is the last child spawn. Age alone
-// would therefore make the gate a deadline rather than a margin — a holder that
-// neither respawns nor is redeployed for a week is fully live with an over-age
-// record, and deleting it makes runningOurCode() answer null, which ends in
-// takeOver() exiting 0 while announcing a deploy that has not taken effect.
+// A PORT THAT STILL ANSWERS OUTRANKS THE CLOCK, because nothing republishes a
+// record: one call site, the spawn path, so the mtime is the last child spawn.
+// Age alone would therefore make the gate a deadline rather than a margin — a
+// holder that neither respawns nor is redeployed for a week is fully live with
+// an over-age record, and deleting it makes runningOurCode() answer null, which
+// ends in takeOver() exiting 0 while announcing a deploy that has not taken
+// effect.
 //
 // Seven days on top, matching the scratch-CA reaper, to bound what a crashed
 // holder leaves behind on a port nobody rebinds.
-function reapFingerprintRecords() {
+async function reapFingerprintRecords() {
   const recordAgeMs = 7 * 86_400_000;
-  // One lsof, and only once something is actually eligible: on a swept host
-  // nothing is, and the reap costs a readdir.
-  let live = null;
   try {
     for (const f of readdirSync(tmpdir())) {
       if (!f.startsWith(RECORD_PREFIX) || !f.endsWith(".sha256")) continue;
       const p = join(tmpdir(), f);
       try {
         if (Date.now() - statSync(p).mtimeMs <= recordAgeMs) continue;
-        live ??= listeningPorts();
-        if (live.has(f.slice(RECORD_PREFIX.length, -".sha256".length))) continue;
+        if (!(await portFree(f.slice(RECORD_PREFIX.length, -".sha256".length)))) continue;
         rmSync(p);
       } catch { /* raced, gone, or refused; a survivor is disk, not correctness */ }
     }
   } catch { /* unreadable tmpdir: publishing already degraded, say nothing more */ }
 }
 
-// EMPTY MEANS "COULD NOT ASK", AND THE CALLER KEEPS EVERYTHING RATHER THAN
-// GUESSING — an lsof that fails would otherwise read as "nothing is listening"
-// and hand the reaper every record on the box. lsof and not /proc for the reason
-// holderPidOn gives: this has to work on macOS.
-function listeningPorts() {
-  try {
-    return new Set(probe("lsof", ["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "n"])
-      .split("\n").filter((l) => l.startsWith("n")).map((l) => l.slice(l.lastIndexOf(":") + 1)));
-  } catch { return { has: () => true }; }
+// ASKED BY BINDING, NOT BY lsof. holderPidOn needs a PID and so has to shell
+// out; this needs one bit and the kernel answers it directly, which keeps the
+// reap working on a host with no lsof — otherwise the leak fix is a silent
+// no-op exactly where nobody would look for it. A name whose port is not a
+// number is not ours to judge, so it is kept.
+function portFree(port) {
+  const n = Number(port);
+  if (!Number.isInteger(n) || n < 1 || n > 65535) return Promise.resolve(false);
+  return new Promise((res) => {
+    const s = net.createServer();
+    s.once("error", () => res(false));
+    s.listen(n, bindAddr(), () => s.close(() => res(true)));
+  });
 }
 
 // TRUE, FALSE, or NULL for "cannot tell" — a third state because the callers

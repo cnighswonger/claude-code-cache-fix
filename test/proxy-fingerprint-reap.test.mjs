@@ -7,14 +7,13 @@ import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { createServer } from "node:net";
+import net, { createServer } from "node:net";
 import { fileURLToPath } from "node:url";
-import { execFileSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { onPort } from "./proc-helpers.mjs";
 
 const LAUNCHER = fileURLToPath(new URL("../bin/claude-via-proxy.mjs", import.meta.url));
 const SRC = readFileSync(LAUNCHER, "utf-8");
-const realProbe = (cmd, args) => execFileSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
 
 // Brace-counted, not regex: a lazy match stops at an inner block's close and
 // yields a fragment that fails as a SyntaxError rather than a named assertion.
@@ -32,12 +31,12 @@ function lift(decl) {
 
 // tmpdir() is rebound to the scratch dir, so the real temp directory is never
 // touched. Every callee comes with it.
-function runReaper(dir, probe = realProbe) {
-  new Function("readdirSync", "statSync", "rmSync", "join", "tmpdir", "probe",
+function runReaper(dir) {
+  return new Function("readdirSync", "statSync", "rmSync", "join", "tmpdir", "net", "bindAddr",
     `const RECORD_PREFIX = ${JSON.stringify(recordPrefix())};\n` +
-    `${lift("function listeningPorts()")}\n` +
-    `${lift("function reapFingerprintRecords()")}\nreturn reapFingerprintRecords();`
-  )(readdirSync, statSync, rmSync, join, () => dir, probe);
+    `${lift("function portFree(")}\n` +
+    `${lift("async function reapFingerprintRecords()")}\nreturn reapFingerprintRecords();`
+  )(readdirSync, statSync, rmSync, join, () => dir, net, () => "127.0.0.1");
 }
 
 test("the launcher carries a reaper for its own fingerprint records", () => {
@@ -79,7 +78,7 @@ test("a record whose port still has a listener is kept however old it is", async
     const old = Date.now() / 1000 - 30 * 86400;
     for (const p of [live, dead]) utimesSync(p, old, old);
 
-    runReaper(dir);
+    await runReaper(dir);
 
     const left = readdirSync(dir);
     assert.ok(left.includes(`cache-fix-proxy-${port}.sha256`),
@@ -130,27 +129,26 @@ test("a launcher that binds reaps on the way up", { timeout: 30_000 }, async () 
   }
 });
 
-// A host with no lsof must keep everything rather than read "could not ask" as
-// "nothing is listening" — that reading hands the reaper every record on the box,
-// live holders included.
-test("a probe that cannot answer reaps nothing", () => {
-  const dir = mkdtempSync(join(tmpdir(), "ccf-fpreap-nolsof-"));
+// A NAME WHOSE PORT IS NOT A NUMBER is not this reaper's to judge, and asking
+// the kernel to bind NaN throws rather than answering.
+test("a record whose port is not a number is kept", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ccf-fpreap-nan-"));
   try {
-    const rec = join(dir, "cache-fix-proxy-40707.sha256");
-    writeFileSync(rec, "x");
+    const odd = join(dir, "cache-fix-proxy-healthcheck.sha256");
+    writeFileSync(odd, "x");
     const old = Date.now() / 1000 - 30 * 86400;
-    utimesSync(rec, old, old);
+    utimesSync(odd, old, old);
 
-    runReaper(dir, () => { throw new Error("lsof: not found"); });
+    await runReaper(dir);
 
-    assert.ok(readdirSync(dir).includes("cache-fix-proxy-40707.sha256"),
-              "an unanswerable probe was read as 'nothing is listening' and the record was reaped");
+    assert.ok(readdirSync(dir).includes("cache-fix-proxy-healthcheck.sha256"),
+              "the reaper judged a name it cannot parse a port out of");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test("a stale record is removed, and anything a live holder may still own is kept", () => {
+test("a stale record is removed, and anything a live holder may still own is kept", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ccf-fpreap-"));
   try {
     const stale = join(dir, "cache-fix-proxy-40001.sha256");
@@ -171,7 +169,7 @@ test("a stale record is removed, and anything a live holder may still own is kep
     const age = (p, days) => utimesSync(p, Date.now() / 1000 - days * 86400, Date.now() / 1000 - days * 86400);
     age(stale, 8); age(longLived, 3); age(nearGate, 6); age(alien, 8); age(inflight, 8);
 
-    runReaper(dir);
+    await runReaper(dir);
 
     const left = readdirSync(dir).sort();
     assert.ok(!left.includes("cache-fix-proxy-40001.sha256"), `the stale record survived: ${left}`);
