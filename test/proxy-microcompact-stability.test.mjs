@@ -1,4 +1,4 @@
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -11,6 +11,25 @@ import ext, {
   buildDiagnosticRecord,
   runMicrocompactStability,
 } from "../proxy/extensions/microcompact-stability.mjs";
+
+// EVERY SCRATCH DIR, EVEN THE RUNS THAT FAIL. Thirteen cases remove theirs on the
+// last line of the test body, so an assertion that throws skips it, and the
+// fourteenth removes nothing at all — that one leaked on the green path too.
+// Those calls stay as they are, since they free disk during a long run; this
+// collects what they miss.
+const scratch = [];
+async function mcTemp() {
+  const d = await mkdtemp(join(tmpdir(), "mc-"));
+  scratch.push(d);
+  return d;
+}
+after(async () => {
+  for (const d of scratch) {
+    // Per dir, so one refused removal cannot strand the rest. `force` already
+    // swallows a missing dir; this is for EPERM and EBUSY.
+    try { await rm(d, { recursive: true, force: true }); } catch { /* see above */ }
+  }
+});
 
 // --- Fixture helpers ---
 
@@ -149,7 +168,7 @@ test("4. unrelated truncation message → no match in either mode (rejected from
 // --- Mode B ---
 
 test("4a. sentinel + trailing text → Mode B match, body NOT mutated, prefix_64 only in dump", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "mc-"));
+  const dir = await mcTemp();
   const dumpPath = join(dir, "dump.jsonl");
   const body = makeBody([
     assistantMsg("t1"),
@@ -182,7 +201,7 @@ test("4a. sentinel + trailing text → Mode B match, body NOT mutated, prefix_64
 
 test("4b. long trailing → prefix_64 captures only first 64 chars, byte_length reports full size", async () => {
   const long = SENTINEL_TS + " " + "x".repeat(200);
-  const dir = await mkdtemp(join(tmpdir(), "mc-"));
+  const dir = await mcTemp();
   const dumpPath = join(dir, "dump.jsonl");
   const body = makeBody([
     assistantMsg("t1"),
@@ -201,7 +220,7 @@ test("4b. long trailing → prefix_64 captures only first 64 chars, byte_length 
 });
 
 test("4c. CACHE_FIX_MICROCOMPACT_REDACT_LEN=0 → prefix_64 absent", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "mc-"));
+  const dir = await mcTemp();
   const dumpPath = join(dir, "dump.jsonl");
   const body = makeBody([
     assistantMsg("t1"),
@@ -237,7 +256,7 @@ test("5a. CACHE_FIX_MICROCOMPACT_SENTINEL_PATTERN_1 adds custom Mode A pattern",
 });
 
 test("5b. custom Mode A regex + custom Mode B prefix → exact match goes to exact_matches", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "mc-"));
+  const dir = await mcTemp();
   const dumpPath = join(dir, "dump.jsonl");
   // Exact match against a custom regex from a sentinel family that does NOT
   // share the built-in prefix. Verifies exact-match path for custom families.
@@ -269,7 +288,7 @@ test("5c. custom Mode B prefix → variant-of-custom-family captured redacted in
   // EXACTLY normalizes, but its prefix-only variant must also be captured
   // in Mode B (redacted) — not silently dropped just because the variant
   // doesn't share the built-in `[Old tool result content cleared` prefix.
-  const dir = await mkdtemp(join(tmpdir(), "mc-"));
+  const dir = await mcTemp();
   const dumpPath = join(dir, "dump.jsonl");
   const text = "[CC microcompact rev2 at 2026-04-30T17:00:00Z] (with trailing content)";
   const body = makeBody([
@@ -352,7 +371,7 @@ test("8. mixed array (text + image) — only the text matches → image untouche
 // --- Diagnostic dump ---
 
 test("9. dump set + sentinel match → JSONL line; session_id is hashed (no plaintext)", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "mc-"));
+  const dir = await mcTemp();
   const dumpPath = join(dir, "dump.jsonl");
   const body = makeBody([
     assistantMsg("t1"),
@@ -373,7 +392,7 @@ test("9. dump set + sentinel match → JSONL line; session_id is hashed (no plai
 });
 
 test("10. dump unset → no fs activity", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "mc-"));
+  const dir = await mcTemp();
   const dumpPath = join(dir, "dump.jsonl");
   const body = makeBody([
     assistantMsg("t1"),
@@ -395,7 +414,7 @@ test("10. dump unset → no fs activity", async () => {
 });
 
 test("11. multiple matches in one request → ONE JSONL line with arrays split A/B", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "mc-"));
+  const dir = await mcTemp();
   const dumpPath = join(dir, "dump.jsonl");
   const body = makeBody([
     assistantMsg("t1"),
@@ -455,7 +474,7 @@ test("13. normalize on + custom canonical → matched sentinel becomes the custo
 });
 
 test("14. normalize disabled, dump enabled → matches recorded in dump but body NOT mutated", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "mc-"));
+  const dir = await mcTemp();
   const dumpPath = join(dir, "dump.jsonl");
   const body = makeBody([
     assistantMsg("t1"),
@@ -500,7 +519,7 @@ test("15. two requests with different timestamps → byte-identical bodies after
 // --- Activation ---
 
 test("16. both gates unset → extension fires but exits early; no telemetry, no mutation, no fs", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "mc-"));
+  const dir = await mcTemp();
   const dumpPath = join(dir, "dump.jsonl");
   const body = makeBody([
     assistantMsg("t1"),
@@ -526,7 +545,7 @@ test("16. both gates unset → extension fires but exits early; no telemetry, no
 });
 
 test("17. only diagnostic enabled → telemetry present, JSONL written, no mutation", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "mc-"));
+  const dir = await mcTemp();
   const dumpPath = join(dir, "dump.jsonl");
   const body = makeBody([
     assistantMsg("t1"),
@@ -548,7 +567,7 @@ test("17. only diagnostic enabled → telemetry present, JSONL written, no mutat
 });
 
 test("18. only normalize enabled → telemetry present, mutation happens, no JSONL", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "mc-"));
+  const dir = await mcTemp();
   const dumpPath = join(dir, "dump.jsonl");
   const body = makeBody([
     assistantMsg("t1"),
@@ -568,7 +587,7 @@ test("18. only normalize enabled → telemetry present, mutation happens, no JSO
 });
 
 test("19. both enabled → telemetry, mutation, AND JSONL all happen; raw text captured pre-normalization", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "mc-"));
+  const dir = await mcTemp();
   const dumpPath = join(dir, "dump.jsonl");
   const body = makeBody([
     assistantMsg("t1"),
@@ -598,7 +617,7 @@ test("19. both enabled → telemetry, mutation, AND JSONL all happen; raw text c
 });
 
 test("19a. CACHE_FIX_DUMP_MICROCOMPACT_INCLUDE_NORMALIZED=1 → adds normalized_text alongside raw sentinel_text", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "mc-"));
+  const dir = await mcTemp();
   const dumpPath = join(dir, "dump.jsonl");
   const body = makeBody([
     assistantMsg("t1"),
