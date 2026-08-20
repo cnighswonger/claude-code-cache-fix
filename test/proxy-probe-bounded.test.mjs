@@ -96,6 +96,10 @@ describe("probe bounding", () => {
     ]);
 
     if (!settled) {
+      // NO-STANDBY: this SIGKILL needs no port sweep. The hang under test is a
+      // probe, and the launcher blocks in it before it ever binds, so there is
+      // no detached standby to reparent. Measured with the deadline forced to
+      // 200 ms, 3 s and 6 s: orphan delta 0 in all three.
       child.kill("SIGKILL");
       assert.fail(`the launcher was still running after ${DEADLINE}ms with a hanging ${hang} — ` +
                   "the probe is unbounded, and on a sick machine it would block here for ever");
