@@ -5,13 +5,21 @@ import net from "node:net";
 import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { mkdir, writeFile, rm } from "node:fs/promises";
-import { readdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { startProxy, upstreamPointsAtSelf } from "../proxy/server.mjs";
 import { startWatcher } from "../proxy/watcher.mjs";
 import { loadExtensions, getRegistry } from "../proxy/pipeline.mjs";
 import { OURS, cmdOf, freePort as takePort, listeners, onPort } from "./proc-helpers.mjs";
+
+// A PRIVATE TMPDIR FOR THE WHOLE FILE. Every launcher spawned here inherits
+// process.env, and the launcher writes cache-fix-proxy-<port>.sha256 under
+// os.tmpdir() on each spawn — so without this the run leaves those records in
+// the shared /tmp, one per spawn. Set once rather than at each spawn site: the
+// env is inherited, so this also covers sites added later.
+const FILE_TMP = mkdtempSync(join(tmpdir(), "ccf-ps-"));
+process.env.TMPDIR = FILE_TMP;
 
 const serverPath = join(dirname(fileURLToPath(import.meta.url)), "..", "proxy", "server.mjs");
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
@@ -1047,3 +1055,7 @@ describe("client-abandon abort", () => {
     } finally { restore(saved); if (h) await h.close(); }
   });
 });
+
+// LAST, so it cannot delete the dir out from under a sweep that reaps ports
+// after the cases: node runs root hooks in registration order.
+after(() => { try { rmSync(FILE_TMP, { recursive: true, force: true }); } catch { /* gone */ } });

@@ -22,14 +22,23 @@
 // mode, and the holder through BOTH of its dispatch doors — `server` with
 // CACHE_FIX_HOLD_PORT=on was the one an earlier fix missed while the other
 // passed, so a single holder row would have called that fixed.
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { withDeadline } from "./child-deadline.mjs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
+
+// A PRIVATE TMPDIR FOR THE WHOLE FILE. Every launcher spawned here inherits
+// process.env, and the launcher writes cache-fix-proxy-<port>.sha256 under
+// os.tmpdir() on each spawn — so without this the run leaves those records in
+// the shared /tmp, one per spawn. Set once rather than at each spawn site: the
+// env is inherited, so this also covers sites added later.
+const FILE_TMP = mkdtempSync(join(tmpdir(), "ccf-se-"));
+process.env.TMPDIR = FILE_TMP;
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const reap = (p) => { try { process.kill(-p.pid, "SIGKILL"); } catch {} try { p.kill("SIGKILL"); } catch {} };
@@ -192,3 +201,7 @@ describe("a dead stdio reader does not kill the port's process", () => {
 // does this holder have", which is a number on the machine, not a shape in the
 // source. `openStandby` states the same identity rule twenty lines below and had
 // always followed it; this is the sibling that was missed in the same sweep.
+
+// LAST, so it cannot delete the dir out from under a sweep that reaps ports
+// after the cases: node runs root hooks in registration order.
+after(() => { try { rmSync(FILE_TMP, { recursive: true, force: true }); } catch { /* gone */ } });

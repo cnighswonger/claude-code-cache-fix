@@ -8,8 +8,17 @@ import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { OURS, cmdOf, freePort as takePort, listeners, onPort } from "./proc-helpers.mjs";
+
+// A PRIVATE TMPDIR FOR THE WHOLE FILE. Every launcher spawned here inherits
+// process.env, and the launcher writes cache-fix-proxy-<port>.sha256 under
+// os.tmpdir() on each spawn — so without this the run leaves those records in
+// the shared /tmp, one per spawn, for every box the suite has ever run on.
+// Set once here rather than at each spawn site: the env is inherited, so this
+// also covers spawn sites added later.
+const FILE_TMP = mkdtempSync(join(tmpdir(), "ccf-hh-"));
+process.env.TMPDIR = FILE_TMP;
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
@@ -1011,3 +1020,7 @@ describe("openGap identity", () => {
   assert.ok(holder._gap === second, "a late 'error' from the retired gap cleared the live one");
 });
 });
+
+// LAST, so it cannot delete the dir out from under a sweep that reaps ports
+// after the cases: node runs root hooks in registration order.
+after(() => { try { rmSync(FILE_TMP, { recursive: true, force: true }); } catch { /* gone */ } });
