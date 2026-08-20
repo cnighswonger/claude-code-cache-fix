@@ -45,6 +45,13 @@ const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", 
 // them, so the body is tested before the code.
 const OUTAGE = { REFUSED: "refused", RESET: "reset", DEGRADED: "degraded" };
 function classify(body) {
+  // A NUMBER IS NOT AN OUTAGE, AND MUST NOT BE A TypeError EITHER. Six of this
+  // file's seven probes resolve `ERR:${e.code}`; the seventh resolves a bare
+  // statusCode on success, and its caller filters out 200 and hands the rest
+  // here. Measured on CI Node 22: one 502 reached this line and the case died
+  // as `body.startsWith is not a function` — a crash where the answer is
+  // simply "that was a reply, not an outage".
+  if (typeof body !== "string") return null;
   if (!body.startsWith("ERR:")) return null;
   if (/"carrying"\s*:\s*"gap-relay"/.test(body)) return null;
   if (/"status"\s*:\s*"degraded"/.test(body)) return OUTAGE.DEGRADED;
@@ -124,6 +131,20 @@ async function freePort() {
 const CONCURRENCY = Math.max(1, Math.floor(availableParallelism() / 2));
 
 describe("held port (CACHE_FIX_HOLD_PORT)", { concurrency: CONCURRENCY }, () => {
+
+  // THE SEVENTH PROBE RESOLVES A NUMBER. Six of this file's probes resolve
+  // `ERR:${e.code}`; the one at the forced-kill case resolves a bare statusCode
+  // on success, and its caller filters out 200 and hands the rest to classify().
+  // A 502 therefore reaches it as a Number. Pinned as a unit case because the
+  // path only opens when a non-200 is actually observed — CI Node 22 saw one and
+  // the case died as `body.startsWith is not a function`, three runners apart
+  // from where it was introduced.
+  it("classify survives a probe that answers with a status code", () => {
+    assert.equal(classify(502), null, "a status code is a reply, not an outage");
+    assert.equal(classify(200), null);
+    assert.equal(classify("ERR:ECONNREFUSED"), OUTAGE.REFUSED);
+    assert.equal(classify("ECONNRESET"), null, "no ERR: prefix means it is not ours to classify");
+  });
 // The default is declared in proxy/config.mjs and repeated in the launcher.
 // If they drift, an unset CACHE_FIX_PROXY_PORT binds one port while callers
 // dial the other.
