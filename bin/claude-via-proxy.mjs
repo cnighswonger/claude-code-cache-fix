@@ -776,29 +776,46 @@ function publishFingerprint(port) {
 }
 
 // Nothing else removes these. The port is ephemeral wherever the OS picks one,
-// so without this a record accumulates per proxy start without bound, and the
-// scratch-CA reaper below pays for it — it walks the same tmpdir on every
-// launcher start.
+// so without this a record accumulates per proxy start without bound, and every
+// later scan of tmpdir pays for the ones already there.
 //
-// Seven days, matching that reaper. publishFingerprint has one call site, the
-// spawn path, and nothing republishes: an unrestarted holder's record mtime is
-// its launch time, so a shorter gate deletes a live holder's own record and
-// runningOurCode() then cannot tell a stale proxy from a healthy one. Age is
-// the only discriminator available — the name says which PORT, never which
-// process.
+// A LISTENING PORT OUTRANKS THE CLOCK, because nothing republishes a record: one
+// call site, the spawn path, so the mtime is the last child spawn. Age alone
+// would therefore make the gate a deadline rather than a margin — a holder that
+// neither respawns nor is redeployed for a week is fully live with an over-age
+// record, and deleting it makes runningOurCode() answer null, which ends in
+// takeOver() exiting 0 while announcing a deploy that has not taken effect.
 //
-// Best effort throughout: a survivor is disk, not correctness, since it is only
-// read by a proxy that hashes the same bytes anyway.
+// Seven days on top, matching the scratch-CA reaper, to bound what a crashed
+// holder leaves behind on a port nobody rebinds.
 function reapFingerprintRecords() {
   const recordAgeMs = 7 * 86_400_000;
+  // One lsof, and only once something is actually eligible: on a swept host
+  // nothing is, and the reap costs a readdir.
+  let live = null;
   try {
     for (const f of readdirSync(tmpdir())) {
       if (!f.startsWith(RECORD_PREFIX) || !f.endsWith(".sha256")) continue;
       const p = join(tmpdir(), f);
-      try { if (Date.now() - statSync(p).mtimeMs > recordAgeMs) rmSync(p); }
-      catch { /* raced, gone, or refused — see above */ }
+      try {
+        if (Date.now() - statSync(p).mtimeMs <= recordAgeMs) continue;
+        live ??= listeningPorts();
+        if (live.has(f.slice(RECORD_PREFIX.length, -".sha256".length))) continue;
+        rmSync(p);
+      } catch { /* raced, gone, or refused; a survivor is disk, not correctness */ }
     }
   } catch { /* unreadable tmpdir: publishing already degraded, say nothing more */ }
+}
+
+// EMPTY MEANS "COULD NOT ASK", AND THE CALLER KEEPS EVERYTHING RATHER THAN
+// GUESSING — an lsof that fails would otherwise read as "nothing is listening"
+// and hand the reaper every record on the box. lsof and not /proc for the reason
+// holderPidOn gives: this has to work on macOS.
+function listeningPorts() {
+  try {
+    return new Set(probe("lsof", ["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "n"])
+      .split("\n").filter((l) => l.startsWith("n")).map((l) => l.slice(l.lastIndexOf(":") + 1)));
+  } catch { return { has: () => true }; }
 }
 
 // TRUE, FALSE, or NULL for "cannot tell" — a third state because the callers
@@ -854,6 +871,10 @@ function holdPort(rest) {
   // it runs on every respawn. Deferred because the scan walks the whole tmpdir
   // and would delay the bind; nothing waits on its result. unref so it cannot
   // hold the process open.
+  //
+  // The idempotent exits below settle before the timers phase and so never reap,
+  // but they publish nothing either: a launcher that leaves a record is one that
+  // reaps.
   setTimeout(reapFingerprintRecords, 0).unref();
   // The proxy's own default: holding a different port than the proxy would have
   // served leaves nothing at the documented address.
