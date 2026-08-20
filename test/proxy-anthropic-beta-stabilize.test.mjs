@@ -244,9 +244,13 @@ test("onRequest: absent or empty beta header is left alone", async () => {
 
 test("onRequest: case-insensitive header key is rewritten in place", async () => {
   process.env.CACHE_FIX_BETA_STABILIZE = "1";
+  // __fs too: this is the one ctx not built by mkCtx, and without the seam
+  // the append falls through to DEFAULT_FS and writes into the real
+  // ~/.claude/cache-fix-snapshots. Found exactly that way — a stray
+  // `…-nosys-empty-anthropic-beta-events.jsonl` in a live home directory.
   const ctx = {
     headers: { "Anthropic-Beta": "a,b", "x-claude-code-session-id": SID },
-    meta: { path: "/v1/messages" }, body: {},
+    meta: { path: "/v1/messages" }, body: {}, __fs: mkFs([]),
   };
   await ext.onRequest(ctx);
   assert.equal(ctx.headers["Anthropic-Beta"], "a, b");
@@ -487,4 +491,18 @@ test("events: a telemetry failure cannot fail the request", async () => {
   await ext.onRequest(ctx);   // must not throw
   assert.equal(ctx.headers["anthropic-beta"], "a, b",
     "the header decision still lands");
+});
+
+test("hygiene: no test may write into the operator's real snapshots dir", async () => {
+  // The guard for the hole above. Any ctx reaching onRequest without __fs
+  // appends to claudeHome()/cache-fix-snapshots for real, and a test suite
+  // that litters a live home directory is the defect this seam exists to
+  // prevent — not a cosmetic one: those rows are indistinguishable from
+  // production telemetry when an operator later reads them.
+  const seen = [];
+  const ctx = mkCtx({ beta: "a,b", events: seen });
+  await ext.onRequest(ctx);
+  assert.equal(seen.length, 1, "the injected fs must be the one that ran");
+  assert.ok(seen[0].file.includes("cache-fix-snapshots"),
+    "and it must still be aimed at the right directory shape");
 });
