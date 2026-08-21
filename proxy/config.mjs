@@ -64,6 +64,23 @@ const config = {
   // inert until CACHE_FIX_OAUTH_REFRESH=on is set and the proxy is restarted.
   // Contract: docs/directives/proxy-owned-oauth-refresh.md.
   get oauthRefreshEnabled() { return process.env.CACHE_FIX_OAUTH_REFRESH === "on"; },
+  // Per-request upstream override (ctx.meta.upstreamOverride). Default OFF, and
+  // off means the field is ignored, not that setting it is an error — an
+  // extension that sets it on a host which never opted in is simply inert.
+  //
+  // GATED BECAUSE OF WHAT THE FIELD CAN DO, IN BOTH DIRECTIONS. Outbound, the
+  // redirected request still carries the caller's credentials in its own bytes
+  // (x-api-key / authorization are what the upstream authenticates with), so
+  // the target learns them and sees the full prompt body. Inbound, the target's
+  // response is relayed back to Claude Code unmodified, so it can return
+  // synthetic tool_use blocks that the client then executes with the user's
+  // permissions. The second is the sharper one: it is an execution path, not a
+  // disclosure.
+  //
+  // Neither is a defect of the seam — an extension already runs in-process and
+  // can do worse — but "an extension I installed for something else can move my
+  // egress" is a decision for the operator, and this is where they make it.
+  get upstreamOverrideEnabled() { return process.env.CACHE_FIX_UPSTREAM_OVERRIDE === "on"; },
   // Forward-proxy (HTTP CONNECT + selective MITM) transport. Default OFF.
   // When "on", the proxy also handles CONNECT and MITMs only the upstream host,
   // so clients point HTTPS_PROXY (not ANTHROPIC_BASE_URL) at it and keep Remote
