@@ -196,14 +196,30 @@ async function handleMessages(clientReq, clientRes) {
     // directly — forwardRequest only reads .url/.method/.headers off its
     // first argument, so a minimal wrapper carrying the mutated headers is
     // sufficient and avoids touching upstream.mjs's signature.
-    // meta.upstreamOverride is the per-request upstream base an extension
-    // may have set in onRequest; undefined → config.upstream inside
+    // meta.upstreamOverride is the per-request upstream base an extension may
+    // have set in onRequest — honoured ONLY when the operator turned the seam on
+    // with CACHE_FIX_UPSTREAM_OVERRIDE=on (config.mjs records why that gate
+    // exists: the redirected request carries the caller's credentials and the
+    // target's response is relayed back to the client unmodified). Off, or
+    // unset by every extension → undefined → config.upstream inside
     // forwardRequest.
+    //
+    // REVERSE-PROXY PATH ONLY. handleMessages serves clients wired through
+    // ANTHROPIC_BASE_URL. In forward-proxy mode (CACHE_FIX_FORWARD_PROXY=on),
+    // /v1/messages arrives through the MITM'd CONNECT tunnel in
+    // forward-proxy.mjs and never reaches here, so the override is silently
+    // inert for --remote-control sessions. Named here because the symptom
+    // ("my override does nothing") gives no hint of the cause.
+    //
+    // request-capture (order 60) records the request as CC sent it, before the
+    // extensions that may set this field run, so a capture taken under an
+    // override still names config.upstream as the destination. Correct for what
+    // capture is for, wrong if read as "where these bytes went".
     ({ upstreamRes, responseHeaders, statusCode, upstreamConnectionId } = await forwardRequest(
       { url: clientReq.url, method: clientReq.method, headers },
       forwardBody,
       abortController.signal,
-      meta.upstreamOverride
+      config.upstreamOverrideEnabled ? meta.upstreamOverride : undefined
     ));
   } catch (err) {
     debugLog("[PROXY] forwardRequest error:", err.message);
