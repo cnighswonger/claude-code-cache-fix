@@ -78,6 +78,8 @@ export function joinBetaTokens(tokens) {
   return tokens.join(", ");
 }
 
+let _advised = false;
+
 export default {
   name: "auto-1m-guard",
   description:
@@ -107,6 +109,11 @@ export default {
       auto_1m_advice: ADVICE,
     };
 
+    // Advice, not a per-request fact: the text never varies, so a second copy
+    // tells a reader nothing the first did — and at request rate it buries
+    // everything else on this stream.
+    if (_advised) return;
+    _advised = true;
     process.stderr.write(
       `[auto-1m-guard] ${BETA_TOKEN_1M} detected in outbound betas` +
         (plan.stripped ? " — stripped" : "") +
@@ -115,3 +122,6 @@ export default {
     );
   },
 };
+
+// Test seam — for unit tests that want to clear the once-per-process latch.
+export function __resetAdvisedForTests() { _advised = false; }

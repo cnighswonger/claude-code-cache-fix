@@ -1,6 +1,7 @@
 import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import ext, {
+  __resetAdvisedForTests,
   findBetaHeader,
   parseBetaTokens,
   planSanitizeBetaHeader,
@@ -188,4 +189,30 @@ test("onRequest: duplicate `context-1m-2025-08-07` tokens (defensive) — all re
     ctx.headers["anthropic-beta"],
     "claude-code-20250219, oauth_auth, interleaved-thinking-2025-05-14",
   );
+});
+
+// --- the advisory is advice, not a per-request fact ---
+
+test("onRequest: the advisory is written once per process, not once per request", async () => {
+  // Ten earlier tests in this file already call onRequest, so without this
+  // the latch is spent and the count reads 0 rather than 1 — order-dependent
+  // either way, and green for the wrong reason.
+  __resetAdvisedForTests();
+  const seen = [];
+  const orig = process.stderr.write;
+  process.stderr.write = (s) => {
+    if (String(s).includes("[auto-1m-guard]")) seen.push(String(s));
+    return true;
+  };
+  try {
+    for (let i = 0; i < 5; i++) {
+      await ext.onRequest(mkCtx({ headers: { "anthropic-beta": STD_BETAS_WITH_1M }, mode: "warn" }));
+    }
+  } finally {
+    process.stderr.write = orig;
+  }
+  // The text never varies, so repeating it says nothing a reader did not
+  // already have. Measured on a live holder: 55,685 of 55,758 log lines were
+  // this one line, 10 MB in 66 h, and zero of the file's lines were errors.
+  assert.equal(seen.length, 1, `advisory written ${seen.length}x for 5 requests`);
 });
