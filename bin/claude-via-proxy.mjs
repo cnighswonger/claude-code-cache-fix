@@ -11,6 +11,7 @@ import net from "node:net";
 import { EventEmitter } from "node:events";
 import { getSystemErrorName } from "node:util";
 import { bundleUsable, carriesOurCA, salvageBundle } from "./ca-trust.mjs";
+import { handoverEnv } from "./handover-env.mjs";
 import { sourceFingerprintSync } from "../proxy/source-fingerprint.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -978,8 +979,16 @@ function holdPort(rest) {
           // 9901."
           //
           // We are bound to the number, so there is nothing to guess.
-          env: { ...process.env, CACHE_FIX_HOLDER_HANDOVER: "1", LISTEN_FDS: "1",
+          env: { ...handoverEnv(process.env), CACHE_FIX_HOLDER_HANDOVER: "1", LISTEN_FDS: "1",
                  CACHE_FIX_PROXY_PORT: String(holder._port || port),
+                 // AND THE BIND: the successor ADOPTS this socket, so a bind from
+                 // the file cannot move it but would still relabel _host, and every
+                 // downstream name (HELD_HOST, the proxy child, /health) with it.
+                 CACHE_FIX_PROXY_BIND: bindAddr(),
+                 // AND A HOLDER IS NOT A STANDBY. openGap() sheds HOLDER_TREE and
+                 // HELD_BY the same way; this one only became reachable when the
+                 // env above stopped being ours alone.
+                 CACHE_FIX_STANDBY: undefined,
                  CACHE_FIX_EXIT_WITH_PARENT: "0" },
         });
         // WE LEAVE WHEN THE SUCCESSOR EXISTS, not when we have asked for one.
