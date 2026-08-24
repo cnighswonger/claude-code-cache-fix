@@ -110,8 +110,7 @@ export default {
     };
 
     // Advice, not a per-request fact: the text never varies, so a second copy
-    // tells a reader nothing the first did — and at request rate it buries
-    // everything else on this stream.
+    // says nothing the first did — at request rate it buries everything else here.
     if (_advised) return;
     _advised = true;
     process.stderr.write(

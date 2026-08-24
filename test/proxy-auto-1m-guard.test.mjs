@@ -194,9 +194,8 @@ test("onRequest: duplicate `context-1m-2025-08-07` tokens (defensive) — all re
 // --- the advisory is advice, not a per-request fact ---
 
 test("onRequest: the advisory is written once per process, not once per request", async () => {
-  // Ten earlier tests in this file already call onRequest, so without this
-  // the latch is spent and the count reads 0 rather than 1 — order-dependent
-  // either way, and green for the wrong reason.
+  // Earlier tests in this file already call onRequest, so without this the
+  // latch is spent and the count reads 0 rather than 1 — green for the wrong reason.
   __resetAdvisedForTests();
   const seen = [];
   const orig = process.stderr.write;
@@ -211,8 +210,5 @@ test("onRequest: the advisory is written once per process, not once per request"
   } finally {
     process.stderr.write = orig;
   }
-  // The text never varies, so repeating it says nothing a reader did not
-  // already have. Measured on a live holder: 55,685 of 55,758 log lines were
-  // this one line, 10 MB in 66 h, and zero of the file's lines were errors.
   assert.equal(seen.length, 1, `advisory written ${seen.length}x for 5 requests`);
 });
