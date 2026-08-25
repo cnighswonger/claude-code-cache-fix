@@ -600,13 +600,17 @@ async function handlePassthrough(clientReq, clientRes) {
  * truncations, not a count of them. Measured: after writeHead and before the
  * first chunk, headersSent=true with socket.bytesWritten=0.
  */
-export function forcedCloseLine(ended, destroyed, held, budgetMs = 5_000) {
+export function forcedCloseLine(ended, destroyed, held, budgetMs = 5_000, why = "") {
   const cut = ended + destroyed;
   // THE BUDGET IT ACTUALLY USED, not the constant this line was written against.
   // The two diverged the moment the handover path got its own, and a log that
   // says "after 5s" about a 1800s wait is the kind of wrong that survives for
   // months because it reads like it was checked.
-  const after = budgetMs % 1000 === 0 ? `${budgetMs / 1000}s` : `${budgetMs}ms`;
+  //
+  // `why` exists because the number alone stopped being the discriminator. Three
+  // things can end a drain now and two of them are opposite outcomes, so the
+  // line names which rather than leaving it to be inferred from a shape.
+  const after = (budgetMs % 1000 === 0 ? `${budgetMs / 1000}s` : `${budgetMs}ms`) + why;
   if (cut > 0) {
     return `[cache-fix] shutdown: forcing close, cut ${cut} in-flight request(s) after ${after} `
          + `(${ended} mid-response, ${destroyed} before headers)\n`;
@@ -1804,22 +1808,22 @@ if (invokedAsScript) {
     // every one 100% mid-response, 0 before headers — so every cut was a reply
     // whose headers the client already had and whose body stopped mid-stream.
     //
-    // WHY A LONGER CLOCK AND NOT A DRAIN PREDICATE. `active.close()` cannot
-    // express "nothing is owed" here: measured on 18.20.8 / 20.20.2 / 24.11.1,
-    // one live CONNECT tunnel leaves close() unresolved with liveResponses 0,
-    // and closeIdleConnections() neither frees it nor unblocks close(). A
-    // byte-rate test cannot separate a slow reply from a keepalive either — a
-    // cross-component peer measured content at 490 B/s and heartbeat at 35 B/s
-    // on the same stream. So there is no predicate available that is honest;
-    // what IS available is the fact that nobody is waiting, which turns the
-    // number from an outage budget into a leak bound.
+    // WHY NOT `active.close()`. It cannot express "nothing is owed" here:
+    // measured on 18.20.8 / 20.20.2 / 24.11.1, one live CONNECT tunnel leaves
+    // close() unresolved with liveResponses 0, and closeIdleConnections()
+    // neither frees it nor unblocks close(). So the drain needs its own test.
+    //
+    // THIS PARAGRAPH USED TO SAY NO HONEST PREDICATE EXISTED, and it was the
+    // reason the answer here stayed a number for as long as it did. What it
+    // actually refutes is a THRESHOLD ON THROUGHPUT — see the arm below, which
+    // never divides anything. Corrected rather than deleted: the wrong version
+    // is the kind that stops the next reader from looking.
     //
     // A lingering predecessor costs RAM and nothing else — it holds no listener
-    // (we released it above) and the successor is serving. The default is 30
-    // minutes because that is well past any reply this proxy relays and still
-    // bounded; CACHE_FIX_DRAIN_MS moves it for an operator who knows their own
-    // traffic. It applies to the handover path ONLY.
-    setTimeout(() => {
+    // (we released it above) and the successor is serving. So the handover arm
+    // can afford to wait, and CACHE_FIX_DRAIN_MS is now its BACKSTOP rather than
+    // its deadline.
+    const forceClose = (afterMs, why) => {
       // End the laggards rather than destroying them. `closeAllConnections()`
       // destroys the socket, and the kernel answers RST — measured, a client
       // that had already received every byte still surfaced ECONNRESET and
@@ -1857,7 +1861,7 @@ if (invokedAsScript) {
       // must not print as "0 connections still held", which is the one reading
       // that would wrongly clear the stop.
       const finish = (held) => {
-        process.stderr.write(forcedCloseLine(ended, destroyed, held, budgetMs));
+        process.stderr.write(forcedCloseLine(ended, destroyed, held, afterMs, why));
         // Then force whatever did not take the FIN. Node >=18.2; package.json
         // engines allows 18.0/18.1, where exiting without forcing is the only
         // option.
@@ -1869,6 +1873,65 @@ if (invokedAsScript) {
       };
       try { active.server.getConnections((err, n) => finish(err ? null : n)); }
       catch { finish(null); }
-    }, budgetMs).unref();
+    };
+    if (!(handedOff || handoverRelease)) {
+      // THE SUPERVISED ARM KEEPS ITS CEILING. Something is waiting on this exit
+      // and the wait is serial, so patience here is downtime — measured, 120s
+      // against a 90s TimeoutStopSec took restart downtime 5.0s -> 53.9s.
+      setTimeout(() => forceClose(budgetMs, ""), budgetMs).unref();
+    } else {
+      // THE HANDOVER ARM HAS NO CEILING, because a ceiling is a bet on how long
+      // a reply takes and every value of it loses: 5s and 1800s cut on this
+      // path, and a neighbouring component retuned the same number three times.
+      //
+      // SCORE BYTES, NOT CONTENT EVENTS, AND NOT A RATE. A rate cannot separate
+      // a slow reply from a heartbeat — 490 B/s against 35 B/s on one stream —
+      // and that measurement is why this file used to conclude no honest
+      // predicate existed. It is an argument against a THRESHOLD ON THROUGHPUT
+      // and it does not touch this test, which never divides anything: a reply
+      // and a heartbeat both answer "moving", which is the correct answer for
+      // both. What it excludes is a connection delivering nothing at all, and
+      // that is a different shape rather than a smaller number of the same one.
+      // The neighbour's distribution, 292 drains: content-free waits reach 186s
+      // while BYTE-free waits top out at 2s. The two populations do not overlap,
+      // so no value in between is wrong — which is why their 90s has never been
+      // retuned while every budget has.
+      //
+      // 90s is a judgement call bounded by two observations (far past any gap a
+      // live stream produces, far short of the ten minutes that was cutting real
+      // work), not a percentile — their byte-free sample is n=6. A number
+      // presented as derived when it was not is worse than an honest guess.
+      const stallMs = Number(process.env.CACHE_FIX_DRAIN_STALL_MS) || 90_000;
+      // Polled off the socket rather than stamped on every write: the hot path
+      // pays nothing, and `bytesWritten` is the byte actually leaving rather than
+      // a chunk we parsed. It is also the only thing that separates a reply that
+      // is streaming from one blocked upstream — `headersSent` goes true at
+      // writeHead, measured with bytesWritten still 0, so the `mid-response`
+      // count above is an upper bound and this is not.
+      // WeakMap: a response that finishes leaves `_live` but would stay reachable
+      // from here, and this drain can run for as long as work keeps arriving.
+      const seen = new WeakMap();
+      let lastMoved = Date.now();
+      const tick = setInterval(() => {
+        let moved = false;
+        for (const res of active.server?._live ?? []) {
+          const n = res.socket?.bytesWritten ?? 0;
+          if (seen.get(res) !== n) { moved = true; seen.set(res, n); }
+        }
+        if (moved) lastMoved = Date.now();
+        const stalled = Date.now() - lastMoved;
+        const elapsed = Date.now() - drainStart;
+        // The budget survives ONLY as a backstop against a bug in the predicate
+        // above. It is not what decides, and if it is what fired, the line says
+        // so — a drain that ends on the backstop means the stall test never
+        // answered, which is a defect here and not a slow client.
+        if (stalled >= stallMs || elapsed >= budgetMs) {
+          clearInterval(tick);
+          forceClose(elapsed, stalled >= stallMs
+            ? ` with no byte written for ${Math.round(stalled / 1000)}s`
+            : ` on the BACKSTOP budget — the stall test never fired, which is a bug here`);
+        }
+      }, 1_000).unref();
+    }
   };
 }

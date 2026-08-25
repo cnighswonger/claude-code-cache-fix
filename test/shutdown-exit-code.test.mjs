@@ -469,6 +469,113 @@ describe("SIGTERM exit code", () => {
   //
   // LIFTED AND EVALUATED, not grepped: the whole point is which VALUE comes out
   // for which arm, and a grep for "handedOff" passes on the comment above it.
+  // THE PREDICATE, END TO END, BOTH DIRECTIONS. A budget test can only ever
+  // assert "it eventually stopped", which a ceiling also satisfies — so the pair
+  // that matters is: a drain with nothing moving must end WITHOUT reaching the
+  // ceiling, and a drain with bytes moving must NOT end while they move. Neither
+  // alone distinguishes a stall predicate from a shorter clock.
+  it("ends a handover drain on the stall, not on the ceiling", async () => {
+    // The same never-answers upstream the destroy-arm case uses: the proxy is
+    // stuck waiting, so the response is owed with bytesWritten 0 — the exact
+    // shape a ceiling waits out and a stall test does not.
+    const upSockets = [];
+    const hung = net.createServer((s) => upSockets.push(s));
+    await new Promise((r) => hung.listen(0, "127.0.0.1", r));
+    const { proc, port, stderr } = startProxy({
+      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${hung.address().port}`,
+      CACHE_FIX_DRAIN_STALL_MS: "1500",
+      // A ceiling far enough away that reaching it is unmistakable: if this is
+      // what ends the drain the case takes a minute and fails on the elapsed
+      // assertion rather than passing slowly.
+      CACHE_FIX_DRAIN_MS: "60000",
+    });
+    try {
+      const p = await port;
+      const c = net.connect(p, "127.0.0.1", () => c.write(
+        "POST /v1/messages HTTP/1.1\r\nHost: x\r\ncontent-type: application/json\r\n" +
+        "content-length: 2\r\n\r\n{}"));
+      c.on("error", () => {});
+      await new Promise((r) => setTimeout(r, 500));
+
+      const exited = exitOf(proc);
+      const t0 = Date.now();
+      proc.kill("SIGUSR2");          // the HANDOVER arm, not a supervised stop
+      await exited;
+      const elapsed = Date.now() - t0;
+      c.destroy();
+
+      assert.ok(elapsed < 20_000,
+        `the handover drain took ${elapsed}ms against a 1500ms stall window and a ` +
+        `60000ms ceiling — the ceiling is what ended it, so the stall test is not ` +
+        `what decides and this is a clock wearing a predicate's name`);
+      assert.match(stderr(), /with no byte written for \d+s/,
+        `the forced close does not say the stall ended it; stderr was:\n${stderr()}`);
+      assert.doesNotMatch(stderr(), /BACKSTOP/,
+        `the drain ended on the backstop budget, which means the stall test never ` +
+        `fired — that is a defect in the predicate, not a slow client`);
+    } finally {
+      for (const s of upSockets) s.destroy();
+      hung.close();
+      proc.kill("SIGKILL");
+    }
+  });
+
+  it("does not end a handover drain while bytes are still moving", async () => {
+    // The SSE fixture the watchdog case uses, because it is the one that actually
+    // gets bytes through this proxy — my first cut dribbled raw chunks from a
+    // net server and delivered nothing, which its own premise assertion caught.
+    // socket.bytesWritten advances per chunk here, which is all the predicate
+    // reads; a CONTENT test would see the same thing and a rate test would have
+    // to decide whether 10 bytes per 100ms is a reply or a heartbeat.
+    const upstream = http.createServer((q, r) => {
+      r.writeHead(200, { "content-type": "text/event-stream" });
+      let n = 0;
+      const t2 = setInterval(() => r.write(`data: ${++n}\n\n`), 100);
+      r.on("close", () => clearInterval(t2));
+      q.resume();
+    });
+    await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
+
+    const { proc, port } = startProxy({
+      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upstream.address().port}`,
+      CACHE_FIX_DRAIN_STALL_MS: "1500",
+      CACHE_FIX_DRAIN_MS: "60000",
+    });
+    try {
+      const p = await port;
+      let chunks = 0;
+      const req = http.request(
+        { host: "127.0.0.1", port: p, path: "/v1/messages", method: "POST",
+          headers: { "content-type": "application/json" } },
+        (res) => { res.on("data", () => chunks++); res.on("error", () => {}); });
+      req.on("error", () => {});
+      req.end(JSON.stringify({ model: "x", messages: [], stream: true }));
+
+      const flowing = Date.now() + 10_000;
+      while (chunks === 0 && Date.now() < flowing) await new Promise((r) => setTimeout(r, 50));
+      assert.ok(chunks > 0, "premise: bytes must be reaching the client before the handover");
+
+      const exited = exitOf(proc);
+      let alive = true;
+      exited.then(() => (alive = false));
+      const before = chunks;
+      proc.kill("SIGUSR2");
+      // FOUR stall windows. A predicate that ignores movement ends at ~1.5s, so
+      // this fails on the arm it is aimed at rather than on timing noise.
+      await new Promise((r) => setTimeout(r, 6_000));
+      assert.ok(alive,
+        "the handover drain ended within 6s while the reply was still delivering " +
+        "a chunk every 100ms — movement does not hold it open, so this is a 1500ms " +
+        "clock and it cuts exactly what the 5s one did");
+      assert.ok(chunks > before,
+        `the reply stopped delivering during the drain (${before} -> ${chunks}), so ` +
+        `"still alive" says nothing about movement — the fixture stalled, not the proxy`);
+    } finally {
+      upstream.close();
+      proc.kill("SIGKILL");
+    }
+  });
+
   it("spends the 5s outage budget only where something waits on our exit", () => {
     const src = readFileSync(serverPath, "utf8");
     const expr = /const budgetMs = [\s\S]*?;\n/.exec(src)?.[0];
