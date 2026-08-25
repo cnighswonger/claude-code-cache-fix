@@ -600,7 +600,19 @@ async function handlePassthrough(clientReq, clientRes) {
  * truncations, not a count of them. Measured: after writeHead and before the
  * first chunk, headersSent=true with socket.bytesWritten=0.
  */
-export function forcedCloseLine(ended, destroyed, held, budgetMs = 5_000, why = "", routes = "", quiet = "") {
+// NEW FIELDS GO AT THE END. This line is a published interface -- it is read by
+// tooling outside this repo -- so the order of what is already in it is part of
+// the contract, not a formatting choice.
+//
+// Measured: putting a field between the budget and `(<n> mid-response,` broke a
+// case in test/shutdown-exit-code.test.mjs that pins that adjacency as a literal
+// regex. That case looks over-specified and a reviewer would trim it; its
+// brittleness IS the contract check, which is why it stays.
+//
+// Appending is not automatically safe either -- it is safe here only because no
+// known reader anchors on the end of the line. A future field should ask the
+// same question rather than assume the tail is free.
+export function forcedCloseLine(ended, destroyed, held, budgetMs = 5_000, why = "", routes = "", quiet = "", owedAtStart = null) {
   const cut = ended + destroyed;
   // THE BUDGET IT ACTUALLY USED, not the constant this line was written against.
   // The two diverged the moment the handover path got its own, and a log that
@@ -618,7 +630,8 @@ export function forcedCloseLine(ended, destroyed, held, budgetMs = 5_000, why = 
     return `[cache-fix] shutdown: forcing close, cut ${cut} in-flight request(s) after ${after} `
          + `(${ended} mid-response, ${destroyed} before headers)`
          + (quiet ? ` quiet ${quiet}` : "")
-         + (routes ? ` routes: ${routes}` : "") + `\n`;
+         + (routes ? ` routes: ${routes}` : "")
+         + (owedAtStart === null ? "" : `, owed ${owedAtStart} at the start`) + `\n`;
   }
   // Not "idle": we did not measure idleness, we measured that no RESPONSE was
   // open. Naming the held count is what stops a reader concluding the stop was
@@ -1818,6 +1831,15 @@ if (invokedAsScript) {
     // neighbour layer measured one legitimate drain at 1126.2s, so the range
     // this lives in is not hypothetical.
     const drainStart = Date.now();
+    // WHAT WAS AT RISK WHEN THE SIGNAL ARRIVED. `drained clean` means everything
+    // owed finished inside the budget -- it does NOT mean nothing was owed, and
+    // without this the two are the same line. How often a stop has anything at
+    // risk was therefore not derivable from these logs, and this arm's cost has
+    // been argued from four terminations.
+    //
+    // Counted HERE, not at the terminal line: by then the set has drained, which
+    // is the question the terminal line already answers.
+    const owedAtStart = [...(active.server?._live ?? [])].length;
     // Hoisted: the clean-drain line is written before the stall loop is
     // installed, so the count has to outlive it.
     let stallEnded = 0;
@@ -1836,6 +1858,7 @@ if (invokedAsScript) {
       // unanchored, so naming the cut in a suffix would not keep it out.
       say(process.stderr, `[cache-fix] shutdown: drained${stallEnded ? "" : " clean"}`
         + ` in ${secs}s of ${budgetMs / 1000}s budget`
+        + `, owed ${owedAtStart} at the start`
         + (stallEnded ? `, ${stallEnded} ended on the stall test` : "") + `\n`);
       process.exit(handedOff ? 75 : 0);
     });
@@ -1957,7 +1980,8 @@ if (invokedAsScript) {
       // must not print as "0 connections still held", which is the one reading
       // that would wrongly clear the stop.
       const finish = (held) => {
-        process.stderr.write(forcedCloseLine(ended, destroyed, held, afterMs, why, routeTally, quietTally));
+        process.stderr.write(forcedCloseLine(
+          ended, destroyed, held, afterMs, why, routeTally, quietTally, owedAtStart));
         // Then force whatever did not take the FIN. Node >=18.2; package.json
         // engines allows 18.0/18.1, where exiting without forcing is the only
         // option.

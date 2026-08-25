@@ -1459,4 +1459,59 @@ describe("SIGTERM exit code", () => {
     }
   });
 
+
+  it("says what was owed when the drain started, even when it ends clean", async () => {
+    // `drained clean in Xs of Ys budget` means everything owed FINISHED inside
+    // the budget. It does NOT mean nothing was owed -- and nothing anywhere says
+    // how much was. So "how often does a stop have anything at risk" cannot be
+    // derived from these logs at all: a clean line and a stop with nothing in
+    // flight are the same text.
+    //
+    // That number is what the supervised arm's cost is argued from, and the
+    // sample behind it is four terminations. This makes every stop report it.
+    const upstream = http.createServer((q, r) => {
+      q.resume();
+      r.writeHead(200, { "content-type": "application/json" });
+      setTimeout(() => { try { r.end(JSON.stringify({ ok: true })); } catch {} }, 500);
+    });
+    await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
+    const { proc, port, stderr } = startProxy({
+      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upstream.address().port}`,
+    });
+    try {
+      const p = await port;
+      let done = false;
+      const req = http.request(
+        { host: "127.0.0.1", port: p, path: "/v1/messages", method: "POST",
+          headers: { "content-type": "application/json" } },
+        (res) => { res.on("data", () => {}); res.on("end", () => { done = true; }); res.on("error", () => {}); });
+      req.on("error", () => {});
+      req.end(JSON.stringify({ model: "x", messages: [] }));
+
+      // Signal while the reply is still owed; it finishes well inside the 5s
+      // budget, so the drain ends CLEAN with something having been at risk.
+      await new Promise((r) => setTimeout(r, 150));
+      proc.kill("SIGTERM");
+      await new Promise((r) => proc.once("exit", r));
+
+      const err = stderr();
+      const line = err.match(/shutdown: drained.*/)?.[0] ?? "";
+      // PRECONDITION: this must be the CLEAN path, not a cut. A cut line would
+      // already carry a count and the case would prove nothing.
+      assert.ok(line, `no drained line at all. stderr:\n${err}`);
+      assert.doesNotMatch(line, /forcing close/,
+        `the drain cut instead of finishing clean, so this case is not measuring ` +
+        `the clean path: ${line}`);
+      assert.ok(done, "premise: the reply never completed, so nothing was owed and finished");
+
+      assert.match(line, /owed [0-9]+ at the start/,
+        `a clean drain must still say how much was owed when it began -- otherwise ` +
+        `"nothing was in flight" and "everything finished in time" are the same ` +
+        `line, and the arm's cost cannot be counted. Got: ${line}`);
+    } finally {
+      try { proc.kill("SIGKILL"); } catch {}
+      upstream.close();
+    }
+  });
+
 });
