@@ -66,3 +66,22 @@ test("handoverEnv: the default path is per config dir, and read live", () => {
     else process.env.CLAUDE_CONFIG_DIR = prev;
   }
 });
+
+// THE LIMIT, PINNED. A key absent from the file inherits; it does NOT unset. An
+// operator who turns a switch on here and then deletes the line still has it on,
+// on every handover after — so the documented way off is the switch's own off
+// value. Asserting it rather than leaving it to be discovered in production.
+test("a key missing from the file is inherited, not cleared", () => {
+  const p = withFile("CACHE_FIX_PREFIXDIFF=1\n");
+  const out = handoverEnv({ CACHE_FIX_REQUEST_CAPTURE: "1" }, p);
+  assert.equal(out.CACHE_FIX_REQUEST_CAPTURE, "1",
+    "a key the file omits was cleared — every switch not restated in the file " +
+    "would silently turn off at the next handover");
+  assert.equal(out.CACHE_FIX_PREFIXDIFF, "1", "the file's own key did not land");
+
+  const off = handoverEnv({ CACHE_FIX_REQUEST_CAPTURE: "1" },
+    withFile("CACHE_FIX_REQUEST_CAPTURE=0\n"));
+  assert.equal(off.CACHE_FIX_REQUEST_CAPTURE, "0",
+    "the documented way to turn a switch off no longer works, and there is no " +
+    "other way — this file cannot express an unset");
+});

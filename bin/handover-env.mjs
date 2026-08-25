@@ -16,6 +16,12 @@ import { claudeHome } from "../proxy/claude-home.mjs";
 // prefix this file can set CACHE_FIX_PROXY_UPSTREAM, CACHE_FIX_REQUEST_CAPTURE
 // and CACHE_FIX_PROXY_CA_FILE, so write access to it is control of the proxy.
 //
+// ABSENCE MEANS INHERIT, NEVER UNSET. There is no syntax here that removes a
+// key, so deleting a line does not turn a switch off — the value the outgoing
+// holder carries stands, and one set through this file is then sticky across
+// every later handover. Turn a switch off by its own off value
+// (`CACHE_FIX_REQUEST_CAPTURE=0`), not by removing the line.
+//
 // Own module: the launcher is an executable, so importing it runs the CLI.
 // Parsed by hand, not util.parseEnv: measured undefined on node 18, which
 // package.json declares as the minimum — there the call throws, outside the try.
