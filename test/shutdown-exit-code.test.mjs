@@ -1089,43 +1089,61 @@ describe("SIGTERM exit code", () => {
 
   it("spends the 5s outage budget only where something waits on our exit", () => {
     const src = readFileSync(serverPath, "utf8");
-    const expr = /const budgetMs = [\s\S]*?;\n/.exec(src)?.[0];
+    // BOTH LINES. The predicate moved off the budget line into `unwaited`, so
+    // lifting only `const budgetMs = ...` leaves it unbound and this throws a
+    // ReferenceError instead of testing anything. That is the correct failure
+    // and it is not a test — measured when the predicate moved.
+    const expr = /const unwaited = [\s\S]*?;\n\s*const budgetMs = [\s\S]*?;\n/.exec(src)?.[0];
     assert.ok(expr, "the drain budget is no longer chosen here — this tests nothing");
     assert.match(expr, /handedOff/, "the budget no longer consults handedOff");
     assert.match(expr, /handoverRelease/,
       "the budget ignores handoverRelease, so a holder-driven handover still spends " +
       "the SUPERVISED budget — the arm that cut 14-18 mid-response replies on every " +
       "one of six handovers in one evening, every one 100% mid-response");
+    assert.match(expr, /heldByLiveHolder/,
+      "the budget ignores heldByLiveHolder, so a stop under a live holder is back on " +
+      "the 5s ceiling — the arm that cut 15 replies on one host across four stops " +
+      "(4, 3, 1, 7), every one with no stall predicate installed at all");
 
-    const pick = (handedOff, handoverRelease, env) => {
+    const pick = (handedOff, handoverRelease, heldByLiveHolder, env) => {
       // eslint-disable-next-line no-new-func
-      return Function("handedOff", "handoverRelease", "process", `${expr} return budgetMs;`)(
-        handedOff, handoverRelease, { env });
+      return Function("handedOff", "handoverRelease", "heldByLiveHolder", "process",
+        `${expr} return budgetMs;`)(handedOff, handoverRelease, heldByLiveHolder, { env });
     };
-    assert.equal(pick(false, false, {}), 5_000,
-      "a SUPERVISED stop no longer uses the 5s it was measured for — systemd waits " +
-      "serially there, so a longer grace is downtime: 120s against a 90s " +
-      "TimeoutStopSec took restart downtime 5.0s -> 53.9s");
-    assert.ok(pick(true, false, {}) >= 600_000,
-      `a HANDOVER got ${pick(true, false, {})}ms — nothing waits on that path and the ` +
+    assert.equal(pick(false, false, false, {}), 5_000,
+      "a STANDALONE stop no longer uses the 5s it was measured for. With no holder " +
+      "above it this process IS what someone waits on, and that wait is serial: 120s " +
+      "against a 90s TimeoutStopSec took restart downtime 5.0s -> 53.9s. This is the " +
+      "one arm that still pays a ceiling, and removing it here removes it everywhere");
+
+    // THE HELD STOP. The holder settles on our RELEASE announcement rather than
+    // on our exit (claude-via-proxy.mjs, the `stopping` arm of onLine), so from
+    // that line nothing is waiting and the ceiling has nothing left to buy.
+    // Landing this half without the holder half puts the 53.9s straight back.
+    assert.ok(pick(false, false, true, {}) >= 600_000,
+      `a stop under a LIVE HOLDER got ${pick(false, false, true, {})}ms — back on the ` +
+      `ceiling that cut 4, 3, 1 and 7 in-flight replies on one host, 15 in total, ` +
+      `every one at 5s with no predicate installed`);
+    assert.ok(pick(true, false, false, {}) >= 600_000,
+      `a HANDOVER got ${pick(true, false, false, {})}ms — nothing waits on that path and the ` +
       `short budget is what cut 16 mid-response replies on the last deploy`);
 
     // THE THIRD CASE, and the one that was spending the wrong budget. A holder
     // handover never sets `handedOff`: it sets `releasing`, so askForSuccessor
     // is false. The successor has adopted fd 3 and the holder settles the moment
     // it signals us, so nothing waits on this exit.
-    assert.ok(pick(false, true, {}) >= 600_000,
-      `a HOLDER-DRIVEN handover got ${pick(false, true, {})}ms. Measured over one ` +
+    assert.ok(pick(false, true, false, {}) >= 600_000,
+      `a HOLDER-DRIVEN handover got ${pick(false, true, false, {})}ms. Measured over one ` +
       `evening of six handovers: cut 17 / 18 / 18 / 16 / 15 / 14 in-flight, every ` +
       `one 100% mid-response and 0 before headers — and that six is a floor, the ` +
       `log had already been truncated at its 4MB cap`);
 
-    assert.equal(pick(false, true, { CACHE_FIX_DRAIN_MS: "90000" }), 90_000,
+    assert.equal(pick(false, true, false, { CACHE_FIX_DRAIN_MS: "90000" }), 90_000,
       "CACHE_FIX_DRAIN_MS does not move the holder-driven handover budget");
-    assert.equal(pick(true, false, { CACHE_FIX_DRAIN_MS: "90000" }), 90_000,
+    assert.equal(pick(true, false, false, { CACHE_FIX_DRAIN_MS: "90000" }), 90_000,
       "CACHE_FIX_DRAIN_MS does not move the handover budget");
-    assert.equal(pick(false, false, { CACHE_FIX_DRAIN_MS: "90000" }), 5_000,
-      "CACHE_FIX_DRAIN_MS moved the SUPERVISED budget too — that one is bounded by " +
+    assert.equal(pick(false, false, false, { CACHE_FIX_DRAIN_MS: "90000" }), 5_000,
+      "CACHE_FIX_DRAIN_MS moved the STANDALONE budget too — that one is bounded by " +
       "the unit's TimeoutStopSec and is not the operator's to raise from here");
   });
 
@@ -1459,6 +1477,169 @@ describe("SIGTERM exit code", () => {
     }
   });
 
+
+  // A STOP UNDER A LIVE HOLDER IS THE ARM THAT CUT THE MOST, AND NOTHING WAS
+  // WATCHING IT. Two filters over one proxy log disagreed — one matched the
+  // BACKSTOP text and saw 5 cuts, the other matched the monitor's own line and
+  // saw 34 — and the gap was this arm: a plain `after 5s` with no predicate
+  // installed at all, 15 replies on one host across four stops (4, 3, 1, 7).
+  // The disagreement is the only reason either of us looked.
+  //
+  // It is fixable only in a pair. The proxy may stop cutting here ONLY because
+  // the holder now settles on the release announcement instead of on this
+  // process's exit; before that, patience here was downtime and the ceiling was
+  // buying something real (120s against a 90s TimeoutStopSec took restart
+  // downtime 5.0s -> 53.9s). Delete either half and this case must fail.
+  it("a stop under a live holder waits for a reply instead of severing it", async () => {
+    const upstream = http.createServer((q, r) => {
+      q.resume();
+      r.writeHead(200, { "content-type": "text/event-stream" });
+      let i = 0;
+      const t = setInterval(() => { try { r.write(`data: ${++i}\n\n`); } catch {} }, 200);
+      r.on("close", () => clearInterval(t));
+    });
+    await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
+    // OUR OWN PID AS THE HOLDER MARKER. `heldByLiveHolder` is
+    // CACHE_FIX_HELD_BY === String(process.ppid), and we ARE the proxy's parent,
+    // so this is the real predicate rather than a stand-in for it.
+    const { proc, port, stderr } = startProxy({
+      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upstream.address().port}`,
+      CACHE_FIX_HELD_BY: String(process.pid),
+      CACHE_FIX_DRAIN_STALL_MS: "5000",   // 200ms writes keep it inside the window
+      CACHE_FIX_DRAIN_MS: "2000",         // budget expires while it is still streaming
+    });
+    try {
+      const p = await port;
+      let chunks = 0;
+      const req = http.request(
+        { host: "127.0.0.1", port: p, path: "/v1/messages", method: "POST",
+          headers: { "content-type": "application/json" } },
+        (res) => { res.on("data", () => { chunks++; }); res.on("error", () => {}); });
+      req.on("error", () => {});
+      req.end(JSON.stringify({ model: "x", messages: [], stream: true }));
+
+      while (chunks < 3) await new Promise((r) => setTimeout(r, 100));
+      // SIGHUP, NOT SIGTERM, because that is what a stop actually looks like from
+      // here: the holder rewrites every stop to SIGHUP before forwarding
+      // (claude-via-proxy.mjs `sig = "SIGHUP"`), so a case that sends SIGTERM is
+      // testing a signal this process never receives under a holder.
+      proc.kill("SIGHUP");
+
+      await new Promise((r) => setTimeout(r, 6_000));   // well past the 2s budget
+
+      const err = stderr();
+      assert.ok(chunks > 3, `premise: the reply stopped streaming on its own (${chunks} chunks)`);
+      assert.doesNotMatch(err, /forcing close/,
+        `a stop severed a reply the stall test had not ended. stderr:\n${err}`);
+      assert.match(err, /still waiting/,
+        `a drain that stays past its budget must say so, and say what it is waiting ` +
+        `on. stderr:\n${err}`);
+      // THE COST, ASSERTED RATHER THAN TOLERATED. Not cutting means the process
+      // is still here. How often that happens is bounded by CONCURRENT ACTIVITY,
+      // not by deploy count: an upstream hop carrying a live stream keeps the
+      // drainer alive, and a host with no live stream drains clean and exits.
+      // Measured across three machines — two carried a resident for over two
+      // hours each, the third held zero connections and no drainer at all.
+      // A case that only checked "no cut" would pass identically on a build that
+      // exited, and would hide the half of the trade that costs something.
+      assert.equal(proc.exitCode, null,
+        "the drain ended anyway, so this case is no longer showing what not-cutting " +
+        "costs — one resident process per stop, unbounded in count");
+    } finally {
+      try { proc.kill("SIGKILL"); } catch {}
+      upstream.close();
+    }
+  });
+
+  // THE CONTROL, and without it the case above only proves the ceiling was
+  // deleted. Standalone, nothing supervising: this process IS what a caller is
+  // waiting on, so the bet a ceiling makes is real here and it must still cut.
+  it("a standalone stop keeps its ceiling and does sever a live reply", async () => {
+    const upstream = http.createServer((q, r) => {
+      q.resume();
+      r.writeHead(200, { "content-type": "text/event-stream" });
+      let i = 0;
+      const t = setInterval(() => { try { r.write(`data: ${++i}\n\n`); } catch {} }, 200);
+      r.on("close", () => clearInterval(t));
+    });
+    await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
+    const { proc, port, stderr } = startProxy({
+      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upstream.address().port}`,
+      CACHE_FIX_HELD_BY: "",              // no holder — the whole difference
+      CACHE_FIX_DRAIN_STALL_MS: "5000",
+      CACHE_FIX_DRAIN_MS: "2000",         // ignored on this arm; asserted above
+    });
+    try {
+      const p = await port;
+      let chunks = 0;
+      const req = http.request(
+        { host: "127.0.0.1", port: p, path: "/v1/messages", method: "POST",
+          headers: { "content-type": "application/json" } },
+        (res) => { res.on("data", () => { chunks++; }); res.on("error", () => {}); });
+      req.on("error", () => {});
+      req.end(JSON.stringify({ model: "x", messages: [], stream: true }));
+
+      while (chunks < 3) await new Promise((r) => setTimeout(r, 100));
+      proc.kill("SIGHUP");
+      const { code } = await exitOf(proc);
+
+      const err = stderr();
+      assert.match(err, /forcing close/,
+        `a standalone stop waited past its ceiling. Nothing here settles early on our ` +
+        `behalf, so patience is somebody's downtime. stderr:\n${err}`);
+      assert.match(err, /after 5s/,
+        `the standalone ceiling is no longer 5s. stderr:\n${err}`);
+      assert.equal(code, 0, "a deliberate stop must not look like a crash");
+    } finally {
+      try { proc.kill("SIGKILL"); } catch {}
+      upstream.close();
+    }
+  });
+
+  // EXIT 0, NOT 75, AND IT IS LOAD-BEARING RATHER THAN COSMETIC.
+  //
+  // One machine on this fleet carries a launchd agent for a DIFFERENT install of
+  // this proxy (the npm-global tree, not the deployed fork) with
+  // `KeepAlive = { SuccessfulExit = false }` — it restarts only a NON-ZERO exit.
+  // It is dormant and it is not the parent of today's holder, which is what makes
+  // the design survivable; but a drainer that starts exiting 75 there gets
+  // resurrected as a second listener from a stale tree. 75 means "put a successor
+  // on this socket" and a stop is precisely the case where nobody should.
+  it("a stop exits 0 and never asks for a successor, held or not", async () => {
+    const upstream = http.createServer((q, r) => {
+      q.resume();
+      r.writeHead(200, { "content-type": "application/json" });
+      setTimeout(() => { try { r.end(JSON.stringify({ ok: true })); } catch {} }, 300);
+    });
+    await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
+    for (const [what, heldBy] of [["held", String(process.pid)], ["standalone", ""]]) {
+      const { proc, port } = startProxy({
+        CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upstream.address().port}`,
+        CACHE_FIX_HELD_BY: heldBy,
+      });
+      try {
+        const p = await port;
+        const req = http.request(
+          { host: "127.0.0.1", port: p, path: "/v1/messages", method: "POST",
+            headers: { "content-type": "application/json" } },
+          (res) => { res.on("data", () => {}); res.on("error", () => {}); });
+        req.on("error", () => {});
+        req.end(JSON.stringify({ model: "x", messages: [] }));
+
+        await new Promise((r) => setTimeout(r, 100));
+        proc.kill("SIGHUP");
+        const { code } = await exitOf(proc);
+        assert.equal(code, 0,
+          `a ${what} stop exited ${code}. 75 asks a supervisor to put a successor on ` +
+          `this socket; under a launchd agent with SuccessfulExit=false a non-zero ` +
+          `exit is also what gets restarted, and on one host that agent points at a ` +
+          `stale npm-global install`);
+      } finally {
+        try { proc.kill("SIGKILL"); } catch {}
+      }
+    }
+    upstream.close();
+  });
 
   it("says what was owed when the drain started, even when it ends clean", async () => {
     // `drained clean in Xs of Ys budget` means everything owed FINISHED inside

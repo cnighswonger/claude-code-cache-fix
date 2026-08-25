@@ -1026,13 +1026,24 @@ describe("holder handover (SIGUSR2)", () => {
 // Ctrl-C, a plain kill) has never been measured with a reply in the middle of
 // being delivered.
 //
-// It matters because the holder rewrites every stop to SIGHUP, and SIGHUP sets
-// `releasingPort`. If that flag ever reaches the handover arm again, an operator
-// stop inherits the uncapped drain and hangs until the supervisor SIGKILLs it —
-// measured elsewhere at 5.0s -> 53.9s of restart downtime. This case is what
-// fails when that happens.
+// WHAT IT USED TO MEASURE IS NO LONGER MEASURABLE HERE, and the replacement is
+// not a weakening. The old form timed how long run-service and the proxy stayed
+// ON THE PORT after a stop and required it to be the 5s ceiling rather than the
+// drain budget. That clock has collapsed: the holder now settles on the proxy's
+// RELEASE announcement instead of on its exit, so the port is free in under a
+// second — before the first `lsof` even returns. The while loop never ran, and
+// `chunks` was then sampled at the same instant as `before`, so the case died on
+// its own premise (2 -> 2) while the reply it was worried about was in fact
+// still streaming. Measured directly: 2 -> 158 chunks over the ten seconds after
+// the stop, holder gone inside 623 ms, and the only listener left was the
+// standby relay, which a stop keeps on purpose.
+//
+// So this pins the two halves that ARE observable, and together they are
+// STRONGER than the old assertion. "the port frees" alone passes on the old code
+// too (it freed at 5s); "the reply keeps arriving after it frees" is what the 5s
+// ceiling could never do, because cutting the reply is how it got there.
 describe("a holder stop with a reply in flight", () => {
-  it("ends on the supervised budget, not on the drain predicate", async () => {
+  it("frees the port without severing the reply", async () => {
     // Bytes must be MOVING at the moment of the stop. If they were not, a stall
     // test would end the drain too and the case could not tell the arms apart.
     const upstream = http.createServer((q, r) => {
@@ -1076,9 +1087,10 @@ describe("a holder stop with a reply in flight", () => {
       const before = chunks;
       const t0 = Date.now();
       holder.kill("SIGTERM");
-      // The supervised budget is 5s. The stall window defaults to 90s and the
-      // backstop to 30 minutes, so a bound of 25s separates the arms by a wide
-      // margin without being sensitive to how long a spawn takes on a loaded box.
+      // 25s, not a tight bound: what must not happen is the port staying held
+      // for a DRAIN budget (90s stall window, 30 minute backstop). Measured, it
+      // frees in well under a second, so this is loose on purpose rather than
+      // sensitive to how long a spawn takes on a loaded box.
       const stopped = Date.now() + 25_000;
       let left = listeners(port);
       while (Date.now() < stopped
@@ -1087,14 +1099,30 @@ describe("a holder stop with a reply in flight", () => {
         left = listeners(port);
       }
       const elapsed = Date.now() - t0;
-
-      assert.ok(chunks > before,
-        `the reply stopped delivering before the stop (${before} -> ${chunks}), so a ` +
-        `stall test would have ended this drain too and the arms are not separated`);
       assert.deepEqual(left.filter((q) => /\brun-service\b|server\.mjs/.test(cmdOf(q))), [],
-        `the holder and its proxy were still on the port ${elapsed}ms after SIGTERM, ` +
-        `with a reply still streaming — an operator stop has inherited the handover ` +
-        `arm's patience, and a supervisor will SIGKILL it at TimeoutStopSec`);
+        `the holder and its proxy were still on the port ${elapsed}ms after SIGTERM — ` +
+        `a stop must free the address whatever its child is still finishing`);
+
+      // AND THE REPLY SURVIVED THE STOP THAT FREED THE PORT. This is the half the
+      // 5s ceiling could not do: it freed the port by CUTTING what was in flight.
+      //
+      // GROWTH, NOT TOTAL, AND SAMPLED PAST THE CEILING. `chunks > before` cannot
+      // see a cut at all: a 5s ceiling delivers five seconds of bytes first, so
+      // the total rises either way. Measured — with the held arm reverted to the
+      // ceiling this case still passed, because a 4s sample also lands INSIDE the
+      // window it is trying to detect. Two late samples with growth required
+      // between them is what separates "still delivering" from "delivered a lot,
+      // then was severed".
+      await new Promise((r) => setTimeout(r, 8_000));
+      const late = chunks;
+      await new Promise((r) => setTimeout(r, 2_500));
+      assert.ok(chunks > before,
+        `premise: no byte arrived after the stop at all (${before}), so the drain ` +
+        `ended before this could measure anything`);
+      assert.ok(chunks > late,
+        `the reply stopped at ${late} chunks and never moved again — the stop severed ` +
+        `it instead of letting the drainer finish it, which is the ceiling this arm no ` +
+        `longer has`);
     } finally {
       try { req?.destroy(); } catch { }
       upstream.close();

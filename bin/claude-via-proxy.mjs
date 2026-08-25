@@ -1359,6 +1359,24 @@ function holdPort(rest) {
         if (!retired && line.includes("releasing the listening socket")) {
           retired = true;
           if (child === me) child = null;
+          // A STOP ENDS HERE, NOT AT THE CHILD'S EXIT. The proxy has just closed
+          // its listening socket; from this line it owns nothing but the replies
+          // it still owes. Waiting for those is what forced a ceiling onto the
+          // child — it could not afford patience while a stop was blocked on it.
+          // Its budget keys on being held (server.mjs `unwaited`), so the two
+          // cannot be separated.
+          //
+          // Two cross-file invariants make the orphaned drainer safe, and
+          // nothing else records either:
+          //   - a released proxy must not resurrect the lineage
+          //     (server.mjs `if (releasingPort) return`), or the orphan returns
+          //     as a rival holder
+          //   - it must exit 0, not 75. A launchd agent with
+          //     `KeepAlive = { SuccessfulExit = false }` restarts a non-zero exit
+          //
+          // reclaim() and spawnWhenReady() below already return early while
+          // stopping, so this returns past nothing.
+          if (stopping) return settle(0);
           // "(handed off)" means the proxy already put its own successor on the
           // socket before announcing, and that successor is serving right now.
           // Reclaiming would take the port from a live proxy and spawning would

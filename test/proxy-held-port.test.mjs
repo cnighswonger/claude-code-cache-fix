@@ -769,6 +769,85 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       }, { subcommand: "run-service", extraEnv: { CACHE_FIX_HOLD_PORT: "" } });
     });
 
+    // THE OTHER HALF OF "A STOP MUST NOT CUT A REPLY", AND THE HALF WITH NOTHING
+    // ELSE WATCHING IT.
+    //
+    // The proxy may take the long drain budget on a held stop ONLY because this
+    // holder stops waiting for it. Before that, the holder settled on the
+    // CHILD'S EXIT, so every second the child spent draining was a second the
+    // stop was blocked — which is what made a 5s ceiling there correct, and what
+    // cut 15 replies on one host across four stops (4, 3, 1, 7).
+    //
+    // Delete `if (stopping) return settle(0)` and the proxy-side case still
+    // passes: it only looks at whether a reply was severed, and it is not. What
+    // breaks is invisible from there — the stop hangs for the whole drain
+    // budget. That is why this case exists in this file rather than beside its
+    // partner: the two halves fail in different places and neither one's test
+    // can see the other's defect.
+    it("a stop returns when the proxy releases, not when it exits", async () => {
+      const upstream = http.createServer((q, r) => {
+        q.resume();
+        r.writeHead(200, { "content-type": "text/event-stream" });
+        let i = 0;
+        const t = setInterval(() => { try { r.write(`data: ${++i}\n\n`); } catch {} }, 200);
+        r.on("close", () => clearInterval(t));
+      });
+      await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
+      let drainer = 0;
+      try {
+        await withHeldPort(async ({ proxyPid, launcher, exited, port }) => {
+          drainer = proxyPid();
+          assert.ok(drainer, "no proxy child, so there is nothing to drain past");
+
+          // A REPLY THAT WILL NOT FINISH INSIDE THE STOP. Without one the child
+          // drains clean in milliseconds and a holder that waits for its exit
+          // looks identical to one that does not — the case would pass on the
+          // broken code, which is the failure this comment exists to prevent.
+          let chunks = 0;
+          const req = http.request(
+            { host: "127.0.0.1", port, path: "/v1/messages", method: "POST",
+              headers: { "content-type": "application/json" } },
+            (res) => { res.on("data", () => { chunks++; }); res.on("error", () => {}); });
+          req.on("error", () => {});
+          req.end(JSON.stringify({ model: "x", messages: [], stream: true }));
+          const warm = Date.now() + 15_000;
+          while (chunks < 3 && Date.now() < warm) await new Promise((r) => setTimeout(r, 100));
+          assert.ok(chunks >= 3, `premise: the reply never started streaming (${chunks} chunks)`);
+
+          const t0 = Date.now();
+          launcher.kill("SIGTERM");
+          const left = await Promise.race([
+            exited, new Promise((r) => setTimeout(() => r(false), 20_000))]);
+          const took = Date.now() - t0;
+
+          assert.ok(left,
+            `the stop did not return in ${took}ms. The holder is waiting for a child ` +
+            `that is deliberately draining for up to 30 minutes, so this is not slow, ` +
+            `it is blocked — and a ceiling on the child is the only way out of it`);
+          assert.ok(took < 10_000,
+            `the stop took ${took}ms. It must return on the release ANNOUNCEMENT, which ` +
+            `the proxy makes before it drains, not on the child's exit`);
+          // AND THE DRAINER IS STILL THERE, which is the point rather than a
+          // side effect: the stop returned while the reply was still being
+          // delivered. A case that only measured the latency would pass on a
+          // holder that had killed its child to get it.
+          let stillDraining = false;
+          try { process.kill(drainer, 0); stillDraining = true; } catch {}
+          assert.ok(stillDraining,
+            "the stop returned because the child was gone, not because it stopped " +
+            "waiting — so the reply was severed after all");
+        }, { subcommand: "run-service",
+             extraEnv: { CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upstream.address().port}` } });
+      } finally {
+        // REAP IT. Its stderr is inherited from the holder, so an orphan left
+        // draining for its full budget keeps this file's event loop alive on a
+        // pipe nobody reads — the shape that hung `node --test` indefinitely
+        // when two servers survived a run.
+        if (drainer > 1) { try { process.kill(drainer, "SIGKILL"); } catch {} }
+        upstream.close();
+      }
+    });
+
     // A supervisor that only ever runs `run-service` must still publish our CA,
     // or every sibling component builds a merged bundle without it and the
     // sessions those components wire cannot verify this proxy. Publishing was
@@ -2109,9 +2188,14 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       const dispatch = /const onLine = \(line\) => \{[\s\S]*?\n      \};/.exec(src)?.[0];
       assert.ok(dispatch, "the holder's announcement dispatch is gone — this tests nothing");
       // What the holder DID, per chunk boundary: "reclaim+spawn" or "-".
-      const drive = (text) => Array.from({ length: text.length + 1 }, (_, cut) => {
+      // `stopping` and `settle` ARE CALLEES OF THE LIFTED REGION, so they are
+      // bound here for the same reason `reclaim` and `publishOurCA` are: a
+      // lifted function fails on a name it does not have, not on the behaviour
+      // the case is about. `stopping` is a parameter rather than a constant
+      // because the branch it selects is the one this case now also covers.
+      const drive = (text, stopping = false) => Array.from({ length: text.length + 1 }, (_, cut) => {
         // eslint-disable-next-line no-new-func
-        const run = Function("chunkA", "chunkB", "reclaim", "spawnWhenReady", `
+        const run = Function("chunkA", "chunkB", "reclaim", "spawnWhenReady", "stopping", "settle", `
           let retired = false, child = null, childPort = 0, served = false, failures = 0;
           const me = null, process = { env: {} };
           const publishOurCA = () => {}, ourCAPath = () => "";
@@ -2125,7 +2209,8 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
           }`);
         const at = [];
         run(text.slice(0, cut), text.slice(cut),
-            () => at.push("reclaim"), () => at.push("spawn"));
+            () => at.push("reclaim"), () => at.push("spawn"),
+            stopping, () => at.push("settle"));
         return at.join("+") || "-";
       });
       const firstOther = (rows, want) => rows.findIndex((r) => r !== want);
@@ -2148,6 +2233,20 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         `a chunk boundary at ${firstOther(handed, "-")} made the holder ` +
         `"${handed[firstOther(handed, "-")]}" on a handover — it read "(handed off)" as a ` +
         `plain release and went after a live proxy's port`);
+
+      // A STOP MUST SETTLE HERE, and the whole drain fix downstream rests on it.
+      // The proxy takes a 30-minute budget on a held stop only because this
+      // holder stops waiting; settle on the child's EXIT instead and the stop
+      // BLOCKS for that budget — measured end to end, 2,254ms fixed against a
+      // 20,001ms timeout with this line deleted. `plain` above is the control:
+      // the same text with `stopping` false must still reclaim and respawn, so
+      // "settle" here cannot be a dispatch that simply stopped doing anything.
+      const stopped = drive("proxy releasing the listening socket\n", true);
+      assert.equal(firstOther(stopped, "settle"), -1,
+        `a stop did not settle on the release announcement at boundary ` +
+        `${firstOther(stopped, "settle")} (got "${stopped[firstOther(stopped, "settle")]}") — ` +
+        `it is still waiting for the child to EXIT, and the child is now draining ` +
+        `for up to 30 minutes`);
     });
   });
 

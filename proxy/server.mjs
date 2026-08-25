@@ -1813,12 +1813,23 @@ if (invokedAsScript) {
     // `after <budget>s`, a completed drain `of <budget>s budget`.
     say(process.stdout,
         `proxy releasing the listening socket${handedOff ? " (handed off)" : ""}\n`);
-    // A holder's handover is never `handedOff`: it sets `releasing`, so
-    // askForSuccessor is false. It is still a handover — the successor has
-    // adopted fd 3 and nothing waits on us — so it takes the long budget. It
-    // must be read from SIGUSR2 and NOT from `releasingPort`, which a plain
-    // supervised stop also sets.
-    const budgetMs = (handedOff || handoverRelease)
+    // NOTHING WAITS ON US — one predicate, and the only thing that ever justified
+    // a ceiling here. A ceiling is a bet on how long a reply takes; it is payable
+    // only when someone's wait is serial.
+    //
+    //   handedOff         we spawned the successor ourselves
+    //   handoverRelease   a holder's SIGUSR2 put a successor on fd 3. Never
+    //                     `handedOff`: it sets `releasing`, so askForSuccessor is
+    //                     false. Read it from SIGUSR2 and NOT from
+    //                     `releasingPort`, which a plain stop also sets.
+    //   heldByLiveHolder  a live holder supervises us, and it settles on our
+    //                     RELEASE announcement rather than on our exit
+    //
+    // The third holds ONLY while claude-via-proxy.mjs settles in the `stopping`
+    // arm of onLine. Separate them and a stop blocks for this whole budget
+    // instead of for 5s, which is the downtime the ceiling was bought with.
+    const unwaited = handedOff || handoverRelease || heldByLiveHolder;
+    const budgetMs = unwaited
       ? (Number(process.env.CACHE_FIX_DRAIN_MS) || 1_800_000)
       : 5_000;
     // TIME THE DRAIN THAT FINISHED, not only the one that was cut.
@@ -1994,10 +2005,10 @@ if (invokedAsScript) {
       try { active.server.getConnections((err, n) => finish(err ? null : n)); }
       catch { finish(null); }
     };
-    if (!(handedOff || handoverRelease)) {
-      // THE SUPERVISED ARM KEEPS ITS CEILING. Something is waiting on this exit
-      // and the wait is serial, so patience here is downtime — measured, 120s
-      // against a 90s TimeoutStopSec took restart downtime 5.0s -> 53.9s.
+    if (!unwaited) {
+      // THE STANDALONE ARM KEEPS ITS CEILING, and it is the only arm left that
+      // has one. Nothing supervises us, so the process we are is the process
+      // somebody is waiting on, and that wait is serial.
       setTimeout(() => forceClose(budgetMs, ""), budgetMs).unref();
     } else {
       // THE HANDOVER ARM HAS NO CEILING, because a ceiling is a bet on how long
