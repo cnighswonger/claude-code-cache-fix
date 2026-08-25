@@ -789,7 +789,10 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         q.resume();
         r.writeHead(200, { "content-type": "text/event-stream" });
         let i = 0;
-        const t = setInterval(() => { try { r.write(`data: ${++i}\n\n`); } catch {} }, 200);
+        // 50ms, and this case does NOT measure a rate — it only needs the reply
+        // ESTABLISHED and owed before the stop. Pace it for how fast that
+        // becomes true, not for realism.
+        const t = setInterval(() => { try { r.write(`data: ${++i}\n\n`); } catch {} }, 50);
         r.on("close", () => clearInterval(t));
       });
       await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
@@ -810,9 +813,17 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
             (res) => { res.on("data", () => { chunks++; }); res.on("error", () => {}); });
           req.on("error", () => {});
           req.end(JSON.stringify({ model: "x", messages: [], stream: true }));
+          // ONE CHUNK, NOT THREE. Three was copied from a sibling case that
+          // measures GROWTH and genuinely needs several. This one needs the
+          // response OWED, and an SSE stream that has delivered a byte stays owed
+          // until something cuts it — so three is a bet on throughput that buys
+          // nothing. It cost a deterministic failure on a 48-core box: node's
+          // test runner fans out at CPU count, so this host runs ~12x more files
+          // at once than a 4-core runner and delivered 2 chunks where 75 were
+          // due. CI was green on all three node versions at the same commit.
           const warm = Date.now() + 15_000;
-          while (chunks < 3 && Date.now() < warm) await new Promise((r) => setTimeout(r, 100));
-          assert.ok(chunks >= 3, `premise: the reply never started streaming (${chunks} chunks)`);
+          while (chunks < 1 && Date.now() < warm) await new Promise((r) => setTimeout(r, 50));
+          assert.ok(chunks >= 1, `premise: the reply never started streaming (${chunks} chunks)`);
 
           const t0 = Date.now();
           launcher.kill("SIGTERM");
