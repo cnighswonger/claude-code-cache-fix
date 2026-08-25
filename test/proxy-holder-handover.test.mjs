@@ -3,6 +3,41 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import net from "node:net";
 import { execFileSync, spawn } from "node:child_process";
+
+// THE HOLDER DELIBERATELY LEAVES A STANDBY BEHIND, and killing the holder is
+// what ARMS it -- that is the standby's whole purpose (bin/gap-relay.mjs), so it
+// is not a leak in the relay. It is a leak here: production wants the armed
+// standby to keep a real port alive, and a test wants its ephemeral port
+// released. Nothing else ends one, so this file has to.
+//
+// Selected by the standby's OWN declaration of its parent, never by name or age:
+// a relay whose ppid no longer matches CACHE_FIX_STANDBY_PARENT has been
+// orphaned, and matching that parent against the holders THIS FILE spawned is
+// what keeps the sweep off production and off other sessions.
+//
+// /proc, so linux only. CI runs linux and that is where the guard is exercised;
+// on a mac the orphan survives until the OS reclaims it, which is a smaller
+// wrong than sweeping by name on a shared box.
+const spawnedHolders = new Set();
+const reapStandbys = () => {
+  let dir;
+  try { dir = readdirSync("/proc"); } catch { return; }
+  for (const e of dir) {
+    if (!/^\d+$/.test(e)) continue;
+    let env, argv;
+    try {
+      argv = readFileSync(`/proc/${e}/cmdline`, "utf8").split("\0");
+      env = readFileSync(`/proc/${e}/environ`, "utf8").split("\0");
+    } catch { continue; }
+    if (!argv.some((a) => a.endsWith("/gap-relay.mjs"))) continue;
+    const parent = env.find((v) => v.startsWith("CACHE_FIX_STANDBY_PARENT="))?.slice(25);
+    if (!parent || !spawnedHolders.has(Number(parent))) continue;
+    try { process.kill(Number(e), "SIGKILL"); } catch {}
+  }
+};
+process.on("exit", reapStandbys);
+// Records the pid so the sweep above can scope itself to this file's holders.
+const spawnHolder = (...args) => { const h = spawn(...args); spawnedHolders.add(h.pid); return h; };
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
@@ -114,7 +149,7 @@ describe("holder handover (SIGUSR2)", () => {
     for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
                      "ALL_PROXY", "all_proxy", "LISTEN_FDS", "LISTEN_PID",
                      "CACHE_FIX_HOLD_PORT", "CACHE_FIX_WATCH_DEPLOY_MS"]) delete env[k];
-    const holder = spawn(process.execPath, [launcherPath, "run-service"],
+    const holder = spawnHolder(process.execPath, [launcherPath, "run-service"],
                          { env, stdio: ["ignore", "pipe", "pipe"] });
     try {
       const up = Date.now() + 25_000;
@@ -216,7 +251,7 @@ describe("holder handover (SIGUSR2)", () => {
                      "ALL_PROXY", "all_proxy", "LISTEN_FDS", "LISTEN_PID",
                      "CACHE_FIX_HOLD_PORT", "CACHE_FIX_WATCH_DEPLOY_MS",
                      "CACHE_FIX_SELF_HEAL"]) delete env[k];
-    const holder = spawn(process.execPath, [launcherPath, "run-service"],
+    const holder = spawnHolder(process.execPath, [launcherPath, "run-service"],
                          { env, stdio: ["ignore", "pipe", "pipe"] });
     const supervised = () => listeners(port).some((p) => {
       let pid = Number(p);
@@ -290,7 +325,7 @@ describe("holder handover (SIGUSR2)", () => {
     for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
                      "ALL_PROXY", "all_proxy", "LISTEN_FDS", "LISTEN_PID",
                      "CACHE_FIX_HOLD_PORT", "CACHE_FIX_WATCH_DEPLOY_MS"]) delete env[k];
-    const holder = spawn(process.execPath, [launcherPath, "run-service"],
+    const holder = spawnHolder(process.execPath, [launcherPath, "run-service"],
                          { env, stdio: ["ignore", "pipe", "pipe"] });
     try {
       const up = Date.now() + 25_000;
@@ -410,7 +445,7 @@ describe("holder handover (SIGUSR2)", () => {
                      "CACHE_FIX_HOLD_PORT", "CACHE_FIX_WATCH_DEPLOY_MS",
                      "CACHE_FIX_SELF_HEAL"]) delete env[k];
     env.CACHE_FIX_SELF_HEAL_MS = "50";
-    const holder = spawn(process.execPath, [launcherPath, "run-service"],
+    const holder = spawnHolder(process.execPath, [launcherPath, "run-service"],
                          { env, stdio: ["ignore", "pipe", "pipe"] });
     try {
       const up = Date.now() + 25_000;
@@ -571,7 +606,7 @@ describe("holder handover (SIGUSR2)", () => {
     // standby never armed" produce the same message — one flake here was
     // undiagnosable for exactly that reason.
     let err = "";
-    const holder = spawn(process.execPath, [launcherPath, "run-service"],
+    const holder = spawnHolder(process.execPath, [launcherPath, "run-service"],
                          { env, stdio: ["ignore", "ignore", "pipe"] });
     holder.stderr.on("data", (d) => { err += d; });
     const carries = () => new Promise((res) => {
@@ -677,7 +712,7 @@ describe("holder handover (SIGUSR2)", () => {
     for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
                      "ALL_PROXY", "all_proxy", "LISTEN_FDS", "LISTEN_PID",
                      "CACHE_FIX_HOLD_PORT", "CACHE_FIX_WATCH_DEPLOY_MS"]) delete env[k];
-    const holder = spawn(process.execPath, [launcherPath, "run-service"],
+    const holder = spawnHolder(process.execPath, [launcherPath, "run-service"],
                          { env, stdio: ["ignore", "ignore", "ignore"] });
     const raw = (send) => new Promise((res) => {
       const c = net.connect(port, "127.0.0.1");
@@ -843,7 +878,7 @@ describe("holder handover (SIGUSR2)", () => {
                      "ALL_PROXY", "all_proxy", "LISTEN_FDS", "LISTEN_PID",
                      "CACHE_FIX_HOLD_PORT", "CACHE_FIX_WATCH_DEPLOY_MS"]) delete env[k];
     const p2 = Number(env.CACHE_FIX_PROXY_PORT);
-    const holder = spawn(process.execPath, [launcherPath, "run-service"],
+    const holder = spawnHolder(process.execPath, [launcherPath, "run-service"],
                          { env, stdio: ["ignore", "pipe", "pipe"] });
     try {
       const up = Date.now() + 25_000;
@@ -1015,7 +1050,7 @@ describe("a holder stop with a reply in flight", () => {
     for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
                      "ALL_PROXY", "all_proxy", "LISTEN_FDS", "LISTEN_PID",
                      "CACHE_FIX_HOLD_PORT", "CACHE_FIX_WATCH_DEPLOY_MS"]) delete env[k];
-    const holder = spawn(process.execPath, [launcherPath, "run-service"],
+    const holder = spawnHolder(process.execPath, [launcherPath, "run-service"],
                          { env, stdio: ["ignore", "ignore", "ignore"] });
     let req = null;
     try {
