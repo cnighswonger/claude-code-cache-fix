@@ -1403,4 +1403,60 @@ describe("SIGTERM exit code", () => {
     }
   });
 
+
+  it("waits past the budget while a reply is still delivering, instead of cutting it", async () => {
+    // MEASURED TWICE on one machine, identical both times:
+    //   cut 4 in-flight request(s) after 1800660ms on the BACKSTOP budget
+    //   -- 0 ended on the stall test, 4 response(s) still owed (4 mid-response)
+    //   cut 4 ... after 1800015ms ... 0 ended on the stall test, 4 still owed
+    //
+    // `0 ended on the stall test` means the predicate ended NOTHING: it judged
+    // all four alive and was right. The wall clock then overruled all four.
+    //
+    // A last resort that overrules the only informed opinion in the system is
+    // not a last resort. And the drain's own comment says a lingering
+    // predecessor costs RAM and nothing else -- so a timer that converts that
+    // into cut replies trades the cheap failure for the expensive one.
+    const upstream = http.createServer((q, r) => {
+      q.resume();
+      r.writeHead(200, { "content-type": "text/event-stream" });
+      let i = 0;
+      const t = setInterval(() => { try { r.write(`data: ${++i}\n\n`); } catch {} }, 200);
+      r.on("close", () => clearInterval(t));
+    });
+    await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
+    const { proc, port, stderr } = startProxy({
+      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upstream.address().port}`,
+      CACHE_FIX_DRAIN_STALL_MS: "5000",   // 200ms writes keep it well inside the window
+      CACHE_FIX_DRAIN_MS: "2000",         // budget expires while it is still streaming
+    });
+    try {
+      const p = await port;
+      let chunks = 0;
+      const req = http.request(
+        { host: "127.0.0.1", port: p, path: "/v1/messages", method: "POST",
+          headers: { "content-type": "application/json" } },
+        (res) => { res.on("data", () => { chunks++; }); res.on("error", () => {}); });
+      req.on("error", () => {});
+      req.end(JSON.stringify({ model: "x", messages: [], stream: true }));
+
+      while (chunks < 3) await new Promise((r) => setTimeout(r, 100));
+      proc.kill("SIGUSR2");                       // handover arm, so the budget is ours
+
+      // PAST the budget, by a margin. A cut would already have happened.
+      await new Promise((r) => setTimeout(r, 6_000));
+
+      const err = stderr();
+      assert.ok(chunks > 3, `premise: the reply stopped streaming on its own (${chunks} chunks)`);
+      assert.doesNotMatch(err, /forcing close/,
+        `the budget cut a reply the stall test had not ended. stderr:\n${err}`);
+      assert.match(err, /still waiting/,
+        `a drain that stays past its budget must say so, and say what it is " +
+        "waiting on. stderr:\n${err}`);
+    } finally {
+      try { proc.kill("SIGKILL"); } catch {}
+      upstream.close();
+    }
+  });
+
 });

@@ -1821,6 +1821,9 @@ if (invokedAsScript) {
     // Hoisted: the clean-drain line is written before the stall loop is
     // installed, so the count has to outlive it.
     let stallEnded = 0;
+    // Rate for the past-budget notice. The tick is 1s and a live stream can hold
+    // the drain open indefinitely, so that line has to be periodic, not per tick.
+    let lastWaitSaid = 0;
     active.close().finally(() => {
       const secs = ((Date.now() - drainStart) / 1000).toFixed(1);
       // PREFIXED like its two siblings above, and NOT the bare phrase
@@ -2073,13 +2076,38 @@ if (invokedAsScript) {
         // mode), and the Node 18 keep-alive case above all reach it with the
         // predicate working. Report what is owed; do not accuse.
         if (elapsed >= budgetMs) {
-          clearInterval(tick);
           // Not `_live.size`: it still holds the ones ended above, so one
           // connection would be counted in both halves of the line.
-          const owed = [...(active.server?._live ?? [])].filter((r) => !seen.get(r)?.done).length;
+          const owedRes = [...(active.server?._live ?? [])].filter((r) => !seen.get(r)?.done);
+          // THE BUDGET IS A RE-EVALUATION POINT, NOT A GUILLOTINE. The stall
+          // test is the only thing here that knows whether a connection is
+          // alive, and a wall clock that overrules it is a second policy
+          // rather than a last resort. Measured twice, identical both times:
+          // four replies still delivering were cut at the budget while the
+          // stall test had ended none, so it had judged all four alive and
+          // was right about all four.
+          //
+          // Waiting is affordable and cutting is not -- the comment above
+          // says a lingering predecessor holds no listener and costs RAM,
+          // and the thing on the other side of this branch is a reply
+          // someone is reading. A ceiling for the RAM belongs in units of
+          // RAM, not seconds.
+          const stillLive = owedRes.filter(
+            (r) => now - (seen.get(r)?.at ?? r._bornAt ?? now) < stallMs);
+          if (stillLive.length) {
+            if (now - lastWaitSaid >= 60_000) {
+              lastWaitSaid = now;
+              say(process.stderr,
+                `[cache-fix] shutdown: still waiting ${Math.round(elapsed / 1000)}s in` +
+                ` (budget ${Math.round(budgetMs / 1000)}s) — ${stillLive.length} of` +
+                ` ${owedRes.length} owed connection(s) still delivering\n`);
+            }
+            return;
+          }
+          clearInterval(tick);
           forceClose(elapsed,
             ` on the BACKSTOP budget — ${stallEnded} ended on the stall test,` +
-            ` ${owed} response(s) still owed`);
+            ` ${owedRes.length} response(s) still owed`);
         }
       }, 1_000).unref();
     }
