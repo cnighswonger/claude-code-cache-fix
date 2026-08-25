@@ -1847,6 +1847,9 @@ if (invokedAsScript) {
       if (typeof u !== "string") return "?";
       return "/" + u.split("?")[0].split("/").filter(Boolean).slice(0, 2).join("/");
     };
+    // Shared with the stall loop below, which marks what it has already ended.
+    // Empty on the supervised arm, where that loop never runs.
+    const seen = new WeakMap();
     const forceClose = (afterMs, why) => {
       // End the laggards rather than destroying them. `closeAllConnections()`
       // destroys the socket, and the kernel answers RST — measured, a client
@@ -1882,6 +1885,10 @@ if (invokedAsScript) {
       let ended = 0, destroyed = 0;
       const routes = new Map();
       for (const res of [...(active.server?._live ?? [])]) {
+        // Already ended by the stall test. It is still here only because its FIN
+        // cannot flush, and counting it again reports one connection twice in a
+        // line an external monitor parses.
+        if (seen.get(res)?.done) continue;
         const r = routeOf(res);
         routes.set(r, (routes.get(r) ?? 0) + 1);
         try { if (res.headersSent) { res.end(); ended++; } else { res.destroy(); destroyed++; } } catch {}
@@ -1971,7 +1978,6 @@ if (invokedAsScript) {
       // zero-interruption violation with the sign flipped. So a quiet connection
       // is ended on its own and the drain keeps going; what ends the drain is
       // `server.close()` resolving, or the backstop.
-      const seen = new WeakMap();
       const tick = setInterval(() => {
         const now = Date.now();
         for (const res of [...(active.server?._live ?? [])]) {

@@ -953,6 +953,64 @@ describe("SIGTERM exit code", () => {
     }
   });
 
+  it("counts a stall-ended connection once, not once per half of the line", async () => {
+    // The backstop line is machine-read — a sibling monitor greps
+    // `drained clean in|cut \d+ in-flight` — and this branch's own deploy
+    // evidence is quoted from it. So the number has to be right.
+    //
+    // An `end()`ed response stays in the live set ONLY because its FIN cannot
+    // flush, and while it is held `server.close()` cannot resolve, so the
+    // backstop always fires. Without a filter it is reported by the stall test
+    // AND counted again by the forced close: one connection, two numbers, on a
+    // line that reads as a total.
+    const BLOB = "x".repeat(256 * 1024);
+    const upstream = http.createServer((q, r) => {
+      q.resume();
+      r.writeHead(200, { "content-type": "text/event-stream" });
+      for (let i = 0; i < 200; i++) r.write(`data: ${BLOB}\n\n`);
+    });
+    await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
+    const { proc, port, stderr } = startProxy({
+      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upstream.address().port}`,
+      CACHE_FIX_DRAIN_STALL_MS: "1500",
+      // Short enough that the backstop is reached inside the case.
+      CACHE_FIX_DRAIN_MS: "9000",
+    });
+    let c;
+    try {
+      const p = await port;
+      c = net.connect(p, "127.0.0.1", () => {
+        c.write("POST /v1/messages HTTP/1.1\r\nHost: x\r\ncontent-type: application/json\r\n" +
+          "content-length: 41\r\n\r\n" + JSON.stringify({ model: "x", messages: [], stream: true }));
+        c.pause();          // never read, so the FIN can never flush
+      });
+      c.on("error", () => {});
+      await new Promise((r) => setTimeout(r, 5_000));
+
+      const exited = exitOf(proc);
+      exited.catch(() => {});
+      proc.kill("SIGUSR2");
+      await new Promise((r) => setTimeout(r, 12_000));
+
+      const back = stderr().match(/on the BACKSTOP budget[^\n]*/)?.[0];
+      assert.ok(back, `premise: the backstop never fired; stderr was:\n${stderr()}`);
+      assert.match(back, /1 ended on the stall test/,
+        `the backstop line does not report the stall end; got: ${back}`);
+      assert.match(back, /0 response\(s\) still owed/,
+        `the one connection the stall test ended is also reported as still owed. ` +
+        `\`_live\` holds it until its FIN flushes, so counting it there reports one ` +
+        `connection twice: ${back}`);
+      assert.match(stderr(), /cut no responses/,
+        `the forced close counted the connection the stall test had already ended. ` +
+        `That number is parsed by a sibling monitor and is this project's own ` +
+        `evidence for what a handover costs. stderr:\n${stderr()}`);
+    } finally {
+      try { c?.destroy(); } catch { /* never opened */ }
+      upstream.close();
+      proc.kill("SIGKILL");
+    }
+  });
+
   it("spends the 5s outage budget only where something waits on our exit", () => {
     const src = readFileSync(serverPath, "utf8");
     const expr = /const budgetMs = [\s\S]*?;\n/.exec(src)?.[0];
