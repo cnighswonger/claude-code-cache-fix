@@ -1998,11 +1998,9 @@ if (invokedAsScript) {
           if (rec.done) continue;
           if (rec.bytes !== n) { rec.bytes = n; rec.at = now; continue; }
           if (now - rec.at < stallMs) continue;
-          // IT ENDED ITSELF. `res.end()` on a finished response returns
-          // silently, so we would cut nothing and report a cut — and that
-          // count flips the clean-drain line off for a drain that lost none.
-          // Reachable on the BUFFERED branch, whose single `end(rawResponse)`
-          // ignores backpressure.
+          // IT ENDED ITSELF, so `res.end()` is a no-op and there is no cut to
+          // report. Reachable on the BUFFERED branch only — its single
+          // `end(rawResponse)` ignores backpressure; the streaming path pipes.
           if (res.writableEnded) { rec.done = true; continue; }
           // BYTES ON THE WIRE, not headers in a buffer. `headersSent` is true
           // from writeHead with nothing delivered, and `res.end()` there emits a
