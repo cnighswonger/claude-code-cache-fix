@@ -600,7 +600,7 @@ async function handlePassthrough(clientReq, clientRes) {
  * truncations, not a count of them. Measured: after writeHead and before the
  * first chunk, headersSent=true with socket.bytesWritten=0.
  */
-export function forcedCloseLine(ended, destroyed, held, budgetMs = 5_000, why = "", routes = "") {
+export function forcedCloseLine(ended, destroyed, held, budgetMs = 5_000, why = "", routes = "", quiet = "") {
   const cut = ended + destroyed;
   // THE BUDGET IT ACTUALLY USED, not the constant this line was written against.
   // The two diverged the moment the handover path got its own, and a log that
@@ -617,6 +617,7 @@ export function forcedCloseLine(ended, destroyed, held, budgetMs = 5_000, why = 
     // routes" rather than "nothing was cut".
     return `[cache-fix] shutdown: forcing close, cut ${cut} in-flight request(s) after ${after} `
          + `(${ended} mid-response, ${destroyed} before headers)`
+         + (quiet ? ` quiet ${quiet}` : "")
          + (routes ? ` routes: ${routes}` : "") + `\n`;
   }
   // Not "idle": we did not measure idleness, we measured that no RESPONSE was
@@ -1911,6 +1912,17 @@ if (invokedAsScript) {
       // route would print one entry per request.
       let ended = 0, destroyed = 0;
       const routes = new Map();
+      // HOW LONG EACH ONE HAD BEEN QUIET. `N still owed` cannot tell a stalled
+      // reply from a live one, so every forced close has needed re-derivation:
+      // measured once under real traffic, `0 ended on the stall test, 4 still
+      // owed` was only readable as "they were streaming" by reasoning from the
+      // zero. The predicate's own record already dates each connection from its
+      // last byte, so this reports what is there rather than counting anything
+      // new. RANGE, not one per connection: the minimum answers "was ANY of
+      // them live" and the maximum "was ANY of them stalled", and two numbers
+      // cannot blow up the line the way a cut of 17 would.
+      const quietMs = [];
+      const nowAt = Date.now();
       for (const res of [...(active.server?._live ?? [])]) {
         // Already ended by the stall test. It is still here only because its FIN
         // cannot flush, and counting it again reports one connection twice in a
@@ -1918,10 +1930,17 @@ if (invokedAsScript) {
         if (seen.get(res)?.done) continue;
         const r = routeOf(res);
         routes.set(r, (routes.get(r) ?? 0) + 1);
+        quietMs.push(nowAt - (seen.get(res)?.at ?? res._bornAt ?? nowAt));
         try { if (res.headersSent) { res.end(); ended++; } else { res.destroy(); destroyed++; } } catch {}
       }
       const routeTally = [...routes].sort((a, b) => b[1] - a[1])
         .map(([r, n]) => `${r}=${n}`).join(" ");
+      const secs = (ms) => (ms / 1000).toFixed(1);
+      const quietTally = quietMs.length
+        ? (Math.min(...quietMs) === Math.max(...quietMs)
+            ? `${secs(quietMs[0])}s`
+            : `${secs(Math.min(...quietMs))}-${secs(Math.max(...quietMs))}s`)
+        : "";
       // THE SAME EXIT CODE THE GRACEFUL PATH USES. It exits
       // `askForSuccessor ? 75 : 0`, and the comment above it says the two paths
       // must not disagree about what our exit means — but this one exited 0
@@ -1935,7 +1954,7 @@ if (invokedAsScript) {
       // must not print as "0 connections still held", which is the one reading
       // that would wrongly clear the stop.
       const finish = (held) => {
-        process.stderr.write(forcedCloseLine(ended, destroyed, held, afterMs, why, routeTally));
+        process.stderr.write(forcedCloseLine(ended, destroyed, held, afterMs, why, routeTally, quietTally));
         // Then force whatever did not take the FIN. Node >=18.2; package.json
         // engines allows 18.0/18.1, where exiting without forcing is the only
         // option.

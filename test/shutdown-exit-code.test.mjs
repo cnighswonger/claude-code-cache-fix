@@ -1343,4 +1343,64 @@ describe("SIGTERM exit code", () => {
     }
   });
 
+
+  it("a forced close names how long each cut connection had been quiet", async () => {
+    // MEASURED, the first real drain after the rewrite shipped, under live
+    // traffic:
+    //   shutdown: forcing close, cut 4 in-flight request(s) after 1800660ms on
+    //   the BACKSTOP budget -- 0 ended on the stall test, 4 response(s) still
+    //   owed (4 mid-response, 0 before headers) routes: /v1/code=4
+    //
+    // `0 ended on the stall test` across 1800s with a 90s window means bytes
+    // kept moving, so the predicate was RIGHT to hold them and the backstop cut
+    // four live replies. But that reading is an INFERENCE from a zero. The line
+    // carries no per-connection byte timing, so the next backstop needs the
+    // same reasoning instead of being read.
+    //
+    // The data already exists: the predicate's own record dates each connection
+    // from its last byte. This asserts the line reports it.
+    const upstream = http.createServer((q, r) => {
+      q.resume();
+      r.writeHead(200, { "content-type": "text/event-stream" });
+      r.write("data: 1\n\n");            // headers + one byte, then silence
+    });
+    await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
+    const { proc, port, stderr } = startProxy({
+      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upstream.address().port}`,
+      CACHE_FIX_DRAIN_STALL_MS: "600000",   // predicate must NOT fire; the backstop must
+      CACHE_FIX_DRAIN_MS: "3000",
+    });
+    try {
+      const p = await port;
+      const req = http.request(
+        { host: "127.0.0.1", port: p, path: "/v1/messages", method: "POST",
+          headers: { "content-type": "application/json" } },
+        (res) => { res.on("data", () => {}); res.on("error", () => {}); });
+      req.on("error", () => {});
+      req.end(JSON.stringify({ model: "x", messages: [], stream: true }));
+
+      await new Promise((r) => setTimeout(r, 2_000));   // let it go quiet
+      proc.kill("SIGTERM");
+      await new Promise((r) => proc.once("exit", r));
+
+      const line = stderr().match(/shutdown: forcing close.*/)?.[0] ?? "";
+      // PRECONDITION: the fixture must actually reach a backstop, not a stall end.
+      assert.ok(line, `no forced-close line at all. stderr:\n${stderr()}`);
+      // The blindness is on BOTH arms, so this does not require the backstop
+      // wording: a supervised stop cuts at a hard 5s with no predicate at all,
+      // and its line is just as unreadable. What it must NOT be is a stall-test
+      // end, where the predicate already decided and said so.
+      assert.ok(!/drain (ended|destroyed)/.test(stderr()),
+        `the predicate ended it, so no connection was OWED: ${line}`);
+
+      assert.match(line, /quiet [0-9]+(\.[0-9]+)?s/,
+        "a backstop must say how long each owed connection had been quiet -- " +
+        "without it, `N still owed` cannot distinguish a stalled reply from a " +
+        `live one and every backstop needs re-derivation. Got: ${line}`);
+    } finally {
+      try { proc.kill("SIGKILL"); } catch {}
+      upstream.close();
+    }
+  });
+
 });
