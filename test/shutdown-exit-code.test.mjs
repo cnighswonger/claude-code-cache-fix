@@ -560,6 +560,9 @@ describe("SIGTERM exit code", () => {
       assert.doesNotMatch(stderr(), /BACKSTOP/,
         `the drain ended on the backstop budget, which means the stall test never ` +
         `fired — that is a defect in the predicate, not a slow client`);
+      assert.doesNotMatch(stderr(), /drained clean/,
+        `the drain cut a reply and still called itself "clean". A reader greps that ` +
+        `phrase unanchored, so a suffix naming the cut does not save it`);
     } finally {
       for (const s of upSockets) s.destroy();
       hung.close();
@@ -763,6 +766,132 @@ describe("SIGTERM exit code", () => {
       for (const sk of upSockets) sk.destroy();
       try { c?.destroy(); } catch { /* never opened */ }
       hung.close();
+      proc.kill("SIGKILL");
+    }
+  });
+
+  it("keeps a reply that has been streaming since long before the handover", async () => {
+    // The other direction of the arrival stamp, and the one that makes it
+    // dangerous. Ageing an owed connection from arrival is right only for one
+    // that has written NOTHING — that is the connection with no byte to date
+    // from. A connection that has been delivering since before the drain began
+    // is aged from its arrival too, so on the first tick that happens to see no
+    // byte cross, `now - at` is the REQUEST'S AGE, which exceeds the window for
+    // any request older than it. The live reply is then cut.
+    //
+    // This selects for exactly what the drain protects: a reply is exposed only
+    // once it is older than the window, so the longer a turn has run the more
+    // certainly it qualifies.
+    const upstream = http.createServer((q, r) => {
+      q.resume();
+      r.writeHead(200, { "content-type": "text/event-stream" });
+      let i = 0;
+      // A gap WIDER than two ticks, so the handover below lands in one
+      // deterministically rather than racing the chunk.
+      const t2 = setInterval(() => { try { r.write(`data: ${++i}\n\n`); } catch {} }, 3_000);
+      r.on("close", () => clearInterval(t2));
+    });
+    await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
+    const { proc, port, stderr } = startProxy({
+      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upstream.address().port}`,
+      CACHE_FIX_DRAIN_STALL_MS: "4000",
+      CACHE_FIX_DRAIN_MS: "60000",
+    });
+    try {
+      const p = await port;
+      let chunks = 0, lastAt = 0;
+      const req = http.request(
+        { host: "127.0.0.1", port: p, path: "/v1/messages", method: "POST",
+          headers: { "content-type": "application/json" } },
+        (res) => { res.on("data", () => { chunks++; lastAt = Date.now(); });
+                   res.on("error", () => {}); });
+      req.on("error", () => {});
+      req.end(JSON.stringify({ model: "x", messages: [], stream: true }));
+
+      // OLDER THAN THE WINDOW before we signal: 7s against 4000ms. That is the
+      // whole premise — a young request is immune and proves nothing.
+      // WAIT ON THE CLOCK, not on a chunk count: the count is satisfied within
+      // the first seconds and would signal while the request is still younger
+      // than the window, where every implementation keeps it and the case
+      // proves nothing. Its own premise caught that.
+      const t0 = Date.now();
+      while (Date.now() - t0 < 7_000) await new Promise((r) => setTimeout(r, 100));
+      assert.ok(chunks >= 2, "premise: the reply must be delivering before the handover");
+      assert.ok(Date.now() - t0 > 4_000,
+        "premise: the request must be OLDER than the stall window at the handover");
+
+      // Immediately after a chunk, so the next two ticks fall inside the 3s gap.
+      while (Date.now() - lastAt > 300) await new Promise((r) => setTimeout(r, 25));
+      const before = chunks;
+      const exited = exitOf(proc);
+      let alive = true;
+      exited.then(() => (alive = false)).catch(() => {});
+      proc.kill("SIGUSR2");
+
+      await new Promise((r) => setTimeout(r, 7_000));
+      assert.ok(alive && chunks > before,
+        `a reply that had been streaming for ${Math.round((Date.now() - t0) / 1000)}s was cut ` +
+        `${Math.round(Date.now() - lastAt)}ms into the drain (alive=${alive}, ` +
+        `${before} -> ${chunks} chunks). It was aged from ARRIVAL rather than from its ` +
+        `last byte, so its own age was read as the time it had been silent. stderr:\n${stderr()}`);
+    } finally {
+      upstream.close();
+      proc.kill("SIGKILL");
+    }
+  });
+
+  it("ends a connection once even when its FIN cannot flush", async () => {
+    // `res.end()` only QUEUES the FIN. With the client not reading and the
+    // socket's write queue deeply backed up, the response cannot finish, so
+    // `close` never fires and it stays in the live set — where a loop that
+    // FORGETS an ended connection re-stamps it from arrival, finds it older
+    // than the window, and ends it again every other tick. The count that
+    // certifies the drain then inflates without bound.
+    //
+    // An earlier fixture used 64 KB chunks on a live upstream and could not
+    // reproduce it: the writes kept `bytesWritten` advancing, so the stall
+    // never fired. The queue has to be deep AND the upstream has to go silent.
+    const BLOB = "x".repeat(256 * 1024);
+    const upstream = http.createServer((q, r) => {
+      q.resume();
+      r.writeHead(200, { "content-type": "text/event-stream" });
+      for (let i = 0; i < 200; i++) r.write(`data: ${BLOB}\n\n`);   // ignore backpressure
+      // then silent forever, so bytesWritten goes constant
+    });
+    await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
+    const { proc, port, stderr } = startProxy({
+      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upstream.address().port}`,
+      CACHE_FIX_DRAIN_STALL_MS: "1500",
+      CACHE_FIX_DRAIN_MS: "60000",
+    });
+    let c;
+    try {
+      const p = await port;
+      c = net.connect(p, "127.0.0.1", () => {
+        c.write("POST /v1/messages HTTP/1.1\r\nHost: x\r\ncontent-type: application/json\r\n" +
+          "content-length: 41\r\n\r\n" + JSON.stringify({ model: "x", messages: [], stream: true }));
+        c.pause();          // NEVER READ: both kernel buffers fill
+      });
+      c.on("error", () => {});
+      await new Promise((r) => setTimeout(r, 6_000));   // fill, then go quiet
+
+      const exited = exitOf(proc);
+      exited.catch(() => {});
+      proc.kill("SIGUSR2");
+      await new Promise((r) => setTimeout(r, 9_000));   // six stall windows
+
+      const ends = stderr().match(/drain (ended|destroyed|gone) one connection/g) ?? [];
+      assert.ok(ends.length >= 1,
+        `premise: the drain never ended the stalled connection at all, so this case ` +
+        `is not exercising the stall path; stderr was:\n${stderr()}`);
+      assert.equal(ends.length, 1,
+        `one connection, ended ${ends.length} times over six stall windows. Its FIN ` +
+        `could not flush, so it stayed in the live set and an entry that was DELETED ` +
+        `rather than MARKED was re-stamped from arrival and ended again — inflating ` +
+        `the very count the backstop line reports`);
+    } finally {
+      try { c?.destroy(); } catch { /* never opened */ }
+      upstream.close();
       proc.kill("SIGKILL");
     }
   });

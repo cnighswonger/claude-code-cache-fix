@@ -658,11 +658,18 @@ export function createProxyServer() {
   const live = new Set();
   const srv = http.createServer((req, res) => {
     live.add(res);
-    // WHEN THIS REQUEST ARRIVED, for the drain's stall test to age it from. A
-    // connection that is owed but has written nothing has no byte to date from,
-    // and ageing it from first SIGHT instead hands a request that was already
-    // stalled before the drain began a fresh window it has not earned.
+    // WHEN THIS REQUEST ARRIVED, and WHAT THE SOCKET HAD WRITTEN THEN. The
+    // drain's stall test ages a connection that has written nothing since it
+    // arrived from this, because such a connection has no byte to date from.
+    // A connection that HAS written must not be aged from here — its own age
+    // would be read as the time it had been silent, and a long-running reply
+    // would be cut on the second tick of every handover.
+    //
+    // The byte count and not `n === 0`: `bytesWritten` belongs to the SOCKET, so
+    // the second request on a keep-alive connection starts at a nonzero count
+    // and would otherwise be treated as already-written.
     res._bornAt = Date.now();
+    res._bornBytes = res.socket?.bytesWritten ?? 0;
     res.on("close", () => live.delete(res));
     // BEFORE the handler, so a writeHead() that names its own headers keeps this
     // one — setHeader values survive writeHead unless writeHead repeats the name.
@@ -1799,8 +1806,13 @@ if (invokedAsScript) {
       // explicit path today so nothing collides — but two components sharing a
       // phrase across two logs is a wrong row that parses cleanly, which is the
       // kind of defect that has no symptom. Renamed before it shipped anywhere.
-      say(process.stderr, `[cache-fix] shutdown: drained clean in ${secs}s of ${budgetMs / 1000}s budget`
-        + (stallEnded ? `, ${stallEnded} ended on the stall test` : "") + `\n`);
+      // "clean" ONLY WHEN NOTHING WAS CUT. A reader matches this phrase
+      // unanchored, so a suffix does not save it: a drain that ended replies
+      // mid-flight must not answer to a grep for a clean one.
+      say(process.stderr, stallEnded
+        ? `[cache-fix] shutdown: drained in ${secs}s of ${budgetMs / 1000}s budget, `
+          + `${stallEnded} ended on the stall test\n`
+        : `[cache-fix] shutdown: drained clean in ${secs}s of ${budgetMs / 1000}s budget\n`);
       process.exit(handedOff ? 75 : 0);
     });
     // THE BUDGET IS 5 s ONLY WHERE SOMETHING IS WAITING ON OUR EXIT.
@@ -1974,8 +1986,19 @@ if (invokedAsScript) {
           const rec = seen.get(res);
           // A connection first seen during the drain is stamped, not judged: it
           // has no history here, and treating "no record" as "no movement"
-          // would end it on the first tick.
-          if (!rec) { seen.set(res, { bytes: n, at: res._bornAt ?? now }); continue; }
+          // would end it on the first tick. It is dated from ARRIVAL only when
+          // nothing has left it since — see `_bornBytes`.
+          if (!rec) {
+            const quietSinceArrival = n === (res._bornBytes ?? 0);
+            seen.set(res, { bytes: n, at: quietSinceArrival ? (res._bornAt ?? now) : now });
+            continue;
+          }
+          // ENDED ONCE. `res.end()` only QUEUES the FIN, so a response whose
+          // client has stopped reading stays in the live set until its socket
+          // drains — which never happens while the client is not reading. The
+          // record is MARKED rather than deleted, because a deleted one is
+          // re-stamped as new on the next tick and ended again every window.
+          if (rec.done) continue;
           if (rec.bytes !== n) { rec.bytes = n; rec.at = now; continue; }
           if (now - rec.at < stallMs) continue;
           // READ IT BEFORE ENDING, and split on it the way the bulk close does:
@@ -1988,7 +2011,7 @@ if (invokedAsScript) {
             if (mid) { res.end(); how = "ended"; }
             else { res.destroy(); how = "destroyed"; }
           } catch { how = "gone"; }
-          seen.delete(res);
+          rec.done = true;
           stallEnded++;
           say(process.stderr, `[cache-fix] shutdown: drain ${how} one connection ` +
             `${routeOf(res)} with no byte written for ${Math.round((now - rec.at) / 1000)}s ` +
@@ -1996,14 +2019,21 @@ if (invokedAsScript) {
         }
         const elapsed = now - drainStart;
         // THE ONLY THING THAT ENDS THE DRAIN FROM IN HERE. A quiet connection is
-        // ended above without ending the drain, so reaching this line means the
-        // predicate never resolved the set — a defect here, not a slow client,
-        // and the line says so rather than reading as an ordinary cut.
+        // ended above without ending the drain.
+        //
+        // REACHING IT IS NOT PROOF OF A DEFECT, and this line used to say it
+        // was. Three ways to get here with the predicate working: a connection
+        // still moving when the budget expires; a CONNECT tunnel or an upgrade,
+        // which `_live` never holds because only the request handler fills it —
+        // the common shape in forward mode; and the Node 18 keep-alive case
+        // above. So report what is owed and let the reader judge.
         if (elapsed >= budgetMs) {
           clearInterval(tick);
+          const owed = active.server?._live?.size ?? 0;
           forceClose(elapsed,
-            ` on the BACKSTOP budget — ${stallEnded} ended on the stall test and the` +
-            ` rest neither moved nor stalled, which is a bug here`);
+            ` on the BACKSTOP budget — ${stallEnded} ended on the stall test,` +
+            ` ${owed} response(s) still owed; a CONNECT tunnel or upgrade is not` +
+            ` among them, this test only sees responses`);
         }
       }, 1_000).unref();
     }
