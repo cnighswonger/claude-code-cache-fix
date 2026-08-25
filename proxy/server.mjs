@@ -1992,13 +1992,9 @@ if (invokedAsScript) {
           if (rec.done) continue;
           if (rec.bytes !== n) { rec.bytes = n; rec.at = now; continue; }
           if (now - rec.at < stallMs) continue;
-          // BYTES ON THE WIRE, not headers in a buffer. `headersSent` goes true
-          // at writeHead with `bytesWritten` still 0, so it says "mid-response"
-          // about a response that has delivered nothing — and `res.end()` on one
-          // emits a well-formed empty 200 the client cannot tell from a real
-          // success and will not retry. The bulk close has only `headersSent`;
-          // here the byte count is in hand, so the split is exact rather than an
-          // upper bound.
+          // BYTES ON THE WIRE, not headers in a buffer. `headersSent` is true
+          // from writeHead with nothing delivered, and `res.end()` there emits a
+          // well-formed empty 200 the client will not retry.
           const mid = n > (res._bornBytes ?? 0);
           let how;
           try {
@@ -2022,9 +2018,8 @@ if (invokedAsScript) {
         // predicate working. Report what is owed; do not accuse.
         if (elapsed >= budgetMs) {
           clearInterval(tick);
-          // NOT `_live.size`: that counts the ones already ended whose FIN cannot
-          // flush, so one connection reported as both "ended on the stall test"
-          // and "still owed" reads as two.
+          // Not `_live.size`: it still holds the ones ended above, so one
+          // connection would be counted in both halves of the line.
           const owed = [...(active.server?._live ?? [])].filter((r) => !seen.get(r)?.done).length;
           forceClose(elapsed,
             ` on the BACKSTOP budget — ${stallEnded} ended on the stall test,` +
