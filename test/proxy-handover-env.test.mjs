@@ -1,11 +1,19 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, chmodSync } from "node:fs";
+import { mkdtempSync, writeFileSync, chmodSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { handoverEnv, handoverEnvPath } from "../bin/handover-env.mjs";
 
-const dir = () => mkdtempSync(join(tmpdir(), "cache-fix-handover-test-"));
+// Every mkdtemp here is removed when the process exits. A per-case `finally` is
+// not enough -- a throwing assertion skips it, and this file makes a directory
+// per case plus one per fixture file, so a red run leaked more than a green one.
+// NOT a root `after()` hook: node:test runs files concurrently and a root hook
+// registered from one file reddened three timing cases in others. Measured, with
+// the control -- the same tree without it was 1974/1973/0.
+const made = [];
+const dir = () => { const d = mkdtempSync(join(tmpdir(), "cache-fix-handover-test-")); made.push(d); return d; };
+process.on("exit", () => { for (const d of made) { try { rmSync(d, { recursive: true, force: true }); } catch {} } });
 const withFile = (body) => { const d = dir(); const p = join(d, "handover.env"); writeFileSync(p, body); return p; };
 
 test("handoverEnv: a config file overrides the env the holder was started with", () => {
