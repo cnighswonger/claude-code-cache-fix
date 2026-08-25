@@ -658,6 +658,11 @@ export function createProxyServer() {
   const live = new Set();
   const srv = http.createServer((req, res) => {
     live.add(res);
+    // WHEN THIS REQUEST ARRIVED, for the drain's stall test to age it from. A
+    // connection that is owed but has written nothing has no byte to date from,
+    // and ageing it from first SIGHT instead hands a request that was already
+    // stalled before the drain began a fresh window it has not earned.
+    res._bornAt = Date.now();
     res.on("close", () => live.delete(res));
     // BEFORE the handler, so a writeHead() that names its own headers keeps this
     // one — setHeader values survive writeHead unless writeHead repeats the name.
@@ -1783,6 +1788,9 @@ if (invokedAsScript) {
     // neighbour layer measured one legitimate drain at 1126.2s, so the range
     // this lives in is not hypothetical.
     const drainStart = Date.now();
+    // Hoisted: the clean-drain line is written before the stall loop is
+    // installed, so the count has to outlive it.
+    let stallEnded = 0;
     active.close().finally(() => {
       const secs = ((Date.now() - drainStart) / 1000).toFixed(1);
       // PREFIXED like its two siblings above, and NOT the bare phrase
@@ -1791,7 +1799,8 @@ if (invokedAsScript) {
       // explicit path today so nothing collides — but two components sharing a
       // phrase across two logs is a wrong row that parses cleanly, which is the
       // kind of defect that has no symptom. Renamed before it shipped anywhere.
-      say(process.stderr, `[cache-fix] shutdown: drained clean in ${secs}s of ${budgetMs / 1000}s budget\n`);
+      say(process.stderr, `[cache-fix] shutdown: drained clean in ${secs}s of ${budgetMs / 1000}s budget`
+        + (stallEnded ? `, ${stallEnded} ended on the stall test` : "") + `\n`);
       process.exit(handedOff ? 75 : 0);
     });
     // THE BUDGET IS 5 s ONLY WHERE SOMETHING IS WAITING ON OUR EXIT.
@@ -1827,6 +1836,14 @@ if (invokedAsScript) {
     // (we released it above) and the successor is serving. So the handover arm
     // can afford to wait, and CACHE_FIX_DRAIN_MS is now its BACKSTOP rather than
     // its deadline.
+    // Hoisted out of forceClose: the per-connection end below names the route of
+    // the ONE connection it ended, for the same reason the bulk tally names the
+    // mix — a cut is a different event depending on which route it was on.
+    const routeOf = (res) => {
+      const u = res.req?.url;
+      if (typeof u !== "string") return "?";
+      return "/" + u.split("?")[0].split("/").filter(Boolean).slice(0, 2).join("/");
+    };
     const forceClose = (afterMs, why) => {
       // End the laggards rather than destroying them. `closeAllConnections()`
       // destroys the socket, and the kernel answers RST — measured, a client
@@ -1859,11 +1876,6 @@ if (invokedAsScript) {
       // grouping is what stops an identifier in a path from being written out.
       // It is also what bounds the cardinality — a per-URL tally on a passthrough
       // route would print one entry per request.
-      const routeOf = (res) => {
-        const u = res.req?.url;
-        if (typeof u !== "string") return "?";
-        return "/" + u.split("?")[0].split("/").filter(Boolean).slice(0, 2).join("/");
-      };
       let ended = 0, destroyed = 0;
       const routes = new Map();
       for (const res of [...(active.server?._live ?? [])]) {
@@ -1943,26 +1955,62 @@ if (invokedAsScript) {
       // count above is an upper bound and this is not.
       // WeakMap: a response that finishes leaves `_live` but would stay reachable
       // from here, and this drain can run for as long as work keeps arriving.
+      // PER CONNECTION, both the clock and the cut.
+      //
+      // This was one shared `lastMoved` reset by a disjunction over the whole
+      // set, and on a port with any traffic that is a clock that never expires:
+      // one live stream answers "moving" for every connection, so a stalled one
+      // never ages. Its first firing cut 6 in-flight requests on the BACKSTOP
+      // with the stall test never having fired once.
+      //
+      // AND THE CUT MOVED WITH IT, which is the half that is easy to miss.
+      // Per-connection STAMPING alone still ends the WHOLE drain the moment one
+      // connection goes quiet, taking the live ones with it — the same
+      // zero-interruption violation with the sign flipped. So a quiet connection
+      // is ended on its own and the drain keeps going; what ends the drain is
+      // `server.close()` resolving, or the backstop.
       const seen = new WeakMap();
-      let lastMoved = Date.now();
       const tick = setInterval(() => {
-        let moved = false;
-        for (const res of active.server?._live ?? []) {
+        const now = Date.now();
+        for (const res of [...(active.server?._live ?? [])]) {
           const n = res.socket?.bytesWritten ?? 0;
-          if (seen.get(res) !== n) { moved = true; seen.set(res, n); }
+          const rec = seen.get(res);
+          // A connection first seen during the drain is stamped, not judged: it
+          // has no history here, and treating "no record" as "no movement"
+          // would end it on the first tick.
+          if (!rec) { seen.set(res, { bytes: n, at: res._bornAt ?? now }); continue; }
+          if (rec.bytes !== n) { rec.bytes = n; rec.at = now; continue; }
+          if (now - rec.at < stallMs) continue;
+          // Same headersSent split the bulk close uses, and for the same
+          // measured reason: `res.end()` on a response that never wrote a header
+          // emits an implicit `200` + `Content-Length: 0`, which a client cannot
+          // tell from a real empty success and will not retry.
+          // READ IT BEFORE ENDING. `res.end()` on a response with no header
+          // WRITES one, so asking afterwards reports "mid-response" about the
+          // request that was blocked upstream — the one case the label exists
+          // to separate.
+          const mid = res.headersSent;
+          let how;
+          try {
+            if (mid) { res.end(); how = "ended"; }
+            else { res.destroy(); how = "destroyed"; }
+          } catch { how = "gone"; }
+          seen.delete(res);
+          stallEnded++;
+          say(process.stderr, `[cache-fix] shutdown: drain ${how} one connection ` +
+            `${routeOf(res)} with no byte written for ${Math.round((now - rec.at) / 1000)}s ` +
+            `(${mid ? "mid-response" : "before headers"})\n`);
         }
-        if (moved) lastMoved = Date.now();
-        const stalled = Date.now() - lastMoved;
         const elapsed = Date.now() - drainStart;
-        // The budget survives ONLY as a backstop against a bug in the predicate
-        // above. It is not what decides, and if it is what fired, the line says
-        // so — a drain that ends on the backstop means the stall test never
-        // answered, which is a defect here and not a slow client.
-        if (stalled >= stallMs || elapsed >= budgetMs) {
+        // THE ONLY THING THAT ENDS THE DRAIN FROM IN HERE. A quiet connection is
+        // ended above without ending the drain, so reaching this line means the
+        // predicate never resolved the set — a defect here, not a slow client,
+        // and the line says so rather than reading as an ordinary cut.
+        if (elapsed >= budgetMs) {
           clearInterval(tick);
-          forceClose(elapsed, stalled >= stallMs
-            ? ` with no byte written for ${Math.round(stalled / 1000)}s`
-            : ` on the BACKSTOP budget — the stall test never fired, which is a bug here`);
+          forceClose(elapsed,
+            ` on the BACKSTOP budget — ${stallEnded} ended on the stall test and the` +
+            ` rest neither moved nor stalled, which is a bug here`);
         }
       }, 1_000).unref();
     }

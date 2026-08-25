@@ -623,6 +623,97 @@ describe("SIGTERM exit code", () => {
     }
   });
 
+  it("ends the stalled connection and keeps the moving one", async () => {
+    // BOTH the cases above use exactly ONE connection, and with one connection
+    // an aggregate clock and a per-connection one are the SAME PROGRAM — no
+    // fixture built that way can fail either version, which is why the
+    // aggregate passed for months while it was cutting live replies.
+    //
+    // It also needs THREE assertions rather than two. A case that checks only
+    // "the stalled one was ended" is blind to the other half: the cut used to
+    // be all-or-nothing, so a predicate that ends the whole drain on the first
+    // quiet connection takes the moving one down with it. That is the same
+    // zero-interruption violation wearing the opposite sign, and only the
+    // "moving one is still delivering" assertion can see it.
+    const upstream = http.createServer((q, r) => {
+      q.resume();
+      // Never answers: the response stays owed with bytesWritten 0, which is
+      // the shape a ceiling waits out and a per-connection stall test ends.
+      if (q.headers["x-fixture"] === "stall") return;
+      r.writeHead(200, { "content-type": "text/event-stream" });
+      let n = 0;
+      const t2 = setInterval(() => r.write(`data: ${++n}\n\n`), 100);
+      r.on("close", () => clearInterval(t2));
+    });
+    await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
+
+    const { proc, port } = startProxy({
+      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upstream.address().port}`,
+      CACHE_FIX_DRAIN_STALL_MS: "1500",
+      CACHE_FIX_DRAIN_MS: "60000",
+    });
+    let c;
+    try {
+      const p = await port;
+
+      let chunks = 0;
+      const req = http.request(
+        { host: "127.0.0.1", port: p, path: "/v1/messages", method: "POST",
+          headers: { "content-type": "application/json", "x-fixture": "stream" } },
+        (res) => { res.on("data", () => chunks++); res.on("error", () => {}); });
+      req.on("error", () => {});
+      req.end(JSON.stringify({ model: "x", messages: [], stream: true }));
+
+      // ITS OWN SOCKET. `bytesWritten` is a property of the SOCKET, not of the
+      // response, so two requests sharing one keep-alive connection would share
+      // the very clock this case exists to separate.
+      let stalledClosed = false;
+      c = net.connect(p, "127.0.0.1", () => c.write(
+        "POST /v1/messages HTTP/1.1\r\nHost: x\r\ncontent-type: application/json\r\n" +
+        "x-fixture: stall\r\ncontent-length: 2\r\n\r\n{}"));
+      c.on("error", () => {});
+      c.on("close", () => (stalledClosed = true));
+
+      const flowing = Date.now() + 10_000;
+      while (chunks === 0 && Date.now() < flowing) await new Promise((r) => setTimeout(r, 50));
+      assert.ok(chunks > 0,
+        "premise: the moving reply must be delivering before the handover, or " +
+        "this case is two stalled connections and proves nothing about movement");
+      assert.ok(!stalledClosed,
+        "premise: the stalled connection must still be open at the handover, or " +
+        "it was ended by something other than the drain");
+
+      const exited = exitOf(proc);
+      let alive = true;
+      exited.then(() => (alive = false)).catch(() => {});
+      const before = chunks;
+      proc.kill("SIGUSR2");          // the HANDOVER arm
+
+      // Four stall windows: long enough that a per-connection test has fired
+      // and far short of the 60s backstop, so neither outcome is timing noise.
+      await new Promise((r) => setTimeout(r, 6_000));
+
+      assert.ok(stalledClosed,
+        "the stalled connection was still open four stall windows into the drain. " +
+        "The moving reply kept a SHARED clock fresh, so the stall test answered " +
+        "\"still moving\" about a connection that had written nothing — this is the " +
+        "aggregate predicate, and it is what let six connections sit for the whole " +
+        "1800s budget and then be cut on the backstop");
+      assert.ok(chunks > before,
+        `the moving reply stopped delivering during the drain (${before} -> ${chunks}). ` +
+        "Ending the stalled connection took the live one with it, which is the " +
+        "all-or-nothing close: per-connection STAMPING alone does not fix this, the " +
+        "cut has to be per-connection too");
+      assert.ok(alive,
+        "the drain returned while a reply was still delivering a chunk every 100ms — " +
+        "the drain ends when nothing is OWED, not when the first connection goes quiet");
+    } finally {
+      try { c?.destroy(); } catch { /* never opened */ }
+      upstream.close();
+      proc.kill("SIGKILL");
+    }
+  });
+
   it("spends the 5s outage budget only where something waits on our exit", () => {
     const src = readFileSync(serverPath, "utf8");
     const expr = /const budgetMs = [\s\S]*?;\n/.exec(src)?.[0];
