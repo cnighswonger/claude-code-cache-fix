@@ -521,7 +521,7 @@ describe("SIGTERM exit code", () => {
     }
   });
 
-  it("ends a handover drain on the stall, not on the ceiling", async () => {
+  it("ends the only owed connection on the stall, not on the ceiling", async () => {
     // The same never-answers upstream the destroy-arm case uses: the proxy is
     // stuck waiting, so the response is owed with bytesWritten 0 — the exact
     // shape a ceiling waits out and a stall test does not.
@@ -851,6 +851,14 @@ describe("SIGTERM exit code", () => {
     // An earlier fixture used 64 KB chunks on a live upstream and could not
     // reproduce it: the writes kept `bytesWritten` advancing, so the stall
     // never fired. The queue has to be deep AND the upstream has to go silent.
+    //
+    // WHAT THIS PINS, precisely: that AT LEAST ONE of the two guards survives,
+    // not marking-versus-deleting. `rec.done` and the `writableEnded` check are
+    // mutually redundant on the ended arm — `res.end()` makes `writableEnded`
+    // true, so the later guard catches the re-visit — and on the destroyed arm
+    // `close` drops the response before the next tick. Removing either alone
+    // leaves this case green; removing BOTH gives three ends over six windows.
+    // The redundancy is deliberate; do not read this case as proving more.
     const BLOB = "x".repeat(256 * 1024);
     const upstream = http.createServer((q, r) => {
       q.resume();
