@@ -1992,11 +1992,14 @@ if (invokedAsScript) {
           if (rec.done) continue;
           if (rec.bytes !== n) { rec.bytes = n; rec.at = now; continue; }
           if (now - rec.at < stallMs) continue;
-          // READ IT BEFORE ENDING, and split on it the way the bulk close does:
-          // `res.end()` on a header-less response WRITES one, so asking after
-          // reports "mid-response" about a request that was blocked upstream —
-          // the one case the label exists to separate.
-          const mid = res.headersSent;
+          // BYTES ON THE WIRE, not headers in a buffer. `headersSent` goes true
+          // at writeHead with `bytesWritten` still 0, so it says "mid-response"
+          // about a response that has delivered nothing — and `res.end()` on one
+          // emits a well-formed empty 200 the client cannot tell from a real
+          // success and will not retry. The bulk close has only `headersSent`;
+          // here the byte count is in hand, so the split is exact rather than an
+          // upper bound.
+          const mid = n > (res._bornBytes ?? 0);
           let how;
           try {
             if (mid) { res.end(); how = "ended"; }
@@ -2019,11 +2022,13 @@ if (invokedAsScript) {
         // predicate working. Report what is owed; do not accuse.
         if (elapsed >= budgetMs) {
           clearInterval(tick);
-          const owed = active.server?._live?.size ?? 0;
+          // NOT `_live.size`: that counts the ones already ended whose FIN cannot
+          // flush, so one connection reported as both "ended on the stall test"
+          // and "still owed" reads as two.
+          const owed = [...(active.server?._live ?? [])].filter((r) => !seen.get(r)?.done).length;
           forceClose(elapsed,
             ` on the BACKSTOP budget — ${stallEnded} ended on the stall test,` +
-            ` ${owed} response(s) still owed; a CONNECT tunnel or upgrade is not` +
-            ` among them, this test only sees responses`);
+            ` ${owed} response(s) still owed`);
         }
       }, 1_000).unref();
     }

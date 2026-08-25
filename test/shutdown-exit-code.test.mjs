@@ -556,7 +556,7 @@ describe("SIGTERM exit code", () => {
         `60000ms ceiling — the ceiling is what ended it, so the stall test is not ` +
         `what decides and this is a clock wearing a predicate's name`);
       assert.match(stderr(), /with no byte written for \d+s/,
-        `the forced close does not say the stall ended it; stderr was:\n${stderr()}`);
+        `no per-connection end said the stall was what ended it; stderr was:\n${stderr()}`);
       assert.doesNotMatch(stderr(), /BACKSTOP/,
         `the drain ended on the backstop budget, which means the stall test never ` +
         `fired — that is a defect in the predicate, not a slow client`);
@@ -844,9 +844,9 @@ describe("SIGTERM exit code", () => {
     // `res.end()` only QUEUES the FIN. With the client not reading and the
     // socket's write queue deeply backed up, the response cannot finish, so
     // `close` never fires and it stays in the live set — where a loop that
-    // FORGETS an ended connection re-stamps it from arrival, finds it older
-    // than the window, and ends it again every other tick. The count that
-    // certifies the drain then inflates without bound.
+    // FORGETS an ended connection re-stamps it as new and ends it again one
+    // window later, and every window after. The count that certifies the drain
+    // inflates for as long as the drain runs.
     //
     // An earlier fixture used 64 KB chunks on a live upstream and could not
     // reproduce it: the writes kept `bytesWritten` advancing, so the stall
@@ -889,6 +889,63 @@ describe("SIGTERM exit code", () => {
         `could not flush, so it stayed in the live set and an entry that was DELETED ` +
         `rather than MARKED was re-stamped from arrival and ended again — inflating ` +
         `the very count the backstop line reports`);
+    } finally {
+      try { c?.destroy(); } catch { /* never opened */ }
+      upstream.close();
+      proc.kill("SIGKILL");
+    }
+  });
+
+  it("does not answer 200 for a stall that delivered no byte", async () => {
+    // `headersSent` goes true at writeHead with `bytesWritten` still 0, so a
+    // response blocked upstream AFTER its headers were buffered looks
+    // mid-response to it. `res.end()` on one emits a well-formed empty 200 —
+    // which a client cannot tell from a real empty success and will not retry,
+    // the same non-retryable answer the bulk close was fixed for. The stall
+    // path has the byte count in hand, so it must split on that.
+    const upstream = http.createServer((q, r) => {
+      q.resume();
+      r.writeHead(200, { "content-type": "text/event-stream" });
+      // FLUSH IS LOAD-BEARING. `writeHead` alone buffers, so without this the
+      // headers never reach the proxy, its own `headersSent` stays false, and
+      // both arms take the destroy path — the case passes without exercising
+      // anything. Measured: the fixture was green against the defect until
+      // this line was added.
+      r.flushHeaders();   // headers on the wire, and no body byte ever
+    });
+    await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
+    const { proc, port, stderr } = startProxy({
+      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upstream.address().port}`,
+      CACHE_FIX_DRAIN_STALL_MS: "1500",
+      CACHE_FIX_DRAIN_MS: "60000",
+    });
+    let c;
+    try {
+      const p = await port;
+      let seen = "";
+      c = net.connect(p, "127.0.0.1", () => c.write(
+        "POST /v1/messages HTTP/1.1\r\nHost: x\r\ncontent-type: application/json\r\n" +
+        "content-length: 2\r\n\r\n{}"));
+      c.on("data", (b) => (seen += b.toString("latin1")));
+      c.on("error", () => {});
+      await new Promise((r) => setTimeout(r, 1_000));
+      assert.equal(seen, "",
+        "premise: nothing must have reached the client before the handover, or " +
+        "this case is about a response that really did deliver");
+
+      const exited = exitOf(proc);
+      exited.catch(() => {});
+      proc.kill("SIGUSR2");
+      await new Promise((r) => setTimeout(r, 5_000));
+
+      assert.match(stderr(), /drain destroyed one connection .* \(before headers\)/,
+        `the stall ended a byte-less response on the "ended" arm; it must be reset, ` +
+        `and labelled for what reached the client rather than for what was buffered. ` +
+        `stderr:\n${stderr()}`);
+      assert.equal(seen, "",
+        `the client received ${JSON.stringify(seen.slice(0, 120))} for a request that ` +
+        `never delivered a byte. A well-formed empty success is not retryable and is ` +
+        `indistinguishable from a real one; a reset is the honest answer here`);
     } finally {
       try { c?.destroy(); } catch { /* never opened */ }
       upstream.close();
