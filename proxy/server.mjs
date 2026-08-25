@@ -745,6 +745,11 @@ export function createProxyServer() {
   // off a SNAPSHOT at force-close time (see there), `_draining` is set by
   // shutdown() the moment it begins.
   srv._live = live;
+  // A reply whose end() has been CALLED is IDLE to Node, so server.close()
+  // severs one that is complete but still flushing. Both close paths ask this
+  // before unbinding; it lives here so there is one spelling of the question.
+  srv._unflushed = () =>
+    [...live].filter((r) => r.writableEnded && !r.writableFinished).length;
   srv._draining = false;
   return srv;
 }
@@ -1158,17 +1163,28 @@ export async function startProxy(options = {}) {
         // rejection; only the process.exit() inside .finally() beat the
         // unhandled-rejection report to it. Both callbacks fire on the same
         // 'close' event, after the drain, so resolving is the true answer.
+        // Measured through this proxy: 4,217,623 bytes delivered of a declared
+        // 16,777,216, with `drained clean` printed for it. Discriminated on
+        // plain Node -- no close 100%, close() alone 6.2%, close() plus the idle
+        // sweep 6.2% -- so the agent is close(), not closeIdleConnections().
+        // No timer of its own: the drain's budget and forced-close backstop
+        // already bound this.
+        const closeNow = () => {
         server.close((err) => (err && err.code !== "ERR_SERVER_NOT_RUNNING" ? reject(err) : resolve()));
         // NODE 18 DOES NOT DO THIS FOR US, and ba2375b silently assumed it did.
-        // From 19 on, close() closes idle keep-alives itself; 18.20.8 does not —
+        // From 19 on, close() closes idle keep-alives itself; 18.20.8 does not --
         // measured, close never fires where 20.20.2 and 24.11.1 report 1-2 ms.
-        // Three consequences and all of them are on 18: the quiet client never
-        // gets `Connection: close` (that header rides a request it will never
-        // send), its socket keeps this promise unresolved, and the handover then
-        // spends its ENTIRE budget — 30 minutes of a client pinned to a proxy
-        // that has stopped being the front door. Optional-call because engines
-        // is ">=18" and closeIdleConnections landed in 18.2.
+        // Optional-call because engines is ">=18" and closeIdleConnections
+        // landed in 18.2.
         server.closeIdleConnections?.();
+        };
+        if (server._unflushed() === 0) return closeNow();
+        const flushTick = setInterval(() => {
+          if (server._unflushed() > 0) return;
+          clearInterval(flushTick);
+          closeNow();
+        }, 50);
+        flushTick.unref?.();
       }),
   };
 }
@@ -1759,7 +1775,18 @@ if (invokedAsScript) {
         process.stderr.write(`[cache-fix] successor spawn failed (${err?.code || err?.message})\n`);
       }
     }
-    active.server.close?.();
+    // Same guard as `close` above: guarding one path alone leaves the other
+    // to sever. Deferring the unbind is safe -- on a handover the successor
+    // already holds the socket, on a stop the drain budget bounds it.
+    if (active.server?._unflushed?.() === 0) active.server.close?.();
+    else {
+      const t = setInterval(() => {
+        if (active.server?._unflushed?.() > 0) return;
+        clearInterval(t);
+        active.server.close?.();
+      }, 50);
+      t.unref?.();
+    }
     // SAY WHO STARTED THE SUCCESSOR. The holder reads this line as "reclaim the
     // port and spawn", so a proxy that already spawned must say so or the two
     // of us put two proxies on one socket — measured, one extra per deploy:

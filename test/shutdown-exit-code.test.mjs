@@ -1277,4 +1277,70 @@ describe("SIGTERM exit code", () => {
     }
   });
 
+
+  it("delivers a finished-but-unflushed reply instead of severing it and calling it clean", async () => {
+    // MEASURED, on this proxy: a client received 4,217,792 bytes of a declared
+    // 67,108,872 while stderr said `drained clean in 0.0s of 9s budget`.
+    //
+    // The mechanism is not the stall predicate and not closeIdleConnections().
+    // Discriminated on plain Node with three arms, no proxy involved:
+    //     no close()                    100.0% delivered
+    //     server.close() alone            6.2%
+    //     server.close() + closeIdle      6.2%
+    // `server.close()` is the agent. Node treats a response whose end() has been
+    // CALLED as idle, so a reply that is complete but still flushing is severed
+    // at drain start -- before any predicate can judge it, which is also why the
+    // branch that would decline to claim a cut for it is unreachable today.
+    const SIZE = 16 * 1024 * 1024;
+    const upstream = http.createServer((q, r) => {
+      q.resume();
+      r.writeHead(200, { "content-type": "application/octet-stream",
+                         "content-length": String(SIZE) });
+      r.end(Buffer.alloc(SIZE, 0x61));
+    });
+    await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
+    const { proc, port, stderr } = startProxy({
+      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upstream.address().port}`,
+      CACHE_FIX_DRAIN_MS: "60000",
+    });
+    try {
+      const p = await port;
+      let got = 0, declared = -1, ended = false;
+      const req = http.request(
+        { host: "127.0.0.1", port: p, path: "/v1/messages", method: "POST",
+          headers: { "content-type": "application/json" } },
+        (res) => {
+          declared = parseInt(res.headers["content-length"] ?? "-1", 10);
+          res.pause();                       // let the bytes queue on the proxy
+          res.on("data", (b) => { got += b.length; });
+          res.on("end", () => { ended = true; });
+          res.on("error", () => {});
+          setTimeout(() => res.resume(), 2_500);
+        });
+      req.on("error", () => {});
+      req.end(JSON.stringify({ model: "x", messages: [] }));
+
+      // Long enough for the whole body to reach the proxy and for it to call
+      // end() with the client still not reading.
+      await new Promise((r) => setTimeout(r, 1_500));
+      proc.kill("SIGTERM");
+
+      const t0 = Date.now();
+      while (!ended && Date.now() - t0 < 20_000) await new Promise((r) => setTimeout(r, 100));
+
+      // PRECONDITION, not the assertion. A fixture that never got headers is
+      // measuring nothing, and would otherwise read as the defect.
+      assert.ok(declared > 0 && got > 0,
+        `fixture never reached the arm: declared=${declared} got=${got}`);
+
+      assert.equal(got, declared,
+        `the drain severed a finished-but-unflushed reply: the client received ` +
+        `${got} of a declared ${declared} bytes (${(100 * got / declared).toFixed(1)}%). ` +
+        `FULL STDERR:\n${stderr()}`);
+    } finally {
+      try { proc.kill("SIGKILL"); } catch {}
+      upstream.close();
+    }
+  });
+
 });
