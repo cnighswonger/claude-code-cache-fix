@@ -1749,6 +1749,12 @@ if (invokedAsScript) {
     // port and spawn", so a proxy that already spawned must say so or the two
     // of us put two proxies on one socket — measured, one extra per deploy:
     // PEAK CONCURRENT 4 and 3 still alive after 4 deploys.
+    // DO NOT READ THE ARM OFF THIS LINE IN A LOG. The holder both forwards our
+    // stdout to the log and parses it, so on a holder-driven handover — where
+    // that holder has already settled and is leaving — the line reaches neither,
+    // and `(handed off)` then reads as "no handover ever happened". Take the arm
+    // from stderr, which names the budget on both outcomes: a cut says
+    // `after <budget>s`, a completed drain `of <budget>s budget`.
     say(process.stdout,
         `proxy releasing the listening socket${handedOff ? " (handed off)" : ""}\n`);
     // A holder's handover is never `handedOff`: it sets `releasing`, so
