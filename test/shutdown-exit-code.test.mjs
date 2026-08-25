@@ -626,15 +626,8 @@ describe("SIGTERM exit code", () => {
   it("ends the stalled connection and keeps the moving one", async () => {
     // BOTH the cases above use exactly ONE connection, and with one connection
     // an aggregate clock and a per-connection one are the SAME PROGRAM — no
-    // fixture built that way can fail either version, which is why the
-    // aggregate passed for months while it was cutting live replies.
-    //
-    // It also needs THREE assertions rather than two. A case that checks only
-    // "the stalled one was ended" is blind to the other half: the cut used to
-    // be all-or-nothing, so a predicate that ends the whole drain on the first
-    // quiet connection takes the moving one down with it. That is the same
-    // zero-interruption violation wearing the opposite sign, and only the
-    // "moving one is still delivering" assertion can see it.
+    // fixture built that way can fail either version. Three assertions, not
+    // two; each says at its own failure what it catches.
     const upstream = http.createServer((q, r) => {
       q.resume();
       // Never answers: the response stays owed with bytesWritten 0, which is

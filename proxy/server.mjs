@@ -1836,9 +1836,7 @@ if (invokedAsScript) {
     // (we released it above) and the successor is serving. So the handover arm
     // can afford to wait, and CACHE_FIX_DRAIN_MS is now its BACKSTOP rather than
     // its deadline.
-    // Hoisted out of forceClose: the per-connection end below names the route of
-    // the ONE connection it ended, for the same reason the bulk tally names the
-    // mix — a cut is a different event depending on which route it was on.
+    // Also used by the per-connection end below.
     const routeOf = (res) => {
       const u = res.req?.url;
       if (typeof u !== "string") return "?";
@@ -1960,8 +1958,7 @@ if (invokedAsScript) {
       // This was one shared `lastMoved` reset by a disjunction over the whole
       // set, and on a port with any traffic that is a clock that never expires:
       // one live stream answers "moving" for every connection, so a stalled one
-      // never ages. Its first firing cut 6 in-flight requests on the BACKSTOP
-      // with the stall test never having fired once.
+      // never ages.
       //
       // AND THE CUT MOVED WITH IT, which is the half that is easy to miss.
       // Per-connection STAMPING alone still ends the WHOLE drain the moment one
@@ -1981,14 +1978,10 @@ if (invokedAsScript) {
           if (!rec) { seen.set(res, { bytes: n, at: res._bornAt ?? now }); continue; }
           if (rec.bytes !== n) { rec.bytes = n; rec.at = now; continue; }
           if (now - rec.at < stallMs) continue;
-          // Same headersSent split the bulk close uses, and for the same
-          // measured reason: `res.end()` on a response that never wrote a header
-          // emits an implicit `200` + `Content-Length: 0`, which a client cannot
-          // tell from a real empty success and will not retry.
-          // READ IT BEFORE ENDING. `res.end()` on a response with no header
-          // WRITES one, so asking afterwards reports "mid-response" about the
-          // request that was blocked upstream — the one case the label exists
-          // to separate.
+          // READ IT BEFORE ENDING, and split on it the way the bulk close does:
+          // `res.end()` on a header-less response WRITES one, so asking after
+          // reports "mid-response" about a request that was blocked upstream —
+          // the one case the label exists to separate.
           const mid = res.headersSent;
           let how;
           try {
@@ -2001,7 +1994,7 @@ if (invokedAsScript) {
             `${routeOf(res)} with no byte written for ${Math.round((now - rec.at) / 1000)}s ` +
             `(${mid ? "mid-response" : "before headers"})\n`);
         }
-        const elapsed = Date.now() - drainStart;
+        const elapsed = now - drainStart;
         // THE ONLY THING THAT ENDS THE DRAIN FROM IN HERE. A quiet connection is
         // ended above without ending the drain, so reaching this line means the
         // predicate never resolved the set — a defect here, not a slow client,
