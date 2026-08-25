@@ -976,6 +976,90 @@ describe("holder handover (SIGUSR2)", () => {
 // through boot and through a child death found a gap exactly zero times, while
 // suppressing that one closeGap() made it appear at once. A property with no
 // observable window has to be asked of the object that owns it.
+// THE HOLDER IS THE ONLY THING THAT KNOWS A REDEPLOY FROM A STOP, and it says
+// so with the signal it sends its child. `forward()` deliberately rewrites every
+// stop to SIGHUP, so if the handover also used SIGHUP the proxy would see one
+// word for two opposite events and have to guess the drain budget: 5s where the
+// supervisor waits serially (measured, 120s against a 90s TimeoutStopSec took
+// restart downtime 5.0s -> 53.9s) against half an hour where a successor is
+// already serving. Source-level because the two call sites are what must differ,
+// and a live handover cannot observe which signal was used.
+describe("the handover signal is not the stop signal", () => {
+  const src = readFileSync(launcherPath, "utf8");
+
+  it("rewrites every stop to SIGHUP", () => {
+    const forward = /const forward = \(sig\) => \{[\s\S]*?\n    \};\n/.exec(src)?.[0];
+    assert.ok(forward, "forward() is gone — this tests nothing");
+    assert.match(forward, /sig = "SIGHUP";/,
+      "forward() no longer collapses the stop signals, so SIGHUP is not the stop " +
+      "word any more and the proxy's budget split is reading a signal nobody sends");
+  });
+
+  // WHAT MAKES SIGUSR2 SAFE TO SEND. A proxy without the handler takes node's
+  // default and dies outright — no drain at all, worse than the 5s it replaces.
+  // The holder may only send it to a child it started from the tree it lives in.
+  it("only ever signals a child it spawned from its own tree", () => {
+    // The RHS is taken as a PREFIX, not to a delimiter: `spawn(...)` spans commas
+    // and newlines, and cutting at the first comma matched "spawn(process.execPath"
+    // for every call — which failed the clean tree and would have passed a mutation.
+    const assigns = [...src.matchAll(/\bchild = /g)].map((m) => src.slice(m.index + m[0].length, m.index + m[0].length + 60));
+    assert.ok(assigns.length, "no assignment to `child` found — this tests nothing");
+    for (const rhs of assigns) {
+      assert.ok(/^null\b/.test(rhs) || /^spawn\(process\.execPath, \[SERVER_PATH\b/.test(rhs),
+        `\`child\` is assigned ${JSON.stringify(rhs.split("\n")[0])} — if the holder can adopt a proxy ` +
+        `it did not spawn, that proxy may predate the SIGUSR2 handler and the handover ` +
+        `kills it instantly instead of handing over`);
+    }
+    assert.match(src, /const SERVER_PATH = resolve\(__dirname, "\.\.\/proxy\/server\.mjs"\)/,
+      "SERVER_PATH no longer resolves beside this file, so the proxy it spawns is not " +
+      "guaranteed to be the same tree and may not know SIGUSR2. This is not a " +
+      "hypothetical: the file documents SERVER_PATH as the single point a harness " +
+      "rewrites to point the launcher at a stand-in proxy");
+  });
+
+  // AND `child` IS NOT THE WHOLE POPULATION — two other spawns of SERVER_PATH in
+  // this file never become `child`, so an assignment rule cannot see them. The
+  // invariant that actually bounds the hazard is about DELIVERY: SIGUSR2 must
+  // reach a proxy from one place only. (The neighbours are safe for their own
+  // reasons — the second forward() passes its signal through unrewritten but is
+  // registered for SIGTERM/SIGINT only — and a rule that leans on that goes
+  // stale the day someone registers one more.)
+  it("has exactly one place that can send a proxy SIGUSR2", () => {
+    const sends = src.split("\n")
+      .filter((l) => /\bkill\([^)]*"SIGUSR2"/.test(l) && !/^\s*\/\//.test(l))
+      .map((l) => l.trim());
+    assert.equal(sends.length, 2,
+      `${sends.length} call sites send SIGUSR2, not 2: ${JSON.stringify(sends)} — a new ` +
+      `sender may reach a proxy that predates the handler, which node terminates ` +
+      `outright with no drain at all`);
+    assert.ok(sends.some((l) => /child\.kill\("SIGUSR2"\)/.test(l)),
+      "the handover no longer sends SIGUSR2 to its own child");
+    assert.ok(sends.some((l) => /process\.kill\(incumbent, "SIGUSR2"\)/.test(l)),
+      "the holder-to-holder handover request is gone or has changed target");
+
+    // The other sender aims at a pid this process did not spawn, so it needs the
+    // check the handover gets from construction: only a run-service holder, which
+    // is the role that knows SIGUSR2.
+    const takeover = /if \(argv\.includes\("run-service"\)\) \{\n\s*try \{ process\.kill\(incumbent, "SIGUSR2"\)/.exec(src);
+    assert.ok(takeover,
+      "the holder-to-holder SIGUSR2 is no longer gated on the target being a " +
+      "run-service holder, so it can now reach a bare proxy and kill it outright");
+  });
+
+  it("signals the handover with SIGUSR2 instead", () => {
+    const spawned = /successor\.once\("spawn", \(\) => \{[\s\S]*?\n        \}\);\n/.exec(src)?.[0];
+    assert.ok(spawned, "the successor's spawn gate is gone — this tests nothing");
+    const sig = /child\.kill\("(SIG[A-Z0-9]+)"\)/.exec(spawned)?.[1];
+    assert.ok(sig, "the handover no longer signals the outgoing child at all");
+    assert.notEqual(sig, "SIGHUP",
+      "the handover signals its child with SIGHUP, the same word forward() rewrites " +
+      "every stop to — the proxy cannot then tell a redeploy from `systemctl stop`, " +
+      "and whichever budget it picks is wrong for the other path");
+    assert.equal(sig, "SIGUSR2",
+      `the handover signals ${sig}, which the proxy does not handle as a handover`);
+  });
+});
+
 describe("openGap identity", () => {
   it("a retired gap's late exit does not clear the live one", () => {
   const src = readFileSync(new URL("../bin/claude-via-proxy.mjs", import.meta.url), "utf8");

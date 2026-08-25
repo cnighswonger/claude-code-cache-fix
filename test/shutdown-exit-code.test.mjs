@@ -471,29 +471,71 @@ describe("SIGTERM exit code", () => {
   // for which arm, and a grep for "handedOff" passes on the comment above it.
   it("spends the 5s outage budget only where something waits on our exit", () => {
     const src = readFileSync(serverPath, "utf8");
-    const expr = /const budgetMs = handedOff\n?[\s\S]*?;\n/.exec(src)?.[0];
+    const expr = /const budgetMs = [\s\S]*?;\n/.exec(src)?.[0];
     assert.ok(expr, "the drain budget is no longer chosen here — this tests nothing");
+    assert.match(expr, /handedOff/, "the budget no longer consults handedOff");
+    assert.match(expr, /handoverRelease/,
+      "the budget ignores handoverRelease, so a holder-driven handover still spends " +
+      "the SUPERVISED budget — the arm that cut 14-18 mid-response replies on every " +
+      "one of six handovers in one evening, every one 100% mid-response");
 
-    const pick = (handedOff, env) => {
+    const pick = (handedOff, handoverRelease, env) => {
       // eslint-disable-next-line no-new-func
-      return Function("handedOff", "process", `${expr} return budgetMs;`)(handedOff, { env });
+      return Function("handedOff", "handoverRelease", "process", `${expr} return budgetMs;`)(
+        handedOff, handoverRelease, { env });
     };
-    assert.equal(pick(false, {}), 5_000,
+    assert.equal(pick(false, false, {}), 5_000,
       "a SUPERVISED stop no longer uses the 5s it was measured for — systemd waits " +
-      "serially there, so a longer grace is downtime");
-    assert.ok(pick(true, {}) >= 600_000,
-      `a HANDOVER got ${pick(true, {})}ms — nothing waits on that path and the ` +
+      "serially there, so a longer grace is downtime: 120s against a 90s " +
+      "TimeoutStopSec took restart downtime 5.0s -> 53.9s");
+    assert.ok(pick(true, false, {}) >= 600_000,
+      `a HANDOVER got ${pick(true, false, {})}ms — nothing waits on that path and the ` +
       `short budget is what cut 16 mid-response replies on the last deploy`);
-    assert.equal(pick(true, { CACHE_FIX_DRAIN_MS: "90000" }), 90_000,
+
+    // THE THIRD CASE, and the one that was spending the wrong budget. A holder
+    // handover never sets `handedOff`: it sets `releasing`, so askForSuccessor
+    // is false. The successor has adopted fd 3 and the holder settles the moment
+    // it signals us, so nothing waits on this exit.
+    assert.ok(pick(false, true, {}) >= 600_000,
+      `a HOLDER-DRIVEN handover got ${pick(false, true, {})}ms. Measured over one ` +
+      `evening of six handovers: cut 17 / 18 / 18 / 16 / 15 / 14 in-flight, every ` +
+      `one 100% mid-response and 0 before headers — and that six is a floor, the ` +
+      `log had already been truncated at its 4MB cap`);
+
+    assert.equal(pick(false, true, { CACHE_FIX_DRAIN_MS: "90000" }), 90_000,
+      "CACHE_FIX_DRAIN_MS does not move the holder-driven handover budget");
+    assert.equal(pick(true, false, { CACHE_FIX_DRAIN_MS: "90000" }), 90_000,
       "CACHE_FIX_DRAIN_MS does not move the handover budget");
-    assert.equal(pick(false, { CACHE_FIX_DRAIN_MS: "90000" }), 5_000,
+    assert.equal(pick(false, false, { CACHE_FIX_DRAIN_MS: "90000" }), 5_000,
       "CACHE_FIX_DRAIN_MS moved the SUPERVISED budget too — that one is bounded by " +
       "the unit's TimeoutStopSec and is not the operator's to raise from here");
   });
 
-  // AND THE LINE MUST NAME THE BUDGET IT ACTUALLY USED. The two diverged the
-  // moment the handover path got its own, and a log that says "after 5s" about a
-  // 1800s wait reads like it was checked.
+  // THE SIGNAL IS THE WHOLE DISCRIMINATOR, so pin which handler may set it.
+  // The holder rewrites EVERY stop to SIGHUP (`systemctl stop`, Ctrl-C, a plain
+  // kill, and a takeover asking it to release the port all arrive as SIGHUP), so
+  // SIGHUP cannot mean "a successor is already serving" without also meaning
+  // "the supervisor is waiting on your exit". Reading the handover off SIGHUP
+  // gives a supervised stop the 30-minute budget, which is the 53.9s downtime
+  // measured above; reading it off SIGUSR2 cannot, because nothing else sends it.
+  it("reads the handover from SIGUSR2 and never from the stop signal", () => {
+    const src = readFileSync(serverPath, "utf8");
+    const hup = /process\.on\("SIGHUP",[\s\S]*?\);\n/.exec(src)?.[0];
+    assert.ok(hup, "the proxy no longer handles SIGHUP — this tests nothing");
+    assert.doesNotMatch(hup, /handoverRelease/,
+      "SIGHUP sets the handover flag, so `systemctl stop` now takes the handover " +
+      "budget and the supervisor SIGKILLs it at TimeoutStopSec");
+
+    const usr2 = /process\.on\("SIGUSR2", \(\) => \{[\s\S]*?\}\);\n/.exec(src)?.[0];
+    assert.ok(usr2, "the proxy no longer handles SIGUSR2, so a handover cannot say so");
+    assert.match(usr2, /handoverRelease = true/,
+      "SIGUSR2 no longer marks the handover, so every handover falls back to the 5s " +
+      "outage budget — the arm this whole case exists to keep off that path");
+    assert.match(usr2, /releasingPort = true/,
+      "SIGUSR2 must still mark the port released, or the lineage self-heals into a " +
+      "rival on a socket the successor already holds");
+  });
+
   it("reports the budget it actually spent, not the one it was written against", () => {
     assert.match(forcedCloseLine(1, 0, 0, 5_000), /after 5s/);
     assert.match(forcedCloseLine(1, 0, 0, 1_800_000), /after 1800s/,

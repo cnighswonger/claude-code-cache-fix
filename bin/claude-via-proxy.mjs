@@ -1018,11 +1018,24 @@ function holdPort(rest) {
         // mutually exclusive, so nothing reaches recovery after departure today;
         // it is kept so a future reordering cannot quietly re-arm a holder that
         // has already handed the address on.
+        // SIGUSR2 IS THE HANDOVER'S OWN WORD, and it has to be its own: this
+        // block rewrites every stop to SIGHUP, so SIGHUP cannot also mean "a
+        // successor is already serving". The proxy picks its drain budget on
+        // the difference — 5 s where a supervisor waits serially, half an hour
+        // where nothing waits on it at all.
+        //
+        // SAFE ONLY BECAUSE `child` IS ALWAYS OURS. A proxy with no SIGUSR2
+        // handler takes node's default and dies outright, cutting everything
+        // with no drain — the hazard deploy.sh guards with a holder_tree check
+        // before signalling a holder it did not start. Here the only assignment
+        // that creates a child spawns SERVER_PATH from beside this file, so it
+        // cannot predate the handler. Adopting a proxy we did not spawn would
+        // make this line fatal.
         successor.once("spawn", () => {
           // The child under us keeps serving until IT is replaced by the
           // successor's own child; nothing here interrupts the accept path.
           if (child && child.exitCode === null && !child.signalCode) {
-            try { child.kill("SIGHUP"); } catch { }
+            try { child.kill("SIGUSR2"); } catch { }
           }
           left = true;
           settle(0);

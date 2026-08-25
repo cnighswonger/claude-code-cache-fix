@@ -866,6 +866,12 @@ delete process.env.LISTEN_PID;
 // stopping its child re-opens the race silently. A flag survives new call sites;
 // an ordering does not.
 let releasingPort = false;
+// A SUCCESSOR ALREADY HOLDS THE SOCKET — set only by SIGUSR2, which no other
+// caller sends. `releasingPort` cannot answer this: the holder rewrites every
+// stop to SIGHUP (see its `forward()`), so SIGHUP means both "a redeploy handed
+// the port on" and "the supervisor is stopping us", and those want opposite
+// budgets.
+let handoverRelease = false;
 
 function inheritedFd() {
   if (!(HANDED_DOWN.fds >= 1)) return null;
@@ -1607,6 +1613,12 @@ if (invokedAsScript) {
   // The supervisor is stopping US, not redeploying: leave without putting a
   // successor on the socket. See the holder's `forward()`.
   process.on("SIGHUP", () => { releasing = true; releasingPort = true; onSignal(); });
+  // The holder handed the listening socket to a successor that is already
+  // serving it, then asked us to go. Nothing waits on this exit: the holder
+  // settles the moment it signals us, so we drain detached.
+  process.on("SIGUSR2", () => {
+    releasing = true; releasingPort = true; handoverRelease = true; onSignal();
+  });
   startProxy()
     .then((handle) => {
       active = handle;
@@ -1739,7 +1751,12 @@ if (invokedAsScript) {
     // PEAK CONCURRENT 4 and 3 still alive after 4 deploys.
     say(process.stdout,
         `proxy releasing the listening socket${handedOff ? " (handed off)" : ""}\n`);
-    const budgetMs = handedOff
+    // A holder's handover is never `handedOff`: it sets `releasing`, so
+    // askForSuccessor is false. It is still a handover — the successor has
+    // adopted fd 3 and nothing waits on us — so it takes the long budget. It
+    // must be read from SIGUSR2 and NOT from `releasingPort`, which a plain
+    // supervised stop also sets.
+    const budgetMs = (handedOff || handoverRelease)
       ? (Number(process.env.CACHE_FIX_DRAIN_MS) || 1_800_000)
       : 5_000;
     // TIME THE DRAIN THAT FINISHED, not only the one that was cut.
