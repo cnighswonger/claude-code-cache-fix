@@ -1998,6 +1998,12 @@ if (invokedAsScript) {
           if (rec.done) continue;
           if (rec.bytes !== n) { rec.bytes = n; rec.at = now; continue; }
           if (now - rec.at < stallMs) continue;
+          // IT ENDED ITSELF. `res.end()` on a finished response returns
+          // silently, so we would cut nothing and report a cut — and that
+          // count flips the clean-drain line off for a drain that lost none.
+          // Reachable on the BUFFERED branch, whose single `end(rawResponse)`
+          // ignores backpressure.
+          if (res.writableEnded) { rec.done = true; continue; }
           // BYTES ON THE WIRE, not headers in a buffer. `headersSent` is true
           // from writeHead with nothing delivered, and `res.end()` there emits a
           // well-formed empty 200 the client will not retry.

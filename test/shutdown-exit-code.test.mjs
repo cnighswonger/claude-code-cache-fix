@@ -1011,6 +1011,74 @@ describe("SIGTERM exit code", () => {
     }
   });
 
+  it("does not report a cut for a reply that had already ended itself", async () => {
+    // NON-STREAMING, which is the whole fixture. The streaming path pipes, and
+    // pipe() honours backpressure, so `clientRes.end()` is never reached while
+    // the client is not reading — no body size gets there. The BUFFERED branch
+    // collects the whole upstream reply and answers with ONE
+    // `clientRes.end(rawResponse)` that ignores backpressure, so the response
+    // is `writableEnded` with megabytes still queued. `res.end()` on one is a
+    // no-op: the drain ends nothing, and saying it did both invents a cut and
+    // suppresses "drained clean" for a drain that lost nothing.
+    //
+    // AFTER THE HANDOVER, or there is nothing to test: `closeIdleConnections()`
+    // runs once at drain start and Node counts a finished-but-unflushed
+    // response as idle, so a reply that completed BEFORE the signal is severed
+    // there and never reaches the stall loop at all.
+    const BODY = Buffer.alloc(16 * 1024 * 1024, 0x61);
+    const upstream = http.createServer((q, r) => {
+      q.resume();
+      setTimeout(() => {
+        r.writeHead(200, { "content-type": "application/json", "content-length": BODY.length });
+        r.end(BODY);
+      }, 1_200);
+    });
+    await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
+    const { proc, port, stderr } = startProxy({
+      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upstream.address().port}`,
+      CACHE_FIX_DRAIN_STALL_MS: "1500",
+      CACHE_FIX_DRAIN_MS: "8000",
+    });
+    let c;
+    try {
+      const p = await port;
+      const reqBody = JSON.stringify({ model: "x", messages: [], stream: true });
+      c = net.connect(p, "127.0.0.1", () => c.write(
+        "POST /v1/messages HTTP/1.1\r\nHost: x\r\ncontent-type: application/json\r\n" +
+        `content-length: ${Buffer.byteLength(reqBody)}\r\n\r\n` + reqBody));
+      c.on("error", () => {});          // NEVER READ: no 'data' listener, no resume()
+
+      const exited = exitOf(proc);
+      await new Promise((r) => setTimeout(r, 800));
+      proc.kill("SIGUSR2");             // upstream is still thinking
+      await exited.catch(() => {});
+
+      // PREMISES, both implementation-independent. Without them a fixture whose
+      // request never reached the proxy passes on the assertion below.
+      assert.match(stderr(), /BACKSTOP/,
+        `premise: the drain must have run to the backstop holding this connection, ` +
+        `or nothing was in the stall loop to judge; stderr:\n${stderr()}`);
+      let got = 0;
+      c.on("data", (b) => (got += b.length));
+      c.resume();
+      await new Promise((r) => setTimeout(r, 500));
+      assert.ok(got > 0 && got < BODY.length,
+        `premise: the proxy must have answered this connection with a body it ` +
+        `could not flush (got ${got} of ${BODY.length})`);
+
+      assert.doesNotMatch(stderr(), /drain ended one connection/,
+        `the stall test called res.end() on a response that had ALREADY ended ` +
+        `itself — a no-op — and reported it as a cut. Nothing was cut: the ` +
+        `connection lived on to the backstop. The false count also flips ` +
+        `"drained clean" off for a drain that lost nothing to the stall test. ` +
+        `stderr:\n${stderr()}`);
+    } finally {
+      try { c?.destroy(); } catch { /* never opened */ }
+      upstream.close();
+      proc.kill("SIGKILL");
+    }
+  });
+
   it("spends the 5s outage budget only where something waits on our exit", () => {
     const src = readFileSync(serverPath, "utf8");
     const expr = /const budgetMs = [\s\S]*?;\n/.exec(src)?.[0];
