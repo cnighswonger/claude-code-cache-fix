@@ -178,3 +178,48 @@ test("request records carry a join id", () => {
   assert.equal(r.id, "cap999");
   assert.ok(r.body, "the request record still carries the body it always did");
 });
+
+test("request-capture: enabled — records the Messages API only, never another route", async () => {
+  // THE SCOPE IS THE GATE, and nothing else pinned it. `onRequest` selects on
+  // the request BODY carrying a `messages` array, so the bootstrap route — the
+  // only other one that reaches the pipeline — is dropped here. Routes that
+  // never reach the pipeline at all are relayed by handlePassthrough and are
+  // not this gate's doing.
+  // Without this case, widening or dropping that gate changes what the corpus
+  // covers and no test says so; the extension's own header would then be the
+  // only statement of scope, which is what it was before this case existed.
+  const dir = await mkdtemp(join(tmpdir(), "capture-test-"));
+  const prevConfig = process.env.CLAUDE_CONFIG_DIR;
+  const prevFlag = process.env.CACHE_FIX_REQUEST_CAPTURE;
+  process.env.CLAUDE_CONFIG_DIR = dir;
+  process.env.CACHE_FIX_REQUEST_CAPTURE = "1";
+  try {
+    // A bridge worker-events body: real, enabled, and not a model call.
+    // ITS OWN SESSION ID, and the premise below gets another. The boot record
+    // is tracked per CAPTURE KEY, which is derived from the session id — not
+    // once per process — so reusing a sibling's id burns the record that
+    // sibling asserts on.
+    await ext.onRequest({
+      body: { events: [{ type: "worker_started", at: 1 }] },
+      headers: { "x-session-id": "scope-check" },
+      meta: { route: "code" },
+    });
+    assert.deepEqual(await readdir(dir), [],
+      "a non-Messages route was captured — the corpus would carry routes the " +
+      "extension does not claim, and a reader filtering it by route would find " +
+      "shapes replay cannot drive");
+
+    // PREMISE, so the case cannot pass because capture was simply off: the same
+    // setup with a Messages body must write.
+    await ext.onRequest(makeCtx({ headers: { "x-session-id": "scope-premise" } }));
+    assert.notDeepEqual(await readdir(dir), [],
+      "premise: capture is enabled and a Messages request must be written, or " +
+      "the assertion above proves nothing");
+  } finally {
+    if (prevConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = prevConfig;
+    if (prevFlag === undefined) delete process.env.CACHE_FIX_REQUEST_CAPTURE;
+    else process.env.CACHE_FIX_REQUEST_CAPTURE = prevFlag;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
