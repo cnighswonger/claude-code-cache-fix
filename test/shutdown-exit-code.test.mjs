@@ -714,6 +714,66 @@ describe("SIGTERM exit code", () => {
     }
   });
 
+  it("ages an owed connection from when it arrived, not from when the drain first saw it", async () => {
+    // A connection already stalled when the drain begins has no byte to date
+    // from. Stamping it at first SIGHT restarts its clock at the handover, so
+    // the one connection most certainly dead gets a fresh full window — and the
+    // longer the window, the longer it holds the drain open. `res._bornAt` is
+    // what makes the first stamp a real age instead of zero, and without this
+    // case nothing in the suite can tell the two apart: every other fixture
+    // opens its connection moments before the handover, where arrival and first
+    // sight are the same instant.
+    const upSockets = [];
+    const hung = net.createServer((sk) => upSockets.push(sk));
+    await new Promise((r) => hung.listen(0, "127.0.0.1", r));
+    const { proc, port } = startProxy({
+      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${hung.address().port}`,
+      CACHE_FIX_DRAIN_STALL_MS: "4000",
+      CACHE_FIX_DRAIN_MS: "60000",
+    });
+    let c;
+    try {
+      const p = await port;
+      let closedAt = 0;
+      c = net.connect(p, "127.0.0.1", () => c.write(
+        "POST /v1/messages HTTP/1.1\r\nHost: x\r\ncontent-type: application/json\r\n" +
+        "content-length: 2\r\n\r\n{}"));
+      c.on("error", () => {});
+      c.on("close", () => (closedAt = Date.now()));
+
+      // IDLE LONGER THAN THE WINDOW BEFORE THE HANDOVER. This is the whole
+      // fixture: 6s of silence against a 4s window means an age-from-arrival
+      // test is already satisfied when the drain starts.
+      await new Promise((r) => setTimeout(r, 6_000));
+      assert.equal(closedAt, 0,
+        "premise: the connection must still be open at the handover, or it was " +
+        "ended by something other than the drain");
+
+      const exited = exitOf(proc);
+      const t0 = Date.now();
+      proc.kill("SIGUSR2");
+      const deadline = t0 + 12_000;
+      while (!closedAt && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+      await exited.catch(() => {});
+
+      assert.ok(closedAt, "the connection was never ended at all within 12s");
+      const took = closedAt - t0;
+      // Ages from arrival: stamped on tick 1 with a 6s age, ended on tick 2.
+      // Ages from first sight: stamped at 0 on tick 1, so it waits out a fresh
+      // 4s window and ends around tick 5. The gap is ~2s against ~5s.
+      assert.ok(took < 3_500,
+        `the stalled connection took ${took}ms to end against a 4000ms window it ` +
+        `had ALREADY exceeded by 6000ms before the handover. Its clock was ` +
+        `restarted at first sight, so the deadest connection on the port bought ` +
+        `itself another full window`);
+    } finally {
+      for (const sk of upSockets) sk.destroy();
+      try { c?.destroy(); } catch { /* never opened */ }
+      hung.close();
+      proc.kill("SIGKILL");
+    }
+  });
+
   it("spends the 5s outage budget only where something waits on our exit", () => {
     const src = readFileSync(serverPath, "utf8");
     const expr = /const budgetMs = [\s\S]*?;\n/.exec(src)?.[0];
