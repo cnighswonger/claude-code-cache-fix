@@ -984,6 +984,90 @@ describe("holder handover (SIGUSR2)", () => {
 // restart downtime 5.0s -> 53.9s) against half an hour where a successor is
 // already serving. Source-level because the two call sites are what must differ,
 // and a live handover cannot observe which signal was used.
+// THE PRODUCTION STOP, WITH SOMETHING IN FLIGHT. Every other holder case here
+// signals with nothing owed, so `close()` resolves at once and the case passes
+// under ANY budget — a ceiling is never reached and a stall test is never asked.
+// That is the gap: the one path an operator actually takes (`systemctl stop`,
+// Ctrl-C, a plain kill) has never been measured with a reply in the middle of
+// being delivered.
+//
+// It matters because the holder rewrites every stop to SIGHUP, and SIGHUP sets
+// `releasingPort`. If that flag ever reaches the handover arm again, an operator
+// stop inherits the uncapped drain and hangs until the supervisor SIGKILLs it —
+// measured elsewhere at 5.0s -> 53.9s of restart downtime. This case is what
+// fails when that happens.
+describe("a holder stop with a reply in flight", () => {
+  it("ends on the supervised budget, not on the drain predicate", async () => {
+    // Bytes must be MOVING at the moment of the stop. If they were not, a stall
+    // test would end the drain too and the case could not tell the arms apart.
+    const upstream = http.createServer((q, r) => {
+      r.writeHead(200, { "content-type": "text/event-stream" });
+      let n = 0;
+      const t2 = setInterval(() => { try { r.write(`data: ${++n}\n\n`); } catch {} }, 100);
+      r.on("close", () => clearInterval(t2));
+      q.resume();
+    });
+    await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
+
+    const port = await takePort();
+    const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port),
+                  CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upstream.address().port}` };
+    for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                     "ALL_PROXY", "all_proxy", "LISTEN_FDS", "LISTEN_PID",
+                     "CACHE_FIX_HOLD_PORT", "CACHE_FIX_WATCH_DEPLOY_MS"]) delete env[k];
+    const holder = spawn(process.execPath, [launcherPath, "run-service"],
+                         { env, stdio: ["ignore", "ignore", "ignore"] });
+    let req = null;
+    try {
+      const up = Date.now() + 25_000;
+      let body = await probe(port);
+      while (body.startsWith("ERR:") && Date.now() < up) body = await probe(port);
+      assert.equal(body, "ok", "the holder never came up, so nothing was measured");
+
+      let chunks = 0;
+      req = http.request(
+        { host: "127.0.0.1", port, path: "/v1/messages", method: "POST",
+          headers: { "content-type": "application/json" } },
+        (res) => { res.on("data", () => chunks++); res.on("error", () => {}); });
+      req.on("error", () => {});
+      req.end(JSON.stringify({ model: "x", messages: [], stream: true }));
+
+      const flowing = Date.now() + 15_000;
+      while (chunks === 0 && Date.now() < flowing) await new Promise((r) => setTimeout(r, 50));
+      assert.ok(chunks > 0,
+        "premise: bytes must be reaching the client, or this measures a stop with " +
+        "nothing owed — which is the case that already exists and cannot fail here");
+
+      const before = chunks;
+      const t0 = Date.now();
+      holder.kill("SIGTERM");
+      // The supervised budget is 5s. The stall window defaults to 90s and the
+      // backstop to 30 minutes, so a bound of 25s separates the arms by a wide
+      // margin without being sensitive to how long a spawn takes on a loaded box.
+      const stopped = Date.now() + 25_000;
+      let left = listeners(port);
+      while (Date.now() < stopped
+             && left.some((q) => /\brun-service\b|server\.mjs/.test(cmdOf(q)))) {
+        await new Promise((r) => setTimeout(r, 200));
+        left = listeners(port);
+      }
+      const elapsed = Date.now() - t0;
+
+      assert.ok(chunks > before,
+        `the reply stopped delivering before the stop (${before} -> ${chunks}), so a ` +
+        `stall test would have ended this drain too and the arms are not separated`);
+      assert.deepEqual(left.filter((q) => /\brun-service\b|server\.mjs/.test(cmdOf(q))), [],
+        `the holder and its proxy were still on the port ${elapsed}ms after SIGTERM, ` +
+        `with a reply still streaming — an operator stop has inherited the handover ` +
+        `arm's patience, and a supervisor will SIGKILL it at TimeoutStopSec`);
+    } finally {
+      try { req?.destroy(); } catch { }
+      upstream.close();
+      try { holder.kill("SIGKILL"); } catch { }
+    }
+  });
+});
+
 describe("the handover signal is not the stop signal", () => {
   const src = readFileSync(launcherPath, "utf8");
 

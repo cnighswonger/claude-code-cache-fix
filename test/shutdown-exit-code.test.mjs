@@ -474,6 +474,53 @@ describe("SIGTERM exit code", () => {
   // that matters is: a drain with nothing moving must end WITHOUT reaching the
   // ceiling, and a drain with bytes moving must NOT end while they move. Neither
   // alone distinguishes a stall predicate from a shorter clock.
+  // WHAT WAS CUT, not just how many. This port carries CLI turns alongside
+  // bridge traffic, quota polls, statusline and title generation; a cut of 15 is
+  // a different event depending on the mix, and the count alone cannot say. One
+  // host measured ~98 cuts against 6 user-visible events and neither of the two
+  // sessions looking at it could name the other ninety-two.
+  it("names the routes it cut, and never writes a query string", async () => {
+    // The never-answers upstream: the request is owed with headers unsent, which
+    // is the arm that reaches `destroyed` rather than `ended`.
+    const upSockets = [];
+    const hung = net.createServer((s) => upSockets.push(s));
+    await new Promise((r) => hung.listen(0, "127.0.0.1", r));
+    const { proc, port, stderr } = startProxy({
+      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${hung.address().port}`,
+    });
+    try {
+      const p = await port;
+      // A QUERY STRING CARRYING SOMETHING THAT MUST NOT REACH A LOG. The proxy
+      // sees whole request URLs and this line is written to stderr, so the
+      // grouping is the only thing between an identifier in a path and a log
+      // file that outlives the process.
+      const c = net.connect(p, "127.0.0.1", () => c.write(
+        "POST /v1/messages?beta=true&tok=SHOULD-NOT-APPEAR HTTP/1.1\r\nHost: x\r\n" +
+        "content-type: application/json\r\ncontent-length: 2\r\n\r\n{}"));
+      c.on("error", () => {});
+      await new Promise((r) => setTimeout(r, 500));
+
+      const exited = exitOf(proc);
+      proc.kill("SIGTERM");
+      await exited;
+      c.destroy();
+
+      assert.match(stderr(), /routes: \/v1\/messages=1/,
+        `the cut line does not name what it cut; stderr was:\n${stderr()}`);
+      assert.doesNotMatch(stderr(), /SHOULD-NOT-APPEAR/,
+        "the route tally wrote the QUERY STRING into a log — this proxy sees whole " +
+        "request URLs, so the grouping is what keeps an identifier in a path out of " +
+        "a file that outlives the process");
+      assert.doesNotMatch(stderr(), /routes: \/v1\/messages\?/,
+        "the tally kept the `?` — grouping must cut at the query, not merely omit " +
+        "the value");
+    } finally {
+      for (const s of upSockets) s.destroy();
+      hung.close();
+      proc.kill("SIGKILL");
+    }
+  });
+
   it("ends a handover drain on the stall, not on the ceiling", async () => {
     // The same never-answers upstream the destroy-arm case uses: the proxy is
     // stuck waiting, so the response is owed with bytesWritten 0 — the exact
@@ -649,6 +696,17 @@ describe("SIGTERM exit code", () => {
       "the forced-close line still hardcodes 5s, so an operator reading it cannot " +
       "tell a handover drain from a supervised stop");
     assert.match(forcedCloseLine(0, 0, 3, 1_800_000), /after 1800s, cut no responses/);
+
+    // The tally rides the CUT line only. On the no-cut line there is nothing to
+    // attribute, and an empty `routes: ` there reads as "no routes" rather than
+    // "nothing was cut".
+    assert.match(forcedCloseLine(2, 0, 0, 5_000, "", "/v1/messages=2"),
+      / routes: \/v1\/messages=2\n$/, "the cut line does not carry the tally it was given");
+    assert.doesNotMatch(forcedCloseLine(2, 0, 0, 5_000), /routes:/,
+      "a caller that passes no tally still gets `routes:` — the field must be absent, " +
+      "not empty, or every old line grows a meaningless suffix");
+    assert.doesNotMatch(forcedCloseLine(0, 0, 3, 5_000, "", "/v1/messages=9"), /routes:/,
+      "the no-cut line carries a tally of things it did NOT cut");
   });
 
   it("says it cut nothing when it cut nothing, and never calls that idle", () => {

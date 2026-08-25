@@ -600,7 +600,7 @@ async function handlePassthrough(clientReq, clientRes) {
  * truncations, not a count of them. Measured: after writeHead and before the
  * first chunk, headersSent=true with socket.bytesWritten=0.
  */
-export function forcedCloseLine(ended, destroyed, held, budgetMs = 5_000, why = "") {
+export function forcedCloseLine(ended, destroyed, held, budgetMs = 5_000, why = "", routes = "") {
   const cut = ended + destroyed;
   // THE BUDGET IT ACTUALLY USED, not the constant this line was written against.
   // The two diverged the moment the handover path got its own, and a log that
@@ -612,8 +612,12 @@ export function forcedCloseLine(ended, destroyed, held, budgetMs = 5_000, why = 
   // line names which rather than leaving it to be inferred from a shape.
   const after = (budgetMs % 1000 === 0 ? `${budgetMs / 1000}s` : `${budgetMs}ms`) + why;
   if (cut > 0) {
+    // The route tally rides the CUT line only. On the no-cut line there is
+    // nothing to attribute, and an empty `routes: ` there would read as "no
+    // routes" rather than "nothing was cut".
     return `[cache-fix] shutdown: forcing close, cut ${cut} in-flight request(s) after ${after} `
-         + `(${ended} mid-response, ${destroyed} before headers)\n`;
+         + `(${ended} mid-response, ${destroyed} before headers)`
+         + (routes ? ` routes: ${routes}` : "") + `\n`;
   }
   // Not "idle": we did not measure idleness, we measured that no RESPONSE was
   // open. Naming the held count is what stops a reader concluding the stop was
@@ -1844,10 +1848,31 @@ if (invokedAsScript) {
       // later, measured before=1 afterSync=1 afterTick=0 on 18/20/24 — and
       // lying the moment anything drains the set synchronously. Do not
       // "simplify" the spread away.
+      // NAME THE ROUTES, because the count alone cannot say what was lost. This
+      // port carries CLI turns alongside bridge traffic, quota polls, statusline
+      // and title generation, and only the first kind is a reply a person is
+      // reading. A cut of 15 is a different event depending on the mix, and
+      // every reader of this line so far has had to guess.
+      //
+      // COARSE, AND NO QUERY STRING. Two path segments, nothing after `?`: the
+      // proxy sees whole request URLs and this line goes to a log, so the
+      // grouping is what stops an identifier in a path from being written out.
+      // It is also what bounds the cardinality — a per-URL tally on a passthrough
+      // route would print one entry per request.
+      const routeOf = (res) => {
+        const u = res.req?.url;
+        if (typeof u !== "string") return "?";
+        return "/" + u.split("?")[0].split("/").filter(Boolean).slice(0, 2).join("/");
+      };
       let ended = 0, destroyed = 0;
+      const routes = new Map();
       for (const res of [...(active.server?._live ?? [])]) {
+        const r = routeOf(res);
+        routes.set(r, (routes.get(r) ?? 0) + 1);
         try { if (res.headersSent) { res.end(); ended++; } else { res.destroy(); destroyed++; } } catch {}
       }
+      const routeTally = [...routes].sort((a, b) => b[1] - a[1])
+        .map(([r, n]) => `${r}=${n}`).join(" ");
       // THE SAME EXIT CODE THE GRACEFUL PATH USES. It exits
       // `askForSuccessor ? 75 : 0`, and the comment above it says the two paths
       // must not disagree about what our exit means — but this one exited 0
@@ -1861,7 +1886,7 @@ if (invokedAsScript) {
       // must not print as "0 connections still held", which is the one reading
       // that would wrongly clear the stop.
       const finish = (held) => {
-        process.stderr.write(forcedCloseLine(ended, destroyed, held, afterMs, why));
+        process.stderr.write(forcedCloseLine(ended, destroyed, held, afterMs, why, routeTally));
         // Then force whatever did not take the FIN. Node >=18.2; package.json
         // engines allows 18.0/18.1, where exiting without forcing is the only
         // option.
@@ -1892,15 +1917,23 @@ if (invokedAsScript) {
       // and a heartbeat both answer "moving", which is the correct answer for
       // both. What it excludes is a connection delivering nothing at all, and
       // that is a different shape rather than a smaller number of the same one.
-      // The neighbour's distribution, 292 drains: content-free waits reach 186s
-      // while BYTE-free waits top out at 2s. The two populations do not overlap,
-      // so no value in between is wrong — which is why their 90s has never been
+      // The neighbour's distribution: content-free waits reach 186s while
+      // BYTE-free waits reach 23s. The two modes do not overlap, so no value in
+      // between is wrong — which is why their stall threshold has never been
       // retuned while every budget has.
       //
-      // 90s is a judgement call bounded by two observations (far past any gap a
-      // live stream produces, far short of the ten minutes that was cutting real
-      // work), not a percentile — their byte-free sample is n=6. A number
-      // presented as derived when it was not is worse than an honest guess.
+      // 90s is a judgement call bounded by two observations (past any gap a live
+      // stream produces, short of the ten minutes that was cutting real work),
+      // not a percentile. A number presented as derived when it was not is worse
+      // than an honest guess.
+      //
+      // DO NOT TIGHTEN THIS TOWARD THE OBSERVED MAXIMUM. That maximum is not
+      // stable: it stood at 2s over 6 samples, then a real reply on a busy host
+      // went 23s without a byte and finished clean. Bimodality is what lets you
+      // choose a threshold without knowing n; it is NOT what tells you how much
+      // MARGIN you have, and only n does that. Every sample under 2s came from
+      // quiet hosts. Below ~60s is inside the observed range of a healthy
+      // stream, so anything there cuts live work.
       const stallMs = Number(process.env.CACHE_FIX_DRAIN_STALL_MS) || 90_000;
       // Polled off the socket rather than stamped on every write: the hot path
       // pays nothing, and `bytesWritten` is the byte actually leaving rather than
