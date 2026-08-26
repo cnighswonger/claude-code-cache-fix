@@ -629,9 +629,18 @@ async function handlePassthrough(clientReq, clientRes) {
 // first tick, ending every owed connection at once -- the guillotine this drain
 // replaced, one typo away.
 export function drainBudgetMs(raw, fallback) {
-  if (raw === undefined || raw === "") return fallback;
-  const n = Number(raw);
-  return Number.isFinite(n) && n >= 0 ? n : fallback;
+  if (typeof raw !== "string") return fallback;
+  // A PLAIN NON-NEGATIVE DECIMAL, matched before `Number()` sees it. `Number()`
+  // reads whitespace as 0 -- `" "`, `"\t"`, `"\n"` all coerce -- so a value
+  // that is only whitespace in an env file or a unit becomes an explicit
+  // budget of zero, which is the guillotine this drain exists to remove. It
+  // also lets `-0` through, and `now - at < -0` is false on every tick just as
+  // `< -1` is. Exotic spellings (`1e3`, `0x10`, `Infinity`) fall back rather
+  // than being guessed at; none is a documented form.
+  const s = raw.trim();
+  if (!/^\d+(\.\d+)?$/.test(s)) return fallback;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : fallback;
 }
 
 export function drainRoute(url) {
@@ -644,7 +653,13 @@ export function drainRoute(url) {
   // which is what separates `/v1/messages` from `//host/v1/messages`.
   if (!abs && !(url.startsWith("/") && !url.startsWith("//"))) return "?";
   const path = abs?.pathname ?? url;
-  return "/" + path.split("?")[0].split("/").filter(Boolean).slice(0, 2).join("/");
+  const route = "/" + path.split("?")[0].split("/").filter(Boolean).slice(0, 2).join("/");
+  // THE SHAPE TEST ABOVE CANNOT ENFORCE THIS. `/http://user:pass@host/v1`,
+  // `/\user:pass@host/x` and a percent-encoded `//` are all a single leading
+  // slash, and `#` survives the `?` split. Judge what is about to be WRITTEN:
+  // neither character belongs in a route label, and either one means an
+  // authority or a fragment came through.
+  return /[@#]/.test(route) ? "?" : route;
 }
 
 export function forcedCloseLine(ended, destroyed, held, budgetMs = 5_000, why = "", routes = "", quiet = "", owedAtStart = null) {

@@ -1240,10 +1240,18 @@ describe("SIGTERM exit code", () => {
     // reaches here unparsed and renders the authority verbatim, which is the
     // credential this function exists to keep out of the log. Origin-form is a
     // SINGLE leading slash, so `//host` is not one of them.
+    // A SHAPE FILTER CANNOT ENFORCE A CONTENT RULE. Each of these is a single
+    // leading slash, so a prefix test admits it, and each renders an authority
+    // into a log line that outlives the process.
     for (const target of [
       "//user:hunter2@example.test/v1/messages",
       "ftp://user:hunter2@example.test/v1/messages",
       "example.test:443",
+      "/http://user:hunter2@example.test/v1",
+      "/\\user:hunter2@example.test/x",
+      "/%2F%2Fuser:hunter2@example.test/x",
+      "/;user:hunter2@example.test/x",
+      "/v1/messages#tok=hunter2",
     ]) {
       assert.equal(drainRoute(target), "?",
         `an authority-first target rendered into the log: ${drainRoute(target)}`);
@@ -1265,6 +1273,17 @@ describe("SIGTERM exit code", () => {
     assert.equal(drainBudgetMs("0", 90_000), 0,
       "an explicit zero asks to cut now; it is not an absent setting");
     assert.equal(drainBudgetMs("30000", 90_000), 30_000);
+    // `Number()` reads whitespace as 0, so a value that is only whitespace --
+    // trivially written into an env file or a systemd unit -- becomes the
+    // guillotine, not the default. Same for a non-string caller.
+    for (const blank of [" ", "\t", "\n", "  \t "]) {
+      assert.equal(drainBudgetMs(blank, 90_000), 90_000,
+        `whitespace ${JSON.stringify(blank)} was read as an explicit budget`);
+    }
+    assert.equal(drainBudgetMs(null, 90_000), 90_000);
+    assert.equal(drainBudgetMs("-0", 90_000), 90_000,
+      "negative zero makes `now - at < budget` false on every tick, like -1");
+    assert.equal(drainBudgetMs(" 5 ", 90_000), 5, "a padded number still parses");
     assert.equal(drainRoute(undefined), "?");
   });
 
