@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, chmodSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { handoverEnv, handoverEnvPath } from "../bin/handover-env.mjs";
@@ -35,10 +35,13 @@ test("handoverEnv: no file — the base is returned untouched", () => {
   assert.deepEqual(handoverEnv(base, join(dir(), "nope.env")), base);
 });
 
-test("handoverEnv: unreadable file is OFF, not an error", () => {
-  const p = withFile("CACHE_FIX_PREFIXDIFF=1\n");
-  chmodSync(p, 0o000);
-  assert.equal(handoverEnv({ CACHE_FIX_PREFIXDIFF: "0" }, p).CACHE_FIX_PREFIXDIFF, "0");
+// A DIRECTORY, NOT `chmod 000`. Mode bits do not stop root, and this package
+// runs in root containers -- there the chmod succeeds, the read succeeds, and
+// the case fails on an assertion that has nothing to do with what it tests.
+// readFileSync on a directory throws for every uid, which is the branch under
+// test: any failure leaves the inherited value standing.
+test("handoverEnv: an unreadable path is OFF, not an error", () => {
+  assert.equal(handoverEnv({ CACHE_FIX_PREFIXDIFF: "0" }, dir()).CACHE_FIX_PREFIXDIFF, "0");
 });
 
 test("handoverEnv: only CACHE_FIX_ keys are honoured — the file cannot inject arbitrary env", () => {
