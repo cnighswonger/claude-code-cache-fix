@@ -459,6 +459,15 @@ test("the SIGUSR2 successor is told the port it must bind", () => {
   // === "1" to take the standby branch, which then refuses for want of
   // STANDBY_PARENT. The gap would be armed and relaying nothing, in the window
   // it exists to cover.
+  // AND THE PATH TO THE FILE ITSELF, or the file moves its own trust anchor: a
+  // CACHE_FIX_HANDOVER_ENV written here points every later handover at a path
+  // outside the config dir, and because absence means inherit, reverting the
+  // original file does not undo it.
+  assert.match(opts, /CACHE_FIX_HANDOVER_ENV\s*:/,
+    "the successor's env does not pin CACHE_FIX_HANDOVER_ENV, so the handover " +
+    "file can relocate the handover file -- permanently, and out of reach of " +
+    "whoever tightens the original");
+
   assert.match(opts, /CACHE_FIX_STANDBY\s*:\s*undefined/,
     "the successor's env does not clear CACHE_FIX_STANDBY. The handover file can " +
     "set it, and the successor hands it to its own gap relay, which takes the " +

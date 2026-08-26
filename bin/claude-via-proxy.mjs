@@ -11,7 +11,7 @@ import net from "node:net";
 import { EventEmitter } from "node:events";
 import { getSystemErrorName } from "node:util";
 import { bundleUsable, carriesOurCA, salvageBundle } from "./ca-trust.mjs";
-import { handoverEnv } from "./handover-env.mjs";
+import { handoverEnv, handoverEnvPath } from "./handover-env.mjs";
 import { sourceFingerprintSync } from "../proxy/source-fingerprint.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -985,6 +985,11 @@ function holdPort(rest) {
                  // the file cannot move it but would still relabel _host, and every
                  // downstream name (HELD_HOST, the proxy child, /health) with it.
                  CACHE_FIX_PROXY_BIND: bindAddr(),
+                 // AND THE PATH TO THE FILE, or the file moves its own trust
+                 // anchor: a CACHE_FIX_HANDOVER_ENV written there points every
+                 // later handover somewhere else, and since absence means
+                 // inherit, reverting the original file cannot take it back.
+                 CACHE_FIX_HANDOVER_ENV: handoverEnvPath(),
                  // AND A HOLDER IS NOT A STANDBY. openGap() sheds HOLDER_TREE and
                  // HELD_BY the same way; this one only became reachable when the
                  // env above stopped being ours alone.
