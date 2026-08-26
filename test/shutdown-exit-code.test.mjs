@@ -1232,6 +1232,18 @@ describe("SIGTERM exit code", () => {
     assert.equal(drainRoute("http://user:hunter2@example.test/v1/messages?x=1"), "/v1/messages",
       "an absolute-form target reached the tally with its AUTHORITY intact, so a " +
       "credential in the userinfo is written to a file that outlives the process");
+    // parseAbsoluteForm knows http and https. Every OTHER authority-first shape
+    // reaches here unparsed and renders the authority verbatim, which is the
+    // credential this function exists to keep out of the log. Origin-form is a
+    // SINGLE leading slash, so `//host` is not one of them.
+    for (const target of [
+      "//user:hunter2@example.test/v1/messages",
+      "ftp://user:hunter2@example.test/v1/messages",
+      "example.test:443",
+    ]) {
+      assert.equal(drainRoute(target), "?",
+        `an authority-first target rendered into the log: ${drainRoute(target)}`);
+    }
     assert.equal(drainRoute("/a/b/c/d"), "/a/b", "the tally must stay two segments deep");
     assert.equal(drainRoute(undefined), "?");
   });

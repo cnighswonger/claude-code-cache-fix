@@ -625,7 +625,14 @@ async function handlePassthrough(clientReq, clientRes) {
 // written to keep credentials out of it.
 export function drainRoute(url) {
   if (typeof url !== "string") return "?";
-  const path = parseAbsoluteForm(url)?.pathname ?? url;
+  const abs = parseAbsoluteForm(url);
+  // parseAbsoluteForm knows http and https. Every other authority-first shape
+  // -- a protocol-relative `//host/path`, a scheme it does not carry, the
+  // authority-form a CONNECT sends -- would otherwise fall to the raw target
+  // and render the authority verbatim. Origin-form is a SINGLE leading slash,
+  // which is what separates `/v1/messages` from `//host/v1/messages`.
+  if (!abs && !(url.startsWith("/") && !url.startsWith("//"))) return "?";
+  const path = abs?.pathname ?? url;
   return "/" + path.split("?")[0].split("/").filter(Boolean).slice(0, 2).join("/");
 }
 
