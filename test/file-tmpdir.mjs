@@ -14,10 +14,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const FILE_TMP = mkdtempSync(join(tmpdir(), "ccf-test-"));
-// ALL THREE. os.tmpdir() reads TMPDIR on POSIX and TEMP then TMP on Windows, so
-// setting only the key THIS platform happens to read leaves the other one
-// writing to the shared root -- and an assertion that the inherited directory is
-// empty then passes because it was never used, not because anything moved.
+// ALL THREE, because os.tmpdir() reads a DIFFERENT one first per platform:
+// TMPDIR || TMP || TEMP on POSIX, TEMP || TMP on Windows. Setting only the key
+// this platform happens to read first leaves a run on another platform writing
+// to the shared root.
 for (const key of ["TMPDIR", "TMP", "TEMP"]) process.env[key] = FILE_TMP;
 process.on("exit", () => {
   try { rmSync(FILE_TMP, { recursive: true, force: true }); } catch { /* already gone */ }

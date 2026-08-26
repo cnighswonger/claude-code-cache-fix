@@ -30,7 +30,12 @@ writeFileSync(join(tmpdir(), "mine"), "");
 spawnSync(process.execPath, ["-e", ${JSON.stringify(KID)}]);
 for (const m of ["mine", "kids"]) {
   if (!existsSync(join(tmpdir(), m))) { console.error("marker never written: " + m); process.exit(3); }
-}`;
+}
+// EVERY key, not just the one this platform reads first. The spawn below points
+// all three at the inherited directory, so a helper that moves only one leaves
+// the others naming it -- which is what a Windows os.tmpdir() would follow.
+const stray = ["TMPDIR", "TMP", "TEMP"].filter((k) => process.env[k] !== tmpdir());
+if (stray.length) { console.error("still on the inherited root: " + stray.join(",")); process.exit(4); }`;
 
 test("a process that imports it leaves the tmpdir it inherited empty", () => {
   const outer = mkdtempSync(join(tmpdir(), "ccf-tmpiso-"));
@@ -49,31 +54,6 @@ test("a process that imports it leaves the tmpdir it inherited empty", () => {
       "the process left scratch in the tmpdir it inherited — on a developer's box " +
       "that is the shared /tmp, where the launcher's records are named after ports " +
       "a live proxy may be serving");
-  } finally {
-    rmSync(outer, { recursive: true, force: true });
-  }
-});
-
-test("it redirects every key os.tmpdir() reads, not just this platform's", () => {
-  // os.tmpdir() reads TMPDIR on POSIX and TEMP then TMP on Windows. Setting only
-  // the one THIS platform happens to read leaves a Windows run writing to the
-  // shared root -- and the case above still passes there, because the inherited
-  // directory is empty for never having been used rather than for being isolated.
-  // That is the shape the brief calls out: a green suite proving the wrong path.
-  const PROBE_KEYS = `
-import ${JSON.stringify(MODULE)};
-import { tmpdir } from "node:os";
-const priv = tmpdir();
-const bad = ["TMPDIR", "TMP", "TEMP"].filter((k) => process.env[k] !== priv);
-if (bad.length) { console.error("still on the inherited root: " + bad.join(",")); process.exit(4); }
-`;
-  const outer = mkdtempSync(join(tmpdir(), "ccf-tmpkeys-"));
-  try {
-    const r = spawnSync(process.execPath, ["--input-type=module", "-e", PROBE_KEYS],
-                        { env: { ...process.env, TMPDIR: outer, TMP: outer, TEMP: outer },
-                          encoding: "utf8", timeout: 30_000 });
-    assert.equal(r.status, 0,
-      `a key os.tmpdir() can read was left on the inherited root: ${r.stderr.trim()}`);
   } finally {
     rmSync(outer, { recursive: true, force: true });
   }
