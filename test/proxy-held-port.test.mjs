@@ -59,6 +59,18 @@ function classify(body) {
   return OUTAGE.RESET;
 }
 
+// 200, or a string classify() can read. A bare status code or a bare e.code is
+// neither: classify() answers null for both, so the refusal count they feed is
+// empty whatever the holder does.
+const health = (port) => new Promise((res) => {
+  http.get({ host: "127.0.0.1", port, path: "/health", timeout: 3_000 }, (r) => {
+    let b = "";
+    r.setEncoding("utf8");
+    r.on("data", (d) => { b += d; });
+    r.on("end", () => res(r.statusCode === 200 ? 200 : `ERR:${r.statusCode} ${b.slice(0, 160)}`));
+  }).on("error", (e) => res(`ERR:${e.code}`));
+});
+
 const usedPorts = [];
 // The shared allocator plus this file's own cleanup registry — the registry is
 // file-local (its after() hook sweeps it), the allocation is not.
@@ -144,6 +156,19 @@ describe("held port (CACHE_FIX_HOLD_PORT)", { concurrency: CONCURRENCY }, () => 
     assert.equal(classify(200), null);
     assert.equal(classify("ERR:ECONNREFUSED"), OUTAGE.REFUSED);
     assert.equal(classify("ECONNRESET"), null, "no ERR: prefix means it is not ours to classify");
+  });
+
+  // AND THE FORCED-KILL PROBE MUST SPEAK IT. That case counts refusals with
+  // classify(), which reads nothing but an ERR: prefix, so a probe resolving a
+  // bare code makes the count empty whatever the holder does and the bound it
+  // asserts cannot fail.
+  //
+  // Port 1 rather than a released one: it needs root to bind, so no fixture here
+  // or in a neighbouring file can be holding it, and this case allocates nothing
+  // that the OS could hand to a launcher about to bind.
+  it("a probe that finds nobody home is a refusal classify can see", async () => {
+    assert.equal(classify(await health(1)), OUTAGE.REFUSED,
+                 "the forced-kill case's refusal count is empty whatever happens");
   });
 // The default is declared in proxy/config.mjs and repeated in the launcher.
 // If they drift, an unset CACHE_FIX_PROXY_PORT binds one port while callers
@@ -239,7 +264,15 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
     const up = Date.now() + 20_000;
     let body = await get();
     while (body.startsWith("ERR:") && Date.now() < up) body = await get();
-    assert.equal(JSON.parse(body).status, "ok", "the held port never came up");
+    // THE LAST BODY RIDES ALONG. Without it a 200 from something that is not our
+    // proxy dies as a bare SyntaxError with the responder unrecoverable from the
+    // log, and a readiness timeout dies with no clue either. Same rule the probes
+    // in this file already follow.
+    let ready;
+    try { ready = JSON.parse(body); }
+    catch { assert.fail(`the held port never answered with the proxy's health JSON; ` +
+                        `last body was ${JSON.stringify(body.slice(0, 160))}`); }
+    assert.equal(ready.status, "ok", "the held port never came up");
     await fn({ get, killProxy, proxyPid, launcher, exited, port });
   } finally {
     // SIGTERM first: SIGKILL cannot be forwarded, so the proxy would outlive
@@ -1258,11 +1291,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         'if (fd === null) { process.stderr.write("no LISTEN_FDS\\n"); process.exit(1); }\n' +
         's.listen({ fd }, () => process.stdout.write("proxy listening on 127.0.0.1:0\\n"));\n',
         async ({ launcher, port }) => {
-          const get = () => new Promise((res) => {
-            http.get({ host: "127.0.0.1", port, path: "/health", timeout: 3_000 }, (r) => {
-              r.resume(); r.on("end", () => res(r.statusCode));
-            }).on("error", (e) => res(e.code));
-          });
+          const get = () => health(port);
           const up = Date.now() + 10_000;
           while (Date.now() < up && (await get()) !== 200) await new Promise((r) => setTimeout(r, 50));
           assert.equal(await get(), 200, "the stand-in never came up behind the holder");
