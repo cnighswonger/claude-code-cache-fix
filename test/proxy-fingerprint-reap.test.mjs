@@ -4,7 +4,7 @@
 // asserted, so a rename fails the test instead of quietly testing nothing.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import net from "node:net";
@@ -96,6 +96,44 @@ test("a record whose port still has a listener is kept however old it is", async
               `a record for a port nothing listens on survived: ${left}`);
   } finally {
     srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Port 0 is the value `port` carries before freePort() assigns it, and the
+// finally below sweeps whatever onPort() returns. The marker ours() reads is
+// CACHE_FIX_PROXY_PORT, which a proxy child legitimately carries as 0 when it
+// inherits the holder's listening fd -- so a throw above the assignment aims
+// the sweep at the operator's live proxy. Measured on this host: 7 processes,
+// one of them the deployed ~/.local/share/cache-fix-fork/proxy/server.mjs.
+test("onPort(0) selects nothing, and still selects on a real port", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ccf-onport0-"));
+  const kids = [];
+  try {
+    mkdirSync(join(dir, "bin"));
+    const stub = join(dir, "bin", "stub.mjs");
+    writeFileSync(stub, "setInterval(() => {}, 1e9);\n");
+    const real = await freePort();
+    const spawnStub = (portValue) => {
+      const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(portValue) };
+      for (const k of HOP_ENV) delete env[k];
+      const c = spawn(process.execPath, [stub], { env, stdio: "ignore" });
+      kids.push(c);
+      return c;
+    };
+    const zero = spawnStub(0);
+    const named = spawnStub(real);
+    for (const c of [zero, named]) await new Promise((r) => setTimeout(r, 50));
+
+    // THE CONTROL. Without it an empty onPort(0) proves nothing: a host with no
+    // proxy at all answers [] either way.
+    assert.ok(onPort(real).includes(String(named.pid)),
+      `the instrument cannot see a stub on its own port ${real} -- the case below is vacuous`);
+
+    assert.ok(!onPort(0).includes(String(zero.pid)),
+      "onPort(0) selected a process carrying CACHE_FIX_PROXY_PORT=0; the sweep would SIGKILL the live proxy");
+  } finally {
+    for (const c of kids) { try { c.kill("SIGKILL"); } catch { /* gone */ } }
     rmSync(dir, { recursive: true, force: true });
   }
 });

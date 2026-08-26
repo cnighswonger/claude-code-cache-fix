@@ -123,4 +123,9 @@ export const HOP_ENV = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"
 // once, the oldest 788 s, accumulating across files and runs until a later
 // file's readiness assertion times out on the CPU and ports they hold. See
 // ours() for the mechanism and the two markers it reads.
-export const onPort = (port) => [...new Set([...listeners(port), ...ours(port)])];
+// Port 0 is the "assign me one" sentinel, never a port anything holds -- and it
+// is what a caller's `let port = 0` still carries if it throws before the
+// assignment. ours() would then match every proxy child running with
+// CACHE_FIX_PROXY_PORT=0, the operator's live one included.
+export const onPort = (port) =>
+  Number(port) > 0 ? [...new Set([...listeners(port), ...ours(port)])] : [];
