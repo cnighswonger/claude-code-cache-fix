@@ -16,6 +16,7 @@ import ext, {
 // registered here and removed once the file is done. Per dir, so one refused
 // removal cannot strand the rest.
 const scratch = [];
+// Load-bearing: a literal here instead would make the guard below flag mcTemp().
 const SCRATCH_PREFIX = "mc-";
 async function mcTemp() {
   const d = await mkdtemp(join(tmpdir(), SCRATCH_PREFIX));
@@ -783,12 +784,12 @@ test("scratch: no test body mints an unregistered temp dir", async () => {
   // Matches any quoted prefix, which the registrar (passing a const) does not
   // have. Comment lines are skipped and this line's own escaping keeps it from
   // matching itself, so neither the prose above nor the assertion self-flags.
-  // Ceiling: one line at a time, and a const prefix is the very thing that
-  // excludes the registrar, so that one shape cannot be closed here.
+  // Ceiling: a single-line textual match on one exact call form, so any other
+  // spelling passes.
   const call = /mkdtemp(?:Sync)?\(join\(tmpdir\(\),\s*["'`][^"'`]+["'`]\s*\)\)/;
   const raw = src.split("\n")
     .map((line, i) => [i + 1, line])
-    .filter(([, l]) => !l.trim().startsWith("//"))
+    .filter(([, l]) => !/^(\/\/|\/?\*)/.test(l.trim()))
     .filter(([, l]) => call.test(l))
     .map(([n]) => n);
   assert.deepEqual(raw, [],
