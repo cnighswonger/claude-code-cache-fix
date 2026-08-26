@@ -10,24 +10,19 @@
 // mutation-checked; it needed isolating, not deleting.
 //
 // node gives each FILE its own process, which is the whole mechanism.
-import { after, describe, it } from "node:test";
+
+// A private TMPDIR for this file, because the launchers spawned below write
+// under os.tmpdir(). First, so nothing reads one before it is set.
+import "./file-tmpdir.mjs";
+import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import net from "node:net";
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { OURS, cmdOf, freePort, listeners } from "./proc-helpers.mjs";
-import { tmpdir } from "node:os";
-
-// A PRIVATE TMPDIR FOR THE WHOLE FILE. Every launcher spawned here inherits
-// process.env, and the launcher writes cache-fix-proxy-<port>.sha256 under
-// os.tmpdir() on each spawn — so without this the run leaves those records in
-// the shared /tmp, one per spawn. Set once rather than at each spawn site: the
-// env is inherited, so this also covers sites added later.
-const FILE_TMP = mkdtempSync(join(tmpdir(), "ccf-so-"));
-process.env.TMPDIR = FILE_TMP;
 
 const here = dirname(fileURLToPath(import.meta.url));
 const launcherPath = join(here, "..", "bin", "claude-via-proxy.mjs");
@@ -243,7 +238,3 @@ describe("shutdown runs once per stop", () => {
     }
   });
 });
-
-// LAST, so it cannot delete the dir out from under a sweep that reaps ports
-// after the cases: node runs root hooks in registration order.
-after(() => { try { rmSync(FILE_TMP, { recursive: true, force: true }); } catch { /* gone */ } });

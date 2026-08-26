@@ -1,3 +1,6 @@
+// A private TMPDIR for this file, because the launchers spawned below write
+// under os.tmpdir(). First, so nothing reads one before it is set.
+import "./file-tmpdir.mjs";
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { withDeadline, exitWithin } from "./child-deadline.mjs";
@@ -37,13 +40,6 @@ function tempDir(prefix) {
   tempDirs.push(d);
   return d;
 }
-// A PRIVATE TMPDIR FOR THE WHOLE FILE, for the same reason the launcher-spawning
-// files carry one: runWrapper forks the wrapper with the inherited env, and the
-// launcher writes its scratch CA under os.tmpdir() — measured, 7
-// cache-fix-ca-scratch-* dirs left in the shared /tmp per run, collected by the
-// launcher's own reaper only after seven days.
-process.env.TMPDIR = tempDir("ccf-pw-");
-
 after(() => {
   for (const d of tempDirs) {
     try { rmSync(d, { recursive: true, force: true }); } catch { /* already gone */ }
