@@ -14,7 +14,6 @@ import { HOP_ENV, freePort, onPort } from "./proc-helpers.mjs";
 
 const LAUNCHER = fileURLToPath(new URL("../bin/claude-via-proxy.mjs", import.meta.url));
 const SRC = readFileSync(LAUNCHER, "utf-8");
-const rec = (port) => `${recordConst("RECORD_PREFIX")}${port}${recordConst("RECORD_SUFFIX")}`;
 
 // Brace-counted, not regex: a lazy match stops at an inner block's close and
 // yields a fragment that fails as a SyntaxError rather than a named assertion.
@@ -54,8 +53,6 @@ test("the reap is driven by the supervisor, and off its startup path", () => {
   assert.ok(!lift("function publishFingerprint(").includes("reapFingerprintRecords"),
             "publishFingerprint reaps, so it is skipped whenever publishing fails and " +
             "repeated on every respawn");
-  // Deferred: run inline the tmpdir scan delays the bind and destabilises the
-  // held-port suite. Nothing reads the result.
   assert.match(hold, /setTimeout\(reapFingerprintRecords, 0\)\.unref\(\)/,
                "the reap runs inline on the supervisor's startup path; a tmpdir scan " +
                "there delays the bind and destabilises the held-port suite");

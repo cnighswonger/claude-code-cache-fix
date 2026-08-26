@@ -2348,11 +2348,10 @@ if (remoteControl) {
     // unique; it guarantees nothing about what else shares a prefix, so the two
     // sites read one constant rather than two matching string literals.
     try {
-      const scratchAgeMs = REAP_AGE_MS;
       for (const f of readdirSync(tmpdir())) {
         if (!f.startsWith(SCRATCH_PREFIX)) continue;
         const p = join(tmpdir(), f);
-        try { if (Date.now() - statSync(p).mtimeMs > scratchAgeMs) rmSync(p, { recursive: true }); }
+        try { if (Date.now() - statSync(p).mtimeMs > REAP_AGE_MS) rmSync(p, { recursive: true }); }
         // Someone else's, already gone, or REFUSED (dir mode 0500, measured).
         // A survivor is litter under tmpdir() that nothing reads — unlike a
         // refused delete that leaves a live state armed, which would need code.
