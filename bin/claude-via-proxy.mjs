@@ -813,6 +813,11 @@ async function reapFingerprintRecords() {
         if (Date.now() - statSync(p).mtimeMs <= REAP_AGE_MS) continue;
         // Only a record answers to a port. A temp is nobody's to read.
         if (isRecord && !(await portFree(f.slice(RECORD_PREFIX.length, -RECORD_SUFFIX.length)))) continue;
+        // RE-READ: publishFingerprint renames a new record over this path, and the
+        // probe's await is wide enough to land inside. Losing a FRESH record makes
+        // runningOurCode() answer null, which holderVerdict() reads as an incumbent
+        // of ours and takeOver() reports as a deploy that has not landed.
+        if (Date.now() - statSync(p).mtimeMs <= REAP_AGE_MS) continue;
         rmSync(p);
       } catch { /* raced, gone, or refused; a survivor is disk, not correctness */ }
     }

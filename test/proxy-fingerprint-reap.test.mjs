@@ -4,7 +4,7 @@
 // asserted, so a rename fails the test instead of quietly testing nothing.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import net from "node:net";
@@ -31,7 +31,7 @@ function lift(decl) {
 
 // tmpdir() is rebound to the scratch dir, so the real temp directory is never
 // touched. Every callee comes with it.
-function runReaper(dir) {
+function runReaper(dir, statFn = statSync) {
   return new Function("readdirSync", "statSync", "rmSync", "join", "tmpdir", "net", "bindAddr",
     `const RECORD_PREFIX = ${JSON.stringify(recordConst("RECORD_PREFIX"))};\n` +
     `const RECORD_SUFFIX = ${JSON.stringify(recordConst("RECORD_SUFFIX"))};\n` +
@@ -41,7 +41,7 @@ function runReaper(dir) {
     `const REAP_AGE_MS = ${ageGate()};\n` +
     `${lift("function portFree(")}\n` +
     `${lift("async function reapFingerprintRecords()")}\nreturn reapFingerprintRecords();`
-  )(readdirSync, statSync, rmSync, join, () => dir, net, () => "127.0.0.1");
+  )(readdirSync, statFn, rmSync, join, () => dir, net, () => "127.0.0.1");
 }
 
 // Once per launcher process, not once per spawn, and not behind
@@ -134,6 +134,44 @@ test("onPort(0) selects nothing, and still selects on a real port", async () => 
       "onPort(0) selected a process carrying CACHE_FIX_PROXY_PORT=0; the sweep would SIGKILL the live proxy");
   } finally {
     for (const c of kids) { try { c.kill("SIGKILL"); } catch { /* gone */ } }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a record republished during the port probe is not reaped", async () => {
+  // stat -> age check -> AWAIT portFree() -> rm. Another launcher publishes by
+  // renaming `<record>.<pid>` over the record, and that await is wide enough to
+  // land inside: the unlink then takes a decision made about a file that is no
+  // longer there. Losing a FRESH record is not cosmetic -- runningOurCode()
+  // answers null for the port, holderVerdict() reads unknown as an incumbent of
+  // ours, and takeOver() exits 0 announcing a deploy that has not taken effect.
+  const dir = mkdtempSync(join(tmpdir(), "ccf-fpreap-race-"));
+  try {
+    const port = await freePort();
+    const rec = join(dir, `cache-fix-proxy-${port}.sha256`);
+    writeFileSync(rec, "stale");
+    const old = Date.now() / 1000 - 30 * 86400;
+    utimesSync(rec, old, old);
+
+    let republished = false;
+    const racingStat = (target, ...rest) => {
+      const st = statSync(target, ...rest);
+      if (!republished && String(target) === rec) {
+        republished = true;
+        const tmp = `${rec}.99999`;
+        writeFileSync(tmp, "fresh");
+        renameSync(tmp, rec);
+      }
+      return st;                       // the STALE stat the reaper decided on
+    };
+    await runReaper(dir, racingStat);
+
+    assert.ok(republished, "premise: the injected publish never fired");
+    assert.ok(existsSync(rec),
+              "the reaper unlinked a record republished during the port probe");
+    assert.equal(readFileSync(rec, "utf8"), "fresh",
+                 "a record survived, but it is not the republished one");
+  } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
