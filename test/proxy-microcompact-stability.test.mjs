@@ -1,8 +1,11 @@
-import { after, test } from "node:test";
+import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { existsSync, rmSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
+import { scratchDir } from "./scratch-registry.mjs";
 
 import ext, {
   matchesSentinelPattern,
@@ -12,22 +15,11 @@ import ext, {
   runMicrocompactStability,
 } from "../proxy/extensions/microcompact-stability.mjs";
 
-// A test body that throws never reaches its own cleanup, so every scratch dir is
-// registered here and removed once the file is done. Per dir, so one refused
-// removal cannot strand the rest.
-const scratch = [];
-// Load-bearing: a literal here instead would make the guard below flag mcTemp().
+// Registration lives in scratch-registry.mjs, which gates removal on the FILE's
+// outcome: a green run cleans up, a red one keeps the dirs and names them. A
+// test body that throws never reaches its own cleanup, which is the whole point.
 const SCRATCH_PREFIX = "mc-";
-async function mcTemp() {
-  const d = await mkdtemp(join(tmpdir(), SCRATCH_PREFIX));
-  scratch.push(d);
-  return d;
-}
-after(async () => {
-  for (const d of scratch) {
-    try { await rm(d, { recursive: true, force: true }); } catch { /* best effort */ }
-  }
-});
+const mcTemp = () => scratchDir(SCRATCH_PREFIX);
 
 // --- Fixture helpers ---
 
@@ -779,6 +771,54 @@ test("15. all sources missing → null", () => {
 
 // A dir minted outside mcTemp() is unregistered, so `after()` cannot remove it
 // and a throwing case strands it, with the suite green either way.
+// The lifecycle cannot be asserted in-process: the decision is taken on the way
+// out, after every hook this file could run. So it is measured through a real
+// child, both ways -- the passing arm is the control, without which "the dir is
+// there" would also be what a registry that never cleans anything looks like.
+test("scratch: a failing run keeps its scratch, a passing one does not", async () => {
+  const registry = new URL("./scratch-registry.mjs", import.meta.url).href;
+  const run = async (outcome) => {
+    const dir = await mcTemp();
+    const file = join(dir, `probe-${outcome}.test.mjs`);
+    await writeFile(file, `
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { scratchDir } from ${JSON.stringify(registry)};
+test("probe", async () => {
+  const d = await scratchDir("mcprobe-");
+  console.error("PROBE_DIR=" + d);
+  ${outcome === "fail" ? 'assert.fail("deliberate");' : "assert.ok(true);"}
+});
+`);
+    // NODE_TEST_CONTEXT is inherited, and the runner refuses to run files when it
+    // sees it ("run() is being called recursively"), so the child would report
+    // nothing and the case would fail on its own plumbing.
+    const env = { ...process.env };
+    delete env.NODE_TEST_CONTEXT;
+    const r = spawnSync(process.execPath, ["--test", file],
+                        { env, encoding: "utf8", timeout: 60_000 });
+    // STDOUT, not stderr: node:test captures a case's output and re-emits it on
+    // its own stream, so a child's `process.stderr.write` arrives here.
+    const out = `${r.stdout}${r.stderr}`;
+    const probe = /PROBE_DIR=(.*)/.exec(out)?.[1]?.trim();
+    assert.ok(probe, `the probe never reported its dir: ${out}`);
+    return { probe, status: r.status, out };
+  };
+
+  const failed = await run("fail");
+  assert.notEqual(failed.status, 0, "premise: the failing probe exited 0");
+  assert.ok(existsSync(failed.probe),
+    "a failing run deleted the scratch that is the only record of what it was looking at");
+  assert.match(failed.out, /\[scratch kept\]/,
+    "the dir was kept and never named — the caller cannot find it");
+  rmSync(failed.probe, { recursive: true, force: true });
+
+  const passed = await run("pass");
+  assert.equal(passed.status, 0, "premise: the passing probe did not pass");
+  assert.ok(!existsSync(passed.probe),
+    "a passing run left its scratch behind — the registry cleans nothing");
+});
+
 test("scratch: no test body mints an unregistered temp dir", async () => {
   const src = await readFile(new URL(import.meta.url), "utf8");
   // Matches any quoted prefix, which the registrar (passing a const) does not
@@ -796,5 +836,13 @@ test("scratch: no test body mints an unregistered temp dir", async () => {
     .map(([n]) => n);
   assert.deepEqual(raw, [],
     `every temp dir must go through mcTemp(); raw mkdtemp at line(s): ${raw.join(", ")}`);
-  assert.ok(scratch.length > 0, "premise: this file does mint temp dirs");
+  // POSITIVE CONTROL. Without it the pattern can be neutered -- a typo, a
+  // rename, anything -- and this case stays green over a file it no longer
+  // matches. Assembled from pieces so the sample itself is not a mint on this
+  // line for the pattern above to find.
+  const sample = ["mkdtemp", "(join(tmpdir(), ", '"x-"))'].join("");
+  assert.ok(call.test(sample), "the pattern no longer matches a raw mint");
+  // The premise is a SOURCE count, not a runtime array: the registration moved
+  // out of this file, so a runtime one would now be empty here and read green.
+  assert.ok(src.split("mcTemp(").length - 1 > 1, "premise: this file does mint temp dirs");
 });
