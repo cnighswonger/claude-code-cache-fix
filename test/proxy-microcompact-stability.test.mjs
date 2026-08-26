@@ -780,11 +780,15 @@ test("15. all sources missing → null", () => {
 // and a throwing case strands it, with the suite green either way.
 test("scratch: no test body mints an unregistered temp dir", async () => {
   const src = await readFile(new URL(import.meta.url), "utf8");
-  // Matches only a literal prefix, so the registrar (which passes a const) is not
-  // a special case, and the escaping keeps this line from matching itself.
-  const call = /mkdtemp(?:Sync)?\(join\(tmpdir\(\),\s*"[^"]+"\s*\)\)/;
+  // Matches any quoted prefix, which the registrar (passing a const) does not
+  // have. Comment lines are skipped and this line's own escaping keeps it from
+  // matching itself, so neither the prose above nor the assertion self-flags.
+  // Ceiling: one line at a time, and a const prefix is the very thing that
+  // excludes the registrar, so that one shape cannot be closed here.
+  const call = /mkdtemp(?:Sync)?\(join\(tmpdir\(\),\s*["'`][^"'`]+["'`]\s*\)\)/;
   const raw = src.split("\n")
     .map((line, i) => [i + 1, line])
+    .filter(([, l]) => !l.trim().startsWith("//"))
     .filter(([, l]) => call.test(l))
     .map(([n]) => n);
   assert.deepEqual(raw, [],
