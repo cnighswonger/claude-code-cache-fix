@@ -1695,4 +1695,132 @@ describe("SIGTERM exit code", () => {
     }
   });
 
+  // A DRAIN MUST NOT KEEP THE ADDRESS. The release announcement goes out before
+  // the drain, and a holder settles on it, so from that line the port has to be
+  // free for whoever takes it next. `http.Server.close()` runs the idle sweep
+  // that severs a finished-but-unflushed reply, so the unbind was deferred
+  // behind that reply -- and the deferral takes the LISTENING socket with it.
+  it("unbinds the port on a stop even while a reply is still flushing", async () => {
+    const SIZE = 16 * 1024 * 1024;
+    const upstream = http.createServer((q, r) => {
+      q.resume();
+      r.writeHead(200, { "content-type": "application/octet-stream",
+                         "content-length": String(SIZE) });
+      r.end(Buffer.alloc(SIZE, 0x61));          // ignores backpressure
+    });
+    await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
+    const { proc, port, stderr } = startProxy({
+      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upstream.address().port}`,
+      // The held arm, so the drain has no ceiling to end it early: this case is
+      // about the unbind, not about how long the drain runs.
+      CACHE_FIX_HELD_BY: String(process.pid),
+      CACHE_FIX_DRAIN_MS: "60000",
+    });
+    try {
+      const p = await port;
+      let got = 0, declared = -1, ended = false, resObj = null;
+      const req = http.request(
+        { host: "127.0.0.1", port: p, path: "/v1/messages", method: "POST",
+          headers: { "content-type": "application/json" } },
+        (res) => {
+          resObj = res;
+          declared = parseInt(res.headers["content-length"] ?? "-1", 10);
+          res.pause();                          // let the bytes queue on the proxy
+          res.on("data", (b) => { got += b.length; });
+          res.on("end", () => { ended = true; });
+          res.on("error", () => {});
+        });
+      req.on("error", () => {});
+      req.end(JSON.stringify({ model: "x", messages: [] }));
+
+      const upTo = Date.now() + 15_000;
+      while (declared < 0 && Date.now() < upTo) await new Promise((r) => setTimeout(r, 50));
+      assert.ok(declared > 0, "premise: the proxy never answered, so nothing is flushing");
+      // Long enough for the whole body to reach the proxy and for it to call
+      // end() with the client still not reading.
+      await new Promise((r) => setTimeout(r, 1_500));
+
+      proc.kill("SIGHUP");
+      await new Promise((r) => setTimeout(r, 3_000));
+
+      const state = await new Promise((res) => {
+        const s = net.connect(p, "127.0.0.1");
+        s.on("connect", () => { s.destroy(); res("still listening"); });
+        s.on("error", (e) => res(e.code));
+        setTimeout(() => { try { s.destroy(); } catch {} res("timeout"); }, 2_000);
+      });
+      assert.equal(state, "ECONNREFUSED",
+        `the port was ${state} 3s after the stop announced it had released the ` +
+        `listening socket. The unbind is deferred behind a reply that cannot flush, ` +
+        `so the address stays held for the whole drain budget -- 30 minutes by ` +
+        `default -- and the dying proxy goes on ACCEPTING requests it will cut. ` +
+        `stderr:\n${stderr()}`);
+
+      // AND THE REPLY SURVIVED IT. Unbinding by severing passes the assertion
+      // above and is the defect the deferral was introduced to fix.
+      resObj?.resume();
+      const t0 = Date.now();
+      while (!ended && Date.now() - t0 < 25_000) await new Promise((r) => setTimeout(r, 100));
+      assert.equal(got, declared,
+        `the unbind severed a finished-but-unflushed reply: the client received ` +
+        `${got} of a declared ${declared} bytes. stderr:\n${stderr()}`);
+    } finally {
+      try { proc.kill("SIGKILL"); } catch {}
+      upstream.close();
+    }
+  });
+
+  // `quiet` IS THE FIELD THAT SAYS WHETHER A CUT MATTERED, so it must not report
+  // a live reply as silent. The stall loop runs on the handover arm only; with no
+  // record the forced close dates a connection from ARRIVAL, which is its whole
+  // age rather than the time it had been silent.
+  it("a forced close reports silence, not the age of the request", async () => {
+    const upstream = http.createServer((q, r) => {
+      q.resume();
+      r.writeHead(200, { "content-type": "text/event-stream" });
+      let i = 0;
+      const t = setInterval(() => { try { r.write(`data: ${++i}\n\n`); } catch {} }, 200);
+      r.on("close", () => clearInterval(t));
+    });
+    await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
+    const { proc, port, stderr } = startProxy({
+      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upstream.address().port}`,
+      CACHE_FIX_HELD_BY: "",            // the standalone arm: a 5s ceiling, no stall loop
+    });
+    try {
+      const p = await port;
+      let chunks = 0, lastAt = 0;
+      const req = http.request(
+        { host: "127.0.0.1", port: p, path: "/v1/messages", method: "POST",
+          headers: { "content-type": "application/json" } },
+        (res) => { res.on("data", () => { chunks++; lastAt = Date.now(); });
+                   res.on("error", () => {}); });
+      req.on("error", () => {});
+      req.end(JSON.stringify({ model: "x", messages: [], stream: true }));
+
+      while (chunks < 3) await new Promise((r) => setTimeout(r, 50));
+      // OLDER THAN THE CEILING BY A MARGIN, and never silent for a moment of it.
+      // A young request cannot tell the two readings apart.
+      await new Promise((r) => setTimeout(r, 12_000));
+      assert.ok(Date.now() - lastAt < 2_000,
+        "premise: the fixture stopped streaming on its own, so there is a real silence");
+
+      proc.kill("SIGTERM");
+      await new Promise((r) => proc.once("exit", r));
+
+      const line = stderr().match(/shutdown: forcing close.*/)?.[0] ?? "";
+      assert.ok(line, `no forced-close line at all. stderr:\n${stderr()}`);
+      const quiet = Number(/quiet ([0-9.]+)/.exec(line)?.[1]);
+      assert.ok(Number.isFinite(quiet), `the line carries no quiet figure: ${line}`);
+      assert.ok(quiet < 6,
+        `a reply delivering a chunk every 200ms was reported as quiet ${quiet}s. ` +
+        `That is its AGE, not its silence, and it reads as "the cut took a reply ` +
+        `that was already dead" about the one case the drain exists to protect. ` +
+        `Got: ${line}`);
+    } finally {
+      try { proc.kill("SIGKILL"); } catch {}
+      upstream.close();
+    }
+  });
+
 });

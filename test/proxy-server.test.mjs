@@ -874,14 +874,18 @@ describe("close() after an external server.close()", () => {
     const handle = await startProxy({ port: 0, watch: false });
     const boom = new Error("disk on fire");
     boom.code = "EIO";
-    const real = handle.server.close.bind(handle.server);
-    handle.server.close = (cb) => cb(boom);
+    // `_unbind`, NOT `close`. The unbind goes through net's close so the http
+    // layer's idle sweep cannot sever a reply that is still flushing (see
+    // createProxyServer), and a stub on `close` is no longer on that path -- it
+    // would leave this case asserting against a function nobody calls.
+    const real = handle.server._unbind;
+    handle.server._unbind = (cb) => cb(boom);
     try {
       await assert.rejects(() => handle.close(), /disk on fire/,
         "the ERR_SERVER_NOT_RUNNING exemption swallowed a genuine close failure");
     } finally {
       // The stub never closed anything, so the listener is still up.
-      handle.server.close = real;
+      handle.server._unbind = real;
       await new Promise((r) => real(r));
     }
   });

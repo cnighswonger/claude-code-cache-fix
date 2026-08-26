@@ -1,4 +1,5 @@
 import http from "node:http";
+import net from "node:net";
 import { createHash } from "node:crypto";
 import https from "node:https";
 import { pathToFileURL, URL } from "node:url";
@@ -764,6 +765,10 @@ export function createProxyServer() {
   // before unbinding; it lives here so there is one spelling of the question.
   srv._unflushed = () =>
     [...live].filter((r) => r.writableEnded && !r.writableFinished).length;
+  // UNBIND WITHOUT THE IDLE SWEEP. `http.Server.close()` runs the sweep first and
+  // the sweep is what severs an unflushed reply; net's close only stops
+  // accepting. Both close paths go through here, so the unbind never waits.
+  srv._unbind = (cb) => net.Server.prototype.close.call(srv, cb);
   srv._draining = false;
   return srv;
 }
@@ -1178,25 +1183,31 @@ export async function startProxy(options = {}) {
         // unhandled-rejection report to it. Both callbacks fire on the same
         // 'close' event, after the drain, so resolving is the true answer.
         // Measured through this proxy: 4,217,623 bytes delivered of a declared
-        // 16,777,216, with `drained clean` printed for it. Discriminated on
-        // plain Node -- no close 100%, close() alone 6.2%, close() plus the idle
-        // sweep 6.2% -- so the agent is close(), not closeIdleConnections().
-        // No timer of its own: the drain's budget and forced-close backstop
-        // already bound this.
-        const closeNow = () => {
-        server.close((err) => (err && err.code !== "ERR_SERVER_NOT_RUNNING" ? reject(err) : resolve()));
+        // 16,777,216, with `drained clean` printed for it. The agent is the IDLE
+        // SWEEP, which `http.Server.close()` runs BEFORE it unbinds: Node counts a
+        // reply whose end() has been CALLED as idle. Discriminated on plain Node,
+        // four arms -- no close 100%, http close() 24.9%, http close() plus an
+        // explicit sweep 24.9%, net close() 100%, all four refusing new
+        // connections after. The three-arm version of this could not separate the
+        // two because every arm that closed also swept.
+        //
+        // So the unbind is free and only the sweep waits. Deferring the unbind
+        // instead holds the LISTENING socket for the whole drain -- and the
+        // release is announced before the drain, with a holder settling on it.
+        server._unbind((err) => (err && err.code !== "ERR_SERVER_NOT_RUNNING" ? reject(err) : resolve()));
         // NODE 18 DOES NOT DO THIS FOR US, and ba2375b silently assumed it did.
         // From 19 on, close() closes idle keep-alives itself; 18.20.8 does not --
         // measured, close never fires where 20.20.2 and 24.11.1 report 1-2 ms.
         // Optional-call because engines is ">=18" and closeIdleConnections
         // landed in 18.2.
-        server.closeIdleConnections?.();
-        };
-        if (server._unflushed() === 0) return closeNow();
+        //
+        // THE SWEEP IS THE ONLY HALF THAT WAITS, because it is the only half that
+        // severs.
+        if (server._unflushed() === 0) return server.closeIdleConnections?.();
         const flushTick = setInterval(() => {
           if (server._unflushed() > 0) return;
           clearInterval(flushTick);
-          closeNow();
+          server.closeIdleConnections?.();
         }, 50);
         flushTick.unref?.();
       }),
@@ -1789,18 +1800,10 @@ if (invokedAsScript) {
         process.stderr.write(`[cache-fix] successor spawn failed (${err?.code || err?.message})\n`);
       }
     }
-    // Same guard as `close` above: guarding one path alone leaves the other
-    // to sever. Deferring the unbind is safe -- on a handover the successor
-    // already holds the socket, on a stop the drain budget bounds it.
-    if (active.server?._unflushed?.() === 0) active.server.close?.();
-    else {
-      const t = setInterval(() => {
-        if (active.server?._unflushed?.() > 0) return;
-        clearInterval(t);
-        active.server.close?.();
-      }, 50);
-      t.unref?.();
-    }
+    // AT THE NET LAYER, so the announcement below is true and nothing is severed
+    // to make it true. `close` above carries the discrimination; the sweep this
+    // skips is run there, once, behind the flush.
+    active.server?._unbind?.();
     // SAY WHO STARTED THE SUCCESSOR. The holder reads this line as "reclaim the
     // port and spawn", so a proxy that already spawned must say so or the two
     // of us put two proxies on one socket — measured, one extra per deploy:
@@ -1964,10 +1967,18 @@ if (invokedAsScript) {
         // Already ended by the stall test. It is still here only because its FIN
         // cannot flush, and counting it again reports one connection twice in a
         // line an external monitor parses.
-        if (seen.get(res)?.done) continue;
+        const rec = seen.get(res);
+        if (rec?.done) continue;
         const r = routeOf(res);
         routes.set(r, (routes.get(r) ?? 0) + 1);
-        quietMs.push(nowAt - (seen.get(res)?.at ?? res._bornAt ?? nowAt));
+        // NO RECORD MEANS THE STALL LOOP NEVER RAN -- the supervised arm -- not
+        // that nothing ever moved. Dating from arrival there reports a reply's
+        // AGE as its silence: measured, `quiet 17.5s` for one delivering a chunk
+        // every 200ms, which reads as a cut that took something already dead.
+        // Resolution on that arm is the budget: a reply that stalled mid-drain
+        // reads 0, erring toward calling the cut costly rather than free.
+        const moved = (res.socket?.bytesWritten ?? 0) !== (res._bornBytes ?? 0);
+        quietMs.push(nowAt - (rec?.at ?? (moved ? nowAt : res._bornAt ?? nowAt)));
         try { if (res.headersSent) { res.end(); ended++; } else { res.destroy(); destroyed++; } } catch {}
       }
       const routeTally = [...routes].sort((a, b) => b[1] - a[1])
