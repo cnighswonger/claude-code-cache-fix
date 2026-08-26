@@ -16,8 +16,9 @@ import ext, {
 // registered here and removed once the file is done. Per dir, so one refused
 // removal cannot strand the rest.
 const scratch = [];
+const SCRATCH_PREFIX = "mc-";
 async function mcTemp() {
-  const d = await mkdtemp(join(tmpdir(), "mc-"));
+  const d = await mkdtemp(join(tmpdir(), SCRATCH_PREFIX));
   scratch.push(d);
   return d;
 }
@@ -779,10 +780,12 @@ test("15. all sources missing → null", () => {
 // and a throwing case strands it, with the suite green either way.
 test("scratch: no test body mints an unregistered temp dir", async () => {
   const src = await readFile(new URL(import.meta.url), "utf8");
-  const call = /mkdtemp(?:Sync)?\(join\(tmpdir\(\),\s*"[^"]+"\s*\)\)/;  // escaped: cannot match its own line
+  // Matches only a literal prefix, so the registrar (which passes a const) is not
+  // a special case, and the escaping keeps this line from matching itself.
+  const call = /mkdtemp(?:Sync)?\(join\(tmpdir\(\),\s*"[^"]+"\s*\)\)/;
   const raw = src.split("\n")
     .map((line, i) => [i + 1, line])
-    .filter(([, l]) => call.test(l) && !l.includes("const d = await mkdtemp"))  // the registrar
+    .filter(([, l]) => call.test(l))
     .map(([n]) => n);
   assert.deepEqual(raw, [],
     `every temp dir must go through mcTemp(); raw mkdtemp at line(s): ${raw.join(", ")}`);
