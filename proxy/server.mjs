@@ -623,6 +623,17 @@ async function handlePassthrough(clientReq, clientRes) {
 // target reaches handlePassthrough un-normalised, so the raw request-target
 // renders as `/http:/user:pass@host` -- a credential, in the log, from the rule
 // written to keep credentials out of it.
+// `Number(x) || fallback` is wrong in both directions for a millisecond budget:
+// it discards an explicit 0, which asks to cut now, and it passes a NEGATIVE
+// through. A negative stall budget makes `now - rec.at < stallMs` false on the
+// first tick, ending every owed connection at once -- the guillotine this drain
+// replaced, one typo away.
+export function drainBudgetMs(raw, fallback) {
+  if (raw === undefined || raw === "") return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
 export function drainRoute(url) {
   if (typeof url !== "string") return "?";
   const abs = parseAbsoluteForm(url);
@@ -1861,7 +1872,7 @@ if (invokedAsScript) {
     // instead of for 5s, which is the downtime the ceiling was bought with.
     const unwaited = handedOff || handoverRelease || heldByLiveHolder;
     const budgetMs = unwaited
-      ? (Number(process.env.CACHE_FIX_DRAIN_MS) || 1_800_000)
+      ? drainBudgetMs(process.env.CACHE_FIX_DRAIN_MS, 1_800_000)
       : 5_000;
     // TIME THE DRAIN THAT FINISHED, not only the one that was cut.
     // 6d6f01d set a 1800s handover budget with no way to see how close anything
@@ -2072,7 +2083,7 @@ if (invokedAsScript) {
       // MARGIN you have, and only n does that. Every sample under 2s came from
       // quiet hosts. Below ~60s is inside the observed range of a healthy
       // stream, so anything there cuts live work.
-      const stallMs = Number(process.env.CACHE_FIX_DRAIN_STALL_MS) || 90_000;
+      const stallMs = drainBudgetMs(process.env.CACHE_FIX_DRAIN_STALL_MS, 90_000);
       // Polled off the socket rather than stamped on every write: the hot path
       // pays nothing, and `bytesWritten` is the byte actually leaving rather than
       // a chunk we parsed. It is also the only thing that separates a reply that

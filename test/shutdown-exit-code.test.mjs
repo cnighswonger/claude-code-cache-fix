@@ -5,7 +5,7 @@ import net from "node:net";
 import http from "node:http";
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { drainRoute, forcedCloseLine } from "../proxy/server.mjs";
+import { drainBudgetMs, drainRoute, forcedCloseLine } from "../proxy/server.mjs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -1123,8 +1123,12 @@ describe("SIGTERM exit code", () => {
 
     const pick = (handedOff, handoverRelease, heldByLiveHolder, env) => {
       // eslint-disable-next-line no-new-func
+      // The REAL helper, injected rather than re-implemented: the lifted line
+      // calls it, and a copy here would let the two drift into agreeing about
+      // a budget the server does not actually use.
       return Function("handedOff", "handoverRelease", "heldByLiveHolder", "process",
-        `${expr} return budgetMs;`)(handedOff, handoverRelease, heldByLiveHolder, { env });
+        "drainBudgetMs", `${expr} return budgetMs;`)(
+          handedOff, handoverRelease, heldByLiveHolder, { env }, drainBudgetMs);
     };
     assert.equal(pick(false, false, false, {}), 5_000,
       "a STANDALONE stop no longer uses the 5s it was measured for. With no holder " +
@@ -1245,6 +1249,22 @@ describe("SIGTERM exit code", () => {
         `an authority-first target rendered into the log: ${drainRoute(target)}`);
     }
     assert.equal(drainRoute("/a/b/c/d"), "/a/b", "the tally must stay two segments deep");
+  });
+
+  it("a drain budget refuses a value that would cut live work", () => {
+    // `Number(x) || fallback` is wrong in BOTH directions here: it discards an
+    // explicit 0 and it passes a negative straight through. A negative stall
+    // budget makes `now - rec.at < stallMs` false on the first tick, so every
+    // owed connection ends at once -- the guillotine this drain replaced,
+    // reachable from one typo in an env file.
+    assert.equal(drainBudgetMs(undefined, 90_000), 90_000);
+    assert.equal(drainBudgetMs("", 90_000), 90_000);
+    assert.equal(drainBudgetMs("abc", 90_000), 90_000);
+    assert.equal(drainBudgetMs("-1", 90_000), 90_000,
+      "a negative budget cuts every owed connection on the first tick");
+    assert.equal(drainBudgetMs("0", 90_000), 0,
+      "an explicit zero asks to cut now; it is not an absent setting");
+    assert.equal(drainBudgetMs("30000", 90_000), 30_000);
     assert.equal(drainRoute(undefined), "?");
   });
 
