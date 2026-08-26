@@ -753,10 +753,8 @@ function codeFingerprint(root) {
   } catch { return ""; }
 }
 
-// The writer and the reaper below must name the same thing, so they read one
-// constant. Deriving the reaper's prefix from this path instead is not
-// portable: the separator is not "/" everywhere, and readdirSync yields
-// basenames.
+// One constant, because the reaper matches the basenames readdirSync() yields
+// and cannot derive the prefix from a joined path.
 const RECORD_PREFIX = "cache-fix-proxy-";
 
 function fingerprintPath(port) {
@@ -775,19 +773,15 @@ function publishFingerprint(port) {
   } catch { /* best effort: an unwritable tmpdir must not stop a proxy starting */ }
 }
 
-// Nothing else removes these. The port is ephemeral wherever the OS picks one,
-// so without this a record accumulates per proxy start without bound, and every
-// later scan of tmpdir pays for the ones already there.
+// Nothing else removes these, and the port is ephemeral wherever the OS picks
+// one, so a record accumulates per proxy start without bound.
 //
-// A PORT THAT STILL ANSWERS OUTRANKS THE CLOCK, because nothing republishes a
-// record: one call site, the spawn path, so the mtime is the last child spawn.
-// Age alone would therefore make the gate a deadline rather than a margin — a
-// holder that neither respawns nor is redeployed for a week is fully live with
-// an over-age record, and deleting it makes runningOurCode() answer null, which
-// ends in takeOver() exiting 0 while announcing a deploy that has not taken
-// effect.
+// A PORT THAT STILL ANSWERS OUTRANKS THE CLOCK. Nothing republishes a record —
+// its mtime is the last child spawn — so age alone reaps the record of a holder
+// that has merely been up a week. runningOurCode() then answers null and
+// takeOver() exits 0 announcing a deploy that has not taken effect.
 //
-// Seven days on top, matching the scratch-CA reaper, to bound what a crashed
+// Seven days on top, matching the scratch-CA reaper, bounds what a crashed
 // holder leaves behind on a port nobody rebinds.
 async function reapFingerprintRecords() {
   const recordAgeMs = 7 * 86_400_000;
@@ -804,31 +798,19 @@ async function reapFingerprintRecords() {
   } catch { /* unreadable tmpdir: publishing already degraded, say nothing more */ }
 }
 
-// ASKED BY BINDING, NOT BY lsof. holderPidOn needs a PID and so has to shell
-// out; this needs one bit and the kernel answers it directly, which keeps the
-// reap working on a host with no lsof — otherwise the leak fix is a silent
-// no-op exactly where nobody would look for it. A name whose port is not a
-// number is not ours to judge, so it is kept.
+// ASKED BY BINDING, NOT BY lsof: holderPidOn needs a pid and has to shell out,
+// this needs one bit, and a host without lsof would otherwise make the reap a
+// silent no-op. A name whose port is not a number is not ours to judge.
 //
-// It answers "is anything LISTENING", which is not the same as "is anyone using
-// this port". Two consequences, both narrow and neither silent:
+// "Is anything LISTENING" is not "is anyone using this port", and the gap cuts
+// both ways. A holder in the bound-but-not-listening state this file creates on
+// purpose reads as free, so an over-age record can be lost in the window before
+// its relay takes over, which ends in the announced exit 0 above. And this probe
+// is itself a listener while it asks, so a launcher running otherHolderOn()
+// concurrently can read it as an incumbent; that window is the bind's lifetime.
 //
-// A holder in the bound-but-not-listening state this file creates on purpose
-// reads as free, so a record could be reaped during the window before its relay
-// takes over. The window has not been measured for the relay specifically; the
-// ~80 ms nearby belongs to the proxy child's boot, which is a larger spawn.
-// Losing a record there ends in the announced exit 0 above.
-//
-// And this probe IS a listener while it asks. A launcher starting concurrently
-// runs otherHolderOn(), which selects on a LISTEN socket plus a run-service
-// command line plus greater uptime — a peer mid-probe can satisfy those and be
-// read as an incumbent. Bounded by the bind lifetime, under 59 µs per record.
-//
-// Serialized, and it does not yield: measured at 3,000 over-age records the loop
-// held the event loop for 176 ms. listen and close resolve on nextTick, so the
-// await never reaches the poll phase. It runs after the bind, so it delays no
-// listener — but budget roughly 60 ms per 1,000 eligible records before calling
-// it free.
+// The loop does not yield: listen and close resolve on nextTick, so the await
+// never reaches the poll phase. It runs after the bind and delays no listener.
 function portFree(port) {
   const n = Number(port);
   if (!Number.isInteger(n) || n < 1 || n > 65535) return Promise.resolve(false);
@@ -888,14 +870,10 @@ function holdPort(rest) {
     s.on("error", () => { /* the reader left; putting the proxy back is the job */ });
   }
   // Here, not in publishFingerprint: that returns early when the fingerprint is
-  // unreadable, which would stop reaping exactly when publishing is broken, and
-  // it runs on every respawn. Deferred because the scan walks the whole tmpdir
-  // and would delay the bind; nothing waits on its result. unref so it cannot
-  // hold the process open.
-  //
-  // The idempotent exits below settle before the timers phase and so never reap,
-  // but they publish nothing either: a launcher that leaves a record is one that
-  // reaps.
+  // unreadable, which would stop the reap exactly when publishing is broken, and
+  // it runs on every respawn. Deferred and unref'd because the scan walks the
+  // whole tmpdir, nothing waits on its result, and it must neither delay the
+  // bind nor hold the process open.
   setTimeout(reapFingerprintRecords, 0).unref();
   // The proxy's own default: holding a different port than the proxy would have
   // served leaves nothing at the documented address.
