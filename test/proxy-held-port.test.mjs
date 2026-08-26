@@ -67,6 +67,12 @@ const health = (port) => new Promise((res) => {
   }).on("error", (e) => res(`ERR:${e.code}`));
 });
 
+// THE ONE TEST FOR "the holder is up", because 200 alone does not say who
+// answered. takePort() releases the port before the launcher binds it and every
+// worker draws ephemeral ports from one pool, so anything a sibling stands up on
+// 127.0.0.1:0 can be handed the same number and answer this probe.
+const readyBody = (b) => { try { return JSON.parse(b)?.status === "ok"; } catch { return false; } };
+
 const usedPorts = [];
 // The shared allocator plus this file's own cleanup registry — the registry is
 // file-local (its after() hook sweeps it), the allocation is not.
@@ -166,6 +172,21 @@ describe("held port (CACHE_FIX_HOLD_PORT)", { concurrency: CONCURRENCY }, () => 
     assert.equal(classify(await health(1)), OUTAGE.REFUSED,
                  "the forced-kill case's refusal count is empty whatever happens");
   });
+
+  // 200 IS NOT READINESS, AND THE PORT IS NOT OURS UNTIL THE HOLDER HAS IT.
+  // freePort() releases the port before the launcher binds it, and a sibling
+  // worker binding 0 draws from the same pool. Two files stand up a stand-in
+  // release channel that answers ANY path with 200 and a bare version string,
+  // and a version string is a JSON number followed by a dot: readiness that
+  // accepts any 200 hands it to JSON.parse and the holder's case dies for a
+  // neighbour's fixture, at whichever case lost the race.
+  it("a 200 that is not the proxy's health JSON is not readiness", () => {
+    assert.equal(readyBody('{"status":"ok"}'), true);
+    assert.equal(readyBody("2.1.222"), false, "a release channel's 200 read as readiness");
+    assert.equal(readyBody("ERR:ECONNREFUSED"), false);
+    assert.equal(readyBody('{"status":"degraded"}'), false);
+    assert.equal(readyBody(""), false);
+  });
 // The default is declared in proxy/config.mjs and repeated in the launcher.
 // If they drift, an unset CACHE_FIX_PROXY_PORT binds one port while callers
 // dial the other.
@@ -259,16 +280,13 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
   try {
     const up = Date.now() + 20_000;
     let body = await get();
-    while (body.startsWith("ERR:") && Date.now() < up) body = await get();
-    // THE LAST BODY RIDES ALONG. Without it a 200 from something that is not our
-    // proxy dies as a bare SyntaxError with the responder unrecoverable from the
-    // log, and a readiness timeout dies with no clue either. Same rule the probes
-    // in this file already follow.
-    let ready;
-    try { ready = JSON.parse(body); }
-    catch { assert.fail(`the held port never answered with the proxy's health JSON; ` +
-                        `last body was ${JSON.stringify(body.slice(0, 160))}`); }
-    assert.equal(ready.status, "ok", "the held port never came up");
+    // KEEP POLLING, do not fail on the first 200: a squatter holds the port for
+    // the width of its own fixture, and the holder takes it back. Failing here
+    // reds this case for a neighbour's server. THE LAST BODY RIDES ALONG so a
+    // real timeout still names whoever answered.
+    while (!readyBody(body) && Date.now() < up) body = await get();
+    assert.ok(readyBody(body), `the held port never answered with the proxy's health JSON; ` +
+                               `last body was ${JSON.stringify(String(body).slice(0, 160))}`);
     await fn({ get, killProxy, proxyPid, launcher, exited, port });
   } finally {
     // SIGTERM first: SIGKILL cannot be forwarded, so the proxy would outlive
@@ -793,8 +811,9 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         killProxy();
         const deadline = Date.now() + 20_000;
         let body = await get();
-        while (body.startsWith("ERR:") && Date.now() < deadline) body = await get();
-        assert.equal(JSON.parse(body).status, "ok", "the port did not come back under run-service");
+        while (!readyBody(body) && Date.now() < deadline) body = await get();
+        assert.ok(readyBody(body), `the port did not come back under run-service; last body ` +
+                                   `was ${JSON.stringify(String(body).slice(0, 160))}`);
       }, { subcommand: "run-service", extraEnv: { CACHE_FIX_HOLD_PORT: "" } });
     });
 
@@ -923,11 +942,9 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       const port = await freePort();
       const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port), CACHE_FIX_FORWARD_PROXY: "on" };
       for (const k of [...HOP_ENV, "LISTEN_FDS", "LISTEN_PID"]) delete env[k];
-      // 200 OR IT IS NOT THE PROXY. A standby relay carrying this address answers
-      // /health with a 503 and a JSON body of its own, and a helper that returned
-      // any body let a readiness loop finish on it — measured, `JSON.parse(body)
-      // .status` came back undefined against a relay that was working perfectly.
-      // The body rides along on a failure for the reason withHeldPort's does.
+      // 200 OR IT IS NOT THE PROXY: a standby relay carrying this address answers
+      // /health with a 503 and a JSON body of its own. readyBody() is the test;
+      // the body rides along on a failure for the reason withHeldPort's does.
       const get = () => new Promise((res) => {
         http.get({ host: "127.0.0.1", port, path: "/health", timeout: 3_000 }, (r) => {
           let b = ""; r.on("data", (d) => (b += d));
@@ -938,8 +955,9 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       try {
         const up = Date.now() + 15_000;
         let body = await get();
-        while (body.startsWith("ERR:") && Date.now() < up) body = await get();
-        assert.equal(JSON.parse(body).status, "ok", "the holder never came up");
+        while (!readyBody(body) && Date.now() < up) body = await get();
+        assert.ok(readyBody(body), `the holder never came up; last body was ` +
+                                   `${JSON.stringify(String(body).slice(0, 160))}`);
 
         // SIGKILL, the shape a supervisor cannot catch: OOM, container stop, kill -9.
         first.kill("SIGKILL");
@@ -1072,11 +1090,9 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port), CACHE_FIX_FORWARD_PROXY: "on",
                     CACHE_FIX_SELF_HEAL: "off" };
       for (const k of [...HOP_ENV, "LISTEN_FDS", "LISTEN_PID", "CACHE_FIX_HOLD_PORT"]) delete env[k];
-      // 200 OR IT IS NOT THE PROXY. A standby relay carrying this address answers
-      // /health with a 503 and a JSON body of its own, and a helper that returned
-      // any body let a readiness loop finish on it — measured, `JSON.parse(body)
-      // .status` came back undefined against a relay that was working perfectly.
-      // The body rides along on a failure for the reason withHeldPort's does.
+      // 200 OR IT IS NOT THE PROXY: a standby relay carrying this address answers
+      // /health with a 503 and a JSON body of its own. readyBody() is the test;
+      // the body rides along on a failure for the reason withHeldPort's does.
       const get = () => new Promise((res) => {
         http.get({ host: "127.0.0.1", port, path: "/health", timeout: 3_000 }, (r) => {
           let b = ""; r.on("data", (d) => (b += d));
@@ -1089,8 +1105,9 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       try {
         const up = Date.now() + 15_000;
         let body = await get();
-        while (body.startsWith("ERR:") && Date.now() < up) body = await get();
-        assert.equal(JSON.parse(body).status, "ok", "nothing served the port");
+        while (!readyBody(body) && Date.now() < up) body = await get();
+        assert.ok(readyBody(body), `nothing served the port; last body was ` +
+                                   `${JSON.stringify(String(body).slice(0, 160))}`);
 
         // TRAFFIC ACROSS THE TAKEOVER, started before the taker exists — the
         // whole window is between the incumbent letting go and the new child
@@ -1288,7 +1305,10 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         's.listen({ fd }, () => process.stdout.write("proxy listening on 127.0.0.1:0\\n"));\n',
         async ({ launcher, port }) => {
           const get = () => health(port);
-          const up = Date.now() + 10_000;
+          // 20 s, the budget every other case here gives a launcher-spawned child
+          // to start serving. 10 s was this file's outlier and it expired on a
+          // loaded box while the case itself costs 3.3 s quiet.
+          const up = Date.now() + 20_000;
           while (Date.now() < up && (await get()) !== 200) await new Promise((r) => setTimeout(r, 50));
           assert.equal(await get(), 200, "the stand-in never came up behind the holder");
 
