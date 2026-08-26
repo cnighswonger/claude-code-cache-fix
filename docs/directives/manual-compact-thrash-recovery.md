@@ -1,8 +1,8 @@
 # Directive: `manual-compact.sh --thrash-recovery` mode
 
-Status: DRAFT (directive stage — AITL scope, awaiting Proxy Builder plan)
+Status: DRAFT r2 (directive stage — AITL scope approved; Codex R1 blockers + attention items addressed in this revision)
 Author: AI Team Lead
-Refs: shared memory `feedback_long_context_thrashing_unrecoverable.md`
+Refs: shared memory `feedback_long_context_thrashing_unrecoverable.md`; Codex R1 review artifact `docs/code-reviews/pr-358-round-1-codex.md`; Proxy Builder implementation plan comment on PR #358
 
 ## Goal
 
@@ -61,12 +61,20 @@ loop from the summary. This mode fixes that.
   progress" line with "The tail was a stuck loop; do not carry the failed
   approach forward; treat turn N as the last verifiably-good state."
 
+**Explicitly unchanged from r169:**
+
+- Summarizer model (Opus, with `MANUAL_COMPACT_MODEL` override still honored).
+- Retry logic.
+- Default-mode output file path: `/tmp/<sid>-compact-summary.txt` — identical
+  to r169. **Only** the new thrash-treatment output path gains a suffix (see
+  "Behavior on detection" §3 below: `/tmp/<sid>-compact-summary-thrash.txt`),
+  so the two artifacts are distinguishable at a glance and a planned-clear
+  operator can't accidentally load a thrash-recovery summary.
+
 **Out of scope (deferred to follow-ups):**
 
 - Live in-session thrash detection (this directive is JSONL-post-hoc only).
 - Automatic invocation from a proxy hook (operator triggers it by hand).
-- Any change to summarizer model, retry logic, or output file path — all
-  identical to r169.
 
 ## Detection signals
 
@@ -145,17 +153,105 @@ committing to auto-mode.
 
 ## Testing
 
-- Bundle a fixture thrashing JSONL under `tests/fixtures/` (small, redacted
-  from a real thrashing session AITL will provide) and add a smoke test that:
-  - `--dry-run --thrash-recovery` detects with score above threshold.
-  - `--dry-run` alone (no `--thrash-recovery`) does NOT alter the extract.
-  - `--thrash-recovery --from-turn N` forces the boundary regardless of
-    detection.
-- Bundle a fixture healthy JSONL (planned-clear case) and verify:
-  - `--thrash-recovery --dry-run` reports "no thrashing detected" and exits
-    non-zero.
-  - Default mode (no flag) is byte-identical to r169 behavior on the same
-    input (regression guard).
+**Fixtures (both required, both under `tests/fixtures/manual-compact/`):**
+
+- `thrashing-sample.jsonl` — small, redacted from a real thrashing session AITL
+  will provide. Redaction requirement: strip session ids, absolute home-dir
+  paths, tokens/credentials, real user names — anonymize to `session_X`,
+  `<PATH>`, `<REDACTED>` placeholders. Provenance note in a companion
+  `README.md` (source date, what was redacted, why the pattern qualifies as
+  thrashing).
+- `healthy-sample.jsonl` — small, redacted planned-clear session with no
+  thrashing signals.
+- `healthy-sample.expected-extract.txt` — golden output pinned from r169 on
+  `healthy-sample.jsonl` (see regression guard below).
+
+**Smoke tests on the thrashing fixture:**
+
+- `--dry-run --thrash-recovery` detects with score above threshold. Assert
+  which signals fired and the computed last-known-good turn.
+- `--dry-run` alone (no `--thrash-recovery`) does NOT alter the extract
+  (byte-identical extract-preview to r169 dry behavior).
+- `--thrash-recovery --from-turn N` forces the boundary regardless of
+  detection.
+- **Boundary case:** the detected loop-start does not always align with the
+  fixed 60% active-work boundary. Include at least one test where
+  `--thrash-recovery --from-turn K` with K < 60%-boundary — verify the
+  pre-K range gets working-segment treatment, K+ gets the compressed block,
+  no crash on the crossing, and the compressed-block header names K
+  correctly.
+
+**Smoke tests on the healthy fixture:**
+
+- `--thrash-recovery --dry-run` reports "no thrashing detected" and exits
+  non-zero (unless `--force`).
+- **Regression guard — golden-file exact compare.** Default mode (no flag)
+  on the healthy fixture produces output byte-identical to
+  `healthy-sample.expected-extract.txt`. Mechanism: `diff -u
+  tests/fixtures/manual-compact/healthy-sample.expected-extract.txt
+  <(manual-compact.sh --extract-only tests/fixtures/manual-compact/healthy-sample.jsonl)`
+  must produce no output. The fixture is generated once from r169 output and
+  pinned to the repo. Not "same general shape" — exact byte match.
+
+## Non-Functional Requirements
+
+**Size/complexity budget.** Implementation budget: ~200 LOC detector
+(`tools/lib/thrash_detect.py`) + ~150 LOC extraction module
+(`tools/lib/manual_compact_extract.py`) + ~50 LOC bash orchestrator delta on
+`manual-compact.sh` + ~150 LOC tests. Total ~550 LOC. Exceeding by more than
+~30% without justification is a scope-creep flag; implementer notes the reason
+in the implementation PR's `## Reasoning` block if the budget grows.
+
+**Fixture provenance and redaction.** Both `thrashing-sample.jsonl` and
+`healthy-sample.jsonl` MUST ship redacted per the Testing section above and
+MUST include a companion `README.md` naming (a) the source-session date, (b)
+the redaction transforms applied, (c) why the pattern qualifies. Raw
+un-redacted sessions do NOT enter the repo. Fixture size cap: 500 KB each so
+the test suite stays fast.
+
+**Maintainability boundary.** The two Python modules (`thrash_detect.py`,
+`manual_compact_extract.py`) MUST be pure-function libraries — no filesystem
+side effects, no subprocess calls, no direct `claude`-CLI invocation. The
+bash orchestrator owns I/O; the Python owns logic. This is the seam that
+makes signal-level unit tests possible.
+
+**Performance expectation.** The Python pre-summarization pass on the largest
+supported fixture (500 KB JSONL, ~1000 turns) MUST complete in under 2s of
+wall-clock on typical developer-workstation hardware. Signal detection is O(turns) with a
+small constant; if a candidate implementation is quadratic (e.g.
+all-pairs Levenshtein), reject and re-scope.
+
+**Default-path no-regression contract.** When invoked WITHOUT
+`--thrash-recovery` and WITHOUT `--dry-run`, `manual-compact.sh` MUST produce
+output byte-identical to r169 on the same input. Enforced by the golden-file
+compare above. This is the load-bearing safety guarantee for existing
+planned-clear callers.
+
+**Threshold calibration acceptance criterion.** Default weights + threshold
+MUST simultaneously (a) trip detection on `thrashing-sample.jsonl` (score
+above threshold, non-empty signal list) AND (b) NOT trip on
+`healthy-sample.jsonl` (score below threshold). Both assertions in the test
+suite. Env-var overrides
+(`MANUAL_COMPACT_THRASH_THRESHOLD`, `MANUAL_COMPACT_THRASH_SIGNAL_WEIGHTS`)
+are for operator tuning on their own fixtures, not a substitute for
+calibrated defaults.
+
+**Operational guard: dry-run first on real thrash sample.** The one
+non-load-bearing footgun is an operator who skips `--dry-run` on a real
+suspected-thrash session, gets a misclassified detection, and restores from
+the wrong summary. Mitigation is procedural: the `--thrash-recovery`
+help-text and the human-facing output MUST include the sentence "Run with
+`--dry-run` first to verify detection before generating the summary." Both
+tests and the tool's own output enforce this pattern.
+
+**Load-bearing classification.** `no`. Tool is opt-in, invoked by operator
+out-of-band, no code path changes for existing callers. Default behavior
+byte-identical on non-thrashing inputs (enforced by golden-file compare);
+explicit flag required for the new behavior. The misfire risk is a manual
+quality/safety concern mitigated by dry-run-first discipline, not a
+shared-abstraction or wire-contract change. If detection misfires and the
+operator skipped dry-run, the summary is aggressive on tail-drop but still
+restorable from the working segment — degraded, not catastrophic.
 
 ## Rollout
 
@@ -175,9 +271,5 @@ the summarizer at Opus rates every time; a small Python pre-pass is
 deterministic, auditable, and cheap. It also gives us `--dry-run` visibility,
 which the prompt-only path cannot.
 
-Load-bearing: **no**. Tool is opt-in, invoked by operator, no code path
-changes for existing callers. Default behavior byte-identical on non-thrashing
-inputs; explicit flag required for the new behavior. If detection misfires,
-the operator sees the `--dry-run` output first (or, in non-dry mode, gets a
-summary that's aggressive on tail-drop but still restorable from the working
-segment — degraded, not catastrophic).
+Load-bearing classification is stated in the Non-Functional Requirements
+section above.
