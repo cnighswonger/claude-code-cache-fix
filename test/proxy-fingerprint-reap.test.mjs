@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import net, { createServer } from "node:net";
+import net from "node:net";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { HOP_ENV, freePort, onPort } from "./proc-helpers.mjs";
@@ -63,7 +63,7 @@ test("the reap is driven by the supervisor, and off its startup path", () => {
 // cannot be.
 test("a record whose port still has a listener is kept however old it is", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ccf-fpreap-live-"));
-  const srv = createServer();
+  const srv = net.createServer();
   try {
     await new Promise((r) => srv.listen(0, "127.0.0.1", r));
     const port = srv.address().port;
@@ -130,25 +130,6 @@ test("a launcher that binds reaps on the way up", { timeout: 30_000 }, async () 
   }
 });
 
-// A NAME WHOSE PORT IS NOT A NUMBER is not this reaper's to judge, and asking
-// the kernel to bind NaN throws rather than answering.
-test("a record whose port is not a number is kept", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "ccf-fpreap-nan-"));
-  try {
-    const odd = join(dir, "cache-fix-proxy-healthcheck.sha256");
-    writeFileSync(odd, "x");
-    const old = Date.now() / 1000 - 30 * 86400;
-    utimesSync(odd, old, old);
-
-    await runReaper(dir);
-
-    assert.ok(readdirSync(dir).includes("cache-fix-proxy-healthcheck.sha256"),
-              "the reaper judged a name it cannot parse a port out of");
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
 test("a stale record is removed, and anything a live holder may still own is kept", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ccf-fpreap-"));
   try {
@@ -170,9 +151,13 @@ test("a stale record is removed, and anything a live holder may still own is kep
     // Ends in .sha256 on purpose: with any other suffix endsWith() alone saves
     // it and an empty prefix would pass.
     const alien = join(dir, "cache-fix-ca-scratch-keepme.sha256");
-    for (const p of [stale, fresh, longLived, nearGate, alien, inflight]) writeFileSync(p, "x");
+    // Over-age, so it DOES reach portFree: a name with no port in it is not this
+    // reaper's to judge, and asking the kernel to bind NaN throws rather than
+    // answering.
+    const unparsed = join(dir, "cache-fix-proxy-healthcheck.sha256");
+    for (const p of [stale, fresh, longLived, nearGate, alien, inflight, unparsed]) writeFileSync(p, "x");
     const age = (p, days) => utimesSync(p, Date.now() / 1000 - days * 86400, Date.now() / 1000 - days * 86400);
-    age(stale, 8); age(longLived, 3); age(nearGate, 6); age(alien, 8); age(inflight, 8);
+    age(stale, 8); age(longLived, 3); age(nearGate, 6); age(alien, 8); age(inflight, 8); age(unparsed, 8);
 
     await runReaper(dir);
 
@@ -187,6 +172,8 @@ test("a stale record is removed, and anything a live holder may still own is kep
               `the reaper took a concurrent launcher's pending write — ${left}`);
     assert.ok(left.includes("cache-fix-ca-scratch-keepme.sha256"),
               `the reaper took a name that is not its own: ${left}`);
+    assert.ok(left.includes("cache-fix-proxy-healthcheck.sha256"),
+              `the reaper judged a name it cannot parse a port out of: ${left}`);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

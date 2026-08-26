@@ -45,12 +45,8 @@ const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", 
 // them, so the body is tested before the code.
 const OUTAGE = { REFUSED: "refused", RESET: "reset", DEGRADED: "degraded" };
 function classify(body) {
-  // A NUMBER IS NOT AN OUTAGE, AND MUST NOT BE A TypeError EITHER. Six of this
-  // file's seven probes resolve `ERR:${e.code}`; the seventh resolves a bare
-  // statusCode on success, and its caller filters out 200 and hands the rest
-  // here. Measured on CI Node 22: one 502 reached this line and the case died
-  // as `body.startsWith is not a function` — a crash where the answer is
-  // simply "that was a reply, not an outage".
+  // A NUMBER IS NOT AN OUTAGE, AND MUST NOT BE A TypeError EITHER — a probe that
+  // resolves a bare statusCode reaches here. See the unit case that pins it.
   if (typeof body !== "string") return null;
   if (!body.startsWith("ERR:")) return null;
   if (/"carrying"\s*:\s*"gap-relay"/.test(body)) return null;

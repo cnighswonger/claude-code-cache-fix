@@ -784,13 +784,12 @@ function publishFingerprint(port) {
 // Seven days on top, matching the scratch-CA reaper, bounds what a crashed
 // holder leaves behind on a port nobody rebinds.
 async function reapFingerprintRecords() {
-  const recordAgeMs = 7 * 86_400_000;
   try {
     for (const f of readdirSync(tmpdir())) {
       if (!f.startsWith(RECORD_PREFIX) || !f.endsWith(".sha256")) continue;
       const p = join(tmpdir(), f);
       try {
-        if (Date.now() - statSync(p).mtimeMs <= recordAgeMs) continue;
+        if (Date.now() - statSync(p).mtimeMs <= 7 * 86_400_000) continue;
         if (!(await portFree(f.slice(RECORD_PREFIX.length, -".sha256".length)))) continue;
         rmSync(p);
       } catch { /* raced, gone, or refused; a survivor is disk, not correctness */ }
@@ -809,8 +808,8 @@ async function reapFingerprintRecords() {
 // is itself a listener while it asks, so a launcher running otherHolderOn()
 // concurrently can read it as an incumbent; that window is the bind's lifetime.
 //
-// The loop does not yield: listen and close resolve on nextTick, so the await
-// never reaches the poll phase. It runs after the bind and delays no listener.
+// Awaiting this does not yield: listen and close resolve on nextTick, so the
+// caller's loop never reaches the poll phase and holds it for the whole scan.
 function portFree(port) {
   const n = Number(port);
   if (!Number.isInteger(n) || n < 1 || n > 65535) return Promise.resolve(false);
