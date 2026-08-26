@@ -180,25 +180,17 @@ test("request records carry a join id", () => {
 });
 
 test("request-capture: enabled — records the Messages API only, never another route", async () => {
-  // THE SCOPE IS THE GATE, and nothing else pinned it. `onRequest` selects on
-  // the request BODY carrying a `messages` array, so the bootstrap route — the
-  // only other one that reaches the pipeline — is dropped here. Routes that
-  // never reach the pipeline at all are relayed by handlePassthrough and are
-  // not this gate's doing.
-  // Without this case, widening or dropping that gate changes what the corpus
-  // covers and no test says so; the extension's own header would then be the
-  // only statement of scope, which is what it was before this case existed.
+  // The gate is a body shape, not a path: a `messages` array. Widening or
+  // dropping it changes what the corpus covers, and nothing else says so.
   const dir = await mkdtemp(join(tmpdir(), "capture-test-"));
   const prevConfig = process.env.CLAUDE_CONFIG_DIR;
   const prevFlag = process.env.CACHE_FIX_REQUEST_CAPTURE;
   process.env.CLAUDE_CONFIG_DIR = dir;
   process.env.CACHE_FIX_REQUEST_CAPTURE = "1";
   try {
-    // A bridge worker-events body: real, enabled, and not a model call.
-    // ITS OWN SESSION ID, and the premise below gets another. The boot record
-    // is tracked per CAPTURE KEY, which is derived from the session id — not
-    // once per process — so reusing a sibling's id burns the record that
-    // sibling asserts on.
+    // A bridge worker-events body: real, enabled, and not a model call. Its own
+    // session id — the boot record is per capture KEY, not per process, so a
+    // shared id would burn the record the premise below asserts on.
     await ext.onRequest({
       body: { events: [{ type: "worker_started", at: 1 }] },
       headers: { "x-session-id": "scope-check" },

@@ -198,7 +198,6 @@ test("onRequest: the advisory is written once per process, but every request is 
   // latch is spent and the count reads 0 rather than 1 — green for the wrong reason.
   __resetAdvisedForTests();
   const seen = [];
-  const ctxs = [];
   const orig = process.stderr.write;
   process.stderr.write = (s) => {
     if (String(s).includes("[auto-1m-guard]")) seen.push(String(s));
@@ -208,14 +207,11 @@ test("onRequest: the advisory is written once per process, but every request is 
     for (let i = 0; i < 5; i++) {
       const ctx = mkCtx({ headers: { "anthropic-beta": STD_BETAS_WITH_1M }, mode: "warn" });
       await ext.onRequest(ctx);
-      ctxs.push(ctx);
+      // The latch sits below the annotation, which every request's session JSON needs.
+      assert.equal(ctx.meta._auto1mGuard?.auto_1m_detected, true, `request ${i} lost its annotation`);
     }
   } finally {
     process.stderr.write = orig;
   }
   assert.equal(seen.length, 1, `advisory written ${seen.length}x for 5 requests`);
-  // The latch sits below the annotation, which every request's session JSON needs.
-  for (const [i, ctx] of ctxs.entries()) {
-    assert.equal(ctx.meta._auto1mGuard?.auto_1m_detected, true, `request ${i} lost its annotation`);
-  }
 });

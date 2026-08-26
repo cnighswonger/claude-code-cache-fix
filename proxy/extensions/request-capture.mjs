@@ -4,15 +4,9 @@
 // the bodies away, so every pipeline change could only be validated against
 // synthetic fixtures or live traffic.
 //
-// The directive and the replay/cache-sim tools this was written for are not in
-// the tree.
-//
-// SCOPE: the gate below selects on the request BODY carrying a `messages`
-// array. Only two routes reach the pipeline at all — /v1/messages and
-// /api/claude_cli/bootstrap — and the gate is what drops the bootstrap one,
-// whose bodies carry no `messages`. Everything else (worker events, RC
-// credentials, OAuth) never reaches this hook: server.mjs relays it through
-// handlePassthrough, no pipeline and no parsing.
+// SCOPE: the gate below selects on the body carrying a `messages` array. It is
+// what drops /api/claude_cli/bootstrap, the only other route that reaches the
+// pipeline; everything else is relayed by handlePassthrough and never gets here.
 //
 // Order 60 — after bootstrap-defense (45) and ttl-tier-detect (75 is
 // AFTER, fine: it only reads), before cc-version-normalize (90), the
@@ -268,7 +262,6 @@ export default {
 
   async onRequest(ctx) {
     if (!isEnabled()) return;
-    // THE SCOPE GATE: Messages-API shape, not a path, same effect as a route filter.
     if (!ctx || !ctx.body || !Array.isArray(ctx.body.messages)) return;
 
     try {
