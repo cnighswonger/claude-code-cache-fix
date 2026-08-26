@@ -208,7 +208,12 @@ test("a stale record is removed, and anything a live holder may still own is kep
     // A concurrent launcher's in-flight write. publishFingerprint writes
     // `<record>.<pid>` and renames; that name carries RECORD_PREFIX, so only the
     // suffix check stands between this reaper and someone else's pending rename.
+    // Left FRESH, because that is the only state a pending rename is ever in.
     const inflight = join(dir, "cache-fix-proxy-30006.sha256.99999");
+    // The same name over the gate. A rename pends for microseconds, so at eight
+    // days it is a crashed publish -- and the suffix test skips it forever, so
+    // nothing in this file or any other ever collects it.
+    const abandoned = join(dir, "cache-fix-proxy-30007.sha256.99998");
     // Ends in .sha256 on purpose: with any other suffix endsWith() alone saves
     // it and an empty prefix would pass.
     const alien = join(dir, "cache-fix-ca-scratch-keepme.sha256");
@@ -221,9 +226,9 @@ test("a stale record is removed, and anything a live holder may still own is kep
     // wrong: listen(0) binds a random free port and always succeeds, so without
     // the floor the probe would call every port-0 record collectable.
     const zero = join(dir, "cache-fix-proxy-0.sha256");
-    for (const p of [stale, fresh, longLived, nearGate, alien, inflight, unparsed, zero]) writeFileSync(p, "x");
+    for (const p of [stale, fresh, longLived, nearGate, alien, inflight, abandoned, unparsed, zero]) writeFileSync(p, "x");
     const age = (p, days) => utimesSync(p, Date.now() / 1000 - days * 86400, Date.now() / 1000 - days * 86400);
-    age(stale, 8); age(longLived, 3); age(nearGate, 6); age(alien, 8); age(inflight, 8); age(unparsed, 8);
+    age(stale, 8); age(longLived, 3); age(nearGate, 6); age(alien, 8); age(abandoned, 8); age(unparsed, 8);
     age(zero, 8);
 
     await runReaper(dir);
@@ -237,6 +242,8 @@ test("a stale record is removed, and anything a live holder may still own is kep
               `a 6-day-old record was reaped: the gate is shorter than 7 days — ${left}`);
     assert.ok(left.includes("cache-fix-proxy-30006.sha256.99999"),
               `the reaper took a concurrent launcher's pending write — ${left}`);
+    assert.ok(!left.includes("cache-fix-proxy-30007.sha256.99998"),
+              `an eight-day-old <record>.<pid> survived: no reaper anywhere collects it — ${left}`);
     assert.ok(left.includes("cache-fix-ca-scratch-keepme.sha256"),
               `the reaper took a name that is not its own: ${left}`);
     assert.ok(left.includes("cache-fix-proxy-healthcheck.sha256"),

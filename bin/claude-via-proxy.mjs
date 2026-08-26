@@ -790,8 +790,9 @@ function publishFingerprint(port) {
 // Seven days on top, matching the scratch-CA reaper, bounds what a crashed
 // holder leaves behind on a port nobody rebinds.
 //
-// The suffix check also excludes publishFingerprint's `<record>.<pid>` temp,
-// deliberately: that name is a concurrent launcher's pending rename, not litter.
+// publishFingerprint's `<record>.<pid>` temp is spared while it is fresh -- a
+// pending rename is not litter -- and collected past the same gate, where the
+// only thing that leaves one behind is a publish that died.
 async function reapFingerprintRecords() {
   let seen = 0;
   try {
@@ -800,11 +801,18 @@ async function reapFingerprintRecords() {
       // uninterrupted pass holds the event loop between the bind and the first
       // accept — which is the delay deferring this was meant to avoid.
       if (++seen % 100 === 0) await new Promise(setImmediate);
-      if (!f.startsWith(RECORD_PREFIX) || !f.endsWith(RECORD_SUFFIX)) continue;
+      if (!f.startsWith(RECORD_PREFIX)) continue;
+      const isRecord = f.endsWith(RECORD_SUFFIX);
+      // A rename pends for microseconds, so a `<record>.<pid>` this far over the
+      // gate is a crashed publish. Nothing else collects it: the suffix test
+      // alone would skip the name forever.
+      const isTemp = !isRecord && f.includes(`${RECORD_SUFFIX}.`);
+      if (!isRecord && !isTemp) continue;
       const p = join(tmpdir(), f);
       try {
         if (Date.now() - statSync(p).mtimeMs <= REAP_AGE_MS) continue;
-        if (!(await portFree(f.slice(RECORD_PREFIX.length, -RECORD_SUFFIX.length)))) continue;
+        // Only a record answers to a port. A temp is nobody's to read.
+        if (isRecord && !(await portFree(f.slice(RECORD_PREFIX.length, -RECORD_SUFFIX.length)))) continue;
         rmSync(p);
       } catch { /* raced, gone, or refused; a survivor is disk, not correctness */ }
     }
