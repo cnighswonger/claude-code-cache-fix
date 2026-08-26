@@ -79,9 +79,11 @@ export function joinBetaTokens(tokens) {
 }
 
 // PROCESS-DURABLE: `loadExtensions` cache-busts every import, so a module-scoped
-// `let` is re-armed on each reload and the advisory returns at request rate.
-// `Symbol.for`, not `Symbol()` -- the registry is what makes every re-evaluated
-// copy reach the same object.
+// `let` is re-armed on every extension reload and the advisory returns once per
+// reload. `Symbol.for`, not `Symbol()` -- the registry is what makes every
+// re-evaluated copy reach the same object. `process.env` is the other way this
+// repo keeps reload-durable state (server.mjs, request-capture.mjs); a boolean
+// does not need the string coercion or the leak into spawned children.
 const _latch = (globalThis[Symbol.for("cache-fix.auto-1m-guard")] ??= { advised: false });
 
 export default {

@@ -505,7 +505,7 @@ cache-fix 的 `bootstrap-defense` 扩展提供三种模式，通过 `CACHE_FIX_B
 | 模式 | 默认？ | 行为 |
 |---|---|---|
 | `off` | 否 | 扩展无操作。 |
-| `warn` | 是 | 检测标记。将注释存储到每个会话 JSON (`auto_1m_detected`, `auto_1m_action: "warn"`, `auto_1m_advice`) 并发出 stderr 日志行。不修改请求。 |
+| `warn` | 是 | 检测标记。将注释存储到每个会话 JSON (`auto_1m_detected`, `auto_1m_action: "warn"`, `auto_1m_advice`) 并发出 stderr 日志行。该行在进程生命周期内锁定为首次检测（建议文本不会变化，扩展重载也不会重新触发）。不修改请求。 |
 | `strip` | 主动选择 | 在转发前检测并从 `anthropic-beta` 头中删除标记。注释：`auto_1m_action: "stripped"`。 |
 
 CC 端的关闭开关是 `CLAUDE_CODE_DISABLE_1M_CONTEXT=1`（环境变量），当它实际到达 CC 进程时才是正确修复。在 VS Code 扩展表面，该环境变量据报道不可靠；代理拦截绕过了这个间隙，因为它在任何 CC 启动器产生的请求上都作用于网络。跟踪 [CC#64919](https://github.com/anthropics/claude-code/issues/64919)；参见 [`docs/directives/proxy-auto-1m-guard.md`](docs/directives/proxy-auto-1m-guard.md) 了解确认代理可见信号是 beta 头（CC 在发送前从 `req.body.model` 客户端侧剥离 `[1m]` 后缀）的二进制步行。

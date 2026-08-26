@@ -193,10 +193,10 @@ test("onRequest: duplicate `context-1m-2025-08-07` tokens (defensive) — all re
 
 // --- the advisory is advice, not a per-request fact ---
 
-// The advisory sampler, shared by the two cases below. Written twice once, and
-// the copies diverged: one swallowed every stderr line, this one forwards what
-// it is not sampling. Resets the latch on both sides -- a spent one makes a
-// case appended later count 0 and read green for the wrong reason.
+// The advisory sampler, shared by the two cases below. Forwards what it is not
+// sampling, so it cannot swallow an unrelated line. Resets the latch on both
+// sides -- a spent one makes a case appended later count 0 and read green for
+// the wrong reason.
 async function sampleAdvisories(fn) {
   __resetAdvisedForTests();
   const seen = [];
