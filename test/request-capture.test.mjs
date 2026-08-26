@@ -183,6 +183,8 @@ test("request records carry a join id", () => {
 test("request-capture: enabled — records the Messages API only, never another route", async () => {
   // Scope has two halves and neither was pinned: the pipeline's route filter
   // (no `routes` here, so it defaults to messages) and this file's body gate.
+  // Distinct session ids: _bootWrittenFor is module-scoped, so a mutation that
+  // makes one of these write cannot burn a sibling case's boot record.
   const dir = await mkdtemp(join(tmpdir(), "capture-test-"));
   const prevConfig = process.env.CLAUDE_CONFIG_DIR;
   const prevFlag = process.env.CACHE_FIX_REQUEST_CAPTURE;
@@ -190,7 +192,7 @@ test("request-capture: enabled — records the Messages API only, never another 
   process.env.CACHE_FIX_REQUEST_CAPTURE = "1";
   try {
     // Inner half — an UNTAGGED caller, which the route filter admits, so only the
-    // body gate is left. Own session id: sharing one burns the premise's boot record.
+    // body gate is left.
     await ext.onRequest({
       body: { events: [{ type: "worker_started", at: 1 }] },
       headers: { "x-session-id": "scope-check" },

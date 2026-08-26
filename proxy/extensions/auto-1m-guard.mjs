@@ -13,7 +13,7 @@
 //
 // Three modes (env: CACHE_FIX_AUTO_1M_GUARD):
 //   off    no-op
-//   warn   (default) stash _auto1mGuard annotation + stderr line; no mutation
+//   warn   (default) stash _auto1mGuard annotation + latched stderr line; no mutation
 //   strip  also remove context-1m-2025-08-07 from the anthropic-beta header
 //
 // Order 520: after ttl-management (500) and before thinking-block-sanitize
@@ -109,7 +109,7 @@ export default {
       auto_1m_advice: ADVICE,
     };
 
-    // The advice never changes, so a repeat says nothing and at request rate buries the log.
+    // A repeat carries nothing the first line did not, and at request rate buries the log.
     if (_advised) return;
     _advised = true;
     process.stderr.write(

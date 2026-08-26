@@ -200,7 +200,8 @@ test("onRequest: the advisory is written once per module instance, but every req
   const seen = [];
   const orig = process.stderr.write;
   process.stderr.write = (s) => {
-    if (String(s).includes("[auto-1m-guard]")) seen.push(String(s));
+    if (!String(s).includes("[auto-1m-guard]")) return orig.call(process.stderr, s);
+    seen.push(String(s));
     return true;
   };
   try {
@@ -212,6 +213,7 @@ test("onRequest: the advisory is written once per module instance, but every req
     }
   } finally {
     process.stderr.write = orig;
+    __resetAdvisedForTests();  // leaving it set would make a case appended below read 0
   }
   assert.equal(seen.length, 1, `advisory written ${seen.length}x for 5 requests`);
 });
