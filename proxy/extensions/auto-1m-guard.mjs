@@ -109,7 +109,7 @@ export default {
       auto_1m_advice: ADVICE,
     };
 
-    // The text never varies, so a repeat says nothing and at request rate buries the log.
+    // The advice never changes, so a repeat says nothing and at request rate buries the log.
     if (_advised) return;
     _advised = true;
     process.stderr.write(
@@ -121,5 +121,7 @@ export default {
   },
 };
 
-// Test seam — for unit tests that want to clear the once-per-process latch.
+// Test seam — for unit tests that want to clear the latch. Its unit is the
+// module instance, not the process: loadExtensions cache-busts its imports, so
+// an extension reload deliberately re-arms the advisory rather than silencing it.
 export function __resetAdvisedForTests() { _advised = false; }

@@ -4,9 +4,10 @@
 // the bodies away, so every pipeline change could only be validated against
 // synthetic fixtures or live traffic.
 //
-// SCOPE: the gate below selects on the body carrying a `messages` array. It is
-// what drops /api/claude_cli/bootstrap, the only other route that reaches the
-// pipeline; everything else is relayed by handlePassthrough and never gets here.
+// SCOPE — the outer half is the pipeline's, not this file's: the extension
+// declares no `routes`, so runOnRequest's default of ["messages"] skips the hook
+// for every other tagged route, /api/claude_cli/bootstrap included. The body
+// gate below is what scopes an UNTAGGED caller, which appliesToRoute admits.
 //
 // Order 60 — after bootstrap-defense (45) and ttl-tier-detect (75 is
 // AFTER, fine: it only reads), before cc-version-normalize (90), the

@@ -4,6 +4,7 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { runOnRequest } from "../proxy/pipeline.mjs";
 import ext, {
   resolveCaptureKey,
   buildCaptureRecord,
@@ -180,26 +181,34 @@ test("request records carry a join id", () => {
 });
 
 test("request-capture: enabled — records the Messages API only, never another route", async () => {
-  // The gate is a body shape, not a path: a `messages` array. Widening or
-  // dropping it changes what the corpus covers, and nothing else says so.
+  // Scope has two halves and neither was pinned: the pipeline's route filter
+  // (no `routes` here, so it defaults to messages) and this file's body gate.
   const dir = await mkdtemp(join(tmpdir(), "capture-test-"));
   const prevConfig = process.env.CLAUDE_CONFIG_DIR;
   const prevFlag = process.env.CACHE_FIX_REQUEST_CAPTURE;
   process.env.CLAUDE_CONFIG_DIR = dir;
   process.env.CACHE_FIX_REQUEST_CAPTURE = "1";
   try {
-    // A bridge worker-events body: real, enabled, and not a model call. Its own
-    // session id — the boot record is per capture KEY, not per process, so a
-    // shared id would burn the record the premise below asserts on.
+    // Inner half — an UNTAGGED caller, which the route filter admits, so the
+    // body gate is all that is left. Its own session id: the boot record is per
+    // capture KEY, so a shared id would burn the record the premise asserts on.
     await ext.onRequest({
       body: { events: [{ type: "worker_started", at: 1 }] },
       headers: { "x-session-id": "scope-check" },
-      meta: { route: "code" },
     });
     assert.deepEqual(await readdir(dir), [],
-      "a non-Messages route was captured — the corpus would carry routes the " +
-      "extension does not claim, and a reader filtering it by route would find " +
-      "shapes replay cannot drive");
+      "a non-Messages body was captured — the corpus would carry shapes the " +
+      "extension does not claim and replay cannot drive");
+
+    // Outer half — a MESSAGES body on the bootstrap route, so the gate above
+    // cannot be what drops it. Declaring `routes` here would widen the corpus
+    // to a route whose bodies the header says are not in it.
+    await runOnRequest(
+      { ...makeCtx({ headers: { "x-session-id": "scope-route" } }), meta: { route: "bootstrap" } },
+      [ext],
+    );
+    assert.deepEqual(await readdir(dir), [],
+      "the bootstrap route reached the capture hook");
 
     // PREMISE, so the case cannot pass because capture was simply off: the same
     // setup with a Messages body must write.

@@ -193,7 +193,7 @@ test("onRequest: duplicate `context-1m-2025-08-07` tokens (defensive) — all re
 
 // --- the advisory is advice, not a per-request fact ---
 
-test("onRequest: the advisory is written once per process, but every request is still annotated", async () => {
+test("onRequest: the advisory is written once per module instance, but every request is still annotated", async () => {
   // Earlier tests in this file already call onRequest, so without this the
   // latch is spent and the count reads 0 rather than 1 — green for the wrong reason.
   __resetAdvisedForTests();
