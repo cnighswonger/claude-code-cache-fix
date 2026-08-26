@@ -121,7 +121,6 @@ export default {
   },
 };
 
-// Test seam — for unit tests that want to clear the latch. Its unit is the
-// module instance, not the process: loadExtensions cache-busts its imports, so
-// an extension reload deliberately re-arms the advisory rather than silencing it.
+// Test seam — clears the latch, whose unit is the module instance, not the
+// process: loadExtensions cache-busts imports, so a reload re-arms it on purpose.
 export function __resetAdvisedForTests() { _advised = false; }

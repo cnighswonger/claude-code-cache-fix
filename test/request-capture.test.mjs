@@ -189,9 +189,8 @@ test("request-capture: enabled — records the Messages API only, never another 
   process.env.CLAUDE_CONFIG_DIR = dir;
   process.env.CACHE_FIX_REQUEST_CAPTURE = "1";
   try {
-    // Inner half — an UNTAGGED caller, which the route filter admits, so the
-    // body gate is all that is left. Its own session id: the boot record is per
-    // capture KEY, so a shared id would burn the record the premise asserts on.
+    // Inner half — an UNTAGGED caller, which the route filter admits, so only the
+    // body gate is left. Own session id: sharing one burns the premise's boot record.
     await ext.onRequest({
       body: { events: [{ type: "worker_started", at: 1 }] },
       headers: { "x-session-id": "scope-check" },
@@ -201,8 +200,7 @@ test("request-capture: enabled — records the Messages API only, never another 
       "extension does not claim and replay cannot drive");
 
     // Outer half — a MESSAGES body on the bootstrap route, so the gate above
-    // cannot be what drops it. Declaring `routes` here would widen the corpus
-    // to a route whose bodies the header says are not in it.
+    // cannot be what drops it. Declaring `routes` here would widen the corpus.
     await runOnRequest(
       { ...makeCtx({ headers: { "x-session-id": "scope-route" } }), meta: { route: "bootstrap" } },
       [ext],
@@ -213,9 +211,7 @@ test("request-capture: enabled — records the Messages API only, never another 
     // PREMISE, so the case cannot pass because capture was simply off: the same
     // setup with a Messages body must write.
     await ext.onRequest(makeCtx({ headers: { "x-session-id": "scope-premise" } }));
-    assert.notDeepEqual(await readdir(dir), [],
-      "premise: capture is enabled and a Messages request must be written, or " +
-      "the assertion above proves nothing");
+    assert.ok((await readdir(dir)).length, "premise: capture is on, so a Messages body must write");
   } finally {
     if (prevConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR;
     else process.env.CLAUDE_CONFIG_DIR = prevConfig;
