@@ -5,7 +5,7 @@ import net from "node:net";
 import http from "node:http";
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { forcedCloseLine } from "../proxy/server.mjs";
+import { drainRoute, forcedCloseLine } from "../proxy/server.mjs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -87,6 +87,42 @@ function exitOf(proc) {
     30_000, proc, "the proxy never exited");
 }
 
+// An upstream that accepts and never replies: the response stays OWED with
+// headersSent false and bytesWritten 0, which is the shape a ceiling waits out
+// and a stall test ends. The sockets are tracked because close() alone WAITS
+// for them -- the proxy's connection never ends, and one cut of this hung the
+// whole file for 200s in its own cleanup. That was the fixture, not the product.
+async function hungUpstream() {
+  const sockets = [];
+  const srv = net.createServer((s) => sockets.push(s));
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  return {
+    port: srv.address().port,
+    close: () => {
+      for (const s of sockets) { try { s.destroy(); } catch {} }
+      return new Promise((r) => srv.close(r));
+    },
+  };
+}
+
+// An SSE upstream that keeps writing, so socket.bytesWritten keeps advancing --
+// which is all the stall predicate reads. `stallHeader` names an `x-fixture`
+// value that gets NO reply at all, so ONE server can serve a moving connection
+// and a stalled one on the same port, which is what separates a per-connection
+// clock from an aggregate one.
+async function sseUpstream({ everyMs = 100, stallHeader = null } = {}) {
+  const srv = http.createServer((q, r) => {
+    q.resume();
+    if (stallHeader && q.headers["x-fixture"] === stallHeader) return;
+    r.writeHead(200, { "content-type": "text/event-stream" });
+    let n = 0;
+    const t = setInterval(() => { try { r.write(`data: ${++n}\n\n`); } catch {} }, everyMs);
+    r.on("close", () => clearInterval(t));
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  return { port: srv.address().port, close: () => new Promise((r) => srv.close(r)) };
+}
+
 describe("SIGTERM exit code", () => {
   // A REQUEST THAT NEVER GOT HEADERS MUST NOT BE ANSWERED "200".
   //
@@ -101,16 +137,10 @@ describe("SIGTERM exit code", () => {
   // ECONNRESET into a well-formed empty SUCCESS. A client cannot tell that from
   // a real empty answer, and will not retry.
   it("does not fabricate a 200 for a request that never got headers", async () => {
-    // An upstream that accepts and never replies: the proxy is stuck waiting,
-    // so the response is live with headersSent false when the watchdog fires.
-    // Sockets tracked because close() alone WAITS for them — the proxy's
-    // connection never ends, so the first cut of this hung the whole file for
-    // 200s in its own cleanup. That was the fixture, not the product.
-    const upSockets = [];
-    const hung = net.createServer((s) => upSockets.push(s));
-    await new Promise((r) => hung.listen(0, "127.0.0.1", r));
+    // The response is live with headersSent false when the watchdog fires.
+    const hung = await hungUpstream();
     const { proc, port, stderr } = startProxy({
-      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${hung.address().port}`,
+      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${hung.port}`,
     });
     try {
       const p = await port;
@@ -142,8 +172,7 @@ describe("SIGTERM exit code", () => {
         `instead of retrying`);
     } finally {
       try { proc.kill("SIGKILL"); } catch {}
-      for (const s of upSockets) { try { s.destroy(); } catch {} }
-      await new Promise((r) => hung.close(r));
+      await hung.close();
     }
   });
 
@@ -282,17 +311,9 @@ describe("SIGTERM exit code", () => {
   // that had already received every byte reads that as ECONNRESET and discards
   // the delivered data. Merged rather than run twice: the grace is 5 s.
   it("exits 0 via the watchdog, ending an in-flight response with FIN not RST", async () => {
-    const upstream = http.createServer((q, r) => {
-      r.writeHead(200, { "content-type": "text/event-stream" });
-      let n = 0;
-      const t = setInterval(() => r.write(`data: ${++n}\n\n`), 100);
-      r.on("close", () => clearInterval(t));
-      q.resume();
-    });
-    await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
-
+    const upstream = await sseUpstream();
     const { proc, port, stderr } = startProxy({
-      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upstream.address().port}`,
+      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upstream.port}`,
     });
     try {
       const p = await port;
@@ -338,7 +359,7 @@ describe("SIGTERM exit code", () => {
         `already had every byte reads that as ECONNRESET and throws the data away`);
     } finally {
       try { proc.kill("SIGKILL"); } catch {}
-      await new Promise((r) => upstream.close(r));
+      await upstream.close();
     }
   });
 
@@ -482,11 +503,9 @@ describe("SIGTERM exit code", () => {
   it("names the routes it cut, and never writes a query string", async () => {
     // The never-answers upstream: the request is owed with headers unsent, which
     // is the arm that reaches `destroyed` rather than `ended`.
-    const upSockets = [];
-    const hung = net.createServer((s) => upSockets.push(s));
-    await new Promise((r) => hung.listen(0, "127.0.0.1", r));
+    const hung = await hungUpstream();
     const { proc, port, stderr } = startProxy({
-      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${hung.address().port}`,
+      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${hung.port}`,
     });
     try {
       const p = await port;
@@ -515,8 +534,7 @@ describe("SIGTERM exit code", () => {
         "the tally kept the `?` — grouping must cut at the query, not merely omit " +
         "the value");
     } finally {
-      for (const s of upSockets) s.destroy();
-      hung.close();
+      await hung.close();
       proc.kill("SIGKILL");
     }
   });
@@ -525,11 +543,9 @@ describe("SIGTERM exit code", () => {
     // The same never-answers upstream the destroy-arm case uses: the proxy is
     // stuck waiting, so the response is owed with bytesWritten 0 — the exact
     // shape a ceiling waits out and a stall test does not.
-    const upSockets = [];
-    const hung = net.createServer((s) => upSockets.push(s));
-    await new Promise((r) => hung.listen(0, "127.0.0.1", r));
+    const hung = await hungUpstream();
     const { proc, port, stderr } = startProxy({
-      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${hung.address().port}`,
+      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${hung.port}`,
       CACHE_FIX_DRAIN_STALL_MS: "1500",
       // A ceiling far enough away that reaching it is unmistakable: if this is
       // what ends the drain the case takes a minute and fails on the elapsed
@@ -564,8 +580,7 @@ describe("SIGTERM exit code", () => {
         `the drain cut a reply and still called itself "clean". A reader greps that ` +
         `phrase unanchored, so a suffix naming the cut does not save it`);
     } finally {
-      for (const s of upSockets) s.destroy();
-      hung.close();
+      await hung.close();
       proc.kill("SIGKILL");
     }
   });
@@ -577,17 +592,9 @@ describe("SIGTERM exit code", () => {
     // socket.bytesWritten advances per chunk here, which is all the predicate
     // reads; a CONTENT test would see the same thing and a rate test would have
     // to decide whether 10 bytes per 100ms is a reply or a heartbeat.
-    const upstream = http.createServer((q, r) => {
-      r.writeHead(200, { "content-type": "text/event-stream" });
-      let n = 0;
-      const t2 = setInterval(() => r.write(`data: ${++n}\n\n`), 100);
-      r.on("close", () => clearInterval(t2));
-      q.resume();
-    });
-    await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
-
+    const upstream = await sseUpstream();
     const { proc, port } = startProxy({
-      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upstream.address().port}`,
+      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upstream.port}`,
       CACHE_FIX_DRAIN_STALL_MS: "1500",
       CACHE_FIX_DRAIN_MS: "60000",
     });
@@ -631,20 +638,11 @@ describe("SIGTERM exit code", () => {
     // an aggregate clock and a per-connection one are the SAME PROGRAM — no
     // fixture built that way can fail either version. Three assertions, not
     // two; each says at its own failure what it catches.
-    const upstream = http.createServer((q, r) => {
-      q.resume();
-      // Never answers: the response stays owed with bytesWritten 0, which is
-      // the shape a ceiling waits out and a per-connection stall test ends.
-      if (q.headers["x-fixture"] === "stall") return;
-      r.writeHead(200, { "content-type": "text/event-stream" });
-      let n = 0;
-      const t2 = setInterval(() => r.write(`data: ${++n}\n\n`), 100);
-      r.on("close", () => clearInterval(t2));
-    });
-    await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
-
+    // `stallHeader`: the stalled request gets no reply at all, so both shapes
+    // live on ONE server and share nothing but the port.
+    const upstream = await sseUpstream({ stallHeader: "stall" });
     const { proc, port } = startProxy({
-      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upstream.address().port}`,
+      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upstream.port}`,
       CACHE_FIX_DRAIN_STALL_MS: "1500",
       CACHE_FIX_DRAIN_MS: "60000",
     });
@@ -719,11 +717,9 @@ describe("SIGTERM exit code", () => {
     // case nothing in the suite can tell the two apart: every other fixture
     // opens its connection moments before the handover, where arrival and first
     // sight are the same instant.
-    const upSockets = [];
-    const hung = net.createServer((sk) => upSockets.push(sk));
-    await new Promise((r) => hung.listen(0, "127.0.0.1", r));
+    const hung = await hungUpstream();
     const { proc, port } = startProxy({
-      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${hung.address().port}`,
+      CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${hung.port}`,
       CACHE_FIX_DRAIN_STALL_MS: "4000",
       CACHE_FIX_DRAIN_MS: "60000",
     });
@@ -763,9 +759,8 @@ describe("SIGTERM exit code", () => {
         `restarted at first sight, so the deadest connection on the port bought ` +
         `itself another full window`);
     } finally {
-      for (const sk of upSockets) sk.destroy();
       try { c?.destroy(); } catch { /* never opened */ }
-      hung.close();
+      await hung.close();
       proc.kill("SIGKILL");
     }
   });
@@ -1074,6 +1069,27 @@ describe("SIGTERM exit code", () => {
         `premise: the proxy must have answered this connection with a body it ` +
         `could not flush (got ${got} of ${BODY.length})`);
 
+      // AND IT IS STILL OWED. `res.end()` was a no-op, but megabytes sit queued
+      // on a socket the client is not reading and closeAllConnections() destroys
+      // it. Marking the connection done for the stall test also took it out of
+      // the backstop's owed count AND out of the forced close's tally, so the
+      // drain reported `0 response(s) still owed` and `cut no responses` about a
+      // reply it was about to truncate -- the severed-and-called-clean shape
+      // this drain exists to remove, one branch over.
+      assert.match(stderr(), /[1-9][0-9]* response\(s\) still owed/,
+        `the backstop said nothing was owed while holding a reply with megabytes ` +
+        `queued on it; stderr:\n${stderr()}`);
+      assert.match(stderr(), /cut 1 in-flight request\(s\)/,
+        `the forced close said it cut nothing and then destroyed a socket carrying ` +
+        `an unflushed body; stderr:\n${stderr()}`);
+      // AND THE BUDGET STAYS IN SECONDS. The backstop passes the ELAPSED time,
+      // which is not a round number of milliseconds, so this arm alone rendered
+      // `after 8003ms` where every other one renders `after 8s` -- and a reader
+      // outside this repo matches `after (\d+)s`.
+      assert.match(stderr(), /forcing close[^\n]*after \d+s/,
+        `the forced-close line reports its budget in milliseconds on the backstop ` +
+        `arm; stderr:\n${stderr()}`);
+
       assert.doesNotMatch(stderr(), /drain ended one connection/,
         `the stall test called res.end() on a response that had ALREADY ended ` +
         `itself — a no-op — and reported it as a cut. Nothing was cut: the ` +
@@ -1189,6 +1205,35 @@ describe("SIGTERM exit code", () => {
       "not empty, or every old line grows a meaningless suffix");
     assert.doesNotMatch(forcedCloseLine(0, 0, 3, 5_000, "", "/v1/messages=9"), /routes:/,
       "the no-cut line carries a tally of things it did NOT cut");
+  });
+
+  // THE ADJACENCY THIS LINE'S OWN COMMENT CALLS THE CONTRACT. `why` was appended
+  // to the budget, which is the one position that block says a field must not
+  // take -- and it takes it on the BACKSTOP arm, the arm that fires in
+  // production, while every pinned case passes `why=""` and cannot see it.
+  it("keeps the cut-line prefix parseable when the drain names why it ended", () => {
+    const legacy = /cut (\d+) in-flight request\(s\) after (\d+)s \((\d+) mid-response/;
+    assert.match(forcedCloseLine(4, 0, 0, 1_800_000), legacy,
+      "the baseline rendering already fails this, so the case below proves nothing");
+    assert.match(forcedCloseLine(4, 0, 0, 1_800_000, ", on the BACKSTOP budget — 0 ended"), legacy,
+      "naming why the drain ended pushed a field between the budget and " +
+      "`(N mid-response`, which is the adjacency this line's own comment records " +
+      "as a contract with a reader outside this repo");
+    assert.match(forcedCloseLine(0, 0, 3, 1_800_000, ", on the BACKSTOP budget"),
+      /after 1800s, cut no responses/,
+      "the no-cut line took the same field in the same wrong place");
+  });
+
+  // A PROXY SEES WHOLE REQUEST URLS. Absolute-form carries an authority and an
+  // authority can carry userinfo, so the tally that rides a log line has to cut
+  // the credential off, not merely the query string.
+  it("the drain route tally never writes userinfo or a query string", () => {
+    assert.equal(drainRoute("/v1/messages?beta=true&tok=SECRET"), "/v1/messages");
+    assert.equal(drainRoute("http://user:hunter2@example.test/v1/messages?x=1"), "/v1/messages",
+      "an absolute-form target reached the tally with its AUTHORITY intact, so a " +
+      "credential in the userinfo is written to a file that outlives the process");
+    assert.equal(drainRoute("/a/b/c/d"), "/a/b", "the tally must stay two segments deep");
+    assert.equal(drainRoute(undefined), "?");
   });
 
   it("says it cut nothing when it cut nothing, and never calls that idle", () => {

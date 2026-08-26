@@ -613,6 +613,22 @@ async function handlePassthrough(clientReq, clientRes) {
 // Appending is not automatically safe either -- it is safe here only because no
 // known reader anchors on the end of the line. A future field should ask the
 // same question rather than assume the tail is free.
+// COARSE, AND NO QUERY STRING. Two path segments, nothing after `?`: the proxy
+// sees whole request URLs and this rides a log line, so the grouping is what
+// keeps an identifier in a path out of a file that outlives the process. It also
+// bounds the cardinality -- a per-URL tally on a passthrough route would print
+// one entry per request.
+//
+// AND THE AUTHORITY, WHICH THE QUERY RULE DOES NOT COVER. A foreign absolute-form
+// target reaches handlePassthrough un-normalised, so the raw request-target
+// renders as `/http:/user:pass@host` -- a credential, in the log, from the rule
+// written to keep credentials out of it.
+export function drainRoute(url) {
+  if (typeof url !== "string") return "?";
+  const path = parseAbsoluteForm(url)?.pathname ?? url;
+  return "/" + path.split("?")[0].split("/").filter(Boolean).slice(0, 2).join("/");
+}
+
 export function forcedCloseLine(ended, destroyed, held, budgetMs = 5_000, why = "", routes = "", quiet = "", owedAtStart = null) {
   const cut = ended + destroyed;
   // THE BUDGET IT ACTUALLY USED, not the constant this line was written against.
@@ -622,8 +638,12 @@ export function forcedCloseLine(ended, destroyed, held, budgetMs = 5_000, why = 
   //
   // `why` exists because the number alone stopped being the discriminator. Three
   // things can end a drain now and two of them are opposite outcomes, so the
-  // line names which rather than leaving it to be inferred from a shape.
-  const after = (budgetMs % 1000 === 0 ? `${budgetMs / 1000}s` : `${budgetMs}ms`) + why;
+  // line names which rather than leaving it to be inferred from a shape. It goes
+  // at the TAIL, like every other field added here: appended to the budget it sat
+  // between `after <n>s` and `(<n> mid-response`, which is the one adjacency the
+  // block above records as a contract -- and it took that position only on the
+  // backstop arm, which no pinned case rendered.
+  const after = budgetMs % 1000 === 0 ? `${budgetMs / 1000}s` : `${budgetMs}ms`;
   if (cut > 0) {
     // The route tally rides the CUT line only. On the no-cut line there is
     // nothing to attribute, and an empty `routes: ` there would read as "no
@@ -632,7 +652,8 @@ export function forcedCloseLine(ended, destroyed, held, budgetMs = 5_000, why = 
          + `(${ended} mid-response, ${destroyed} before headers)`
          + (quiet ? ` quiet ${quiet}` : "")
          + (routes ? ` routes: ${routes}` : "")
-         + (owedAtStart === null ? "" : `, owed ${owedAtStart} at the start`) + `\n`;
+         + (owedAtStart === null ? "" : `, owed ${owedAtStart} at the start`)
+         + why + `\n`;
   }
   // Not "idle": we did not measure idleness, we measured that no RESPONSE was
   // open. Naming the held count is what stops a reader concluding the stop was
@@ -647,7 +668,7 @@ export function forcedCloseLine(ended, destroyed, held, budgetMs = 5_000, why = 
   // the number says, and the number is the only thing this redesign added.
   return `[cache-fix] shutdown: forcing close after ${after}, cut no responses`
        + `${held === null ? "" : `, ${held} connection(s) still held`}`
-       + ` (kind unknown; may include CONNECT tunnels and upgrades)\n`;
+       + ` (kind unknown; may include CONNECT tunnels and upgrades)` + why + `\n`;
 }
 
 // SHUTTING DOWN, read by the request handler. server.close() stops ACCEPTS; it
@@ -1910,11 +1931,6 @@ if (invokedAsScript) {
     // can afford to wait, and CACHE_FIX_DRAIN_MS is now its BACKSTOP rather than
     // its deadline.
     // Also used by the per-connection end below.
-    const routeOf = (res) => {
-      const u = res.req?.url;
-      if (typeof u !== "string") return "?";
-      return "/" + u.split("?")[0].split("/").filter(Boolean).slice(0, 2).join("/");
-    };
     // Shared with the stall loop below, which marks what it has already ended.
     // Empty on the supervised arm, where that loop never runs.
     const seen = new WeakMap();
@@ -1969,7 +1985,7 @@ if (invokedAsScript) {
         // line an external monitor parses.
         const rec = seen.get(res);
         if (rec?.done) continue;
-        const r = routeOf(res);
+        const r = drainRoute(res.req?.url);
         routes.set(r, (routes.get(r) ?? 0) + 1);
         // NO RECORD MEANS THE STALL LOOP NEVER RAN -- the supervised arm -- not
         // that nothing ever moved. Dating from arrival there reports a reply's
@@ -2094,7 +2110,16 @@ if (invokedAsScript) {
           // IT ENDED ITSELF, so `res.end()` is a no-op and there is no cut to
           // report. Reachable on the BUFFERED branch only — its single
           // `end(rawResponse)` ignores backpressure; the streaming path pipes.
-          if (res.writableEnded) { rec.done = true; continue; }
+          //
+          // NOT MARKED DONE. `done` means "already accounted for", and this one
+          // is still OWED: megabytes are queued on a socket the client is not
+          // reading, and the forced close destroys it. Marking it here dropped it
+          // from the backstop's owed count AND from the cut tally, so the drain
+          // said `0 response(s) still owed` and `cut no responses` about a reply
+          // it then truncated -- the severed-and-called-clean shape this drain
+          // exists to remove, one branch over. Re-entering this test each tick
+          // costs one comparison and keeps both counts honest.
+          if (res.writableEnded) continue;
           // BYTES ON THE WIRE, not headers in a buffer. `headersSent` is true
           // from writeHead with nothing delivered, and `res.end()` there emits a
           // well-formed empty 200 the client will not retry.
@@ -2107,7 +2132,7 @@ if (invokedAsScript) {
           rec.done = true;
           stallEnded++;
           say(process.stderr, `[cache-fix] shutdown: drain ${how} one connection ` +
-            `${routeOf(res)} with no byte written for ${Math.round((now - rec.at) / 1000)}s ` +
+            `${drainRoute(res.req?.url)} with no byte written for ${Math.round((now - rec.at) / 1000)}s ` +
             `(${mid ? "mid-response" : "before headers"})\n`);
         }
         const elapsed = now - drainStart;
@@ -2149,8 +2174,13 @@ if (invokedAsScript) {
             return;
           }
           clearInterval(tick);
-          forceClose(elapsed,
-            ` on the BACKSTOP budget — ${stallEnded} ended on the stall test,` +
+          // ROUNDED, because this arm passes the ELAPSED time rather than a
+          // configured budget, and `after` renders a non-multiple of 1000 in
+          // milliseconds -- so this arm alone said `after 1800660ms` where every
+          // other says `after 1800s`, and a reader outside this repo matches the
+          // seconds form.
+          forceClose(Math.round(elapsed / 1000) * 1000,
+            `, on the BACKSTOP budget — ${stallEnded} ended on the stall test,` +
             ` ${owedRes.length} response(s) still owed`);
         }
       }, 1_000).unref();
