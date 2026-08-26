@@ -782,14 +782,16 @@ test("15. all sources missing → null", () => {
 test("scratch: no test body mints an unregistered temp dir", async () => {
   const src = await readFile(new URL(import.meta.url), "utf8");
   // Matches any quoted prefix, which the registrar (passing a const) does not
-  // have. Comment lines are skipped and this line's own escaping keeps it from
+  // have. Line comments are skipped and this line's own escaping keeps it from
   // matching itself, so neither the prose above nor the assertion self-flags.
-  // Ceiling: a single-line textual match on one exact call form, so any other
-  // spelling passes.
+  // Only "//": nothing can follow it on the line, while a block comment closes
+  // mid-line, so skipping "/*" and "*" would hide a real mint after the close
+  // and behind any generator method. Ceiling: a single-line textual match on
+  // one exact call form, so any other spelling passes.
   const call = /mkdtemp(?:Sync)?\(join\(tmpdir\(\),\s*["'`][^"'`]+["'`]\s*\)\)/;
   const raw = src.split("\n")
     .map((line, i) => [i + 1, line])
-    .filter(([, l]) => !/^(\/\/|\/?\*)/.test(l.trim()))
+    .filter(([, l]) => !l.trim().startsWith("//"))
     .filter(([, l]) => call.test(l))
     .map(([n]) => n);
   assert.deepEqual(raw, [],
