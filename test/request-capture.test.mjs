@@ -198,8 +198,7 @@ test("request-capture: enabled — records the Messages API only, never another 
       headers: { "x-session-id": "scope-check" },
     });
     assert.deepEqual(await readdir(dir), [],
-      "a non-Messages body was captured — the corpus would carry shapes the " +
-      "extension does not claim and replay cannot drive");
+      "a non-Messages body was captured — the corpus would carry shapes replay cannot drive");
 
     // Outer half — a MESSAGES body on the bootstrap route, so the gate above
     // cannot be what drops it. Declaring `routes` here would widen the corpus.
