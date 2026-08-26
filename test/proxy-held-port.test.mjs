@@ -45,7 +45,15 @@ const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", 
 // them, so the body is tested before the code.
 const OUTAGE = { REFUSED: "refused", RESET: "reset", DEGRADED: "degraded" };
 function classify(body) {
-  if (!body.startsWith("ERR:")) return null;
+  // A BOUNDARY GUARD, and it is load-bearing under concurrency. Not every probe
+  // in this file resolves a BODY -- the readiness loops resolve a bare status
+  // code -- and `freePort()` releases a port before its caller binds it, so a
+  // neighbouring test file can be holding the number this one just drew. Its
+  // 200 then reaches here as a Number and used to throw
+  // `body.startsWith is not a function` out of the helper whose whole job is to
+  // answer "is this an outage". A non-string is not an ERR: body; it is not an
+  // outage either.
+  if (typeof body !== "string" || !body.startsWith("ERR:")) return null;
   if (/"carrying"\s*:\s*"gap-relay"/.test(body)) return null;
   if (/"status"\s*:\s*"degraded"/.test(body)) return OUTAGE.DEGRADED;
   if (/ECONNREFUSED|ETIMEDOUT|HUNG/.test(body)) return OUTAGE.REFUSED;
