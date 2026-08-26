@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import net, { createServer } from "node:net";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
-import { onPort } from "./proc-helpers.mjs";
+import { HOP_ENV, freePort, onPort } from "./proc-helpers.mjs";
 
 const LAUNCHER = fileURLToPath(new URL("../bin/claude-via-proxy.mjs", import.meta.url));
 const SRC = readFileSync(LAUNCHER, "utf-8");
@@ -38,22 +38,6 @@ function runReaper(dir) {
     `${lift("async function reapFingerprintRecords()")}\nreturn reapFingerprintRecords();`
   )(readdirSync, statSync, rmSync, join, () => dir, net, () => "127.0.0.1");
 }
-
-// A FIXED PORT SITS INSIDE THE EPHEMERAL RANGE, so a sibling test's launcher can
-// be handed one and hold it for a whole run; portFree then answers false and the
-// reaper correctly keeps a record these cases expect reaped. A port the kernel
-// has just released is the last one it hands out again.
-function releasedPort() {
-  return new Promise((res) => {
-    const s = createServer();
-    s.listen(0, "127.0.0.1", () => { const port = s.address().port; s.close(() => res(port)); });
-  });
-}
-
-test("the launcher carries a reaper for its own fingerprint records", () => {
-  assert.match(SRC, /const\s+recordAgeMs\s*=/,
-               "no fingerprint reaper found in claude-via-proxy.mjs — this test guards nothing");
-});
 
 // Once per launcher process, not once per spawn, and not behind
 // publishFingerprint's early return.
@@ -84,7 +68,10 @@ test("a record whose port still has a listener is kept however old it is", async
     await new Promise((r) => srv.listen(0, "127.0.0.1", r));
     const port = srv.address().port;
     const live = join(dir, `cache-fix-proxy-${port}.sha256`);
-    const deadPort = await releasedPort();
+    // Derived, not fixed: a fixed port sits inside the ephemeral range, so a
+    // sibling file's launcher can hold it for a whole run and portFree() then
+    // answers false for a record this case expects reaped.
+    const deadPort = await freePort();
     const dead = join(dir, `cache-fix-proxy-${deadPort}.sha256`);
     for (const p of [live, dead]) writeFileSync(p, "x");
     const old = Date.now() / 1000 - 30 * 86400;
@@ -110,16 +97,21 @@ test("a launcher that binds reaps on the way up", { timeout: 30_000 }, async () 
   const dir = mkdtempSync(join(tmpdir(), "ccf-fpreap-e2e-"));
   let child = null, port = 0;
   try {
-    const stalePort = await releasedPort();
+    const stalePort = await freePort();
     const stale = join(dir, `cache-fix-proxy-${stalePort}.sha256`);
     writeFileSync(stale, "x");
     const old = Date.now() / 1000 - 30 * 86400;
     utimesSync(stale, old, old);
 
-    port = await releasedPort();
-    const env = { ...process.env, TMPDIR: dir, CACHE_FIX_PROXY_PORT: String(port),
-                  CACHE_FIX_FORWARD_PROXY: "on", CACHE_FIX_SELF_HEAL: "off" };
-    for (const k of ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"]) delete env[k];
+    port = await freePort();
+    // CLAUDE_CONFIG_DIR with TMPDIR, or the launcher mints its CA in the
+    // operator's real ~/.claude and republishes ca-trust.d/ccf.pem — the
+    // rendezvous file every sibling component reads — from under a live proxy.
+    // CACHE_FIX_FORWARD_PROXY is what asks for that publish, and the reap does
+    // not need a CA at all.
+    const env = { ...process.env, TMPDIR: dir, CLAUDE_CONFIG_DIR: dir,
+                  CACHE_FIX_PROXY_PORT: String(port), CACHE_FIX_SELF_HEAL: "off" };
+    for (const k of HOP_ENV) delete env[k];
     child = spawn(process.execPath, [LAUNCHER, "run-service"], { env, stdio: "ignore" });
 
     const deadline = Date.now() + 25_000;
@@ -160,7 +152,7 @@ test("a record whose port is not a number is kept", async () => {
 test("a stale record is removed, and anything a live holder may still own is kept", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ccf-fpreap-"));
   try {
-    const stalePort = await releasedPort();
+    const stalePort = await freePort();
     const stale = join(dir, `cache-fix-proxy-${stalePort}.sha256`);
     // Fixed numbers, below the ephemeral floor so they cannot collide with the
     // derived one above: none of these four reaches portFree, so only the name
