@@ -109,8 +109,7 @@ export default {
       auto_1m_advice: ADVICE,
     };
 
-    // Advice, not a per-request fact: the text never varies, so a second copy
-    // says nothing the first did — at request rate it buries everything else here.
+    // The text never varies, so a repeat says nothing and at request rate buries the log.
     if (_advised) return;
     _advised = true;
     process.stderr.write(
