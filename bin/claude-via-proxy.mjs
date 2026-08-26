@@ -753,12 +753,18 @@ function codeFingerprint(root) {
   } catch { return ""; }
 }
 
-// One constant, because the reaper matches the basenames readdirSync() yields
-// and cannot derive the prefix from a joined path.
+// BOTH HALVES, because the reaper matches the basenames readdirSync() yields and
+// cannot derive them from a joined path. A literal on either side drifts the
+// reaper into matching nothing, which collects nothing and reports nothing.
 const RECORD_PREFIX = "cache-fix-proxy-";
+const RECORD_SUFFIX = ".sha256";
+
+// Shared with the scratch-CA reaper below: the two gates are equal by
+// construction, not by a comment claiming they are.
+const REAP_AGE_MS = 7 * 86_400_000;
 
 function fingerprintPath(port) {
-  return join(tmpdir(), `${RECORD_PREFIX}${port}.sha256`);
+  return join(tmpdir(), `${RECORD_PREFIX}${port}${RECORD_SUFFIX}`);
 }
 
 // Temp + rename: a reader that opens this mid-write would compare against a
@@ -783,14 +789,22 @@ function publishFingerprint(port) {
 //
 // Seven days on top, matching the scratch-CA reaper, bounds what a crashed
 // holder leaves behind on a port nobody rebinds.
+//
+// The suffix check also excludes publishFingerprint's `<record>.<pid>` temp,
+// deliberately: that name is a concurrent launcher's pending rename, not litter.
 async function reapFingerprintRecords() {
+  let seen = 0;
   try {
     for (const f of readdirSync(tmpdir())) {
-      if (!f.startsWith(RECORD_PREFIX) || !f.endsWith(".sha256")) continue;
+      // Yield periodically. Nothing awaited below reaches the poll phase, so an
+      // uninterrupted pass holds the event loop between the bind and the first
+      // accept — which is the delay deferring this was meant to avoid.
+      if (++seen % 100 === 0) await new Promise(setImmediate);
+      if (!f.startsWith(RECORD_PREFIX) || !f.endsWith(RECORD_SUFFIX)) continue;
       const p = join(tmpdir(), f);
       try {
-        if (Date.now() - statSync(p).mtimeMs <= 7 * 86_400_000) continue;
-        if (!(await portFree(f.slice(RECORD_PREFIX.length, -".sha256".length)))) continue;
+        if (Date.now() - statSync(p).mtimeMs <= REAP_AGE_MS) continue;
+        if (!(await portFree(f.slice(RECORD_PREFIX.length, -RECORD_SUFFIX.length)))) continue;
         rmSync(p);
       } catch { /* raced, gone, or refused; a survivor is disk, not correctness */ }
     }
@@ -801,15 +815,24 @@ async function reapFingerprintRecords() {
 // this needs one bit, and a host without lsof would otherwise make the reap a
 // silent no-op. A name whose port is not a number is not ours to judge.
 //
-// "Is anything LISTENING" is not "is anyone using this port", and the gap cuts
-// both ways. A holder in the bound-but-not-listening state this file creates on
-// purpose reads as free, so an over-age record can be lost in the window before
-// its relay takes over, which ends in the announced exit 0 above. And this probe
-// is itself a listener while it asks, so a launcher running otherHolderOn()
-// concurrently can read it as an incumbent; that window is the bind's lifetime.
+// THREE THINGS THIS DOES NOT ANSWER, all narrow, none free to close here:
 //
-// Awaiting this does not yield: listen and close resolve on nextTick, so the
-// caller's loop never reaches the poll phase and holds it for the whole scan.
+// 1. "Is anything LISTENING" is not "is anyone using this port". A holder in the
+//    bound-but-not-listening state this file creates on purpose reads as free,
+//    so an over-age record can be lost in the window before its relay takes over.
+// 2. A record is keyed by PORT ALONE, and this asks about bindAddr(). A holder on
+//    another address reads as free to a reaper on loopback. Probing the wildcard
+//    would close it and open a worse one — an externally reachable socket per
+//    over-age record — and carrying the address would change the record format.
+// 3. The probe is itself a listener while it asks, so a launcher in otherHolderOn()
+//    can read it as an incumbent, print "this one is surplus" and settle(0),
+//    leaving the port empty. Needs a record for the exact port a second launcher
+//    is binding, i.e. one idle seven days and then reused.
+//
+// All three end in the same place: runningOurCode() answers null and takeOver()
+// exits 0 announcing a deploy that has not taken effect. The local variant of 3
+// cannot happen — listen() is the last synchronous statement of holdPort's
+// executor, so this launcher already owns its own port when the reap runs.
 function portFree(port) {
   const n = Number(port);
   if (!Number.isInteger(n) || n < 1 || n > 65535) return Promise.resolve(false);
@@ -2325,7 +2348,7 @@ if (remoteControl) {
     // unique; it guarantees nothing about what else shares a prefix, so the two
     // sites read one constant rather than two matching string literals.
     try {
-      const scratchAgeMs = 7 * 86_400_000;
+      const scratchAgeMs = REAP_AGE_MS;
       for (const f of readdirSync(tmpdir())) {
         if (!f.startsWith(SCRATCH_PREFIX)) continue;
         const p = join(tmpdir(), f);

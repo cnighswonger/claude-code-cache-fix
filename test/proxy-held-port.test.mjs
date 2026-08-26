@@ -45,8 +45,10 @@ const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", 
 // them, so the body is tested before the code.
 const OUTAGE = { REFUSED: "refused", RESET: "reset", DEGRADED: "degraded" };
 function classify(body) {
-  // A NUMBER IS NOT AN OUTAGE, AND MUST NOT BE A TypeError EITHER — a probe that
-  // resolves a bare statusCode reaches here. See the unit case that pins it.
+  // A BOUNDARY GUARD, NOT A LIVE PATH: every caller now hands this an ERR: string,
+  // because health() replaced the probe that resolved a bare statusCode. Kept
+  // because this is a shared helper with a history of differently shaped probes,
+  // and the answer to one is "that was a reply, not an outage", not a TypeError.
   if (typeof body !== "string") return null;
   if (!body.startsWith("ERR:")) return null;
   if (/"carrying"\s*:\s*"gap-relay"/.test(body)) return null;

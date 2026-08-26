@@ -14,6 +14,7 @@ import { HOP_ENV, freePort, onPort } from "./proc-helpers.mjs";
 
 const LAUNCHER = fileURLToPath(new URL("../bin/claude-via-proxy.mjs", import.meta.url));
 const SRC = readFileSync(LAUNCHER, "utf-8");
+const rec = (port) => `${recordConst("RECORD_PREFIX")}${port}${recordConst("RECORD_SUFFIX")}`;
 
 // Brace-counted, not regex: a lazy match stops at an inner block's close and
 // yields a fragment that fails as a SyntaxError rather than a named assertion.
@@ -33,7 +34,12 @@ function lift(decl) {
 // touched. Every callee comes with it.
 function runReaper(dir) {
   return new Function("readdirSync", "statSync", "rmSync", "join", "tmpdir", "net", "bindAddr",
-    `const RECORD_PREFIX = ${JSON.stringify(recordPrefix())};\n` +
+    `const RECORD_PREFIX = ${JSON.stringify(recordConst("RECORD_PREFIX"))};\n` +
+    `const RECORD_SUFFIX = ${JSON.stringify(recordConst("RECORD_SUFFIX"))};\n` +
+    // Verbatim, not a copy of the number: the inner catch swallows a
+    // ReferenceError, so a constant this harness forgets to inject makes the
+    // reaper collect NOTHING while every case still reports what it expected.
+    `const REAP_AGE_MS = ${ageGate()};\n` +
     `${lift("function portFree(")}\n` +
     `${lift("async function reapFingerprintRecords()")}\nreturn reapFingerprintRecords();`
   )(readdirSync, statSync, rmSync, join, () => dir, net, () => "127.0.0.1");
@@ -53,6 +59,13 @@ test("the reap is driven by the supervisor, and off its startup path", () => {
   assert.match(hold, /setTimeout\(reapFingerprintRecords, 0\)\.unref\(\)/,
                "the reap runs inline on the supervisor's startup path; a tmpdir scan " +
                "there delays the bind and destabilises the held-port suite");
+  // Deferring alone does not stop it blocking: nothing the loop awaits reaches
+  // the poll phase, so without a periodic yield the scan holds the event loop
+  // between the bind and the first accept. Measured at 300 records: a
+  // setImmediate queued first fires 13 ms into a 28 ms scan with the yield, and
+  // not at all without it, at no cost to the total.
+  assert.match(lift("async function reapFingerprintRecords()"), /await new Promise\(setImmediate\)/,
+               "the scan never yields, so it holds the event loop for its whole pass");
 });
 
 // AGE ALONE MAKES SEVEN DAYS A DEADLINE, NOT A MARGIN. Nothing republishes a
@@ -130,6 +143,19 @@ test("a launcher that binds reaps on the way up", { timeout: 30_000 }, async () 
   }
 });
 
+// THE CEILING IS INVISIBLE FROM THE DIRECTORY. Without it listen() throws
+// ERR_SOCKET_BAD_PORT, the reaper's inner catch keeps the record, and a fixture
+// asserting "the record survived" passes either way — measured, that case stayed
+// green with the guard deleted. Asked of the predicate the two differ: answer
+// false, or reject.
+test("portFree answers false outside the port range, rather than throwing", async () => {
+  const portFree = new Function("net", "bindAddr",
+    `${lift("function portFree(")}\nreturn portFree;`)(net, () => "127.0.0.1");
+  assert.equal(await portFree("70000"), false, "a port above 65535 reached listen()");
+  assert.equal(await portFree("0"), false, "port 0 reached listen(), which takes a random port");
+  assert.equal(await portFree("-1"), false);
+});
+
 test("a stale record is removed, and anything a live holder may still own is kept", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ccf-fpreap-"));
   try {
@@ -155,9 +181,15 @@ test("a stale record is removed, and anything a live holder may still own is kep
     // reaper's to judge, and asking the kernel to bind NaN throws rather than
     // answering.
     const unparsed = join(dir, "cache-fix-proxy-healthcheck.sha256");
-    for (const p of [stale, fresh, longLived, nearGate, alien, inflight, unparsed]) writeFileSync(p, "x");
+    // The range edges, both over-age so they DO reach portFree. Port 0 is a name
+    // older launcher versions demonstrably wrote, and it is the worst one to get
+    // wrong: listen(0) binds a random free port and always succeeds, so without
+    // the floor the probe would call every port-0 record collectable.
+    const zero = join(dir, "cache-fix-proxy-0.sha256");
+    for (const p of [stale, fresh, longLived, nearGate, alien, inflight, unparsed, zero]) writeFileSync(p, "x");
     const age = (p, days) => utimesSync(p, Date.now() / 1000 - days * 86400, Date.now() / 1000 - days * 86400);
     age(stale, 8); age(longLived, 3); age(nearGate, 6); age(alien, 8); age(inflight, 8); age(unparsed, 8);
+    age(zero, 8);
 
     await runReaper(dir);
 
@@ -174,17 +206,28 @@ test("a stale record is removed, and anything a live holder may still own is kep
               `the reaper took a name that is not its own: ${left}`);
     assert.ok(left.includes("cache-fix-proxy-healthcheck.sha256"),
               `the reaper judged a name it cannot parse a port out of: ${left}`);
+    assert.ok(left.includes("cache-fix-proxy-0.sha256"),
+              `port 0 was probed: listen(0) takes a random port and always succeeds — ${left}`);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-// The writer and the reaper must read one constant, or they drift apart on any
-// platform whose separator is not "/".
-function recordPrefix() {
-  const m = SRC.match(/const RECORD_PREFIX = "([^"]+)";/);
-  assert.ok(m, "RECORD_PREFIX is gone — the writer and the reaper can drift apart again");
-  assert.ok(lift("function fingerprintPath(").includes("RECORD_PREFIX"),
-            "fingerprintPath no longer builds the name from RECORD_PREFIX");
+// BOTH HALVES OF THE NAME, from the launcher's own constants. A hardcoded copy
+// here drifts silently the other way: the reaper would match nothing and collect
+// nothing, with every case in this file still green.
+function ageGate() {
+  const m = SRC.match(/const REAP_AGE_MS = ([^;]+);/);
+  assert.ok(m, "REAP_AGE_MS is gone — the two reapers can drift to different gates");
+  assert.match(lift("async function reapFingerprintRecords()"), /REAP_AGE_MS/,
+               "the reaper no longer reads the shared gate");
+  return m[1];
+}
+
+function recordConst(name) {
+  const m = SRC.match(new RegExp(`const ${name} = "([^"]+)";`));
+  assert.ok(m, `${name} is gone — the writer and the reaper can drift apart again`);
+  assert.ok(lift("function fingerprintPath(").includes(name),
+            `fingerprintPath no longer builds the name from ${name}`);
   return m[1];
 }
