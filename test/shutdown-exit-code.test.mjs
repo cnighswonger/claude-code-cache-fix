@@ -1685,7 +1685,11 @@ describe("SIGTERM exit code", () => {
         `the clean path: ${line}`);
       assert.ok(done, "premise: the reply never completed, so nothing was owed and finished");
 
-      assert.match(line, /owed [0-9]+ at the start/,
+      // NOT `[0-9]+`. This case holds a reply open across the stop, so the count
+      // is known to be at least one -- and a shape-only match is satisfied by
+      // `owed 0`, which is the exact reading the field exists to distinguish
+      // from. Pinning the shape alone leaves the number free to be wrong.
+      assert.match(line, /owed [1-9][0-9]* at the start/,
         `a clean drain must still say how much was owed when it began -- otherwise ` +
         `"nothing was in flight" and "everything finished in time" are the same ` +
         `line, and the arm's cost cannot be counted. Got: ${line}`);
