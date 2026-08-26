@@ -78,7 +78,11 @@ export function joinBetaTokens(tokens) {
   return tokens.join(", ");
 }
 
-let _advised = false;
+// PROCESS-DURABLE: `loadExtensions` cache-busts every import, so a module-scoped
+// `let` is re-armed on each reload and the advisory returns at request rate.
+// `Symbol.for`, not `Symbol()` -- the registry is what makes every re-evaluated
+// copy reach the same object.
+const _latch = (globalThis[Symbol.for("cache-fix.auto-1m-guard")] ??= { advised: false });
 
 export default {
   name: "auto-1m-guard",
@@ -110,8 +114,8 @@ export default {
     };
 
     // A repeat carries nothing the first line did not, and at request rate buries the log.
-    if (_advised) return;
-    _advised = true;
+    if (_latch.advised) return;
+    _latch.advised = true;
     process.stderr.write(
       `[auto-1m-guard] ${BETA_TOKEN_1M} detected in outbound betas` +
         (plan.stripped ? " — stripped" : "") +
@@ -121,6 +125,6 @@ export default {
   },
 };
 
-// Test seam — clears the latch, whose unit is the module instance, not the
-// process: loadExtensions cache-busts imports, so a reload re-arms it on purpose.
-export function __resetAdvisedForTests() { _advised = false; }
+// Test seam — clears the process-wide latch. Any module instance clears it for
+// all of them, which is the property the latch exists to have.
+export function __resetAdvisedForTests() { _latch.advised = false; }
