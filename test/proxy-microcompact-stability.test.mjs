@@ -12,11 +12,9 @@ import ext, {
   runMicrocompactStability,
 } from "../proxy/extensions/microcompact-stability.mjs";
 
-// EVERY SCRATCH DIR, EVEN THE RUNS THAT FAIL. Thirteen cases remove theirs on the
-// last line of the test body, so an assertion that throws skips it, and the
-// fourteenth removes nothing at all — that one leaked on the green path too.
-// Those calls stay as they are, since they free disk during a long run; this
-// collects what they miss.
+// A test body that throws never reaches its own cleanup, so every scratch dir is
+// registered here and removed once the file is done. Per dir, so one refused
+// removal cannot strand the rest.
 const scratch = [];
 async function mcTemp() {
   const d = await mkdtemp(join(tmpdir(), "mc-"));
@@ -25,9 +23,7 @@ async function mcTemp() {
 }
 after(async () => {
   for (const d of scratch) {
-    // Per dir, so one refused removal cannot strand the rest. `force` already
-    // swallows a missing dir; this is for EPERM and EBUSY.
-    try { await rm(d, { recursive: true, force: true }); } catch { /* see above */ }
+    try { await rm(d, { recursive: true, force: true }); } catch { /* best effort */ }
   }
 });
 
@@ -196,7 +192,6 @@ test("4a. sentinel + trailing text → Mode B match, body NOT mutated, prefix_64
   assert.equal(rec.partial_matches[0].sentinel_text, undefined);
   assert.ok(rec.partial_matches[0].prefix_64.length <= 64);
   assert.ok(rec.partial_matches[0].prefix_64.startsWith("[Old tool result content cleared"));
-  await rm(dir, { recursive: true, force: true });
 });
 
 test("4b. long trailing → prefix_64 captures only first 64 chars, byte_length reports full size", async () => {
@@ -216,7 +211,6 @@ test("4b. long trailing → prefix_64 captures only first 64 chars, byte_length 
   assert.equal(rec.partial_matches.length, 1);
   assert.equal(rec.partial_matches[0].prefix_64.length, 64);
   assert.equal(rec.partial_matches[0].byte_length, Buffer.byteLength(long, "utf8"));
-  await rm(dir, { recursive: true, force: true });
 });
 
 test("4c. CACHE_FIX_MICROCOMPACT_REDACT_LEN=0 → prefix_64 absent", async () => {
@@ -241,7 +235,6 @@ test("4c. CACHE_FIX_MICROCOMPACT_REDACT_LEN=0 → prefix_64 absent", async () =>
   assert.equal(rec.partial_matches.length, 1);
   assert.equal(rec.partial_matches[0].prefix_64, undefined);
   assert.equal(typeof rec.partial_matches[0].byte_length, "number");
-  await rm(dir, { recursive: true, force: true });
 });
 
 // --- Custom patterns ---
@@ -280,7 +273,6 @@ test("5b. custom Mode A regex + custom Mode B prefix → exact match goes to exa
   assert.equal(rec.exact_matches.length, 1);
   assert.equal(rec.partial_matches.length, 0);
   assert.equal(rec.exact_matches[0].sentinel_text, "[CC microcompact rev2]");
-  await rm(dir, { recursive: true, force: true });
 });
 
 test("5c. custom Mode B prefix → variant-of-custom-family captured redacted in partial_matches", async () => {
@@ -318,7 +310,6 @@ test("5c. custom Mode B prefix → variant-of-custom-family captured redacted in
   assert.equal(rec.partial_matches.length, 1);
   assert.equal(rec.partial_matches[0].sentinel_text, undefined); // never full text
   assert.ok(rec.partial_matches[0].prefix_64.startsWith("[CC microcompact"));
-  await rm(dir, { recursive: true, force: true });
 });
 
 // --- Tool_result content shapes ---
@@ -388,7 +379,6 @@ test("9. dump set + sentinel match → JSONL line; session_id is hashed (no plai
   assert.equal(rec.session_id_hash.length, 8);
   assert.ok(!JSON.stringify(rec).includes("secret-session-12345"));
   assert.equal(rec.model, "claude-opus-4-7-20260101");
-  await rm(dir, { recursive: true, force: true });
 });
 
 test("10. dump unset → no fs activity", async () => {
@@ -410,7 +400,6 @@ test("10. dump unset → no fs activity", async () => {
     );
   });
   await assert.rejects(() => stat(dumpPath), /ENOENT/);
-  await rm(dir, { recursive: true, force: true });
 });
 
 test("11. multiple matches in one request → ONE JSONL line with arrays split A/B", async () => {
@@ -495,7 +484,6 @@ test("14. normalize disabled, dump enabled → matches recorded in dump but body
   assert.equal(JSON.stringify(body), before);
   const rec = JSON.parse((await readFile(dumpPath, "utf8")).trim());
   assert.equal(rec.exact_matches.length, 1);
-  await rm(dir, { recursive: true, force: true });
 });
 
 test("15. two requests with different timestamps → byte-identical bodies after normalization", async () => {
@@ -541,7 +529,6 @@ test("16. both gates unset → extension fires but exits early; no telemetry, no
   assert.equal(JSON.stringify(body), before);
   assert.equal(ctx.meta.microcompactStats, undefined);
   await assert.rejects(() => stat(dumpPath), /ENOENT/);
-  await rm(dir, { recursive: true, force: true });
 });
 
 test("17. only diagnostic enabled → telemetry present, JSONL written, no mutation", async () => {
@@ -563,7 +550,6 @@ test("17. only diagnostic enabled → telemetry present, JSONL written, no mutat
   assert.equal(ctx.meta.microcompactStats.diagnostic_enabled, true);
   assert.equal(ctx.meta.microcompactStats.normalization_enabled, false);
   assert.equal(ctx.meta.microcompactStats.diagnostic_records_written, 1);
-  await rm(dir, { recursive: true, force: true });
 });
 
 test("18. only normalize enabled → telemetry present, mutation happens, no JSONL", async () => {
@@ -583,7 +569,6 @@ test("18. only normalize enabled → telemetry present, mutation happens, no JSO
   assert.equal(ctx.meta.microcompactStats.normalization_enabled, true);
   assert.equal(ctx.meta.microcompactStats.sentinels_normalized, 1);
   await assert.rejects(() => stat(dumpPath), /ENOENT/);
-  await rm(dir, { recursive: true, force: true });
 });
 
 test("19. both enabled → telemetry, mutation, AND JSONL all happen; raw text captured pre-normalization", async () => {
@@ -613,7 +598,6 @@ test("19. both enabled → telemetry, mutation, AND JSONL all happen; raw text c
   assert.equal(rec.exact_matches[0].normalized_text, undefined);
   // Telemetry attached.
   assert.equal(ctx.meta.microcompactStats.sentinels_normalized, 1);
-  await rm(dir, { recursive: true, force: true });
 });
 
 test("19a. CACHE_FIX_DUMP_MICROCOMPACT_INCLUDE_NORMALIZED=1 → adds normalized_text alongside raw sentinel_text", async () => {
@@ -638,7 +622,6 @@ test("19a. CACHE_FIX_DUMP_MICROCOMPACT_INCLUDE_NORMALIZED=1 → adds normalized_
   const rec = JSON.parse((await readFile(dumpPath, "utf8")).trim());
   assert.equal(rec.exact_matches[0].sentinel_text, SENTINEL_TS);
   assert.equal(rec.exact_matches[0].normalized_text, SENTINEL_BARE);
-  await rm(dir, { recursive: true, force: true });
 });
 
 // --- Telemetry shape ---
@@ -790,4 +773,18 @@ test("15. all sources missing → null", () => {
   const reqCtx = { body: { messages: [] } };
   const rec = buildDiagnosticRecord(reqCtx, [], [], 0, { ts: "t" });
   assert.equal(rec.session_id_hash, null);
+});
+
+// A dir minted outside mcTemp() is unregistered, so `after()` cannot remove it
+// and a throwing case strands it, with the suite green either way.
+test("scratch: no test body mints an unregistered temp dir", async () => {
+  const src = await readFile(new URL(import.meta.url), "utf8");
+  const call = /mkdtemp(?:Sync)?\(join\(tmpdir\(\),\s*"[^"]+"\s*\)\)/;  // escaped: cannot match its own line
+  const raw = src.split("\n")
+    .map((line, i) => [i + 1, line])
+    .filter(([, l]) => call.test(l) && !l.includes("const d = await mkdtemp"))  // the registrar
+    .map(([n]) => n);
+  assert.deepEqual(raw, [],
+    `every temp dir must go through mcTemp(); raw mkdtemp at line(s): ${raw.join(", ")}`);
+  assert.ok(scratch.length > 0, "premise: this file does mint temp dirs");
 });
