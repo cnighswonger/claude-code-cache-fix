@@ -50,6 +50,23 @@ test("handoverEnv: only CACHE_FIX_ keys are honoured — the file cannot inject 
   assert.equal(out.CACHE_FIX_PREFIXDIFF, "1");
 });
 
+// A HALF-WRITTEN FILE PARSES CLEANLY, which is what makes it worse than a
+// malformed one. `writeFileSync` truncates and then writes, so a handover that
+// lands mid-write reads a prefix -- and a cut line like
+// `CACHE_FIX_PROXY_UPSTREAM=http://ho` is a well-formed assignment with a broken
+// value. Nothing later corrects it: the successor carries it until the next
+// handover. A line is honoured once its terminator has been written, so a
+// truncated tail is invisible and the inherited value stands.
+test("handoverEnv: a line whose newline has not been written yet is not applied", () => {
+  const p = withFile("CACHE_FIX_PREFIXDIFF=1\nCACHE_FIX_PROXY_UPSTREAM=http://ho");
+  const out = handoverEnv({ CACHE_FIX_PROXY_UPSTREAM: "https://api.example.invalid" }, p);
+  assert.equal(out.CACHE_FIX_PROXY_UPSTREAM, "https://api.example.invalid",
+    "a half-written line was applied — the successor now points at a truncated " +
+    "upstream and stays there until something hands the port on again");
+  assert.equal(out.CACHE_FIX_PREFIXDIFF, "1",
+    "the complete lines before the cut must still land");
+});
+
 test("handoverEnv: junk lines are skipped, valid ones still applied", () => {
   const p = withFile("# a comment\n\nnot-an-assignment\nCACHE_FIX_PREFIXDIFF=1\n");
   assert.equal(handoverEnv({}, p).CACHE_FIX_PREFIXDIFF, "1");

@@ -32,7 +32,12 @@ export function handoverEnv(base, path = handoverEnvPath()) {
   let text;
   try { text = readFileSync(path, "utf8"); } catch { return base; }
   const out = { ...base };
-  for (const line of text.split("\n")) {
+  // A LINE IS HONOURED ONCE ITS TERMINATOR IS THERE. A half-written file parses
+  // cleanly -- `..._UPSTREAM=http://ho` is a well-formed assignment with a broken
+  // value -- so dropping the unterminated tail is what makes a truncated write
+  // invisible here. It also means a file with no final newline loses its last
+  // line, which is the fail-safe direction: the inherited value stands.
+  for (const line of text.split("\n").slice(0, -1)) {
     const eq = line.indexOf("=");
     if (eq < 1) continue;
     const k = line.slice(0, eq).trim();
