@@ -259,6 +259,12 @@ export default {
     "~/.claude/cache-fix-captures/<key>-requests.jsonl for offline " +
     "replay and cache simulation",
   enabled: false, // overridden by extensions.json
+  // Declared, not inherited. runOnRequest defaults to exactly this, so the
+  // value is a no-op -- but the SCOPE note at the top of this file reasons
+  // about it, and an inherited default is invisible to anyone widening the
+  // corpus. jsonl-session-mirror and image-retry-circuit-breaker spell it out
+  // for the same reason.
+  routes: ["messages"],
   order: 60,
 
   async onRequest(ctx) {
