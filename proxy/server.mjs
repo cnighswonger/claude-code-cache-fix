@@ -1853,7 +1853,7 @@ if (invokedAsScript) {
     //
     // Counted HERE, not at the terminal line: by then the set has drained, which
     // is the question the terminal line already answers.
-    const owedAtStart = [...(active.server?._live ?? [])].length;
+    const owedAtStart = active.server?._live?.size ?? 0;
     // Hoisted: the clean-drain line is written before the stall loop is
     // installed, so the count has to outlive it.
     let stallEnded = 0;
@@ -1984,11 +1984,9 @@ if (invokedAsScript) {
       const routeTally = [...routes].sort((a, b) => b[1] - a[1])
         .map(([r, n]) => `${r}=${n}`).join(" ");
       const secs = (ms) => (ms / 1000).toFixed(1);
-      const quietTally = quietMs.length
-        ? (Math.min(...quietMs) === Math.max(...quietMs)
-            ? `${secs(quietMs[0])}s`
-            : `${secs(Math.min(...quietMs))}-${secs(Math.max(...quietMs))}s`)
-        : "";
+      const lo = Math.min(...quietMs), hi = Math.max(...quietMs);
+      const quietTally = !quietMs.length ? ""
+        : lo === hi ? `${secs(lo)}s` : `${secs(lo)}-${secs(hi)}s`;
       // THE SAME EXIT CODE THE GRACEFUL PATH USES. It exits
       // `askForSuccessor ? 75 : 0`, and the comment above it says the two paths
       // must not disagree about what our exit means — but this one exited 0
