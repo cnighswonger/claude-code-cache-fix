@@ -1217,13 +1217,6 @@ export async function startProxy(options = {}) {
     inheritedSocket: listenFd === 3,
     close: () =>
       new Promise((resolve, reject) => {
-        // Retire this instance's forward-mode vote exactly once (guarded
-        // against double-close): routing/health stop passthrough behavior and
-        // the process-wide self-heal is removed with the last live instance.
-        if (!closed) {
-          closed = true;
-          if (forwardAttached) { _forwardActive--; removeSelfHeal(); }
-        }
         try { stopOAuthRefresher(); } catch {}
         try {
           if (watcher) watcher.close();
@@ -1248,7 +1241,30 @@ export async function startProxy(options = {}) {
         // So the unbind is free and only the sweep waits. Deferring the unbind
         // instead holds the LISTENING socket for the whole drain -- and the
         // release is announced before the drain, with a holder settling on it.
-        server._unbind((err) => (err && err.code !== "ERR_SERVER_NOT_RUNNING" ? reject(err) : resolve()));
+        server._unbind((err) => {
+          // WHEN THE DRAIN HAS ENDED, NOT WHEN IT STARTED. This used to run
+          // synchronously in the executor above, so the moment a stop was
+          // signalled `_forwardActive` fell to zero and the two readers of it —
+          // the absolute-form rewrite and the passthrough — sent every path
+          // that is not /health, POST /v1/messages or the bootstrap to
+          // handleNotFound. A connection still in flight then got a
+          // well-formed 404 the client cannot tell from a real one and will not
+          // retry, which is the failure the passthrough exists to prevent.
+          //
+          // The window was 5s while a stop under a live holder shared the
+          // standalone ceiling. It is the drain budget now, so the same line
+          // that widens the drain widens this: measured 200 before the stop and
+          // 404 on the same socket 1.4s into it.
+          //
+          // Retired on BOTH outcomes and exactly once: the server is going away
+          // either way, and the guard keeps a double close from double
+          // decrementing.
+          if (!closed) {
+            closed = true;
+            if (forwardAttached) { _forwardActive--; removeSelfHeal(); }
+          }
+          return err && err.code !== "ERR_SERVER_NOT_RUNNING" ? reject(err) : resolve();
+        });
         // NODE 18 DOES NOT DO THIS FOR US, and ba2375b silently assumed it did.
         // From 19 on, close() closes idle keep-alives itself; 18.20.8 does not --
         // measured, close never fires where 20.20.2 and 24.11.1 report 1-2 ms.
