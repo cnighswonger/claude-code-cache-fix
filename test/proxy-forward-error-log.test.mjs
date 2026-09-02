@@ -111,6 +111,26 @@ describe("upstream connection failures are reported on stderr, not only debugLog
     assert.ok(!matches[0].includes("s3cret") && !matches[0].includes("token=T"), `leaked:\n${matches[0]}`);
   });
 
+  it("passthrough site, non-origin-form targets: authority never reaches stderr, not just the http(s) scrub", async () => {
+    delete process.env.CACHE_FIX_GATEWAY_ERROR_LOG;
+    for (const target of ["ftp://alice:s3cret@127.0.0.1:9/p?q=1", "//alice:s3cret@evil/p"]) {
+      const cap = captureStderr();
+      let res;
+      try {
+        res = await clientRequest(handle.port, "GET", target);
+      } finally {
+        cap.restore();
+      }
+      assert.equal(res.status, 502, `status for ${target}`);
+      const matches = cap.lines.filter((l) => l.startsWith("[cache-fix] upstream error -> 502:"));
+      assert.equal(matches.length, 1, `expected exactly one line for ${target}, got:\n${cap.lines.join("")}`);
+      assert.ok(
+        !matches[0].includes("s3cret") && !matches[0].includes("alice") && !matches[0].includes("evil"),
+        `leaked for ${target}:\n${matches[0]}`,
+      );
+    }
+  });
+
   it("messages site: 502 and one stderr line with ECONNREFUSED and the route", async () => {
     delete process.env.CACHE_FIX_GATEWAY_ERROR_LOG;
     const cap = captureStderr();

@@ -80,8 +80,16 @@ function debugLog(...args) {
 // session doesn't put that id in a mode-644 stderr file.
 function reportUpstreamError(err, method, url) {
   if (process.env.CACHE_FIX_GATEWAY_ERROR_LOG === "off") return;
-  const route = (parseAbsoluteForm(url)?.pathname ?? String(url || "").split("?")[0])
-    .replace(/cse_[A-Za-z0-9]+/g, "cse_<id>");
+  // parseAbsoluteForm only recognizes http(s)://. Every other non-origin-form
+  // shape (ftp://, a malformed http:// that fails URL parse, `//host/path`)
+  // fell through to the raw target string, putting its authority — userinfo
+  // included — on stderr. RFC 7230 origin-form (a single leading `/`, not
+  // `//`) is the only shape that reaches these handlers legitimately.
+  const urlStr = String(url || "");
+  const route = (
+    parseAbsoluteForm(url)?.pathname
+    ?? (urlStr.startsWith("/") && !urlStr.startsWith("//") ? urlStr.split("?")[0] : "<non-origin-form>")
+  ).replace(/cse_[A-Za-z0-9]+/g, "cse_<id>");
   const code = err?.code ? `${err.code} ` : "";
   process.stderr.write(
     `[cache-fix] upstream error -> 502: ${code}${err?.message ?? err} for ${method} ${route}\n`,
