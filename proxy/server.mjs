@@ -70,7 +70,7 @@ function debugLog(...args) {
 // [cache-fix] stderr convention as the holder/hop lines elsewhere in this
 // file and in upstream.mjs — not debug-gated, so the reason survives
 // without anyone having turned debug logging on. Default ON; set
-// CACHE_FIX_FORWARD_ERROR_LOG=off to silence it. Env read per call, same
+// CACHE_FIX_GATEWAY_ERROR_LOG=off to silence it. Env read per call, same
 // as debugLog and CACHE_FIX_SELF_HEAL.
 //
 // Path only (no query, no headers, no body — a query can carry values
@@ -79,7 +79,7 @@ function debugLog(...args) {
 // any session id folded to `cse_<id>`, so a route that names a specific
 // session doesn't put that id in a mode-644 stderr file.
 function reportUpstreamError(err, method, url) {
-  if (process.env.CACHE_FIX_FORWARD_ERROR_LOG === "off") return;
+  if (process.env.CACHE_FIX_GATEWAY_ERROR_LOG === "off") return;
   const route = (parseAbsoluteForm(url)?.pathname ?? String(url || "").split("?")[0])
     .replace(/cse_[A-Za-z0-9]+/g, "cse_<id>");
   const code = err?.code ? `${err.code} ` : "";

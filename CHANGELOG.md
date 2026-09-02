@@ -8,7 +8,7 @@
 
 ### Fixed
 
-- **A 502 handed to a client no longer leaves no record of why.** The three `forwardRequest` catch blocks (messages, bootstrap, passthrough) only logged the reason through `debugLog`, gated on `CACHE_FIX_DEBUG=1` and off by default on every host — an outage left nothing to read back. Each site now also writes one `[cache-fix] upstream error -> 502: <code> <message> for <method> <route>` line to stderr (session ids in the route scrubbed to `cse_<id>`), on by default; set `CACHE_FIX_FORWARD_ERROR_LOG=off` to silence it.
+- **A 502 handed to a client no longer leaves no record of why.** The three `forwardRequest` catch blocks (messages, bootstrap, passthrough) only logged the reason through `debugLog`, gated on `CACHE_FIX_DEBUG=1` and off by default on every host — an outage left nothing to read back. Each site now also writes one `[cache-fix] upstream error -> 502: <code> <message> for <method> <route>` line to stderr (session ids in the route scrubbed to `cse_<id>`), on by default; set `CACHE_FIX_GATEWAY_ERROR_LOG=off` to silence it.
 
 - **A refused fd-3 handover no longer makes the proxy claim it handed the socket on.** `inheritedSocket` was computed from "handover was attempted", not "handover succeeded", so a proxy that was refused fd 3 and fell back to binding its own port still advertised an inherited socket. On `SIGTERM` it then spawned a successor pointed at the same unservable descriptor and exited `75` — telling the supervisor a successor holds the socket — while the port it actually served was released with nobody on it. Exits `0` now, spawns nothing, and leaves no orphan.
 

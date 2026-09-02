@@ -453,7 +453,7 @@ All proxy settings are controlled via environment variables. Set them before sta
 | `CACHE_FIX_EXTENSIONS_DIR` | `proxy/extensions/` | Directory for extension `.mjs` files |
 | `CACHE_FIX_EXTENSIONS_CONFIG` | `proxy/extensions.json` | Extension configuration file |
 | `CACHE_FIX_DEBUG` | `0` | Enable debug logging |
-| `CACHE_FIX_FORWARD_ERROR_LOG` | `on` | Log one `[cache-fix] upstream error -> 502: ...` stderr line (error, method, route; session ids scrubbed) whenever the proxy hands a client a 502 for an upstream connection failure. Set to `off` to disable. |
+| `CACHE_FIX_GATEWAY_ERROR_LOG` | `on` | Log one `[cache-fix] upstream error -> 502: ...` stderr line (error, method, route; session ids scrubbed) whenever the proxy hands a client a 502 for an upstream connection failure. Set to `off` to disable. |
 | `CACHE_FIX_HOT_RELOAD` | unset | Set to `on` to enable in-process extension hot-reload. Off by default as of v4.0.0 — see [Upgrading from v3.x](#upgrading-from-v3x) for details and the supervisor restart flow. |
 | `CACHE_FIX_READ_DEDUPE` | unset | Set to `1` to dedupe repeat `Read` tool results that re-appear unchanged across turns. Keeps the first occurrence intact; replaces later byte-identical ones (keyed on `file_path` + content + `offset` + `limit`) with a stable pointer line. Default-off; opt in per session to validate before broader rollout. See [extension impact guide](docs/extension-impact-guide.md). |
 | `CACHE_FIX_ADVISOR_PLAN` | unset | Plan override for `tools/tier-advisor.mjs` — one of `max-5x`, `max-20x`, `pro`. Bypasses heuristic plan detection. See [Tier advisor](docs/tier-advisor.md). |

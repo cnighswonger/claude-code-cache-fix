@@ -3,7 +3,7 @@
 // only logged through debugLog, gated on CACHE_FIX_DEBUG=1 and off by
 // default on every host. This asserts each site now writes one
 // [cache-fix] stderr line naming the error and the route, on by default,
-// silenced only by CACHE_FIX_FORWARD_ERROR_LOG=off — and that a session id
+// silenced only by CACHE_FIX_GATEWAY_ERROR_LOG=off — and that a session id
 // in the route never reaches stderr.
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
@@ -46,7 +46,7 @@ describe("upstream connection failures are reported on stderr, not only debugLog
   let handle;
   let caDir;
   const savedEnv = {};
-  const ENV_KEYS = ["CACHE_FIX_PROXY_UPSTREAM", "CACHE_FIX_FORWARD_PROXY", "CACHE_FIX_CA_DIR", "CACHE_FIX_FORWARD_ERROR_LOG"];
+  const ENV_KEYS = ["CACHE_FIX_PROXY_UPSTREAM", "CACHE_FIX_FORWARD_PROXY", "CACHE_FIX_CA_DIR", "CACHE_FIX_GATEWAY_ERROR_LOG"];
 
   before(async () => {
     for (const k of ENV_KEYS) savedEnv[k] = process.env[k];
@@ -76,7 +76,7 @@ describe("upstream connection failures are reported on stderr, not only debugLog
   });
 
   it("passthrough site: 502 and one stderr line with ECONNREFUSED, method, route, session id scrubbed", async () => {
-    delete process.env.CACHE_FIX_FORWARD_ERROR_LOG;
+    delete process.env.CACHE_FIX_GATEWAY_ERROR_LOG;
     const cap = captureStderr();
     let res;
     try {
@@ -95,7 +95,7 @@ describe("upstream connection failures are reported on stderr, not only debugLog
   });
 
   it("passthrough site, absolute-form foreign target: userinfo, host and query never reach stderr", async () => {
-    delete process.env.CACHE_FIX_FORWARD_ERROR_LOG;
+    delete process.env.CACHE_FIX_GATEWAY_ERROR_LOG;
     const foreignPort = await freePort();
     const cap = captureStderr();
     let res;
@@ -112,7 +112,7 @@ describe("upstream connection failures are reported on stderr, not only debugLog
   });
 
   it("messages site: 502 and one stderr line with ECONNREFUSED and the route", async () => {
-    delete process.env.CACHE_FIX_FORWARD_ERROR_LOG;
+    delete process.env.CACHE_FIX_GATEWAY_ERROR_LOG;
     const cap = captureStderr();
     let res;
     try {
@@ -128,7 +128,7 @@ describe("upstream connection failures are reported on stderr, not only debugLog
   });
 
   it("bootstrap site: 502 and one stderr line with ECONNREFUSED and the route", async () => {
-    delete process.env.CACHE_FIX_FORWARD_ERROR_LOG;
+    delete process.env.CACHE_FIX_GATEWAY_ERROR_LOG;
     const cap = captureStderr();
     let res;
     try {
@@ -143,15 +143,15 @@ describe("upstream connection failures are reported on stderr, not only debugLog
     assert.match(matches[0], /POST \/api\/claude_cli\/bootstrap/);
   });
 
-  it("CACHE_FIX_FORWARD_ERROR_LOG=off: still 502, no such line", async () => {
-    process.env.CACHE_FIX_FORWARD_ERROR_LOG = "off";
+  it("CACHE_FIX_GATEWAY_ERROR_LOG=off: still 502, no such line", async () => {
+    process.env.CACHE_FIX_GATEWAY_ERROR_LOG = "off";
     const cap = captureStderr();
     let res;
     try {
       res = await clientRequest(handle.port, "POST", `/v1/code/sessions/${SESSION_ID}/worker/heartbeat`);
     } finally {
       cap.restore();
-      delete process.env.CACHE_FIX_FORWARD_ERROR_LOG;
+      delete process.env.CACHE_FIX_GATEWAY_ERROR_LOG;
     }
     assert.equal(res.status, 502);
     const matches = cap.lines.filter((l) => l.startsWith("[cache-fix] upstream error -> 502:"));
