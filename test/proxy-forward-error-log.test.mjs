@@ -94,6 +94,23 @@ describe("upstream connection failures are reported on stderr, not only debugLog
     assert.ok(!line.includes(SESSION_ID), `session id reached stderr:\n${line}`);
   });
 
+  it("passthrough site, absolute-form foreign target: userinfo, host and query never reach stderr", async () => {
+    delete process.env.CACHE_FIX_FORWARD_ERROR_LOG;
+    const foreignPort = await freePort();
+    const cap = captureStderr();
+    let res;
+    try {
+      res = await clientRequest(handle.port, "GET", `http://alice:s3cret@127.0.0.1:${foreignPort}/v1/code/sessions/${SESSION_ID}/x?token=T`);
+    } finally {
+      cap.restore();
+    }
+    assert.equal(res.status, 502);
+    const matches = cap.lines.filter((l) => l.startsWith("[cache-fix] upstream error -> 502:"));
+    assert.equal(matches.length, 1, `expected exactly one line, got:\n${cap.lines.join("")}`);
+    assert.match(matches[0], /for GET \/v1\/code\/sessions\/cse_<id>\/x\n$/);
+    assert.ok(!matches[0].includes("s3cret") && !matches[0].includes("token=T"), `leaked:\n${matches[0]}`);
+  });
+
   it("messages site: 502 and one stderr line with ECONNREFUSED and the route", async () => {
     delete process.env.CACHE_FIX_FORWARD_ERROR_LOG;
     const cap = captureStderr();

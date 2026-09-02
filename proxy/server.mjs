@@ -71,16 +71,17 @@ function debugLog(...args) {
 // file and in upstream.mjs — not debug-gated, so the reason survives
 // without anyone having turned debug logging on. Default ON; set
 // CACHE_FIX_FORWARD_ERROR_LOG=off to silence it. Env read per call, same
-// as debugLog and CACHE_FIX_SELF_HEAL, so an operator can flip it without a
-// restart via bin/handover-env.mjs.
+// as debugLog and CACHE_FIX_SELF_HEAL.
 //
-// Route only (no query, no headers, no body — a query can carry values
-// debugLog's own discipline wouldn't put on stderr either) with any session
-// id folded to `cse_<id>`, so a route that names a specific session doesn't
-// put that id in a mode-644 stderr file.
+// Path only (no query, no headers, no body — a query can carry values
+// debugLog's own discipline wouldn't put on stderr either; an absolute-form
+// target in forward mode carries an authority, possibly with userinfo) with
+// any session id folded to `cse_<id>`, so a route that names a specific
+// session doesn't put that id in a mode-644 stderr file.
 function reportUpstreamError(err, method, url) {
   if (process.env.CACHE_FIX_FORWARD_ERROR_LOG === "off") return;
-  const route = String(url || "").split("?")[0].replace(/cse_[A-Za-z0-9]+/g, "cse_<id>");
+  const route = (parseAbsoluteForm(url)?.pathname ?? String(url || "").split("?")[0])
+    .replace(/cse_[A-Za-z0-9]+/g, "cse_<id>");
   const code = err?.code ? `${err.code} ` : "";
   process.stderr.write(
     `[cache-fix] upstream error -> 502: ${code}${err?.message ?? err} for ${method} ${route}\n`,
