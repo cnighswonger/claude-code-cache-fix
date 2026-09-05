@@ -437,6 +437,41 @@ test("the SIGUSR2 successor is told the port it must bind", () => {
   assert.match(opts, /CACHE_FIX_PROXY_PORT\s*:\s*String\(/,
     "CACHE_FIX_PROXY_PORT is present but not built from a value — the successor " +
     "needs the port this holder actually bound, not a literal or a passthrough");
+
+  // ORDER IS THE WHOLE GUARD. Move the spread after the pinned keys and nothing
+  // fails at runtime; the file simply starts winning over them.
+  assert.match(opts, /env:\s*\{\s*\.\.\.handoverEnv\(/,
+    "the handover env re-read is not the FIRST entry of the successor's env " +
+    "object — anything the file sets now wins over the keys this holder pins, " +
+    "including the port it is bound to and the orphan guard it must drop");
+
+  // The mechanism the message cannot fit: the adopted socket is unchanged, but
+  // listen() still stores the value as _host and every downstream label is built
+  // from that — so the socket would be right and everything naming it wrong.
+  assert.match(opts, /CACHE_FIX_PROXY_BIND\s*:/,
+    "the successor's env does not pin CACHE_FIX_PROXY_BIND. The adopted socket " +
+    "keeps the predecessor's address, so a bind from the handover file does not " +
+    "take effect but does mislabel HELD_HOST, the proxy child and /health");
+
+  // A HOLDER IS NOT A STANDBY, and the handover file can now say otherwise. The
+  // successor carries what it is given into openGap(), whose env clears
+  // HOLDER_TREE and HELD_BY but not this — and gap-relay reads CACHE_FIX_STANDBY
+  // === "1" to take the standby branch, which then refuses for want of
+  // STANDBY_PARENT. The gap would be armed and relaying nothing, in the window
+  // it exists to cover.
+  // AND THE PATH TO THE FILE ITSELF, or the file moves its own trust anchor: a
+  // CACHE_FIX_HANDOVER_ENV written here points every later handover at a path
+  // outside the config dir, and because absence means inherit, reverting the
+  // original file does not undo it.
+  assert.match(opts, /CACHE_FIX_HANDOVER_ENV\s*:/,
+    "the successor's env does not pin CACHE_FIX_HANDOVER_ENV, so the handover " +
+    "file can relocate the handover file -- permanently, and out of reach of " +
+    "whoever tightens the original");
+
+  assert.match(opts, /CACHE_FIX_STANDBY\s*:\s*undefined/,
+    "the successor's env does not clear CACHE_FIX_STANDBY. The handover file can " +
+    "set it, and the successor hands it to its own gap relay, which takes the " +
+    "standby branch and refuses — an armed gap that carries nothing");
 });
 
 test("a failed SIGUSR2 handover recovers, from both failure modes, through the ladder", () => {

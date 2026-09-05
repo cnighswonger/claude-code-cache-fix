@@ -11,6 +11,7 @@ import net from "node:net";
 import { EventEmitter } from "node:events";
 import { getSystemErrorName } from "node:util";
 import { bundleUsable, carriesOurCA, salvageBundle } from "./ca-trust.mjs";
+import { handoverEnv, handoverEnvPath } from "./handover-env.mjs";
 import { sourceFingerprintSync } from "../proxy/source-fingerprint.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -978,8 +979,21 @@ function holdPort(rest) {
           // 9901."
           //
           // We are bound to the number, so there is nothing to guess.
-          env: { ...process.env, CACHE_FIX_HOLDER_HANDOVER: "1", LISTEN_FDS: "1",
+          env: { ...handoverEnv(process.env), CACHE_FIX_HOLDER_HANDOVER: "1", LISTEN_FDS: "1",
                  CACHE_FIX_PROXY_PORT: String(holder._port || port),
+                 // AND THE BIND: the successor ADOPTS this socket, so a bind from
+                 // the file cannot move it but would still relabel _host, and every
+                 // downstream name (HELD_HOST, the proxy child, /health) with it.
+                 CACHE_FIX_PROXY_BIND: bindAddr(),
+                 // AND THE PATH TO THE FILE, or the file moves its own trust
+                 // anchor: a CACHE_FIX_HANDOVER_ENV written there points every
+                 // later handover somewhere else, and since absence means
+                 // inherit, reverting the original file cannot take it back.
+                 CACHE_FIX_HANDOVER_ENV: handoverEnvPath(),
+                 // AND A HOLDER IS NOT A STANDBY. openGap() sheds HOLDER_TREE and
+                 // HELD_BY the same way; this one only became reachable when the
+                 // env above stopped being ours alone.
+                 CACHE_FIX_STANDBY: undefined,
                  CACHE_FIX_EXIT_WITH_PARENT: "0" },
         });
         // WE LEAVE WHEN THE SUCCESSOR EXISTS, not when we have asked for one.
@@ -1009,11 +1023,24 @@ function holdPort(rest) {
         // mutually exclusive, so nothing reaches recovery after departure today;
         // it is kept so a future reordering cannot quietly re-arm a holder that
         // has already handed the address on.
+        // SIGUSR2 IS THE HANDOVER'S OWN WORD, and it has to be its own: this
+        // block rewrites every stop to SIGHUP, so SIGHUP cannot also mean "a
+        // successor is already serving". The proxy picks its drain budget on
+        // the difference — 5 s where a supervisor waits serially, half an hour
+        // where nothing waits on it at all.
+        //
+        // SAFE ONLY BECAUSE `child` IS ALWAYS OURS. A proxy with no SIGUSR2
+        // handler takes node's default and dies outright, cutting everything
+        // with no drain — the hazard deploy.sh guards with a holder_tree check
+        // before signalling a holder it did not start. Here the only assignment
+        // that creates a child spawns SERVER_PATH from beside this file, so it
+        // cannot predate the handler. Adopting a proxy we did not spawn would
+        // make this line fatal.
         successor.once("spawn", () => {
           // The child under us keeps serving until IT is replaced by the
           // successor's own child; nothing here interrupts the accept path.
           if (child && child.exitCode === null && !child.signalCode) {
-            try { child.kill("SIGHUP"); } catch { }
+            try { child.kill("SIGUSR2"); } catch { }
           }
           left = true;
           settle(0);
@@ -1337,6 +1364,24 @@ function holdPort(rest) {
         if (!retired && line.includes("releasing the listening socket")) {
           retired = true;
           if (child === me) child = null;
+          // A STOP ENDS HERE, NOT AT THE CHILD'S EXIT. The proxy has just closed
+          // its listening socket; from this line it owns nothing but the replies
+          // it still owes. Waiting for those is what forced a ceiling onto the
+          // child — it could not afford patience while a stop was blocked on it.
+          // Its budget keys on being held (server.mjs `unwaited`), so the two
+          // cannot be separated.
+          //
+          // Two cross-file invariants make the orphaned drainer safe, and
+          // nothing else records either:
+          //   - a released proxy must not resurrect the lineage
+          //     (server.mjs `if (releasingPort) return`), or the orphan returns
+          //     as a rival holder
+          //   - it must exit 0, not 75. A launchd agent with
+          //     `KeepAlive = { SuccessfulExit = false }` restarts a non-zero exit
+          //
+          // reclaim() and spawnWhenReady() below already return early while
+          // stopping, so this returns past nothing.
+          if (stopping) return settle(0);
           // "(handed off)" means the proxy already put its own successor on the
           // socket before announcing, and that successor is serving right now.
           // Reclaiming would take the port from a live proxy and spawning would

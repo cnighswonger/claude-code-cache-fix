@@ -3,6 +3,41 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import net from "node:net";
 import { execFileSync, spawn } from "node:child_process";
+
+// THE HOLDER DELIBERATELY LEAVES A STANDBY BEHIND, and killing the holder is
+// what ARMS it -- that is the standby's whole purpose (bin/gap-relay.mjs), so it
+// is not a leak in the relay. It is a leak here: production wants the armed
+// standby to keep a real port alive, and a test wants its ephemeral port
+// released. Nothing else ends one, so this file has to.
+//
+// Selected by the standby's OWN declaration of its parent, never by name or age:
+// a relay whose ppid no longer matches CACHE_FIX_STANDBY_PARENT has been
+// orphaned, and matching that parent against the holders THIS FILE spawned is
+// what keeps the sweep off production and off other sessions.
+//
+// /proc, so linux only. CI runs linux and that is where the guard is exercised;
+// on a mac the orphan survives until the OS reclaims it, which is a smaller
+// wrong than sweeping by name on a shared box.
+const spawnedHolders = new Set();
+const reapStandbys = () => {
+  let dir;
+  try { dir = readdirSync("/proc"); } catch { return; }
+  for (const e of dir) {
+    if (!/^\d+$/.test(e)) continue;
+    let env, argv;
+    try {
+      argv = readFileSync(`/proc/${e}/cmdline`, "utf8").split("\0");
+      env = readFileSync(`/proc/${e}/environ`, "utf8").split("\0");
+    } catch { continue; }
+    if (!argv.some((a) => a.endsWith("/gap-relay.mjs"))) continue;
+    const parent = env.find((v) => v.startsWith("CACHE_FIX_STANDBY_PARENT="))?.slice(25);
+    if (!parent || !spawnedHolders.has(Number(parent))) continue;
+    try { process.kill(Number(e), "SIGKILL"); } catch {}
+  }
+};
+process.on("exit", reapStandbys);
+// Records the pid so the sweep above can scope itself to this file's holders.
+const spawnHolder = (...args) => { const h = spawn(...args); spawnedHolders.add(h.pid); return h; };
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
@@ -114,7 +149,7 @@ describe("holder handover (SIGUSR2)", () => {
     for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
                      "ALL_PROXY", "all_proxy", "LISTEN_FDS", "LISTEN_PID",
                      "CACHE_FIX_HOLD_PORT", "CACHE_FIX_WATCH_DEPLOY_MS"]) delete env[k];
-    const holder = spawn(process.execPath, [launcherPath, "run-service"],
+    const holder = spawnHolder(process.execPath, [launcherPath, "run-service"],
                          { env, stdio: ["ignore", "pipe", "pipe"] });
     try {
       const up = Date.now() + 25_000;
@@ -216,7 +251,7 @@ describe("holder handover (SIGUSR2)", () => {
                      "ALL_PROXY", "all_proxy", "LISTEN_FDS", "LISTEN_PID",
                      "CACHE_FIX_HOLD_PORT", "CACHE_FIX_WATCH_DEPLOY_MS",
                      "CACHE_FIX_SELF_HEAL"]) delete env[k];
-    const holder = spawn(process.execPath, [launcherPath, "run-service"],
+    const holder = spawnHolder(process.execPath, [launcherPath, "run-service"],
                          { env, stdio: ["ignore", "pipe", "pipe"] });
     const supervised = () => listeners(port).some((p) => {
       let pid = Number(p);
@@ -290,7 +325,7 @@ describe("holder handover (SIGUSR2)", () => {
     for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
                      "ALL_PROXY", "all_proxy", "LISTEN_FDS", "LISTEN_PID",
                      "CACHE_FIX_HOLD_PORT", "CACHE_FIX_WATCH_DEPLOY_MS"]) delete env[k];
-    const holder = spawn(process.execPath, [launcherPath, "run-service"],
+    const holder = spawnHolder(process.execPath, [launcherPath, "run-service"],
                          { env, stdio: ["ignore", "pipe", "pipe"] });
     try {
       const up = Date.now() + 25_000;
@@ -410,7 +445,7 @@ describe("holder handover (SIGUSR2)", () => {
                      "CACHE_FIX_HOLD_PORT", "CACHE_FIX_WATCH_DEPLOY_MS",
                      "CACHE_FIX_SELF_HEAL"]) delete env[k];
     env.CACHE_FIX_SELF_HEAL_MS = "50";
-    const holder = spawn(process.execPath, [launcherPath, "run-service"],
+    const holder = spawnHolder(process.execPath, [launcherPath, "run-service"],
                          { env, stdio: ["ignore", "pipe", "pipe"] });
     try {
       const up = Date.now() + 25_000;
@@ -571,7 +606,7 @@ describe("holder handover (SIGUSR2)", () => {
     // standby never armed" produce the same message — one flake here was
     // undiagnosable for exactly that reason.
     let err = "";
-    const holder = spawn(process.execPath, [launcherPath, "run-service"],
+    const holder = spawnHolder(process.execPath, [launcherPath, "run-service"],
                          { env, stdio: ["ignore", "ignore", "pipe"] });
     holder.stderr.on("data", (d) => { err += d; });
     const carries = () => new Promise((res) => {
@@ -677,7 +712,7 @@ describe("holder handover (SIGUSR2)", () => {
     for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
                      "ALL_PROXY", "all_proxy", "LISTEN_FDS", "LISTEN_PID",
                      "CACHE_FIX_HOLD_PORT", "CACHE_FIX_WATCH_DEPLOY_MS"]) delete env[k];
-    const holder = spawn(process.execPath, [launcherPath, "run-service"],
+    const holder = spawnHolder(process.execPath, [launcherPath, "run-service"],
                          { env, stdio: ["ignore", "ignore", "ignore"] });
     const raw = (send) => new Promise((res) => {
       const c = net.connect(port, "127.0.0.1");
@@ -843,7 +878,7 @@ describe("holder handover (SIGUSR2)", () => {
                      "ALL_PROXY", "all_proxy", "LISTEN_FDS", "LISTEN_PID",
                      "CACHE_FIX_HOLD_PORT", "CACHE_FIX_WATCH_DEPLOY_MS"]) delete env[k];
     const p2 = Number(env.CACHE_FIX_PROXY_PORT);
-    const holder = spawn(process.execPath, [launcherPath, "run-service"],
+    const holder = spawnHolder(process.execPath, [launcherPath, "run-service"],
                          { env, stdio: ["ignore", "pipe", "pipe"] });
     try {
       const up = Date.now() + 25_000;
@@ -976,6 +1011,202 @@ describe("holder handover (SIGUSR2)", () => {
 // through boot and through a child death found a gap exactly zero times, while
 // suppressing that one closeGap() made it appear at once. A property with no
 // observable window has to be asked of the object that owns it.
+// THE HOLDER IS THE ONLY THING THAT KNOWS A REDEPLOY FROM A STOP, and it says
+// so with the signal it sends its child. `forward()` deliberately rewrites every
+// stop to SIGHUP, so if the handover also used SIGHUP the proxy would see one
+// word for two opposite events and have to guess the drain budget: 5s where the
+// supervisor waits serially (measured, 120s against a 90s TimeoutStopSec took
+// restart downtime 5.0s -> 53.9s) against half an hour where a successor is
+// already serving. Source-level because the two call sites are what must differ,
+// and a live handover cannot observe which signal was used.
+// THE PRODUCTION STOP, WITH SOMETHING IN FLIGHT. Every other holder case here
+// signals with nothing owed, so `close()` resolves at once and the case passes
+// under ANY budget — a ceiling is never reached and a stall test is never asked.
+// That is the gap: the one path an operator actually takes (`systemctl stop`,
+// Ctrl-C, a plain kill) has never been measured with a reply in the middle of
+// being delivered.
+//
+// WHAT IT USED TO MEASURE IS NO LONGER MEASURABLE HERE, and the replacement is
+// not a weakening. The old form timed how long run-service and the proxy stayed
+// ON THE PORT after a stop and required it to be the 5s ceiling rather than the
+// drain budget. That clock has collapsed: the holder now settles on the proxy's
+// RELEASE announcement instead of on its exit, so the port is free in under a
+// second — before the first `lsof` even returns. The while loop never ran, and
+// `chunks` was then sampled at the same instant as `before`, so the case died on
+// its own premise (2 -> 2) while the reply it was worried about was in fact
+// still streaming. Measured directly: 2 -> 158 chunks over the ten seconds after
+// the stop, holder gone inside 623 ms, and the only listener left was the
+// standby relay, which a stop keeps on purpose.
+//
+// So this pins the two halves that ARE observable, and together they are
+// STRONGER than the old assertion. "the port frees" alone passes on the old code
+// too (it freed at 5s); "the reply keeps arriving after it frees" is what the 5s
+// ceiling could never do, because cutting the reply is how it got there.
+describe("a holder stop with a reply in flight", () => {
+  it("frees the port without severing the reply", async () => {
+    // Bytes must be MOVING at the moment of the stop. If they were not, a stall
+    // test would end the drain too and the case could not tell the arms apart.
+    const upstream = http.createServer((q, r) => {
+      r.writeHead(200, { "content-type": "text/event-stream" });
+      let n = 0;
+      const t2 = setInterval(() => { try { r.write(`data: ${++n}\n\n`); } catch {} }, 100);
+      r.on("close", () => clearInterval(t2));
+      q.resume();
+    });
+    await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
+
+    const port = await takePort();
+    const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port),
+                  CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upstream.address().port}` };
+    for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                     "ALL_PROXY", "all_proxy", "LISTEN_FDS", "LISTEN_PID",
+                     "CACHE_FIX_HOLD_PORT", "CACHE_FIX_WATCH_DEPLOY_MS"]) delete env[k];
+    const holder = spawnHolder(process.execPath, [launcherPath, "run-service"],
+                         { env, stdio: ["ignore", "ignore", "ignore"] });
+    let req = null;
+    try {
+      const up = Date.now() + 25_000;
+      let body = await probe(port);
+      while (body.startsWith("ERR:") && Date.now() < up) body = await probe(port);
+      assert.equal(body, "ok", "the holder never came up, so nothing was measured");
+
+      let chunks = 0;
+      req = http.request(
+        { host: "127.0.0.1", port, path: "/v1/messages", method: "POST",
+          headers: { "content-type": "application/json" } },
+        (res) => { res.on("data", () => chunks++); res.on("error", () => {}); });
+      req.on("error", () => {});
+      req.end(JSON.stringify({ model: "x", messages: [], stream: true }));
+
+      const flowing = Date.now() + 15_000;
+      while (chunks === 0 && Date.now() < flowing) await new Promise((r) => setTimeout(r, 50));
+      assert.ok(chunks > 0,
+        "premise: bytes must be reaching the client, or this measures a stop with " +
+        "nothing owed — which is the case that already exists and cannot fail here");
+
+      const before = chunks;
+      const t0 = Date.now();
+      holder.kill("SIGTERM");
+      // 25s, not a tight bound: what must not happen is the port staying held
+      // for a DRAIN budget (90s stall window, 30 minute backstop). Measured, it
+      // frees in well under a second, so this is loose on purpose rather than
+      // sensitive to how long a spawn takes on a loaded box.
+      const stopped = Date.now() + 25_000;
+      let left = listeners(port);
+      while (Date.now() < stopped
+             && left.some((q) => /\brun-service\b|server\.mjs/.test(cmdOf(q)))) {
+        await new Promise((r) => setTimeout(r, 200));
+        left = listeners(port);
+      }
+      const elapsed = Date.now() - t0;
+      assert.deepEqual(left.filter((q) => /\brun-service\b|server\.mjs/.test(cmdOf(q))), [],
+        `the holder and its proxy were still on the port ${elapsed}ms after SIGTERM — ` +
+        `a stop must free the address whatever its child is still finishing`);
+
+      // AND THE REPLY SURVIVED THE STOP THAT FREED THE PORT. This is the half the
+      // 5s ceiling could not do: it freed the port by CUTTING what was in flight.
+      //
+      // GROWTH, NOT TOTAL, AND SAMPLED PAST THE CEILING. `chunks > before` cannot
+      // see a cut at all: a 5s ceiling delivers five seconds of bytes first, so
+      // the total rises either way. Measured — with the held arm reverted to the
+      // ceiling this case still passed, because a 4s sample also lands INSIDE the
+      // window it is trying to detect. Two late samples with growth required
+      // between them is what separates "still delivering" from "delivered a lot,
+      // then was severed".
+      await new Promise((r) => setTimeout(r, 8_000));
+      const late = chunks;
+      await new Promise((r) => setTimeout(r, 2_500));
+      assert.ok(chunks > before,
+        `premise: no byte arrived after the stop at all (${before}), so the drain ` +
+        `ended before this could measure anything`);
+      assert.ok(chunks > late,
+        `the reply stopped at ${late} chunks and never moved again — the stop severed ` +
+        `it instead of letting the drainer finish it, which is the ceiling this arm no ` +
+        `longer has`);
+    } finally {
+      try { req?.destroy(); } catch { }
+      upstream.close();
+      try { holder.kill("SIGKILL"); } catch { }
+    }
+  });
+});
+
+describe("the handover signal is not the stop signal", () => {
+  const src = readFileSync(launcherPath, "utf8");
+
+  it("rewrites every stop to SIGHUP", () => {
+    const forward = /const forward = \(sig\) => \{[\s\S]*?\n    \};\n/.exec(src)?.[0];
+    assert.ok(forward, "forward() is gone — this tests nothing");
+    assert.match(forward, /sig = "SIGHUP";/,
+      "forward() no longer collapses the stop signals, so SIGHUP is not the stop " +
+      "word any more and the proxy's budget split is reading a signal nobody sends");
+  });
+
+  // WHAT MAKES SIGUSR2 SAFE TO SEND. A proxy without the handler takes node's
+  // default and dies outright — no drain at all, worse than the 5s it replaces.
+  // The holder may only send it to a child it started from the tree it lives in.
+  it("only ever signals a child it spawned from its own tree", () => {
+    // The RHS is taken as a PREFIX, not to a delimiter: `spawn(...)` spans commas
+    // and newlines, and cutting at the first comma matched "spawn(process.execPath"
+    // for every call — which failed the clean tree and would have passed a mutation.
+    const assigns = [...src.matchAll(/\bchild = /g)].map((m) => src.slice(m.index + m[0].length, m.index + m[0].length + 60));
+    assert.ok(assigns.length, "no assignment to `child` found — this tests nothing");
+    for (const rhs of assigns) {
+      assert.ok(/^null\b/.test(rhs) || /^spawn\(process\.execPath, \[SERVER_PATH\b/.test(rhs),
+        `\`child\` is assigned ${JSON.stringify(rhs.split("\n")[0])} — if the holder can adopt a proxy ` +
+        `it did not spawn, that proxy may predate the SIGUSR2 handler and the handover ` +
+        `kills it instantly instead of handing over`);
+    }
+    assert.match(src, /const SERVER_PATH = resolve\(__dirname, "\.\.\/proxy\/server\.mjs"\)/,
+      "SERVER_PATH no longer resolves beside this file, so the proxy it spawns is not " +
+      "guaranteed to be the same tree and may not know SIGUSR2. This is not a " +
+      "hypothetical: the file documents SERVER_PATH as the single point a harness " +
+      "rewrites to point the launcher at a stand-in proxy");
+  });
+
+  // AND `child` IS NOT THE WHOLE POPULATION — two other spawns of SERVER_PATH in
+  // this file never become `child`, so an assignment rule cannot see them. The
+  // invariant that actually bounds the hazard is about DELIVERY: SIGUSR2 must
+  // reach a proxy from one place only. (The neighbours are safe for their own
+  // reasons — the second forward() passes its signal through unrewritten but is
+  // registered for SIGTERM/SIGINT only — and a rule that leans on that goes
+  // stale the day someone registers one more.)
+  it("has exactly one place that can send a proxy SIGUSR2", () => {
+    const sends = src.split("\n")
+      .filter((l) => /\bkill\([^)]*"SIGUSR2"/.test(l) && !/^\s*\/\//.test(l))
+      .map((l) => l.trim());
+    assert.equal(sends.length, 2,
+      `${sends.length} call sites send SIGUSR2, not 2: ${JSON.stringify(sends)} — a new ` +
+      `sender may reach a proxy that predates the handler, which node terminates ` +
+      `outright with no drain at all`);
+    assert.ok(sends.some((l) => /child\.kill\("SIGUSR2"\)/.test(l)),
+      "the handover no longer sends SIGUSR2 to its own child");
+    assert.ok(sends.some((l) => /process\.kill\(incumbent, "SIGUSR2"\)/.test(l)),
+      "the holder-to-holder handover request is gone or has changed target");
+
+    // The other sender aims at a pid this process did not spawn, so it needs the
+    // check the handover gets from construction: only a run-service holder, which
+    // is the role that knows SIGUSR2.
+    const takeover = /if \(argv\.includes\("run-service"\)\) \{\n\s*try \{ process\.kill\(incumbent, "SIGUSR2"\)/.exec(src);
+    assert.ok(takeover,
+      "the holder-to-holder SIGUSR2 is no longer gated on the target being a " +
+      "run-service holder, so it can now reach a bare proxy and kill it outright");
+  });
+
+  it("signals the handover with SIGUSR2 instead", () => {
+    const spawned = /successor\.once\("spawn", \(\) => \{[\s\S]*?\n        \}\);\n/.exec(src)?.[0];
+    assert.ok(spawned, "the successor's spawn gate is gone — this tests nothing");
+    const sig = /child\.kill\("(SIG[A-Z0-9]+)"\)/.exec(spawned)?.[1];
+    assert.ok(sig, "the handover no longer signals the outgoing child at all");
+    assert.notEqual(sig, "SIGHUP",
+      "the handover signals its child with SIGHUP, the same word forward() rewrites " +
+      "every stop to — the proxy cannot then tell a redeploy from `systemctl stop`, " +
+      "and whichever budget it picks is wrong for the other path");
+    assert.equal(sig, "SIGUSR2",
+      `the handover signals ${sig}, which the proxy does not handle as a handover`);
+  });
+});
+
 describe("openGap identity", () => {
   it("a retired gap's late exit does not clear the live one", () => {
   const src = readFileSync(new URL("../bin/claude-via-proxy.mjs", import.meta.url), "utf8");

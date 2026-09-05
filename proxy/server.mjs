@@ -1,4 +1,5 @@
 import http from "node:http";
+import net from "node:net";
 import { createHash } from "node:crypto";
 import https from "node:https";
 import { pathToFileURL, URL } from "node:url";
@@ -600,16 +601,92 @@ async function handlePassthrough(clientReq, clientRes) {
  * truncations, not a count of them. Measured: after writeHead and before the
  * first chunk, headersSent=true with socket.bytesWritten=0.
  */
-export function forcedCloseLine(ended, destroyed, held, budgetMs = 5_000) {
+// NEW FIELDS GO AT THE END. This line is a published interface -- it is read by
+// tooling outside this repo -- so the order of what is already in it is part of
+// the contract, not a formatting choice.
+//
+// Measured: putting a field between the budget and `(<n> mid-response,` broke a
+// case in test/shutdown-exit-code.test.mjs that pins that adjacency as a literal
+// regex. That case looks over-specified and a reviewer would trim it; its
+// brittleness IS the contract check, which is why it stays.
+//
+// Appending is not automatically safe either -- it is safe here only because no
+// known reader anchors on the end of the line. A future field should ask the
+// same question rather than assume the tail is free.
+// COARSE, AND NO QUERY STRING. Two path segments, nothing after `?`: the proxy
+// sees whole request URLs and this rides a log line, so the grouping is what
+// keeps an identifier in a path out of a file that outlives the process. It also
+// bounds the cardinality -- a per-URL tally on a passthrough route would print
+// one entry per request.
+//
+// AND THE AUTHORITY, WHICH THE QUERY RULE DOES NOT COVER. A foreign absolute-form
+// target reaches handlePassthrough un-normalised, so the raw request-target
+// renders as `/http:/user:pass@host` -- a credential, in the log, from the rule
+// written to keep credentials out of it.
+// `Number(x) || fallback` is wrong in both directions for a millisecond budget:
+// it discards an explicit 0, which asks to cut now, and it passes a NEGATIVE
+// through. A negative stall budget makes `now - rec.at < stallMs` false on the
+// first tick, ending every owed connection at once -- the guillotine this drain
+// replaced, one typo away.
+export function drainBudgetMs(raw, fallback) {
+  if (typeof raw !== "string") return fallback;
+  // A PLAIN NON-NEGATIVE DECIMAL, matched before `Number()` sees it. `Number()`
+  // reads whitespace as 0 -- `" "`, `"\t"`, `"\n"` all coerce -- so a value
+  // that is only whitespace in an env file or a unit becomes an explicit
+  // budget of zero, which is the guillotine this drain exists to remove. It
+  // also lets `-0` through, and `now - at < -0` is false on every tick just as
+  // `< -1` is. Exotic spellings (`1e3`, `0x10`, `Infinity`) fall back rather
+  // than being guessed at; none is a documented form.
+  const s = raw.trim();
+  if (!/^\d+(\.\d+)?$/.test(s)) return fallback;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+export function drainRoute(url) {
+  if (typeof url !== "string") return "?";
+  const abs = parseAbsoluteForm(url);
+  // parseAbsoluteForm knows http and https. Every other authority-first shape
+  // -- a protocol-relative `//host/path`, a scheme it does not carry, the
+  // authority-form a CONNECT sends -- would otherwise fall to the raw target
+  // and render the authority verbatim. Origin-form is a SINGLE leading slash,
+  // which is what separates `/v1/messages` from `//host/v1/messages`.
+  if (!abs && !(url.startsWith("/") && !url.startsWith("//"))) return "?";
+  const path = abs?.pathname ?? url;
+  const route = "/" + path.split("?")[0].split("/").filter(Boolean).slice(0, 2).join("/");
+  // THE SHAPE TEST ABOVE CANNOT ENFORCE THIS. `/http://user:pass@host/v1`,
+  // `/\user:pass@host/x` and a percent-encoded `//` are all a single leading
+  // slash, and `#` survives the `?` split. Judge what is about to be WRITTEN:
+  // neither character belongs in a route label, and either one means an
+  // authority or a fragment came through.
+  return /[@#]/.test(route) ? "?" : route;
+}
+
+export function forcedCloseLine(ended, destroyed, held, budgetMs = 5_000, why = "", routes = "", quiet = "", owedAtStart = null) {
   const cut = ended + destroyed;
   // THE BUDGET IT ACTUALLY USED, not the constant this line was written against.
   // The two diverged the moment the handover path got its own, and a log that
   // says "after 5s" about a 1800s wait is the kind of wrong that survives for
   // months because it reads like it was checked.
+  //
+  // `why` exists because the number alone stopped being the discriminator. Three
+  // things can end a drain now and two of them are opposite outcomes, so the
+  // line names which rather than leaving it to be inferred from a shape. It goes
+  // at the TAIL, like every other field added here: appended to the budget it sat
+  // between `after <n>s` and `(<n> mid-response`, which is the one adjacency the
+  // block above records as a contract -- and it took that position only on the
+  // backstop arm, which no pinned case rendered.
   const after = budgetMs % 1000 === 0 ? `${budgetMs / 1000}s` : `${budgetMs}ms`;
   if (cut > 0) {
+    // The route tally rides the CUT line only. On the no-cut line there is
+    // nothing to attribute, and an empty `routes: ` there would read as "no
+    // routes" rather than "nothing was cut".
     return `[cache-fix] shutdown: forcing close, cut ${cut} in-flight request(s) after ${after} `
-         + `(${ended} mid-response, ${destroyed} before headers)\n`;
+         + `(${ended} mid-response, ${destroyed} before headers)`
+         + (quiet ? ` quiet ${quiet}` : "")
+         + (routes ? ` routes: ${routes}` : "")
+         + (owedAtStart === null ? "" : `, owed ${owedAtStart} at the start`)
+         + why + `\n`;
   }
   // Not "idle": we did not measure idleness, we measured that no RESPONSE was
   // open. Naming the held count is what stops a reader concluding the stop was
@@ -624,7 +701,7 @@ export function forcedCloseLine(ended, destroyed, held, budgetMs = 5_000) {
   // the number says, and the number is the only thing this redesign added.
   return `[cache-fix] shutdown: forcing close after ${after}, cut no responses`
        + `${held === null ? "" : `, ${held} connection(s) still held`}`
-       + ` (kind unknown; may include CONNECT tunnels and upgrades)\n`;
+       + ` (kind unknown; may include CONNECT tunnels and upgrades)` + why + `\n`;
 }
 
 // SHUTTING DOWN, read by the request handler. server.close() stops ACCEPTS; it
@@ -650,6 +727,13 @@ export function createProxyServer() {
   const live = new Set();
   const srv = http.createServer((req, res) => {
     live.add(res);
+    // The drain's stall test dates a connection from here ONLY while nothing
+    // has left it since it arrived — one that has written must be dated from
+    // its last byte, or its own age reads as the time it was silent.
+    // `_bornBytes` and not `n === 0`: `bytesWritten` belongs to the SOCKET, so
+    // the second request on a keep-alive connection starts nonzero.
+    res._bornAt = Date.now();
+    res._bornBytes = res.socket?.bytesWritten ?? 0;
     res.on("close", () => live.delete(res));
     // BEFORE the handler, so a writeHead() that names its own headers keeps this
     // one — setHeader values survive writeHead unless writeHead repeats the name.
@@ -730,6 +814,15 @@ export function createProxyServer() {
   // off a SNAPSHOT at force-close time (see there), `_draining` is set by
   // shutdown() the moment it begins.
   srv._live = live;
+  // A reply whose end() has been CALLED is IDLE to Node, so server.close()
+  // severs one that is complete but still flushing. Both close paths ask this
+  // before unbinding; it lives here so there is one spelling of the question.
+  srv._unflushed = () =>
+    [...live].filter((r) => r.writableEnded && !r.writableFinished).length;
+  // UNBIND WITHOUT THE IDLE SWEEP. `http.Server.close()` runs the sweep first and
+  // the sweep is what severs an unflushed reply; net's close only stops
+  // accepting. Both close paths go through here, so the unbind never waits.
+  srv._unbind = (cb) => net.Server.prototype.close.call(srv, cb);
   srv._draining = false;
   return srv;
 }
@@ -866,6 +959,12 @@ delete process.env.LISTEN_PID;
 // stopping its child re-opens the race silently. A flag survives new call sites;
 // an ordering does not.
 let releasingPort = false;
+// A SUCCESSOR ALREADY HOLDS THE SOCKET — set only by SIGUSR2, which no other
+// caller sends. `releasingPort` cannot answer this: the holder rewrites every
+// stop to SIGHUP (see its `forward()`), so SIGHUP means both "a redeploy handed
+// the port on" and "the supervisor is stopping us", and those want opposite
+// budgets.
+let handoverRelease = false;
 
 function inheritedFd() {
   if (!(HANDED_DOWN.fds >= 1)) return null;
@@ -1118,13 +1217,6 @@ export async function startProxy(options = {}) {
     inheritedSocket: listenFd === 3,
     close: () =>
       new Promise((resolve, reject) => {
-        // Retire this instance's forward-mode vote exactly once (guarded
-        // against double-close): routing/health stop passthrough behavior and
-        // the process-wide self-heal is removed with the last live instance.
-        if (!closed) {
-          closed = true;
-          if (forwardAttached) { _forwardActive--; removeSelfHeal(); }
-        }
         try { stopOAuthRefresher(); } catch {}
         try {
           if (watcher) watcher.close();
@@ -1137,17 +1229,57 @@ export async function startProxy(options = {}) {
         // rejection; only the process.exit() inside .finally() beat the
         // unhandled-rejection report to it. Both callbacks fire on the same
         // 'close' event, after the drain, so resolving is the true answer.
-        server.close((err) => (err && err.code !== "ERR_SERVER_NOT_RUNNING" ? reject(err) : resolve()));
+        // Measured through this proxy: 4,217,623 bytes delivered of a declared
+        // 16,777,216, with `drained clean` printed for it. The agent is the IDLE
+        // SWEEP, which `http.Server.close()` runs BEFORE it unbinds: Node counts a
+        // reply whose end() has been CALLED as idle. Discriminated on plain Node,
+        // four arms -- no close 100%, http close() 24.9%, http close() plus an
+        // explicit sweep 24.9%, net close() 100%, all four refusing new
+        // connections after. The three-arm version of this could not separate the
+        // two because every arm that closed also swept.
+        //
+        // So the unbind is free and only the sweep waits. Deferring the unbind
+        // instead holds the LISTENING socket for the whole drain -- and the
+        // release is announced before the drain, with a holder settling on it.
+        server._unbind((err) => {
+          // WHEN THE DRAIN HAS ENDED, NOT WHEN IT STARTED. This used to run
+          // synchronously in the executor above, so the moment a stop was
+          // signalled `_forwardActive` fell to zero and the two readers of it —
+          // the absolute-form rewrite and the passthrough — sent every path
+          // that is not /health, POST /v1/messages or the bootstrap to
+          // handleNotFound. A connection still in flight then got a
+          // well-formed 404 the client cannot tell from a real one and will not
+          // retry, which is the failure the passthrough exists to prevent.
+          //
+          // The window was 5s while a stop under a live holder shared the
+          // standalone ceiling. It is the drain budget now, so the same line
+          // that widens the drain widens this: measured 200 before the stop and
+          // 404 on the same socket 1.4s into it.
+          //
+          // Retired on BOTH outcomes and exactly once: the server is going away
+          // either way, and the guard keeps a double close from double
+          // decrementing.
+          if (!closed) {
+            closed = true;
+            if (forwardAttached) { _forwardActive--; removeSelfHeal(); }
+          }
+          return err && err.code !== "ERR_SERVER_NOT_RUNNING" ? reject(err) : resolve();
+        });
         // NODE 18 DOES NOT DO THIS FOR US, and ba2375b silently assumed it did.
-        // From 19 on, close() closes idle keep-alives itself; 18.20.8 does not —
+        // From 19 on, close() closes idle keep-alives itself; 18.20.8 does not --
         // measured, close never fires where 20.20.2 and 24.11.1 report 1-2 ms.
-        // Three consequences and all of them are on 18: the quiet client never
-        // gets `Connection: close` (that header rides a request it will never
-        // send), its socket keeps this promise unresolved, and the handover then
-        // spends its ENTIRE budget — 30 minutes of a client pinned to a proxy
-        // that has stopped being the front door. Optional-call because engines
-        // is ">=18" and closeIdleConnections landed in 18.2.
-        server.closeIdleConnections?.();
+        // Optional-call because engines is ">=18" and closeIdleConnections
+        // landed in 18.2.
+        //
+        // THE SWEEP IS THE ONLY HALF THAT WAITS, because it is the only half that
+        // severs.
+        if (server._unflushed() === 0) return server.closeIdleConnections?.();
+        const flushTick = setInterval(() => {
+          if (server._unflushed() > 0) return;
+          clearInterval(flushTick);
+          server.closeIdleConnections?.();
+        }, 50);
+        flushTick.unref?.();
       }),
   };
 }
@@ -1607,6 +1739,12 @@ if (invokedAsScript) {
   // The supervisor is stopping US, not redeploying: leave without putting a
   // successor on the socket. See the holder's `forward()`.
   process.on("SIGHUP", () => { releasing = true; releasingPort = true; onSignal(); });
+  // The holder handed the listening socket to a successor that is already
+  // serving it, then asked us to go. Nothing waits on this exit: the holder
+  // settles the moment it signals us, so we drain detached.
+  process.on("SIGUSR2", () => {
+    releasing = true; releasingPort = true; handoverRelease = true; onSignal();
+  });
   startProxy()
     .then((handle) => {
       active = handle;
@@ -1732,15 +1870,40 @@ if (invokedAsScript) {
         process.stderr.write(`[cache-fix] successor spawn failed (${err?.code || err?.message})\n`);
       }
     }
-    active.server.close?.();
+    // AT THE NET LAYER, so the announcement below is true and nothing is severed
+    // to make it true. `close` above carries the discrimination; the sweep this
+    // skips is run there, once, behind the flush.
+    active.server?._unbind?.();
     // SAY WHO STARTED THE SUCCESSOR. The holder reads this line as "reclaim the
     // port and spawn", so a proxy that already spawned must say so or the two
     // of us put two proxies on one socket — measured, one extra per deploy:
     // PEAK CONCURRENT 4 and 3 still alive after 4 deploys.
+    // DO NOT READ THE ARM OFF THIS LINE IN A LOG. The holder both forwards our
+    // stdout to the log and parses it, so on a holder-driven handover — where
+    // that holder has already settled and is leaving — the line reaches neither,
+    // and `(handed off)` then reads as "no handover ever happened". Take the arm
+    // from stderr, which names the budget on both outcomes: a cut says
+    // `after <budget>s`, a completed drain `of <budget>s budget`.
     say(process.stdout,
         `proxy releasing the listening socket${handedOff ? " (handed off)" : ""}\n`);
-    const budgetMs = handedOff
-      ? (Number(process.env.CACHE_FIX_DRAIN_MS) || 1_800_000)
+    // NOTHING WAITS ON US — one predicate, and the only thing that ever justified
+    // a ceiling here. A ceiling is a bet on how long a reply takes; it is payable
+    // only when someone's wait is serial.
+    //
+    //   handedOff         we spawned the successor ourselves
+    //   handoverRelease   a holder's SIGUSR2 put a successor on fd 3. Never
+    //                     `handedOff`: it sets `releasing`, so askForSuccessor is
+    //                     false. Read it from SIGUSR2 and NOT from
+    //                     `releasingPort`, which a plain stop also sets.
+    //   heldByLiveHolder  a live holder supervises us, and it settles on our
+    //                     RELEASE announcement rather than on our exit
+    //
+    // The third holds ONLY while claude-via-proxy.mjs settles in the `stopping`
+    // arm of onLine. Separate them and a stop blocks for this whole budget
+    // instead of for 5s, which is the downtime the ceiling was bought with.
+    const unwaited = handedOff || handoverRelease || heldByLiveHolder;
+    const budgetMs = unwaited
+      ? drainBudgetMs(process.env.CACHE_FIX_DRAIN_MS, 1_800_000)
       : 5_000;
     // TIME THE DRAIN THAT FINISHED, not only the one that was cut.
     // 6d6f01d set a 1800s handover budget with no way to see how close anything
@@ -1752,6 +1915,21 @@ if (invokedAsScript) {
     // neighbour layer measured one legitimate drain at 1126.2s, so the range
     // this lives in is not hypothetical.
     const drainStart = Date.now();
+    // WHAT WAS AT RISK WHEN THE SIGNAL ARRIVED. `drained clean` means everything
+    // owed finished inside the budget -- it does NOT mean nothing was owed, and
+    // without this the two are the same line. How often a stop has anything at
+    // risk was therefore not derivable from these logs, and this arm's cost has
+    // been argued from four terminations.
+    //
+    // Counted HERE, not at the terminal line: by then the set has drained, which
+    // is the question the terminal line already answers.
+    const owedAtStart = active.server?._live?.size ?? 0;
+    // Hoisted: the clean-drain line is written before the stall loop is
+    // installed, so the count has to outlive it.
+    let stallEnded = 0;
+    // Rate for the past-budget notice. The tick is 1s and a live stream can hold
+    // the drain open indefinitely, so that line has to be periodic, not per tick.
+    let lastWaitSaid = 0;
     active.close().finally(() => {
       const secs = ((Date.now() - drainStart) / 1000).toFixed(1);
       // PREFIXED like its two siblings above, and NOT the bare phrase
@@ -1760,7 +1938,12 @@ if (invokedAsScript) {
       // explicit path today so nothing collides — but two components sharing a
       // phrase across two logs is a wrong row that parses cleanly, which is the
       // kind of defect that has no symptom. Renamed before it shipped anywhere.
-      say(process.stderr, `[cache-fix] shutdown: drained clean in ${secs}s of ${budgetMs / 1000}s budget\n`);
+      // "clean" only when nothing was cut: its reader greps the phrase
+      // unanchored, so naming the cut in a suffix would not keep it out.
+      say(process.stderr, `[cache-fix] shutdown: drained${stallEnded ? "" : " clean"}`
+        + ` in ${secs}s of ${budgetMs / 1000}s budget`
+        + `, owed ${owedAtStart} at the start`
+        + (stallEnded ? `, ${stallEnded} ended on the stall test` : "") + `\n`);
       process.exit(handedOff ? 75 : 0);
     });
     // THE BUDGET IS 5 s ONLY WHERE SOMETHING IS WAITING ON OUR EXIT.
@@ -1781,22 +1964,26 @@ if (invokedAsScript) {
     // every one 100% mid-response, 0 before headers — so every cut was a reply
     // whose headers the client already had and whose body stopped mid-stream.
     //
-    // WHY A LONGER CLOCK AND NOT A DRAIN PREDICATE. `active.close()` cannot
-    // express "nothing is owed" here: measured on 18.20.8 / 20.20.2 / 24.11.1,
-    // one live CONNECT tunnel leaves close() unresolved with liveResponses 0,
-    // and closeIdleConnections() neither frees it nor unblocks close(). A
-    // byte-rate test cannot separate a slow reply from a keepalive either — a
-    // cross-component peer measured content at 490 B/s and heartbeat at 35 B/s
-    // on the same stream. So there is no predicate available that is honest;
-    // what IS available is the fact that nobody is waiting, which turns the
-    // number from an outage budget into a leak bound.
+    // WHY NOT `active.close()`. It cannot express "nothing is owed" here:
+    // measured on 18.20.8 / 20.20.2 / 24.11.1, one live CONNECT tunnel leaves
+    // close() unresolved with liveResponses 0, and closeIdleConnections()
+    // neither frees it nor unblocks close(). So the drain needs its own test.
+    //
+    // THIS PARAGRAPH USED TO SAY NO HONEST PREDICATE EXISTED, and it was the
+    // reason the answer here stayed a number for as long as it did. What it
+    // actually refutes is a THRESHOLD ON THROUGHPUT — see the arm below, which
+    // never divides anything. Corrected rather than deleted: the wrong version
+    // is the kind that stops the next reader from looking.
     //
     // A lingering predecessor costs RAM and nothing else — it holds no listener
-    // (we released it above) and the successor is serving. The default is 30
-    // minutes because that is well past any reply this proxy relays and still
-    // bounded; CACHE_FIX_DRAIN_MS moves it for an operator who knows their own
-    // traffic. It applies to the handover path ONLY.
-    setTimeout(() => {
+    // (we released it above) and the successor is serving. So the handover arm
+    // can afford to wait, and CACHE_FIX_DRAIN_MS is now its BACKSTOP rather than
+    // its deadline.
+    // Also used by the per-connection end below.
+    // Shared with the stall loop below, which marks what it has already ended.
+    // Empty on the supervised arm, where that loop never runs.
+    const seen = new WeakMap();
+    const forceClose = (afterMs, why) => {
       // End the laggards rather than destroying them. `closeAllConnections()`
       // destroys the socket, and the kernel answers RST — measured, a client
       // that had already received every byte still surfaced ECONNRESET and
@@ -1817,10 +2004,54 @@ if (invokedAsScript) {
       // later, measured before=1 afterSync=1 afterTick=0 on 18/20/24 — and
       // lying the moment anything drains the set synchronously. Do not
       // "simplify" the spread away.
+      // NAME THE ROUTES, because the count alone cannot say what was lost. This
+      // port carries CLI turns alongside bridge traffic, quota polls, statusline
+      // and title generation, and only the first kind is a reply a person is
+      // reading. A cut of 15 is a different event depending on the mix, and
+      // every reader of this line so far has had to guess.
+      //
+      // COARSE, AND NO QUERY STRING. Two path segments, nothing after `?`: the
+      // proxy sees whole request URLs and this line goes to a log, so the
+      // grouping is what stops an identifier in a path from being written out.
+      // It is also what bounds the cardinality — a per-URL tally on a passthrough
+      // route would print one entry per request.
       let ended = 0, destroyed = 0;
+      const routes = new Map();
+      // HOW LONG EACH ONE HAD BEEN QUIET. `N still owed` cannot tell a stalled
+      // reply from a live one, so every forced close has needed re-derivation:
+      // measured once under real traffic, `0 ended on the stall test, 4 still
+      // owed` was only readable as "they were streaming" by reasoning from the
+      // zero. The predicate's own record already dates each connection from its
+      // last byte, so this reports what is there rather than counting anything
+      // new. RANGE, not one per connection: the minimum answers "was ANY of
+      // them live" and the maximum "was ANY of them stalled", and two numbers
+      // cannot blow up the line the way a cut of 17 would.
+      const quietMs = [];
+      const nowAt = Date.now();
       for (const res of [...(active.server?._live ?? [])]) {
+        // Already ended by the stall test. It is still here only because its FIN
+        // cannot flush, and counting it again reports one connection twice in a
+        // line an external monitor parses.
+        const rec = seen.get(res);
+        if (rec?.done) continue;
+        const r = drainRoute(res.req?.url);
+        routes.set(r, (routes.get(r) ?? 0) + 1);
+        // NO RECORD MEANS THE STALL LOOP NEVER RAN -- the supervised arm -- not
+        // that nothing ever moved. Dating from arrival there reports a reply's
+        // AGE as its silence: measured, `quiet 17.5s` for one delivering a chunk
+        // every 200ms, which reads as a cut that took something already dead.
+        // Resolution on that arm is the budget: a reply that stalled mid-drain
+        // reads 0, erring toward calling the cut costly rather than free.
+        const moved = (res.socket?.bytesWritten ?? 0) !== (res._bornBytes ?? 0);
+        quietMs.push(nowAt - (rec?.at ?? (moved ? nowAt : res._bornAt ?? nowAt)));
         try { if (res.headersSent) { res.end(); ended++; } else { res.destroy(); destroyed++; } } catch {}
       }
+      const routeTally = [...routes].sort((a, b) => b[1] - a[1])
+        .map(([r, n]) => `${r}=${n}`).join(" ");
+      const secs = (ms) => (ms / 1000).toFixed(1);
+      const lo = Math.min(...quietMs), hi = Math.max(...quietMs);
+      const quietTally = !quietMs.length ? ""
+        : lo === hi ? `${secs(lo)}s` : `${secs(lo)}-${secs(hi)}s`;
       // THE SAME EXIT CODE THE GRACEFUL PATH USES. It exits
       // `askForSuccessor ? 75 : 0`, and the comment above it says the two paths
       // must not disagree about what our exit means — but this one exited 0
@@ -1834,7 +2065,8 @@ if (invokedAsScript) {
       // must not print as "0 connections still held", which is the one reading
       // that would wrongly clear the stop.
       const finish = (held) => {
-        process.stderr.write(forcedCloseLine(ended, destroyed, held, budgetMs));
+        process.stderr.write(forcedCloseLine(
+          ended, destroyed, held, afterMs, why, routeTally, quietTally, owedAtStart));
         // Then force whatever did not take the FIN. Node >=18.2; package.json
         // engines allows 18.0/18.1, where exiting without forcing is the only
         // option.
@@ -1846,6 +2078,161 @@ if (invokedAsScript) {
       };
       try { active.server.getConnections((err, n) => finish(err ? null : n)); }
       catch { finish(null); }
-    }, budgetMs).unref();
+    };
+    if (!unwaited) {
+      // THE STANDALONE ARM KEEPS ITS CEILING, and it is the only arm left that
+      // has one. Nothing supervises us, so the process we are is the process
+      // somebody is waiting on, and that wait is serial.
+      setTimeout(() => forceClose(budgetMs, ""), budgetMs).unref();
+    } else {
+      // THE HANDOVER ARM HAS NO CEILING, because a ceiling is a bet on how long
+      // a reply takes and every value of it loses: 5s and 1800s cut on this
+      // path, and a neighbouring component retuned the same number three times.
+      //
+      // SCORE BYTES, NOT CONTENT EVENTS, AND NOT A RATE. A rate cannot separate
+      // a slow reply from a heartbeat — 490 B/s against 35 B/s on one stream —
+      // and that measurement is why this file used to conclude no honest
+      // predicate existed. It is an argument against a THRESHOLD ON THROUGHPUT
+      // and it does not touch this test, which never divides anything: a reply
+      // and a heartbeat both answer "moving", which is the correct answer for
+      // both. What it excludes is a connection delivering nothing at all, and
+      // that is a different shape rather than a smaller number of the same one.
+      // The neighbour's distribution: content-free waits reach 186s while
+      // BYTE-free waits reach 23s. The two modes do not overlap, so no value in
+      // between is wrong — which is why their stall threshold has never been
+      // retuned while every budget has.
+      //
+      // 90s is a judgement call bounded by two observations (past any gap a live
+      // stream produces, short of the ten minutes that was cutting real work),
+      // not a percentile. A number presented as derived when it was not is worse
+      // than an honest guess.
+      //
+      // DO NOT TIGHTEN THIS TOWARD THE OBSERVED MAXIMUM. That maximum is not
+      // stable: it stood at 2s over 6 samples, then a real reply on a busy host
+      // went 23s without a byte and finished clean. Bimodality is what lets you
+      // choose a threshold without knowing n; it is NOT what tells you how much
+      // MARGIN you have, and only n does that. Every sample under 2s came from
+      // quiet hosts. Below ~60s is inside the observed range of a healthy
+      // stream, so anything there cuts live work.
+      const stallMs = drainBudgetMs(process.env.CACHE_FIX_DRAIN_STALL_MS, 90_000);
+      // Polled off the socket rather than stamped on every write: the hot path
+      // pays nothing, and `bytesWritten` is the byte actually leaving rather than
+      // a chunk we parsed. It is also the only thing that separates a reply that
+      // is streaming from one blocked upstream — `headersSent` goes true at
+      // writeHead, measured with bytesWritten still 0, so the `mid-response`
+      // count above is an upper bound and this is not.
+      // WeakMap: a response that finishes leaves `_live` but would stay reachable
+      // from here, and this drain can run for as long as work keeps arriving.
+      // PER CONNECTION, both the clock and the cut.
+      //
+      // This was one shared `lastMoved` reset by a disjunction over the whole
+      // set, and on a port with any traffic that is a clock that never expires:
+      // one live stream answers "moving" for every connection, so a stalled one
+      // never ages.
+      //
+      // AND THE CUT MOVED WITH IT, which is the half that is easy to miss.
+      // Per-connection STAMPING alone still ends the WHOLE drain the moment one
+      // connection goes quiet, taking the live ones with it — the same
+      // zero-interruption violation with the sign flipped. So a quiet connection
+      // is ended on its own and the drain keeps going; what ends the drain is
+      // `server.close()` resolving, or the backstop.
+      const tick = setInterval(() => {
+        const now = Date.now();
+        for (const res of [...(active.server?._live ?? [])]) {
+          const n = res.socket?.bytesWritten ?? 0;
+          const rec = seen.get(res);
+          // A connection first seen during the drain is stamped, not judged: it
+          // has no history here, and treating "no record" as "no movement"
+          // would end it on the first tick. It is dated from ARRIVAL only when
+          // nothing has left it since — see `_bornBytes`.
+          if (!rec) {
+            const quietSinceArrival = n === (res._bornBytes ?? 0);
+            seen.set(res, { bytes: n, at: quietSinceArrival ? (res._bornAt ?? now) : now });
+            continue;
+          }
+          // MARKED, never deleted. `res.end()` only queues the FIN, so a
+          // response whose client stopped reading never leaves the live set,
+          // and a deleted record is re-stamped as new and ended again.
+          if (rec.done) continue;
+          if (rec.bytes !== n) { rec.bytes = n; rec.at = now; continue; }
+          if (now - rec.at < stallMs) continue;
+          // IT ENDED ITSELF, so `res.end()` is a no-op and there is no cut to
+          // report. Reachable on the BUFFERED branch only — its single
+          // `end(rawResponse)` ignores backpressure; the streaming path pipes.
+          //
+          // NOT MARKED DONE. `done` means "already accounted for", and this one
+          // is still OWED: megabytes are queued on a socket the client is not
+          // reading, and the forced close destroys it. Marking it here dropped it
+          // from the backstop's owed count AND from the cut tally, so the drain
+          // said `0 response(s) still owed` and `cut no responses` about a reply
+          // it then truncated -- the severed-and-called-clean shape this drain
+          // exists to remove, one branch over. Re-entering this test each tick
+          // costs one comparison and keeps both counts honest.
+          if (res.writableEnded) continue;
+          // BYTES ON THE WIRE, not headers in a buffer. `headersSent` is true
+          // from writeHead with nothing delivered, and `res.end()` there emits a
+          // well-formed empty 200 the client will not retry.
+          const mid = n > (res._bornBytes ?? 0);
+          let how;
+          try {
+            if (mid) { res.end(); how = "ended"; }
+            else { res.destroy(); how = "destroyed"; }
+          } catch { how = "gone"; }
+          rec.done = true;
+          stallEnded++;
+          say(process.stderr, `[cache-fix] shutdown: drain ${how} one connection ` +
+            `${drainRoute(res.req?.url)} with no byte written for ${Math.round((now - rec.at) / 1000)}s ` +
+            `(${mid ? "mid-response" : "before headers"})\n`);
+        }
+        const elapsed = now - drainStart;
+        // THE ONLY THING THAT ENDS THE DRAIN FROM IN HERE. A quiet connection is
+        // ended above without ending the drain.
+        //
+        // REACHING IT IS NOT PROOF OF A DEFECT. A connection still moving at
+        // expiry, a CONNECT tunnel or upgrade (never in `_live` — only the
+        // request handler fills it, and that is the common shape in forward
+        // mode), and the Node 18 keep-alive case above all reach it with the
+        // predicate working. Report what is owed; do not accuse.
+        if (elapsed >= budgetMs) {
+          // Not `_live.size`: it still holds the ones ended above, so one
+          // connection would be counted in both halves of the line.
+          const owedRes = [...(active.server?._live ?? [])].filter((r) => !seen.get(r)?.done);
+          // THE BUDGET IS A RE-EVALUATION POINT, NOT A GUILLOTINE. The stall
+          // test is the only thing here that knows whether a connection is
+          // alive, and a wall clock that overrules it is a second policy
+          // rather than a last resort. Measured twice, identical both times:
+          // four replies still delivering were cut at the budget while the
+          // stall test had ended none, so it had judged all four alive and
+          // was right about all four.
+          //
+          // Waiting is affordable and cutting is not -- the comment above
+          // says a lingering predecessor holds no listener and costs RAM,
+          // and the thing on the other side of this branch is a reply
+          // someone is reading. A ceiling for the RAM belongs in units of
+          // RAM, not seconds.
+          const stillLive = owedRes.filter(
+            (r) => now - (seen.get(r)?.at ?? r._bornAt ?? now) < stallMs);
+          if (stillLive.length) {
+            if (now - lastWaitSaid >= 60_000) {
+              lastWaitSaid = now;
+              say(process.stderr,
+                `[cache-fix] shutdown: still waiting ${Math.round(elapsed / 1000)}s in` +
+                ` (budget ${Math.round(budgetMs / 1000)}s) — ${stillLive.length} of` +
+                ` ${owedRes.length} owed connection(s) still delivering\n`);
+            }
+            return;
+          }
+          clearInterval(tick);
+          // ROUNDED, because this arm passes the ELAPSED time rather than a
+          // configured budget, and `after` renders a non-multiple of 1000 in
+          // milliseconds -- so this arm alone said `after 1800660ms` where every
+          // other says `after 1800s`, and a reader outside this repo matches the
+          // seconds form.
+          forceClose(Math.round(elapsed / 1000) * 1000,
+            `, on the BACKSTOP budget — ${stallEnded} ended on the stall test,` +
+            ` ${owedRes.length} response(s) still owed`);
+        }
+      }, 1_000).unref();
+    }
   };
 }
