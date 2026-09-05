@@ -1,6 +1,7 @@
 import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import ext, {
+  __resetAdvisedForTests,
   findBetaHeader,
   parseBetaTokens,
   planSanitizeBetaHeader,
@@ -188,4 +189,54 @@ test("onRequest: duplicate `context-1m-2025-08-07` tokens (defensive) — all re
     ctx.headers["anthropic-beta"],
     "claude-code-20250219, oauth_auth, interleaved-thinking-2025-05-14",
   );
+});
+
+// --- the advisory is advice, not a per-request fact ---
+
+// The advisory sampler, shared by the two cases below. Forwards what it is not
+// sampling, so it cannot swallow an unrelated line. Resets the latch on both
+// sides -- a spent one makes a case appended later count 0 and read green for
+// the wrong reason.
+async function sampleAdvisories(fn) {
+  __resetAdvisedForTests();
+  const seen = [];
+  const orig = process.stderr.write;
+  process.stderr.write = (s) => {
+    if (!String(s).includes("[auto-1m-guard]")) return orig.call(process.stderr, s);
+    seen.push(String(s));
+    return true;
+  };
+  try { await fn(); } finally { process.stderr.write = orig; __resetAdvisedForTests(); }
+  return seen;
+}
+
+test("onRequest: the advisory is written once, but every request is still annotated", async () => {
+  const seen = await sampleAdvisories(async () => {
+    for (let i = 0; i < 5; i++) {
+      const ctx = mkCtx({ headers: { "anthropic-beta": STD_BETAS_WITH_1M }, mode: "warn" });
+      await ext.onRequest(ctx);
+      // The latch sits below the annotation, which every request's session JSON needs.
+      assert.equal(ctx.meta._auto1mGuard?.auto_1m_detected, true, `request ${i} lost its annotation`);
+    }
+  });
+  assert.equal(seen.length, 1, `advisory written ${seen.length}x for 5 requests`);
+});
+
+test("onRequest: the advisory latch spans the process, not one module instance", async () => {
+  // loadExtensions cache-busts every import (pipeline.mjs), so this module is
+  // re-evaluated inside ONE process on every reload -- and a module-scoped latch
+  // re-arms there, returning the advisory this exists to silence.
+  const href = new URL("../proxy/extensions/auto-1m-guard.mjs", import.meta.url).href;
+  const a = await import(`${href}?latch=a`);
+  const b = await import(`${href}?latch=b`);
+  assert.notEqual(a.default, b.default,
+    "premise: both imports resolved to the same module, so this case proves nothing");
+
+  const seen = await sampleAdvisories(async () => {
+    for (const m of [a, b]) {
+      await m.default.onRequest(mkCtx({ headers: { "anthropic-beta": STD_BETAS_WITH_1M } }));
+    }
+  });
+  assert.equal(seen.length, 1,
+    `two module instances in one process wrote ${seen.length} advisories`);
 });

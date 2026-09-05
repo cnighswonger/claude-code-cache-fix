@@ -504,7 +504,7 @@ cache-fix의 `bootstrap-defense` 확장은 `CACHE_FIX_BOOTSTRAP_MODE`를 통해 
 | 모드 | 기본? | 동작 |
 |---|---|---|
 | `off` | 아니요 | 확장은 무작위입니다. |
-| `warn` | 예 | 토큰을 감지합니다. 각 세션 JSON(`auto_1m_detected`, `auto_1m_action: "warn"`, `auto_1m_advice`)에 주석을 저장하고 stderr 로그 라인을 출력합니다. 요청을 수정하지 않습니다. |
+| `warn` | 예 | 토큰을 감지합니다. 각 세션 JSON(`auto_1m_detected`, `auto_1m_action: "warn"`, `auto_1m_advice`)에 주석을 저장하고 stderr 로그 라인을 출력합니다. 이 라인은 프로세스 수명 동안 최초 감지 1회로 고정됩니다(조언 문구는 변하지 않으며, 확장 리로드로 재무장되지 않습니다). 요청을 수정하지 않습니다. |
 | `strip` | 선택적 | 전송 전 토큰을 감지하고 `anthropic-beta` 헤더에서 제거합니다. 주석: `auto_1m_action: "stripped"`. |
 
 CC 측 종료 스위치는 `CLAUDE_CODE_DISABLE_1M_CONTEXT=1`(환경 변수)이며, CC 프로세스에 실제로 도달했을 때 올바른 수정입니다. VS Code 확장 표면에서는 이 환경 변수가 신뢰할 수 없다고 보고됩니다; 프록시 인터셉트는 요청을 생성한 어떤 CC 래퍼든 작동하므로 간격을 우회합니다. [CC#64919](https://github.com/anthropics/claude-code/issues/64919) 추적; [`docs/directives/proxy-auto-1m-guard.md`](docs/directives/proxy-auto-1m-guard.md)에서 프록시 가시 신호가 베타 헤더(예: CC는 `req.body.model` 클라이언트 측에서 `[1m]` 접미사를 제거하기 전에 보냅니다)임을 확인하는 바이너리 워크를 참조하세요.
