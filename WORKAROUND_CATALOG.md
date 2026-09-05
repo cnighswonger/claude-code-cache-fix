@@ -53,7 +53,7 @@ Upstream: https://github.com/anthropics/claude-code/issues/59844 — Open as of 
 
 ### CC#59628 — Worktree sessions can edit files in the parent main checkout with no guardrail
 
-Upstream: https://github.com/anthropics/claude-code/issues/59628 — Open as of 2026-06-11.
+Upstream: https://github.com/anthropics/claude-code/issues/59628 — Closed 2026-07-08 as `not_planned` by Anthropic. The workaround below is still applicable for users who want the guardrail; Anthropic will not ship a native fix.
 
 | Depth | Knob | Survives update? | Verified by | Recommendation |
 |---|---|---|---|---|
@@ -73,28 +73,32 @@ Upstream: https://github.com/anthropics/claude-code/issues/63147 — Open as of 
 
 ---
 
-### CC#62272 — `cleanupPeriodDays` values above ~24 silently wipe or truncate historic session JSONLs
+### CC#62272 — Silent JSONL deletion despite `cleanupPeriodDays` set high (mechanism unresolved)
 
-Upstream: https://github.com/anthropics/claude-code/issues/62272 — Open as of 2026-09-01. Related historical loss: #59248 (orphaned subagent/tool-results dirs), #41458 (490 sessions lost at 99999).
+Upstream: https://github.com/anthropics/claude-code/issues/62272 — Closed 2026-08-19 as duplicate of **#41458** (canonical tracker; follow that one). Related historical loss: #59248 (orphaned subagent/tool-results dirs).
 
-**Mechanism (theory, math-consistent with reports).** The daily retention cleanup path computes an age cutoff from `cleanupPeriodDays × 86400 × 1000` ms. Signed int32 max is 2,147,483,647 ms ≈ **24.855 days** — any value above that is a candidate for truncation. The empirical failure mode reported by gregmarkowitz-gif (2026-08-31, Windows 11, CLI-only, `cleanupPeriodDays: 99999` set on two seats) matches signed-int32 truncation of the cutoff:
+**Status of the theories on the thread — read this before citing anything below.**
 
-- **99999 days** → 8.64e12 ms → mod 2³² lands NEGATIVE (~ −8.7e9), so the cutoff is in the future — everything classifies as older than cutoff → mass delete on next cleanup pass. Deletions are hard-unlinks; Recycle Bin empty.
-- **365 days** → 3.15e10 ms → mod 2³² ≈ +1.47e9 ms ≈ **17 days effective retention**. Recent sessions survive (consistent with the reporter's "safe after downgrading to 365" observation) but anything older than ~17 days is silently deleted on the next pass.
-- **≤ ~24 days** — the retention math does not overflow; the setting behaves as expected.
+An earlier reading of gregmarkowitz-gif's 2026-08-31 report on the thread framed the mechanism as signed-int32 overflow of a days→ms cutoff. **That hypothesis has been retracted by the original reporter on 2026-09-01T15:42Z.** The kill argument is short: `2^31 - 1 ms ≈ 24.855 days`, so if a days→ms cutoff truly overflowed int32, the shipped default `cleanupPeriodDays: 30` would misbehave identically. The default doesn't misbehave for the general user base, so int32 overflow can't be the mechanism. Any earlier framing (including cache-fix-team's comment posted on the thread the same day) is superseded.
 
-Mass-loss timing per the report: falls inside the 2.1.237 → 2.1.252 window, i.e. after the 2.1.248 retention rework. `~/.claude/.last-cleanup` tracks the last daily pass per config-dir seat.
+**What is known on the thread as of 2026-09-01:**
+
+- **Version-specific.** Machine A on 2.1.252 lost files under `cleanupPeriodDays: 99999`. Machine B in the same org on 2.1.251 with the same setting lost none (714 transcripts intact back to 2026-08-01). Loss window narrows to 2.1.252+.
+- **Not simple age reap.** After the wipe on machine A, the busiest project directory held **exactly 25** top-level `.jsonl`, none older than 2026-08-31T18:48Z, while quieter project directories on the same box kept files from 2026-08-24 through 08-28. A global age reap takes the oldest first; here the oldest survived in quiet dirs and newer files in the busy dir died. Working hypothesis on the thread: **per-project-directory count cap (~25) applied to the busiest dir**. Not confirmed.
+- **Inverse pattern reported on WSL2** by dowdys on 2026-07-21: idle project directories deleted entirely (64 of 69), busy directories survived. Same directory axis, opposite sign. Possibly two mechanisms; possibly one mechanism keyed on "was this directory being written to at sweep time" with a sign that hasn't been pinned.
+- **Age-based cleanup does work at moderate settings on 2.1.252.** Canary on machine A at `cleanupPeriodDays: 365`: two synthetic `.jsonl` files backdated to −40d and −400d — next pass deleted the −400d file and spared the −40d file. So the setting itself honors age when it's in the sane range; the Aug-31 mass loss under 99999 is the anomaly to explain, and it isn't age.
+- **Sweep cadence on affected boxes is ~4 hours, not daily**, per the same reporter's `~/.claude/.last-cleanup` timeline on machine A (`12:16:17Z`, `16:16:17Z`, same seconds 4h apart). Docs describe daily.
+- **Blast radius is broader than `~/.claude/projects/`** per the WSL2 report: `file-history/` and paste-cache siblings were swept with the same cutoff. So any workaround that only snapshots `projects/` is partial.
 
 | Depth | Knob | Survives update? | Verified by | Recommendation |
 |---|---|---|---|---|
-| `settings.json` | `"cleanupPeriodDays": 24` (or any integer in `[1, 24]`) in `~/.claude/settings.json` and any per-project `.claude/settings.json`. Do NOT set `99999`, `36500`, or other "keep forever" placeholders on affected CC versions. | Yes — the setting key is stable | originator (gregmarkowitz-gif, 2026-09-01, 30-min tripwire since downgrade to 365 shows zero deletions) | `preferred` on 2.1.248+ until Anthropic ships a fix. Downside: retention capped at ~24 days; anything older will be purged on the next cleanup pass. Users who need longer retention should also snapshot `~/.claude/projects/` out-of-band (e.g. rsync to a location the cleanup does not touch). |
-| `settings.json` | Downgrade to a CC version before 2.1.248 via `npm install -g @anthropic-ai/claude-code@2.1.237` and pin. | No — the point is to stay off the affected versions until the fix ships | cache-fix-team (one of our internal hosts, `cleanupPeriodDays: 99999` set, running a pre-2.1.248 CC, `.last-cleanup: 2026-08-31` — JSONLs from 2026-01-23 through today all present; 1985 files across 120 distinct days, no gaps consistent with truncation) | `narrow-use` — trades this bug against every fix that shipped after 2.1.237. Only for users whose retention needs strictly exceed 24 days and who can defer other CC updates. |
+| `settings.json` | `"cleanupPeriodDays": <sane value>` (default 30 or a smaller integer) in `~/.claude/settings.json` and any per-project `.claude/settings.json`. **Do NOT set 99999, 36500, or other "keep forever" placeholders on 2.1.252+.** Community-reported: they are the exact configurations under which the losses occurred. Note this is defensive-configuration only — it does not target the actual (unknown) mechanism. | Yes — the setting key is stable. | `community-reported` — several thread reporters on 2.1.252+ recovered stability by dropping to `365` or below. Mechanism still open on #41458. | `preferred` while the upstream fix is pending. |
+| `settings.json` | Downgrade to a CC version before 2.1.252 via `npm install -g @anthropic-ai/claude-code@2.1.251` (or earlier) and pin. | No — the point is to stay off the affected versions until the fix ships. | community-reported (machine B in the reporter's org on 2.1.251 + 99999 lost nothing). | `narrow-use` — trades this bug against every fix that shipped after 2.1.251. Only for users whose retention needs strictly exceed the sane-range cap and who can defer other CC updates. |
+| `tool` | Out-of-band snapshot of `~/.claude/` (not just `projects/` — include `file-history/`, `paste-cache/`, memory subdirs) to a filesystem the built-in cleanup does not walk. `rsync -a` with hardlink dedup between snapshots (or `cp --reflink` on Btrfs) is the durable-copy primitive; retention on the archive is orthogonal to whatever CC does. See `blain3white/clean-my-agent` on the thread for a shipped user-space implementation. | Yes — decoupled from CC entirely. | community-reported (`blain3white/clean-my-agent`); cache-fix-team runs an internal equivalent (hourly rsync to a Btrfs tier with 48h rotation). | `preferred` for users who need retention past whatever cap the mechanism turns out to be. This is the only workaround that survives if the mechanism turns out to be per-dir count cap or idle-dir removal rather than age. |
 
-**What the reporter's evidence rules out:** VS Code extension involvement (CLI-only), scheduled-task deletion (audited), soft-delete (Recycle Bin empty), Retention Bot / third-party tools (none installed). The `.last-cleanup` timestamp advances daily per config-dir seat, so the deleter is CC's own built-in cleanup path.
+**What the thread has NOT established:** the actual mechanism, the exact CC version boundary (some reports use `2.1.114`, some `2.1.252`), whether Windows/WSL2/Linux/macOS all share one bug or multiple, and whether `.last-cleanup`'s ~4h cadence is intentional. Reading the shipped binary for 2.1.252+ is the missing evidence.
 
-**What the reporter's evidence does NOT prove:** the exact overflow site. The mod-2³² math above predicts the observed retention outcomes (99999 → mass delete, 365 → ~17-day silent retention, ≤24 → safe), but confirming it requires reading the 2.1.248+ cleanup path in the shipped binary — cc-watch extracts of that version window would let us pin the offset.
-
-**Authoritative fix Anthropic should ship:** widen the retention-cutoff math to `Number` or `BigInt` (JS has no int32 by default — `Math.imul` and typed-array coercions do; if the cleanup path involves either, that's the site). Alternately, cap `cleanupPeriodDays` inputs at the safe boundary and warn users setting higher values.
+**Authoritative fix Anthropic should ship (from the thread):** the canonical tracker is #41458. Any workaround here is defensive; the upstream fix is theirs. Ship with the mechanism identified so users can distinguish "safe to leave setting high" from "safe to leave setting low" from "no configuration is safe."
 
 ---
 
@@ -141,5 +145,5 @@ This is the seed for the catalog. Future additions are made by the contributor w
 1. **CC#59844 / thinking-display** — three mitigations at three depths; the claudio-felicioli wrapper is the cleanest for VS Code extension users.
 2. **CC#59628 / worktree-edit-guard** — our shipped hook example.
 3. **CC#63147 / thinking-wedge** — env-var workarounds (lossy) + proxy `session-health` extension.
-4. **CC#62272 / cleanupPeriodDays overflow** — `settings.json` cap at 24 (originator-verified), OR pin CC to a pre-2.1.248 version (cache-fix-team-verified on our own host at 99999 with cleanup running daily, no losses).
+4. **CC#62272 / cleanupPeriodDays silent JSONL loss (mechanism unresolved)** — closed as dupe of #41458. Defensive settings (`cleanupPeriodDays` at 365 or lower), pin to pre-2.1.252, and durable out-of-band snapshot are the three complementary paths; the int32-overflow theory from an earlier version of this entry has been retracted upstream.
 5. **Silent model remap (Web Manager pattern)** — `CLAUDE_CODE_DISABLE_LEGACY_MODEL_REMAP=1` env-var.
