@@ -2,9 +2,8 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
 
-const testFile = join(dirname(fileURLToPath(import.meta.url)), "proxy-holder-handover.test.mjs");
+const testFile = fileURLToPath(new URL("./proxy-holder-handover.test.mjs", import.meta.url));
 
 describe("diagnostic evidence when a holder never comes up", () => {
   // A REAL, DETERMINISTIC repro of "the holder never came up" rather than the
@@ -26,10 +25,6 @@ describe("diagnostic evidence when a holder never comes up", () => {
        "--test-name-pattern", "no hop is configured", testFile],
       { env, encoding: "utf8", timeout: 90_000 });
     const out = r.stdout + r.stderr;
-    const at = out.indexOf("the holder never came up");
-    assert.ok(at >= 0, `expected the forced startup failure to fire:\n${out}`);
-    const block = out.slice(at, at + 500);
-    assert.match(block, /cache-fix\] cannot bind/,
-      `the startup assertion's failure message dropped the launcher's stderr:\n${block}`);
+    assert.match(out, /the holder never came up[^\n]*\[cache-fix\] cannot bind/, out);
   });
 });
