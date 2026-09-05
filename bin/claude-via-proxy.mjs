@@ -753,8 +753,18 @@ function codeFingerprint(root) {
   } catch { return ""; }
 }
 
+// BOTH HALVES, because the reaper matches the basenames readdirSync() yields and
+// cannot derive them from a joined path. A literal on either side drifts the
+// reaper into matching nothing, which collects nothing and reports nothing.
+const RECORD_PREFIX = "cache-fix-proxy-";
+const RECORD_SUFFIX = ".sha256";
+
+// Shared with the scratch-CA reaper below: the two gates are equal by
+// construction, not by a comment claiming they are.
+const REAP_AGE_MS = 7 * 86_400_000;
+
 function fingerprintPath(port) {
-  return join(tmpdir(), `cache-fix-proxy-${port}.sha256`);
+  return join(tmpdir(), `${RECORD_PREFIX}${port}${RECORD_SUFFIX}`);
 }
 
 // Temp + rename: a reader that opens this mid-write would compare against a
@@ -769,10 +779,88 @@ function publishFingerprint(port) {
   } catch { /* best effort: an unwritable tmpdir must not stop a proxy starting */ }
 }
 
+// Nothing else removes these, and the port is ephemeral wherever the OS picks
+// one, so a record accumulates per proxy start without bound.
+//
+// A PORT THAT STILL ANSWERS OUTRANKS THE CLOCK. Nothing republishes a record —
+// its mtime is the last child spawn — so age alone reaps the record of a holder
+// that has merely been up a week. runningOurCode() then answers null and
+// takeOver() exits 0 announcing a deploy that has not taken effect.
+//
+// Seven days on top, matching the scratch-CA reaper, bounds what a crashed
+// holder leaves behind on a port nobody rebinds.
+//
+// publishFingerprint's `<record>.<pid>` temp is spared while it is fresh -- a
+// pending rename is not litter -- and collected past the same gate, where the
+// only thing that leaves one behind is a publish that died.
+async function reapFingerprintRecords() {
+  let seen = 0;
+  try {
+    for (const f of readdirSync(tmpdir())) {
+      // Yield periodically. Nothing awaited below reaches the poll phase, so an
+      // uninterrupted pass holds the event loop between the bind and the first
+      // accept — which is the delay deferring this was meant to avoid.
+      if (++seen % 100 === 0) await new Promise(setImmediate);
+      if (!f.startsWith(RECORD_PREFIX)) continue;
+      const isRecord = f.endsWith(RECORD_SUFFIX);
+      // A rename pends for microseconds, so a `<record>.<pid>` this far over the
+      // gate is a crashed publish. Nothing else collects it: the suffix test
+      // alone would skip the name forever.
+      const isTemp = !isRecord && f.includes(`${RECORD_SUFFIX}.`);
+      if (!isRecord && !isTemp) continue;
+      const p = join(tmpdir(), f);
+      try {
+        if (Date.now() - statSync(p).mtimeMs <= REAP_AGE_MS) continue;
+        // Only a record answers to a port. A temp is nobody's to read.
+        if (isRecord && !(await portFree(f.slice(RECORD_PREFIX.length, -RECORD_SUFFIX.length)))) continue;
+        // RE-READ: publishFingerprint renames a new record over this path, and the
+        // probe's await is wide enough to land inside. Losing a FRESH record makes
+        // runningOurCode() answer null, which holderVerdict() reads as an incumbent
+        // of ours and takeOver() reports as a deploy that has not landed.
+        if (Date.now() - statSync(p).mtimeMs <= REAP_AGE_MS) continue;
+        rmSync(p);
+      } catch { /* raced, gone, or refused; a survivor is disk, not correctness */ }
+    }
+  } catch { /* unreadable tmpdir: publishing already degraded, say nothing more */ }
+}
+
+// ASKED BY BINDING, NOT BY lsof: holderPidOn needs a pid and has to shell out,
+// this needs one bit, and a host without lsof would otherwise make the reap a
+// silent no-op. A name whose port is not a number is not ours to judge.
+//
+// THREE THINGS THIS DOES NOT ANSWER, all narrow, none free to close here:
+//
+// 1. "Is anything LISTENING" is not "is anyone using this port". A holder in the
+//    bound-but-not-listening state this file creates on purpose reads as free,
+//    so an over-age record can be lost in the window before its relay takes over.
+// 2. A record is keyed by PORT ALONE, and this asks about bindAddr(). A holder on
+//    another address reads as free to a reaper on loopback. Probing the wildcard
+//    would close it and open a worse one — an externally reachable socket per
+//    over-age record — and carrying the address would change the record format.
+// 3. The probe is itself a listener while it asks, so a launcher in otherHolderOn()
+//    can read it as an incumbent, print "this one is surplus" and settle(0),
+//    leaving the port empty. Needs a record for the exact port a second launcher
+//    is binding, i.e. one idle seven days and then reused.
+//
+// All three end in the same place: runningOurCode() answers null and takeOver()
+// exits 0 announcing a deploy that has not taken effect. The local variant of 3
+// cannot happen — listen() is the last synchronous statement of holdPort's
+// executor, so this launcher already owns its own port when the reap runs.
+function portFree(port) {
+  const n = Number(port);
+  if (!Number.isInteger(n) || n < 1 || n > 65535) return Promise.resolve(false);
+  return new Promise((res) => {
+    const s = net.createServer();
+    s.once("error", () => res(false));
+    s.listen(n, bindAddr(), () => s.close(() => res(true)));
+  });
+}
+
 // TRUE, FALSE, or NULL for "cannot tell" — a third state because the callers
 // must be able to TELL unknown apart, not because they answer it differently.
 // Both end at exit 0; only one of them says why (see otherHolderOn). Unknown is
-// ordinary: the record lives in /tmp, which systemd-tmpfiles sweeps.
+// ordinary: the record is age-reaped (see reapFingerprintRecords) and a host
+// with a /tmp sweeper clears it too.
 function runningOurCode(port) {
   let theirs = "";
   try { theirs = readFileSync(fingerprintPath(port), "utf8").trim(); } catch { return null; }
@@ -816,6 +904,12 @@ function holdPort(rest) {
   for (const s of [process.stdout, process.stderr]) {
     s.on("error", () => { /* the reader left; putting the proxy back is the job */ });
   }
+  // Here, not in publishFingerprint: that returns early when the fingerprint is
+  // unreadable, which would stop the reap exactly when publishing is broken, and
+  // it runs on every respawn. Deferred and unref'd because the scan walks the
+  // whole tmpdir, nothing waits on its result, and it must neither delay the
+  // bind nor hold the process open.
+  setTimeout(reapFingerprintRecords, 0).unref();
   // The proxy's own default: holding a different port than the proxy would have
   // served leaves nothing at the documented address.
   // `|| 9801` REWROTE PORT 0 to 9801. "0" is a truthy string so the run-service
@@ -2267,11 +2361,10 @@ if (remoteControl) {
     // unique; it guarantees nothing about what else shares a prefix, so the two
     // sites read one constant rather than two matching string literals.
     try {
-      const scratchAgeMs = 7 * 86_400_000;
       for (const f of readdirSync(tmpdir())) {
         if (!f.startsWith(SCRATCH_PREFIX)) continue;
         const p = join(tmpdir(), f);
-        try { if (Date.now() - statSync(p).mtimeMs > scratchAgeMs) rmSync(p, { recursive: true }); }
+        try { if (Date.now() - statSync(p).mtimeMs > REAP_AGE_MS) rmSync(p, { recursive: true }); }
         // Someone else's, already gone, or REFUSED (dir mode 0500, measured).
         // A survivor is litter under tmpdir() that nothing reads — unlike a
         // refused delete that leaves a live state armed, which would need code.

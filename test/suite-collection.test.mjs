@@ -126,6 +126,34 @@ test("a test that SIGKILLs a holder reaps the successor, holder first", () => {
     "that a live holder immediately replaces");
 });
 
+// A LAUNCHER THAT IS SIGKILLED LEAVES A DETACHED STANDBY ON ITS PORT. It stands
+// down only for a claimant's SIGHUP, so the kill reparents it to init still
+// listening — measured, one per run from proxy-fingerprint-reap's spawn case,
+// eight alive at once, the oldest over three hours, each one a listener in the
+// band the suite's own fixtures bind from.
+//
+// Swept over every file rather than named, because the guard above went blind
+// the moment a second file learned the same debt. Any spelling of the sweep
+// counts: onPort(), listeners(), or a raw lsof -iTCP. A file that kills a
+// launcher and genuinely has nothing to sweep says so with NO-STANDBY: and why
+// — proxy-probe-bounded blocks in a probe before it binds, measured at three
+// deadlines.
+test("every test that SIGKILLs a launcher sweeps the port or says why not", () => {
+  const offenders = [];
+  for (const f of readdirSync(testDir).filter((n) => n.endsWith(".test.mjs"))) {
+    if (f === "suite-collection.test.mjs") continue;
+    const src = readFileSync(join(testDir, f), "utf8");
+    if (!/claude-via-proxy\.mjs|launcherPath/.test(src)) continue;
+    if (!/SIGKILL/.test(src)) continue;
+    if (/onPort\(|listeners\(|process\.kill\(-/.test(src)) continue;
+    if (/NO-STANDBY:/.test(src)) continue;
+    offenders.push(f);
+  }
+  assert.deepEqual(offenders, [],
+    "these spawn a launcher and SIGKILL it without reaping what it left on the " +
+    "port, and without saying why none is owed");
+});
+
 // A FAILURE MESSAGE IS PUBLISHED OUTPUT. proxy-held-port's probes append the
 // 503 body to what they assert on, and the gap relay's 503 body carries the hop
 // it would forward to — so an env var that gives a child a hop and is not
