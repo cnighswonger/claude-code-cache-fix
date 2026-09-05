@@ -100,6 +100,34 @@ An earlier reading of gregmarkowitz-gif's 2026-08-31 report on the thread framed
 
 **Authoritative fix Anthropic should ship (from the thread):** the canonical tracker is #41458. Any workaround here is defensive; the upstream fix is theirs. Ship with the mechanism identified so users can distinguish "safe to leave setting high" from "safe to leave setting low" from "no configuration is safe."
 
+#### Operational recipe: durable-snapshot + touch-refresh stack
+
+The `tool`-depth row above ("out-of-band snapshot") is the mitigation that survives regardless of mechanism. Below is the operational shape cache-fix-team runs, with the gotchas we hit the hard way in the 2026-09-01 → 2026-09-05 window. Adapt to fit; the invariants that matter are called out.
+
+**The stack (four pieces):**
+
+1. **Settings:** `"cleanupPeriodDays": 30` (default) or lower in `~/.claude/settings.json`. Do not set 99999.
+2. **Hourly snapshot:** `rsync -a --link-dest=<prev-snap>` from `~/.claude/` to an archive dir on a filesystem CC does not walk. Not just `projects/` — the WSL2 report on CC#62272 shows `file-history/` and paste-cache siblings in the blast radius. `--link-dest` gives hardlink dedup between snapshots when they share a filesystem; on Btrfs `cp --reflink=always` is the CoW alternative.
+3. **Daily selective touch:** `find ~/.claude/projects/ -type f -mtime +20 -exec touch {} +`. Only bumps files near whatever mtime cliff CC uses, does NOT flatten recent mtimes.
+4. **Systemd-timer with `Persistent=true` for both jobs** so a missed run catches up on next boot.
+
+**Non-obvious behaviors (each one cost real evidence to pin):**
+
+- **Blanket touch breaks `claude --continue`.** `--continue` picks the most-recently-modified JSONL in the current project's directory. A blanket touch across every file flattens all mtimes to the touch instant, and `--continue` then picks arbitrarily among tied siblings. Selective touch (`-mtime +20`, or wherever your safety buffer lands relative to your setting) preserves the mtime ordering `--continue` needs. If you must recover a specific old session, use `claude --resume <session-id>` — it bypasses the `--continue` heuristic entirely.
+- **`/rename <name>` writes to two locations.** Runtime: `~/.claude/sessions/<pid>.json` (dies with the process, has `formerNames[]` for rename history). Durable: `~/.claude/projects/<project-key>/<session-id>/custom-title.json` — a `{"customTitle":"..."}` file inside the per-session subdir. `claude --resume <name>` reads the durable one at invocation time. Any snapshot that captures `~/.claude/projects/` recursively catches both cases; the selective touch above walks into the subdir and bumps `custom-title.json` too.
+- **Archive on a separate filesystem breaks `--link-dest` hardlinks** (Linux hardlinks can't cross filesystems). Snapshots still succeed as independent copies but you lose the dedup. Keep previous-snapshot and new-snapshot on one filesystem (or switch to `cp --reflink` if that filesystem is Btrfs).
+- **`find -newer` against the archive is not evidence of file freshness.** `rsync -a` preserves the source mtime, so a file the source hasn't changed in 60 days still shows a 60-day-old mtime in the archive even though the snapshot was written today. Use content hashes for reconciliation, not mtime.
+- **Prune inside the snapshot cron, AFTER the current snapshot lands.** `find <archive> -maxdepth 1 -type d -name 'snap-*' -mmin +$((48*60)) -exec rm -rf {} +` — but ONLY on the success path. If snapshot creation fails, the prune step MUST be skipped so a broken cron can't cascade into history loss.
+
+**Restore workflow (when a loss is caught):**
+
+1. Identify affected project keys: `find ~/.claude/projects/ -maxdepth 1 -type d` — subdirs with no top-level `<sid>.jsonl` are candidates.
+2. Rsync-back: `rsync -a <archive>/snap-<pre-loss-timestamp>/-home-manager-... ~/.claude/projects/-home-manager-.../`. Additive without `--delete`, so files created since the snapshot are preserved.
+3. `touch` the restored files so their mtimes are current and won't age out immediately: `find ~/.claude/projects/<project-key>/ -type f -exec touch {} +`.
+4. Verify: `claude --resume <session-id>` — direct-session-id resume works even when `/resume`'s picker filters by cwd or session-recency.
+
+If the top-level session JSONL itself is gone from every snapshot (e.g. loss predates the archive's oldest snap), the subagent tree under `~/.claude/projects/<key>/<sid>/subagents/` often survives, along with `~/.claude/history.jsonl` entries for the sessionId — enough to reconstruct a session-continuation brief without the main transcript.
+
 ---
 
 ### Cross-symptom — Post-update silent model remap (the Web Manager / April 17 pattern)
