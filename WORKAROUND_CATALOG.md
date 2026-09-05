@@ -122,7 +122,7 @@ The `tool`-depth row above ("out-of-band snapshot") is the mitigation that survi
 **Restore workflow (when a loss is caught):**
 
 1. Identify affected project keys: `find ~/.claude/projects/ -maxdepth 1 -type d` — subdirs with no top-level `<sid>.jsonl` are candidates.
-2. Rsync-back: `rsync -a <archive>/snap-<pre-loss-timestamp>/-home-manager-... ~/.claude/projects/-home-manager-.../`. Additive without `--delete`, so files created since the snapshot are preserved.
+2. Rsync-back: `rsync -a <archive>/snap-<pre-loss-timestamp>/projects/-home-manager-.../ ~/.claude/projects/-home-manager-.../`. Path assumes the documented whole-`~/.claude/` snapshot shape above — the archive's `projects/` subdir mirrors `~/.claude/projects/`. Additive without `--delete`, so files created since the snapshot are preserved. Restore other sibling subtrees (`file-history/`, paste-cache) the same way: `rsync -a <archive>/snap-.../file-history/ ~/.claude/file-history/`.
 3. `touch` the restored files so their mtimes are current and won't age out immediately: `find ~/.claude/projects/<project-key>/ -type f -exec touch {} +`.
 4. Verify: `claude --resume <session-id>` — direct-session-id resume works even when `/resume`'s picker filters by cwd or session-recency.
 
