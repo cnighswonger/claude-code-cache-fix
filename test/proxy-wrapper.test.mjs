@@ -1,3 +1,6 @@
+// A private TMPDIR for this file, because the launchers spawned below write
+// under os.tmpdir(). First, so nothing reads one before it is set.
+import "./file-tmpdir.mjs";
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { withDeadline, exitWithin } from "./child-deadline.mjs";

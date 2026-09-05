@@ -10,6 +10,10 @@
 // mutation-checked; it needed isolating, not deleting.
 //
 // node gives each FILE its own process, which is the whole mechanism.
+
+// A private TMPDIR for this file, because the launchers spawned below write
+// under os.tmpdir(). First, so nothing reads one before it is set.
+import "./file-tmpdir.mjs";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";

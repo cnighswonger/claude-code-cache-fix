@@ -22,6 +22,10 @@
 // mode, and the holder through BOTH of its dispatch doors — `server` with
 // CACHE_FIX_HOLD_PORT=on was the one an earlier fix missed while the other
 // passed, so a single holder row would have called that fixed.
+
+// A private TMPDIR for this file, because the launchers spawned below write
+// under os.tmpdir(). First, so nothing reads one before it is set.
+import "./file-tmpdir.mjs";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
