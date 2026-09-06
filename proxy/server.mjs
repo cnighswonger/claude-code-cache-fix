@@ -64,6 +64,201 @@ function debugLog(...args) {
   try { appendFileSync(path, line); } catch {}
 }
 
+// ── Duplicate sidecar coalescing — threat-matrix row 31 ──────────────────
+//
+// CC issues one sidecar request TWICE, 6-25 ms apart on 47/47 measured
+// pairs, with distinct upstream request-ids and two completed usage-log
+// records: both sends are answered and both are charged (48,203 input-side
+// tokens corpus-wide). Dropping the second is unavailable — two client
+// requests are in flight and each is owed a response — so the only safe
+// shape is ONE upstream call serving both callers.
+//
+// Four conditions, all required. The mid-session duplicate class, where a
+// second send is a legitimate retry and suppressing it would leave a real
+// request unanswered, fails on `nMsg` alone — that is the discriminator
+// row 31 asked for:
+//
+//   1. exactly one message        3. byte-identical FORWARDED bodies,
+//   2. no tools[]                    from the SAME caller
+//                                 4. < 50 ms, first still in flight
+//
+// Why substituting one answer for the other is fidelity-safe, which is the
+// objection that kept this parked: a request carrying no conversation
+// history and no tools produces output that can enter no cached prefix, and
+// CC issued the second send before it could have observed the first, so it
+// already treats the two as interchangeable.
+//
+// Condition 3 is checked on the bytes we ACTUALLY send, after every
+// extension has run — identical forwarded bodies is what makes the two
+// upstream calls the same call — and it IS the map key: a full-length
+// sha256 over the caller's credential digest and those bytes, so a hit
+// already means byte-identical AND same-caller. Why the caller half is
+// there: `coalesceIdentity` below.
+const COALESCE_WINDOW_MS = 50;
+
+/** key (sha256 of credential digest + forwarded bytes) -> in-flight leader. */
+const inFlightSidecars = new Map();
+
+// Entries normally leave on their leader's `close`. That is not guaranteed:
+// a client that hangs without closing its socket, against an upstream that
+// never answers, leaves one behind for as long as both hold. So the map is
+// bounded by SWEEPING rather than trusting the event.
+//
+// The sweep needs no timer and no LRU because the window already bounds an
+// entry's usefulness: an entry is only ever consulted inside COALESCE_WINDOW_MS,
+// so one twice that old can never be hit again — the window check below would
+// reject it. Deleting it is therefore invisible to the mechanism, and running
+// the sweep at INSERT is what makes the map's size proportional to the
+// coalesce-candidate requests of the last 100 ms rather than to the process's
+// lifetime.
+//
+// Deleting only, never settling: `entry.done` is what an attached follower
+// awaits, and resolving it here would answer for a leader still streaming.
+// The leader's own `close` handler still settles if it ever fires.
+export const COALESCE_SWEEP_AFTER_MS = COALESCE_WINDOW_MS * 2;
+
+function sweepInFlightSidecars(now = Date.now()) {
+  for (const [key, entry] of inFlightSidecars) {
+    if (now - entry.at >= COALESCE_SWEEP_AFTER_MS) inFlightSidecars.delete(key);
+  }
+}
+
+// Exported for the bite: the map is module-private, and a bound that cannot
+// be observed is a bound nothing can show red.
+export function inFlightSidecarCount() {
+  return inFlightSidecars.size;
+}
+
+// The key separates CALLERS as well as bytes, which is condition 3's other
+// half. The session-start sidecar has a FIXED shape — same model, same
+// max_tokens, one no-tools message — so on a shared proxy two different
+// users' sends are byte-identical. Under a body-only key one user's
+// in-flight call would answer the other's request: the leader's account is
+// billed for both, a leader's 401 propagates to a follower holding valid
+// credentials, and the leader's plan-tier / org context ships in bytes the
+// follower reads.
+//
+// The credential set is DERIVED from SENSITIVE_HEADERS rather than restated
+// beside it. A hand-copied list stays green the day a new credential header
+// is added to that one, and the failure direction of deriving is fewer
+// coalesces, never a shared one. `set-cookie` is a response header and is
+// dropped.
+//
+// When a request carries none of them the digest is a constant, and that is
+// deliberate rather than a hole: a caller presenting no credential has no
+// per-caller billing identity to leak — every such request is answered under
+// whatever single credential the deployment supplies, or 401s alike. The
+// leak this closes is between callers the UPSTREAM can tell apart.
+//
+// Header names arrive lowercased from Node, but `reqCtx.headers` is handed
+// to extensions to mutate, so the scan keys on the lowercased name — the
+// invariant every spelling carries — not on the casing in hand. Entries are
+// sorted so two identical header sets cannot digest differently on
+// insertion order alone.
+const COALESCE_IDENTITY_HEADERS = new Set(
+  [...SENSITIVE_HEADERS].filter((h) => h !== "set-cookie"),
+);
+
+export function coalesceIdentity(headers) {
+  const material = [];
+  for (const [name, value] of Object.entries(headers || {})) {
+    const lower = name.toLowerCase();
+    if (COALESCE_IDENTITY_HEADERS.has(lower)) material.push([lower, String(value)]);
+  }
+  material.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  // A DIGEST, never the credential: the key's first 16 chars reach the debug
+  // log, and SENSITIVE_HEADERS exists so that file never holds one.
+  const h = createHash("sha256");
+  for (const [name, value] of material) h.update(name).update("\0").update(value).update("\0");
+  return h.digest("hex");
+}
+
+// Conditions 1 and 2 — the half that is a property of ONE request. 3 and 4
+// belong to a PAIR and are checked at the map hit. Exported for the bites:
+// a predicate whose arms are only reachable through a live socket cannot be
+// shown red on the case it was built for.
+export function coalesceCandidate(parsed) {
+  if (!parsed || typeof parsed !== "object") return false;
+  if (!Array.isArray(parsed.messages) || parsed.messages.length !== 1) return false;
+  if (Array.isArray(parsed.tools) && parsed.tools.length > 0) return false;
+  return true;
+}
+
+// One writable face over N client responses. `streamResponse` touches only
+// write / once("drain") / end, and the non-streaming branch only
+// writeHead / end, so this is the whole surface either needs.
+//
+// A follower may attach mid-stream, so the leader keeps every chunk it has
+// written and replays it on attach — the alternative (buffering the whole
+// response before writing any of it) would convert the leader's stream into
+// a single delivery, which is a behaviour change to the streaming path for
+// every coalesced request.
+export function createFanOut(leaderRes) {
+  const sinks = [leaderRes];
+  const replay = [];
+  let head = null;
+  let ended = false;
+
+  const live = () => sinks.filter((r) => !r.writableEnded && !r.destroyed);
+
+  return {
+    get sinkCount() { return live().length; },
+    get writableEnded() { return live().length === 0; },
+    writeHead(status, headers) {
+      head = { status, headers };
+      for (const r of live()) r.writeHead(status, headers);
+    },
+    // Returns false when the follower arrived too late to join — the caller
+    // has already been served in full and owes it nothing further.
+    attach(res) {
+      if (head) {
+        res.writeHead(head.status, head.headers);
+        for (const chunk of replay) res.write(chunk);
+      }
+      if (ended) {
+        res.end();
+        return false;
+      }
+      sinks.push(res);
+      return true;
+    },
+    write(chunk) {
+      replay.push(chunk);
+      let ok = true;
+      for (const r of live()) {
+        if (!r.write(chunk)) ok = false;
+      }
+      return ok;
+    },
+    once(event, cb) {
+      if (event !== "drain") return;
+      const pending = live().filter((r) => r.writableNeedDrain);
+      if (pending.length === 0) {
+        setImmediate(cb);
+        return;
+      }
+      // The slowest attached client governs, and a client that goes away
+      // mid-drain must not hold the others: `close` counts as drained, or a
+      // follower hanging up would stall the leader's stream forever.
+      let left = pending.length;
+      const fire = () => { if (--left === 0) cb(); };
+      for (const r of pending) {
+        r.once("drain", fire);
+        r.once("close", fire);
+      }
+    },
+    end(data) {
+      if (data !== undefined) replay.push(data);
+      ended = true;
+      for (const r of live()) r.end(data);
+    },
+    destroy(err) {
+      ended = true;
+      for (const r of live()) r.destroy(err);
+    },
+  };
+}
+
 function collectBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -173,8 +368,18 @@ async function handleMessages(clientReq, clientRes) {
   // clientRes's close fires when the response is finished OR the connection is
   // destroyed, so pairing it with writableEnded separates the two: ended means
   // we answered, not-ended means the client hung up and the upstream should go.
+  //
+  // ONE MORE CALLER CAN BE WAITING. Under coalescing (gated off by default)
+  // `sink` becomes the leader's fan-out and the upstream call is serving
+  // followers as well, so "this client hung up" stops meaning "nobody needs
+  // the response". The fan-out's live-sink count is what answers that, and it
+  // is asked only when a fan-out is in play — on the plain path this guard is
+  // byte-for-byte the one above it.
+  let sink = clientRes;
   clientRes.on("close", () => {
-    if (!clientRes.writableEnded) abortController.abort();
+    if (clientRes.writableEnded) return;                  // answered; nothing to free
+    if (sink !== clientRes && sink.sinkCount > 0) return;  // followers still reading
+    abortController.abort();
   });
 
   const pre = await preForward(clientReq, clientRes, abortController, extSnapshot, "messages");
@@ -186,6 +391,48 @@ async function handleMessages(clientReq, clientRes) {
     return;
   }
   const { parsed, forwardBody, headers, meta } = pre;
+
+  // Row 31. Gated OFF by default: the mechanism ships with its bites, and
+  // enabling it is a separate, declared act (ship-proxy-change step 4b).
+  const coalesceKey = process.env.CACHE_FIX_COALESCE_SIDECAR === "1" && coalesceCandidate(parsed)
+    ? createHash("sha256")
+        .update(coalesceIdentity(headers)).update("\0")
+        .update(forwardBody)
+        .digest("hex")
+    : null;
+
+  if (coalesceKey) {
+    const leader = inFlightSidecars.get(coalesceKey);
+    // Condition 3 IS the key: a full-length sha256 of the forwarded bytes,
+    // so a map hit already means byte-identical. A second `Buffer.equals`
+    // beside it was written here first and removed after the mutation proof
+    // — disabling it left every arm green, because differing bodies produce
+    // a different key and never reach the compare. Its only falsifying input
+    // is a sha256 collision, which makes it an unprovable predicate wearing
+    // a check's clothes. Condition 4, the window, is what remains here.
+    if (leader && Date.now() - leader.at < COALESCE_WINDOW_MS) {
+      debugLog("[PROXY] coalescing duplicate sidecar into in-flight request",
+               "key:", coalesceKey.slice(0, 16), "ageMs:", Date.now() - leader.at);
+      if (leader.fanOut.attach(clientRes)) await leader.done;
+      return;
+    }
+    sweepInFlightSidecars();
+    let settle;
+    const entry = {
+      at: Date.now(),
+      fanOut: createFanOut(clientRes),
+      done: new Promise((r) => { settle = r; }),
+    };
+    entry.settle = settle;
+    inFlightSidecars.set(coalesceKey, entry);
+    sink = entry.fanOut;
+    // The map entry outlives neither the request nor an early throw: every
+    // exit below runs through this.
+    clientRes.on("close", () => {
+      if (inFlightSidecars.get(coalesceKey) === entry) inFlightSidecars.delete(coalesceKey);
+      entry.settle();
+    });
+  }
 
   const requestedModel = parsed?.model || null;
 
@@ -204,8 +451,8 @@ async function handleMessages(clientReq, clientRes) {
   } catch (err) {
     debugLog("[PROXY] forwardRequest error:", err.message);
     if (abortController.signal.aborted) return;
-    clientRes.writeHead(502, { "content-type": "application/json" });
-    clientRes.end(JSON.stringify({ error: "upstream_error", message: err.message }));
+    sink.writeHead(502, { "content-type": "application/json" });
+    sink.end(JSON.stringify({ error: "upstream_error", message: err.message }));
     return;
   }
 
@@ -241,35 +488,41 @@ async function handleMessages(clientReq, clientRes) {
       if (responseBody) {
         const resCtx = { status: statusCode, headers: responseHeaders, body: responseBody, meta };
         await runOnResponse(resCtx, extSnapshot);
-        clientRes.writeHead(statusCode, resCtx.headers);
-        clientRes.end(JSON.stringify(resCtx.body));
+        sink.writeHead(statusCode, resCtx.headers);
+        sink.end(JSON.stringify(resCtx.body));
       } else {
-        clientRes.writeHead(statusCode, responseHeaders);
-        clientRes.end(rawResponse);
+        sink.writeHead(statusCode, responseHeaders);
+        sink.end(rawResponse);
       }
     } else {
-      clientRes.writeHead(statusCode, responseHeaders);
-      clientRes.end(rawResponse);
+      sink.writeHead(statusCode, responseHeaders);
+      sink.end(rawResponse);
     }
     return;
   }
 
-  clientRes.writeHead(statusCode, responseHeaders);
+  sink.writeHead(statusCode, responseHeaders);
 
   const telemetry = createTelemetryRecord();
   telemetry.requestedModel = requestedModel;
 
   upstreamRes.on("error", (err) => {
-    if (!clientRes.writableEnded) {
-      clientRes.destroy(err);
+    if (!sink.writableEnded) {
+      sink.destroy(err);
     }
   });
 
   try {
-    await streamResponse(upstreamRes, clientRes, telemetry, extSnapshot, meta, responseHeaders);
+    // Fan-out sits at the RESPONSE WRITER, never at the upstream reader: the
+    // extension pass and the telemetry record run exactly once, so both
+    // callers receive byte-identical post-pipeline output. Tee-ing the raw
+    // upstream instead would hand the follower unmutated bytes while the
+    // leader got the pipeline's — a fidelity split, and fidelity outranks
+    // cache here.
+    await streamResponse(upstreamRes, sink, telemetry, extSnapshot, meta, responseHeaders);
   } catch (err) {
-    if (!clientRes.writableEnded) {
-      clientRes.destroy(err);
+    if (!sink.writableEnded) {
+      sink.destroy(err);
     }
   }
 }

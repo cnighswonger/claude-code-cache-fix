@@ -455,6 +455,7 @@ All proxy settings are controlled via environment variables. Set them before sta
 | `CACHE_FIX_DEBUG` | `0` | Enable debug logging |
 | `CACHE_FIX_HOT_RELOAD` | unset | Set to `on` to enable in-process extension hot-reload. Off by default as of v4.0.0 — see [Upgrading from v3.x](#upgrading-from-v3x) for details and the supervisor restart flow. |
 | `CACHE_FIX_READ_DEDUPE` | unset | Set to `1` to dedupe repeat `Read` tool results that re-appear unchanged across turns. Keeps the first occurrence intact; replaces later byte-identical ones (keyed on `file_path` + content + `offset` + `limit`) with a stable pointer line. Default-off; opt in per session to validate before broader rollout. See [extension impact guide](docs/extension-impact-guide.md). |
+| `CACHE_FIX_COALESCE_SIDECAR` | unset | Set to `1` to serve CC's duplicated session-start sidecar send from one upstream call instead of two. Default-off. See [Duplicate sidecar coalescing](#duplicate-sidecar-coalescing-proxy-mode-opt-in). |
 | `CACHE_FIX_ADVISOR_PLAN` | unset | Plan override for `tools/tier-advisor.mjs` — one of `max-5x`, `max-20x`, `pro`. Bypasses heuristic plan detection. See [Tier advisor](docs/tier-advisor.md). |
 | `CACHE_FIX_ADVISOR_UPGRADE_THRESHOLD` | `80` | Projected-Q7d percent that triggers an `UPGRADE` recommendation from tier-advisor. |
 | `CACHE_FIX_ADVISOR_DOWNGRADE_THRESHOLD` | `20` | Projected-Q7d percent that triggers a `DOWNGRADE` recommendation from tier-advisor (paired with the `DOWNGRADE_WEEKS` consecutive-weeks gate). |
@@ -1173,6 +1174,37 @@ export CACHE_FIX_NORMALIZE_CC_VERSION=pin:2.1.185    # operator-supplied literal
 | `pin:<value>` | Replaces `cc_version=<anything>` with the operator literal. Validation: `^[A-Za-z0-9.\-]+$`, max 64 chars (anything that would break the surrounding header grammar fails-open to `off` with a one-shot stderr warning). |
 
 The extension runs at order 90, before `fingerprint-strip` at order 100. After normalization the `cc_version` has at most 3 segments, so `fingerprint-strip`'s `dotParts.length < 4` guard makes it a no-op — the two cooperate cleanly with no other ordering hazards. Field-boundary anchored regex `(^|[;\s:])cc_version=([^;\s]+)` so a `cc_version=` substring embedded in another field's value cannot be accidentally rewritten. Atomic fail-open: planned rewrites stage in a local array and apply only after the scan completes; any error during the scan leaves the body byte-intact.
+
+## Duplicate sidecar coalescing (proxy mode, opt-in)
+
+At session start Claude Code issues one small "sidecar" request **twice**, 6–25 ms apart. Both sends reach the API, both get distinct upstream request-ids, and both produce a completed usage-log record — so both are charged. Measured over one corpus: 144 pairs, 114 streaks, 55 double-billed sends, 48,203 input-side tokens.
+
+Dropping the second send is not available: two client requests are in flight and each is owed a response. The only safe shape is **one upstream call serving both callers**, which is what this does — the second caller attaches to the first call's response stream and receives it in full (including mid-stream, via replay of what the leader has already written).
+
+Opt-in via env var; default-off:
+
+```bash
+export CACHE_FIX_COALESCE_SIDECAR=1
+```
+
+**Four conditions, all required.** The mid-session duplicate class — where a second identical send is a legitimate retry and answering it from a sibling would leave a real request unanswered — fails on `nMsg` alone, which is the discriminator:
+
+| # | Condition |
+|---|-----------|
+| 1 | Exactly one message in `messages[]` |
+| 2 | No `tools[]` (an empty array counts as none) |
+| 3 | Byte-identical **forwarded** bodies (after every extension has run) **from the same caller** |
+| 4 | The second send arrives < 50 ms later, with the first still in flight |
+
+**Why substituting one answer for the other is fidelity-safe**, which is the objection that kept this parked: a request carrying no conversation history and no tools produces output that can enter no cached prefix, and CC issues the second send before it could have observed the first — so it already treats the two as interchangeable.
+
+### Shared-proxy posture
+
+Condition 3's "from the same caller" half is what makes this safe to run on a proxy more than one person's credentials pass through. The sidecar's shape is fixed, so two different users' sends are **byte-identical**; a body-only coalescing key would let one user's in-flight call answer the other's request — the leader's account billed for both, a leader's `401` propagated to a follower holding valid credentials, and the leader's plan-tier / org context in bytes the follower reads.
+
+The coalescing key is therefore a digest of the request's **credential headers** (`authorization`, `x-api-key`, `proxy-authorization`, `cookie`) **and** the forwarded bytes. Two requests coalesce only when both halves match, so a pair from different callers never meets. The credential is hashed, never stored or logged — only the resulting key's first 16 characters reach the debug log.
+
+One case stated rather than left to be discovered: when a request carries **none** of those headers the credential digest is a constant, and such requests can coalesce with one another. That is deliberate. A caller presenting no credential has no per-caller billing identity to leak — every such request is answered under whatever single credential the deployment supplies, or is rejected alike. The isolation this buys is between callers the **upstream** can tell apart.
 
 ## Session backup (proxy mode, opt-in)
 
