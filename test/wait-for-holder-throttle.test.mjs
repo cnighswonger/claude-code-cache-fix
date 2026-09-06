@@ -15,7 +15,7 @@ describe("waitForHolder throttles its poll", () => {
   it("does not spin: attempts stay bounded over the ceiling", async () => {
     let attempts = 0;
     const neverUp = async () => { attempts++; return "ERR:ECONNREFUSED"; };
-    await waitForHolder(0, { ceilingMs: 1_000, intervalMs: 100, probe: neverUp });
+    await waitForHolder(0, { ceilingMs: 1_000, probe: neverUp });
     assert.ok(attempts < 50,
       `expected a throttled poll (<50 attempts over 1s) — got ${attempts}, so the loop is spinning unthrottled`);
   });
