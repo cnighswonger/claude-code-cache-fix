@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { OURS, cmdOf, freePort as takePort, listeners, onPort } from "./proc-helpers.mjs";
+import { OURS, cmdOf, freePort as takePort, listeners, onPort, probeHealth as probe, waitForHolder } from "./proc-helpers.mjs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
@@ -31,19 +31,6 @@ async function freePort() {
   usedPorts.push(p);
   return p;
 }
-
-const probe = (port) => new Promise((res) => {
-  const r = http.get({ host: "127.0.0.1", port, path: "/health", agent: false, timeout: 8_000 },
-                     // THE STATUS, not merely a reply. A standby relay carrying
-                     // this address answers 503 on purpose, and a fixture that
-                     // took any response for "the proxy is up" started measuring
-                     // 1.3s before one existed.
-                     (s) => { s.resume(); s.on("end", () => res(s.statusCode === 200 ? "ok" : `ERR:${s.statusCode}`)); });
-  r.on("error", (e) => res(`ERR:${e.code}`));
-  // The timeout must RESOLVE, not merely fire: an unhandled one leaves the
-  // request hanging and the sampler stalls on it forever.
-  r.on("timeout", () => { r.destroy(); res("ERR:ETIMEDOUT"); });
-});
 
 // SIGHUP and SIGUSR2 are a pair, and the difference is who ends up holding the
 // address. SIGHUP says LET GO, which leaves the port unowned until somebody
@@ -117,9 +104,7 @@ describe("holder handover (SIGUSR2)", () => {
     const holder = spawn(process.execPath, [launcherPath, "run-service"],
                          { env, stdio: ["ignore", "pipe", "pipe"] });
     try {
-      const up = Date.now() + 25_000;
-      let body = await probe(port);
-      while (body.startsWith("ERR:") && Date.now() < up) body = await probe(port);
+      const body = await waitForHolder(port);
       assert.equal(body, "ok", "the holder never came up, so nothing was measured");
 
       const before = new Set(listeners(port));
@@ -231,9 +216,7 @@ describe("holder handover (SIGUSR2)", () => {
       return false;
     });
     try {
-      const up = Date.now() + 25_000;
-      let body = await probe(port);
-      while (body.startsWith("ERR:") && Date.now() < up) body = await probe(port);
+      const body = await waitForHolder(port);
       assert.equal(body, "ok", "the holder never came up, so nothing was measured");
 
       // Force a HANDOVER, so the process on the port carries FROM_HANDOVER: the
@@ -293,9 +276,7 @@ describe("holder handover (SIGUSR2)", () => {
     const holder = spawn(process.execPath, [launcherPath, "run-service"],
                          { env, stdio: ["ignore", "pipe", "pipe"] });
     try {
-      const up = Date.now() + 25_000;
-      let body = await probe(port);
-      while (body.startsWith("ERR:") && Date.now() < up) body = await probe(port);
+      const body = await waitForHolder(port);
       assert.equal(body, "ok", "the holder never came up, so nothing was measured");
 
       // RETRIED TO 200. A restart can put the relay in front between the probe
@@ -413,9 +394,7 @@ describe("holder handover (SIGUSR2)", () => {
     const holder = spawn(process.execPath, [launcherPath, "run-service"],
                          { env, stdio: ["ignore", "pipe", "pipe"] });
     try {
-      const up = Date.now() + 25_000;
-      let body = await probe(port);
-      while (body.startsWith("ERR:") && Date.now() < up) body = await probe(port);
+      const body = await waitForHolder(port);
       assert.equal(body, "ok", "the holder never came up, so nothing was measured");
 
       // ARM the self-heal first: kill the holder, so the child's marker no
@@ -591,9 +570,7 @@ describe("holder handover (SIGUSR2)", () => {
       req.end();
     });
     try {
-      const up = Date.now() + 25_000;
-      let body = await probe(port);
-      while (body.startsWith("ERR:") && Date.now() < up) body = await probe(port);
+      const body = await waitForHolder(port);
       assert.equal(body, "ok", "the holder never came up, so nothing was measured");
       assert.equal(await carries(), "pong", "premise: the live proxy must carry a CONNECT");
 
@@ -690,9 +667,7 @@ describe("holder handover (SIGUSR2)", () => {
       c.on("error", (e) => { clearTimeout(t); done(`ERR:${e.code}`); });
     });
     try {
-      const up = Date.now() + 25_000;
-      let body = await probe(port);
-      while (body.startsWith("ERR:") && Date.now() < up) body = await probe(port);
+      const body = await waitForHolder(port);
       assert.equal(body, "ok", "the holder never came up, so nothing was measured");
 
       // The proxy's own answer first: same field, same stripping, different
@@ -846,9 +821,7 @@ describe("holder handover (SIGUSR2)", () => {
     const holder = spawn(process.execPath, [launcherPath, "run-service"],
                          { env, stdio: ["ignore", "pipe", "pipe"] });
     try {
-      const up = Date.now() + 25_000;
-      let body = await probe(p2);
-      while (body.startsWith("ERR:") && Date.now() < up) body = await probe(p2);
+      const body = await waitForHolder(p2);
       assert.equal(body, "ok", "the holder never came up, so nothing was measured");
       // WITH /proc DISABLED, so the lsof path is what answers even here.
       process.env.CACHE_FIX_NO_PROC = "1";
