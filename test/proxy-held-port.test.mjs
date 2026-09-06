@@ -11,7 +11,7 @@ import { tmpdir, availableParallelism } from "node:os";
 import { join, dirname } from "node:path";
 
 import { sourceFingerprintSync } from "../proxy/source-fingerprint.mjs";
-import { HOP_ENV, OURS, cmdOf, freePort as takePort, listeners, onPort } from "./proc-helpers.mjs";
+import { HOP_ENV, OURS, cmdOf, freePort as takePort, listeners, onPort, waitForHolder } from "./proc-helpers.mjs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
@@ -215,10 +215,8 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
     process.kill(pid, "SIGKILL");
   };
   try {
-    const up = Date.now() + 20_000;
-    let body = await get();
-    while (body.startsWith("ERR:") && Date.now() < up) body = await get();
-    assert.equal(JSON.parse(body).status, "ok", "the held port never came up");
+    const body = await waitForHolder(port, { ceilingMs: 20_000 });
+    assert.equal(body, "ok", "the held port never came up");
     await fn({ get, killProxy, proxyPid, launcher, exited, port });
   } finally {
     // SIGTERM first: SIGKILL cannot be forwarded, so the proxy would outlive
@@ -739,12 +737,10 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
     });
 
     it("holds the port across a proxy death without CACHE_FIX_HOLD_PORT", async () => {
-      await withHeldPort(async ({ get, killProxy }) => {
+      await withHeldPort(async ({ killProxy, port }) => {
         killProxy();
-        const deadline = Date.now() + 20_000;
-        let body = await get();
-        while (body.startsWith("ERR:") && Date.now() < deadline) body = await get();
-        assert.equal(JSON.parse(body).status, "ok", "the port did not come back under run-service");
+        const body = await waitForHolder(port, { ceilingMs: 20_000 });
+        assert.equal(body, "ok", "the port did not come back under run-service");
       }, { subcommand: "run-service", extraEnv: { CACHE_FIX_HOLD_PORT: "" } });
     });
 
@@ -798,15 +794,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       const holder = spawn(process.execPath, [launcherPath, "run-service"], { env, stdio: ["ignore", "pipe", "pipe"] });
       let kid = 0;
       try {
-        const up = Date.now() + 15_000;
-        while (Date.now() < up) {
-          const body = await new Promise((res) => {
-            http.get({ host: "127.0.0.1", port, path: "/health", timeout: 3_000 }, (r) => {
-              let b = ""; r.on("data", (d) => (b += d)); r.on("end", () => res(b));
-            }).on("error", (e) => res(`ERR:${e.code}`));
-          });
-          if (!body.startsWith("ERR:")) break;
-        }
+        await waitForHolder(port, { ceilingMs: 15_000 });
         try { kid = Number(execFileSync("pgrep", ["-P", String(holder.pid)]).toString().trim().split("\n")[0]); } catch {}
         assert.ok(kid > 1, "the holder never spawned a proxy, so this measures nothing");
 
@@ -886,10 +874,8 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       });
       const first = spawn(process.execPath, [launcherPath, "run-service"], { env, stdio: ["ignore", "pipe", "pipe"] });
       try {
-        const up = Date.now() + 15_000;
-        let body = await get();
-        while (body.startsWith("ERR:") && Date.now() < up) body = await get();
-        assert.equal(JSON.parse(body).status, "ok", "the holder never came up");
+        const body = await waitForHolder(port, { ceilingMs: 15_000 });
+        assert.equal(body, "ok", "the holder never came up");
 
         // SIGKILL, the shape a supervisor cannot catch: OOM, container stop, kill -9.
         first.kill("SIGKILL");
@@ -1037,10 +1023,8 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       let warned = "";
       let taker = null;
       try {
-        const up = Date.now() + 15_000;
-        let body = await get();
-        while (body.startsWith("ERR:") && Date.now() < up) body = await get();
-        assert.equal(JSON.parse(body).status, "ok", "nothing served the port");
+        const body = await waitForHolder(port, { ceilingMs: 15_000 });
+        assert.equal(body, "ok", "nothing served the port");
 
         // TRAFFIC ACROSS THE TAKEOVER, started before the taker exists — the
         // whole window is between the incumbent letting go and the new child
