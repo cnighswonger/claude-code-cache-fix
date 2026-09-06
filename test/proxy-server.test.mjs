@@ -541,7 +541,10 @@ describe("zero-downtime reload", () => {
       });
       let health = await probe();
       const settled = Date.now() + 10_000;
-      while (health === "ERR:ECONNRESET" && Date.now() < settled) health = await probe();
+      while (health === "ERR:ECONNRESET" && Date.now() < settled) {
+        await new Promise((r) => setTimeout(r, 100));
+        health = await probe();
+      }
       assert.ok(!health.startsWith("ERR:"),
         `the port answered nothing after the predecessor exited: ${health}`);
       assert.equal(JSON.parse(health).status, "ok",

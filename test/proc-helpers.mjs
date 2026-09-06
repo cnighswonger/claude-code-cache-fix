@@ -11,6 +11,7 @@
 
 import { execFileSync } from "node:child_process";
 import { readdirSync, readFileSync } from "node:fs";
+import http from "node:http";
 import net from "node:net";
 
 // NEVER SIGNAL A PID WE KNOW ONLY BY PORT. freePort() binds 0, reads the number
@@ -124,3 +125,31 @@ export const HOP_ENV = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"
 // file's readiness assertion times out on the CPU and ports they hold. See
 // ours() for the mechanism and the two markers it reads.
 export const onPort = (port) => [...new Set([...listeners(port), ...ours(port)])];
+
+// The HTTP health probe every holder-wait fixture used to hand-roll, once. THE
+// STATUS is what answers, not merely a reply: a standby relay carrying this
+// address answers 503 on purpose, and a fixture that took any response for
+// "the proxy is up" started measuring before one existed.
+export const probeHealth = (port) => new Promise((res) => {
+  const r = http.get({ host: "127.0.0.1", port, path: "/health", agent: false, timeout: 8_000 },
+                     (s) => { s.resume(); s.on("end", () => res(s.statusCode === 200 ? "ok" : `ERR:${s.statusCode}`)); });
+  r.on("error", (e) => res(`ERR:${e.code}`));
+  // The timeout must RESOLVE, not merely fire: an unhandled one leaves the
+  // request hanging and the sampler stalls on it forever.
+  r.on("timeout", () => { r.destroy(); res("ERR:ETIMEDOUT"); });
+});
+
+// Poll probeHealth() for "ok" until the ceiling passes. THROTTLED — the naive
+// version re-dials with zero delay between attempts, spinning an http.get
+// against a closed port for the whole ceiling instead of giving the holder
+// time to bind. 100ms matches the throttle already used by the sibling wait
+// in proxy-holder-handover.test.mjs.
+export async function waitForHolder(port, { ceilingMs = 60_000, probe = probeHealth } = {}) {
+  const up = Date.now() + ceilingMs;
+  let body = await probe(port);
+  while (body.startsWith("ERR:") && Date.now() < up) {
+    await new Promise((r) => setTimeout(r, 100));
+    body = await probe(port);
+  }
+  return body;
+}
