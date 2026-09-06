@@ -12,11 +12,13 @@ import assert from "node:assert/strict";
 import { waitForHolder } from "./proc-helpers.mjs";
 
 describe("waitForHolder throttles its poll", () => {
-  it("does not spin: attempts stay bounded over the ceiling", async () => {
+  it("does not spin: attempts stay bounded over the ceiling, and it still returns the last ERR", async () => {
     let attempts = 0;
     const neverUp = async () => { attempts++; return "ERR:ECONNREFUSED"; };
-    await waitForHolder(0, { ceilingMs: 1_000, probe: neverUp });
-    assert.ok(attempts < 50,
-      `expected a throttled poll (<50 attempts over 1s) — got ${attempts}, so the loop is spinning unthrottled`);
+    const body = await waitForHolder(0, { ceilingMs: 1_000, probe: neverUp });
+    assert.equal(body, "ERR:ECONNREFUSED");
+    assert.ok(attempts >= 5 && attempts < 50,
+      `expected a throttled poll (5-49 attempts over 1s) — got ${attempts}, so the loop is either ` +
+      `spinning unthrottled or not polling at all`);
   });
 });
