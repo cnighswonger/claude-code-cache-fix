@@ -149,8 +149,19 @@ export default {
       return;
     }
 
-    // Scan backwards to find latest instance of each relocatable block type
+    // Scan backwards to find latest instance of each relocatable block type.
+    // `occurrences` counts EVERY instance seen in the same pass (not just the
+    // kept one) — the extension's own record of whether the type it is about
+    // to relocate has ever appeared anywhere else in this array (including
+    // already at messages[firstUserIdx], before mutation). One occurrence
+    // means this relocation is the type's first appearance in the whole
+    // array — the deliberate one-time bust this extension exists for
+    // (see the module doc). More than one means it recurred — reported as
+    // such rather than folded into the same "first appearance" telemetry,
+    // so a consumer (replay's stability exemption) can tell the two apart
+    // instead of re-deriving it from shape.
     const found = new Map();
+    const occurrences = new Map();
     for (let i = body.messages.length - 1; i >= firstUserIdx; i--) {
       const msg = body.messages[i];
       if (msg.role !== "user" || !Array.isArray(msg.content)) continue;
@@ -158,7 +169,9 @@ export default {
         const block = msg.content[j];
         const text = block.text || "";
         const blockType = getBlockType(text);
-        if (!blockType || found.has(blockType)) continue;
+        if (!blockType) continue;
+        occurrences.set(blockType, (occurrences.get(blockType) ?? 0) + 1);
+        if (found.has(blockType)) continue;
 
         const fixedText = fixBlockText(blockType, text);
         const { cache_control, ...rest } = block;
@@ -180,11 +193,24 @@ export default {
 
     // Prepend in deterministic order: deferred → mcp → skills → hooks
     const ORDER = ["deferred", "mcp", "skills", "hooks"];
-    const toRelocate = ORDER.filter((t) => found.has(t)).map((t) => found.get(t));
+    const relocatedTypes = ORDER.filter((t) => found.has(t));
+    const toRelocate = relocatedTypes.map((t) => found.get(t));
 
     body.messages[firstUserIdx] = {
       ...body.messages[firstUserIdx],
       content: [...toRelocate, ...body.messages[firstUserIdx].content],
+    };
+
+    // Report what happened — nothing downstream re-derives this. A
+    // first-appearance relocation prepends content CC never had at
+    // messages[firstUserIdx] before, which is exactly the shape replay's
+    // cross-request stability check flags as a self-inflicted byte flip
+    // (module doc, top). Telemetry lets that check tell the deliberate
+    // one-time bust apart from a genuine repeat/thrash at the same index.
+    ctx.meta = ctx.meta || {};
+    ctx.meta.freshSessionSortStats = {
+      relocated: relocatedTypes.map((t) => ({ type: t, firstAppearance: occurrences.get(t) === 1 })),
+      targetIndex: firstUserIdx,
     };
   },
 };

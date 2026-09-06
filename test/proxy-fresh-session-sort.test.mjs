@@ -227,6 +227,95 @@ test("onRequest: strips cache_control from relocated blocks", async () => {
   assert.equal(relocated.cache_control, undefined, "cache_control should be stripped from relocated blocks");
 });
 
+// --- onRequest: freshSessionSortStats telemetry (relocate branch only) ---
+//
+// The extension reports what it did; replay's stability exemption reads
+// this instead of re-deriving "was this relocation a first appearance" from
+// output shape (dev-loop's "never a re-derived guess" — mirrors
+// suppressedIndices in tools/replay.mjs). Two shapes matter: a type
+// relocated because it is genuinely new to the array (firstAppearance:
+// true) vs. a type that already existed elsewhere in the array and is now
+// recurring (firstAppearance: false) — the checker must be able to tell
+// them apart, not treat every relocation event alike.
+
+test("onRequest: relocate branch reports freshSessionSortStats with firstAppearance:true for a genuinely new type", async () => {
+  const skills = SR + "The following skills are available\n\n- alpha: a\n</system-reminder>";
+  const ctx = {
+    body: {
+      messages: [
+        { role: "user", content: [{ type: "text", text: "first prompt" }] },
+        { role: "assistant", content: [{ type: "text", text: "reply" }] },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: skills },
+            { type: "text", text: "second prompt" },
+          ],
+        },
+      ],
+    },
+    headers: {},
+    meta: {},
+  };
+
+  await ext.onRequest(ctx);
+
+  assert.ok(ctx.meta.freshSessionSortStats, "relocate branch must report telemetry");
+  assert.equal(ctx.meta.freshSessionSortStats.targetIndex, 0, "targetIndex is the message index content was prepended to");
+  assert.deepEqual(ctx.meta.freshSessionSortStats.relocated, [{ type: "skills", firstAppearance: true }]);
+});
+
+test("onRequest: freshSessionSortStats reports firstAppearance:false when the type already appeared earlier in the array", async () => {
+  const skillsA = SR + "The following skills are available\n\n- alpha: a\n</system-reminder>";
+  const skillsB = SR + "The following skills are available\n\n- beta: b\n</system-reminder>";
+  const deferred = SR + "The following deferred tools are now available:\ntool1\n</system-reminder>";
+  const ctx = {
+    body: {
+      messages: [
+        // skills already present at messages[0] — this type is NOT new.
+        { role: "user", content: [{ type: "text", text: skillsA }, { type: "text", text: "first prompt" }] },
+        { role: "assistant", content: [{ type: "text", text: "reply" }] },
+        {
+          // A scattered block elsewhere is required to enter the relocate
+          // branch at all (hasScatteredBlocks); "deferred" is genuinely new
+          // here, "skills" recurs.
+          role: "user",
+          content: [
+            { type: "text", text: skillsB },
+            { type: "text", text: deferred },
+            { type: "text", text: "second prompt" },
+          ],
+        },
+      ],
+    },
+    headers: {},
+    meta: {},
+  };
+
+  await ext.onRequest(ctx);
+
+  const byType = Object.fromEntries(ctx.meta.freshSessionSortStats.relocated.map((r) => [r.type, r.firstAppearance]));
+  assert.equal(byType.deferred, true, "deferred appears exactly once in the array — first appearance");
+  assert.equal(byType.skills, false, "skills appeared twice (messages[0] and scattered) — not a first appearance");
+});
+
+test("onRequest: no freshSessionSortStats when the in-place branch runs (nothing scattered)", async () => {
+  const skillsText = SR + "The following skills are available\n\n- zephyr: z\n- alpha: a\n</system-reminder>";
+  const ctx = {
+    body: {
+      messages: [
+        { role: "user", content: [{ type: "text", text: skillsText }, { type: "text", text: "prompt" }] },
+      ],
+    },
+    headers: {},
+    meta: {},
+  };
+
+  await ext.onRequest(ctx);
+
+  assert.equal(ctx.meta.freshSessionSortStats, undefined, "in-place branch must not emit relocate telemetry");
+});
+
 test("onRequest: no-op when no user messages", async () => {
   const ctx = {
     body: { messages: [{ role: "assistant", content: [{ type: "text", text: "hi" }] }] },

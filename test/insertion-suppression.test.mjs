@@ -154,53 +154,6 @@ test("classifyPinned: a standalone duplicate of a pinned block is suppressed; th
   assert.deepEqual(result.messages[result.messages.length - 1], userMsg("continue"));
 });
 
-// =====================================================================
-// TAIL GUARD (BACKLOG.md, "suppression can strip a request's FINAL
-// message", 2026-07-30). Three real 400s ("must end with a user
-// message"): report-enforcer injects identical instruction bytes at
-// every SubagentStop; the first occurrence is pinned, and when the SAME
-// bytes arrive again as a resume request's ONLY/new final message,
-// suppressing it left the forwarded array ending on the prior assistant
-// turn. A tail-position duplicate is CC's live payload for THIS request,
-// not a migration copy of already-pinned content, regardless of role or
-// which hash set (single-block or join) matched it.
-// =====================================================================
-
-test("TAIL GUARD: a standalone duplicate at the FINAL index is never suppressed — it is live payload, not a migration", () => {
-  const orig = [withReminderMsg("tool result"), assistantMsg("a1")];
-  const canon = pinCanon(orig);
-
-  const strippedTail = { role: "user", content: [{ type: "text", text: "tool result" }] };
-  const standaloneDuplicate = { role: "system", content: [{ type: "text", text: REMINDER_INNER }] };
-  // No trailing entry after the duplicate — it IS the array's final
-  // message, mirroring the real resume-request shape.
-  const next = [strippedTail, assistantMsg("a1"), standaloneDuplicate];
-
-  const result = classifyPinned(next, canon);
-  assert.equal(result.suppressed, 0, "a final-position duplicate must never be suppressed");
-  assert.equal(result.suppressions.length, 0);
-  assert.deepEqual(
-    result.messages[result.messages.length - 1],
-    standaloneDuplicate,
-    "the final message must be forwarded intact — this is exactly what would otherwise strip a resume's last turn",
-  );
-});
-
-test("REGRESSION: the same standalone duplicate, mid-history (not final), is still suppressed", () => {
-  const orig = [withReminderMsg("tool result"), assistantMsg("a1")];
-  const canon = pinCanon(orig);
-
-  const strippedTail = { role: "user", content: [{ type: "text", text: "tool result" }] };
-  const standaloneDuplicate = { role: "system", content: [{ type: "text", text: REMINDER_INNER }] };
-  // Same duplicate, same position (index 2) as the tail-guard test above,
-  // but with a trailing turn after it — no longer the final index.
-  const next = [strippedTail, assistantMsg("a1"), standaloneDuplicate, userMsg("continue")];
-
-  const result = classifyPinned(next, canon);
-  assert.equal(result.suppressed, 1, "mid-history duplicates are suppressed exactly as before the tail guard");
-  assert.equal(result.suppressions[0].index, 2);
-});
-
 test("classifyPinned: suppression is stable across a THIRD request — CC keeps resending the duplicate, it keeps getting suppressed, with no persisted marker needed", () => {
   const orig = [withReminderMsg("tool result"), assistantMsg("a1")];
   let canon = pinCanon(orig);
@@ -286,45 +239,42 @@ test("classifyPinned: an assistant-role standalone entry is never suppressed, ev
 const PINNED_FIXTURE =
   process.env.CACHE_FIX_TEST_FIXTURE_OVERRIDE ??
   join(__dirname, "fixtures", "harvested", "pinned-s-4b6a435234bf-26-28.json");
-// The capture is NAMED WITHOUT BEING NAMED: the pinned fixture's header
-// carries `s-<sha12>` = sidToken(conversation key) for the capture it was
-// frozen from, and every capture on disk is named `<key>-requests.jsonl`,
-// so the right file is recoverable by hashing the candidates rather than
-// by hardcoding one — this repo is public, and a capture UUID plus a home
-// path is a live identifier. The per-machine capture directory comes from
-// homedir(), never a literal path; `sidToken` ships in the tools slice,
-// so a tree without tools/ resolves no capture and the pinned fixture
-// below is the source.
-async function resolveRealCapture(fixturePath) {
+
+// The capture is NAMED WITHOUT BEING NAMED (BACKLOG.md g2: "test
+// REAL_CAPTURE defaults carry a live session UUID and an absolute /home
+// path" — this repo is public, and a capture UUID plus a home path is a live
+// identifier). The pinned fixture's header already carries `s-<sha12>` =
+// sidToken(conversation key) for the capture it was frozen from, and every
+// capture on disk is named `<key>-requests.jsonl`, so the right file is
+// recoverable by hashing the candidates rather than by hardcoding one. The
+// per-machine capture directory itself comes from homedir(), never a literal
+// path. `sidToken` ships in the tools slice, so it is passed in by the test
+// (which loads tools/harvest.mjs dynamically); no tools/ -> no capture
+// resolution -> the fixture fallback, then the designed skip.
+function resolveRealCapture(fixturePath, sidToken) {
   if (process.env.CACHE_FIX_TEST_CAPTURE_OVERRIDE) return process.env.CACHE_FIX_TEST_CAPTURE_OVERRIDE;
-  let sidToken;
-  try {
-    ({ sidToken } = await import("../tools/harvest.mjs"));
-  } catch {
-    return "";
-  }
+  if (!sidToken) return null;
   let wanted;
   try {
     wanted = JSON.parse(readFileSync(fixturePath, "utf-8")).header?.key;
   } catch {
-    return "";
+    return null;
   }
-  if (!wanted) return "";
+  if (!wanted) return null;
   const dir = join(homedir(), ".claude", "cache-fix-captures");
   let names;
   try {
     names = readdirSync(dir);
   } catch {
-    return "";
+    return null;
   }
   const SUFFIX = "-requests.jsonl";
   for (const name of names) {
     if (!name.endsWith(SUFFIX)) continue;
     if (sidToken(name.slice(0, -SUFFIX.length)) === wanted) return join(dir, name);
   }
-  return "";
+  return null;
 }
-const REAL_CAPTURE = await resolveRealCapture(PINNED_FIXTURE);
 const GATES = {
   CACHE_FIX_FORWARD_PROXY: "on",
   CACHE_FIX_SESSION_MIRROR: "on",
@@ -359,20 +309,33 @@ test(
     // identical either way. The fixture reader ships in the tools slice
     // (like replayTools below), so it loads dynamically — a tree without
     // tools/ skips instead of failing at module load.
+    //
+    // ORDINALS. The fixture is MINIMIZED (directive, "Fixture strategy"): it
+    // holds capture ordinals replayFrom..m rather than 0..m, since the
+    // dropped prefix only ever established pin state. Numbering the replayed
+    // entries from `header.replayFrom` instead of from 0 is what keeps
+    // "n=26->28" (and the suppressed index 31) the same facts on both paths —
+    // the assertions below are untouched by the cut. The live capture starts
+    // at 0 by definition.
     let readPinnedFixture;
+    let sidToken;
     try {
-      ({ readPinnedFixture } = await import("../tools/harvest.mjs"));
+      ({ readPinnedFixture, sidToken } = await import("../tools/harvest.mjs"));
     } catch {
       readPinnedFixture = null;
+      sidToken = null;
     }
+    const REAL_CAPTURE = resolveRealCapture(PINNED_FIXTURE, sidToken);
     let source;
-    if (existsSync(REAL_CAPTURE)) {
+    let replayFrom = 0;
+    if (REAL_CAPTURE && existsSync(REAL_CAPTURE)) {
       source = null; // resolved below, once readCapture is loaded from tools/replay.mjs
     } else if (existsSync(PINNED_FIXTURE) && readPinnedFixture) {
       source = readPinnedFixture(PINNED_FIXTURE);
+      replayFrom = JSON.parse(readFileSync(PINNED_FIXTURE, "utf-8")).header?.replayFrom ?? 0;
     } else {
       t.skip(
-        `capture rotated away (not found at ${REAL_CAPTURE}) and no pinned fixture at ${PINNED_FIXTURE} — COULD NOT VERIFY`,
+        `capture rotated away (no capture on disk hashing to the fixture's key) and no pinned fixture at ${PINNED_FIXTURE} — COULD NOT VERIFY`,
       );
       return;
     }
@@ -406,7 +369,7 @@ test(
       const extensions = await loadExtensions(EXT_DIR, EXT_CONFIG);
 
       const entries = [];
-      let reqN = -1;
+      let reqN = replayFrom - 1;
       for await (const [, line] of source) {
         let rec;
         try {

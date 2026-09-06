@@ -255,7 +255,7 @@ test("injectAdditions: no user message at all → injection skipped, reported wi
 });
 
 // BITE — the LIFO bug (BACKLOG "READY — fix injectAdditions' LIFO stacking").
-// Real capture s-dc3f8071, n=372-397: an MCP-tool-discovery cascade produces
+// A real capture, n=372-397: an MCP-tool-discovery cascade produces
 // one new `additions` entry per request, all anchored to the SAME message
 // (the real conversation stays at 1 message the whole burst). The buggy
 // implementation re-finds the anchor fresh on every iteration (the search
@@ -514,7 +514,7 @@ test("onRequest: pruned anchor → re-anchor once, stable thereafter", async () 
 });
 
 test("onRequest BITE: MCP-discovery cascade — same 1-message conversation, tools[] grows 3x → additions stack in discovery order, prefix stable", async () => {
-  // Mirrors the real capture (s-dc3f8071, n=372-397): CC's own progressive
+  // Mirrors that real capture (n=372-397): CC's own progressive
   // MCP-tool-discovery cascade at session boot sends one new tool batch per
   // request while the real conversation never grows past 1 message, so every
   // addition shares the identical anchor (messages[0]).
