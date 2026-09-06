@@ -10,10 +10,13 @@
 // directly.
 //
 // Shape: a `while` loop whose ceiling is `Date.now()` and whose span (its
-// condition plus its body) checks an "ERR:"-tagged probe result, with no
-// `setTimeout` anywhere in that span. That excludes: samplers with no ceiling
-// (`while (!stop) …`), TCP/pid polls that never look at an "ERR:" tag, and
-// every throttled wait (a `setTimeout` sits in its span already).
+// condition plus its body) awaits something, with no `setTimeout` anywhere
+// in that span — an awaiting loop bounded by a wall clock with no delay is a
+// spin, whatever it polls. That excludes: samplers with no ceiling
+// (`while (!stop) …`) and every throttled wait (a `setTimeout` sits in its
+// span already). Not scoped to "ERR:"-tagged probes: that was only ever a
+// proxy for "this is a readiness poll", and it hid a spin whose body checked
+// `!== "pong"` instead.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync, statSync } from "node:fs";
@@ -54,7 +57,7 @@ function findUnthrottledPolls(src) {
     }
 
     const span = cond + body;
-    if (/ERR:/.test(span) && !/setTimeout/.test(span)) {
+    if (/\bawait\b/.test(span) && !/setTimeout/.test(span)) {
       findings.push({ line: src.slice(0, m.index).split("\n").length, span });
     }
   }
@@ -71,13 +74,13 @@ function walk(dir) {
   return out;
 }
 
-test("no test file spins an unthrottled Date.now()-bounded ERR: readiness poll", () => {
+test("no test file spins an unthrottled Date.now()-bounded await loop", () => {
   const unexpected = [];
   for (const p of walk(TEST_DIR)) {
     const rel = relative(TEST_DIR, p);
     const src = readFileSync(p, "utf-8");
     for (const { line } of findUnthrottledPolls(src)) unexpected.push(`${rel}:${line}`);
   }
-  assert.deepEqual(unexpected, [], "unthrottled \"ERR:\"-checking readiness poll(s) with no throttle " +
-    `between attempts — burns the whole ceiling spinning against a closed/failing port: ${unexpected.join(", ")}`);
+  assert.deepEqual(unexpected, [], "unthrottled await-poll(s) with no throttle between attempts " +
+    `— burns the whole ceiling spinning with no delay: ${unexpected.join(", ")}`);
 });
