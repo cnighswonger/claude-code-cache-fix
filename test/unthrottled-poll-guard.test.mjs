@@ -22,7 +22,7 @@ import { fileURLToPath } from "node:url";
 
 const TEST_DIR = dirname(fileURLToPath(import.meta.url));
 
-export function findUnthrottledPolls(src) {
+function findUnthrottledPolls(src) {
   const findings = [];
   const whileRe = /while\s*\(/g;
   let m;
@@ -71,34 +71,13 @@ function walk(dir) {
   return out;
 }
 
-// A pre-existing, out-of-round-scope copy this guard's widening found live in
-// test/proxy-server.test.mjs (PR #369's holder-wait-throttle round; reported,
-// not fixed there): it retries ONLY on the exact string "ERR:ECONNRESET" (a
-// reset racing the fixture's accept queue), deliberately narrower than
-// waitForHolder's retry-on-any-"ERR:" contract — the file's own comment says
-// a wrong body or any OTHER refusal must fail immediately, not retry. Landing
-// waitForHolder there would broaden what gets retried and weaken that
-// invariant, so it needs its own fix, not this round's drop-in. The marker
-// must stay present, or this entry is stale and must be deleted.
-const KNOWN_EXCEPTIONS = [
-  { file: "proxy-server.test.mjs", marker: 'health === "ERR:ECONNRESET"' },
-];
-
 test("no test file spins an unthrottled Date.now()-bounded ERR: readiness poll", () => {
   const unexpected = [];
-  const seenExceptions = new Set();
   for (const p of walk(TEST_DIR)) {
     const rel = relative(TEST_DIR, p);
     const src = readFileSync(p, "utf-8");
-    for (const { line, span } of findUnthrottledPolls(src)) {
-      const known = KNOWN_EXCEPTIONS.find((e) => e.file === rel && span.includes(e.marker));
-      if (known) seenExceptions.add(known.file);
-      else unexpected.push(`${rel}:${line}`);
-    }
+    for (const { line } of findUnthrottledPolls(src)) unexpected.push(`${rel}:${line}`);
   }
   assert.deepEqual(unexpected, [], "unthrottled \"ERR:\"-checking readiness poll(s) with no throttle " +
     `between attempts — burns the whole ceiling spinning against a closed/failing port: ${unexpected.join(", ")}`);
-  for (const e of KNOWN_EXCEPTIONS) {
-    assert.ok(seenExceptions.has(e.file), `known exception for ${e.file} no longer matches — it is fixed, remove it`);
-  }
 });

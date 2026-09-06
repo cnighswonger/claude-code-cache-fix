@@ -590,7 +590,10 @@ describe("holder handover (SIGUSR2)", () => {
       // The standby polls before it arms, so give it the window it asks for.
       const by = Date.now() + 15_000;
       let got = await carries();
-      while (got !== "pong" && Date.now() < by) got = await carries();
+      while (got !== "pong" && Date.now() < by) {
+        await new Promise((r) => setTimeout(r, 100));
+        got = await carries();
+      }
       assert.equal(got, "pong",
         "with the holder and the proxy both dead the address stopped carrying — a live " +
         `session whose HTTPS_PROXY points here has nowhere else to go. Launcher stderr: ` +
