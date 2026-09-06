@@ -5,18 +5,28 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync, symlinkSync, realpathSyn
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { SCRUBBED_GIT_ENV } from "./git-env.mjs";
 
 const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "..", "hooks", "examples", "worktree-edit-guard.py");
 
+// SCRUBBED, or none of the scratch repos below are scratch. `cwd` does not win
+// against an exported GIT_DIR, and makeRepo() runs exactly the operations that
+// damaged a real clone once — `git init`, then `user.email=t@t` / `user.name=t`
+// written straight into whatever config git resolved to. Those are this file's
+// fixture values; see test/git-env.mjs for the incident.
 function git(cwd, ...args) {
-  const r = spawnSync("git", args, { cwd, encoding: "utf8" });
+  const r = spawnSync("git", args, { cwd, encoding: "utf8", env: SCRUBBED_GIT_ENV });
   if (r.status !== 0) throw new Error(`git ${args.join(" ")} in ${cwd}: ${r.stderr}`);
   return r.stdout.trim();
 }
 
+// The hook under test shells out to `git rev-parse` itself, so it inherits what
+// it is handed. Unscrubbed, it answers about the RUNNER's repository instead of
+// the fixture, and every assertion below reads the wrong repo while passing —
+// the quiet direction of the same defect.
 function runHook({ toolName, toolInput, cwd }) {
   const payload = JSON.stringify({ tool_name: toolName, tool_input: toolInput, cwd });
-  const r = spawnSync(SCRIPT, [], { input: payload, encoding: "utf8" });
+  const r = spawnSync(SCRIPT, [], { input: payload, encoding: "utf8", env: SCRUBBED_GIT_ENV });
   return { code: r.status, stderr: r.stderr };
 }
 

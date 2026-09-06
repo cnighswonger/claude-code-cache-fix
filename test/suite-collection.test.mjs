@@ -931,6 +931,39 @@ test("no test file asks lsof who holds a port", () => {
     `filters the pid before it reaches process.kill():\n  ${bad.join("\n  ")}`);
 });
 
+test("no test file spawns git with the runner's own environment", () => {
+  // ASSEMBLED, so no needle appears whole in THIS file — which is itself one of
+  // the .test.mjs files swept below.
+  const VCS = "gi" + "t";
+  const SPAWNS = new RegExp(
+    String.raw`\b(?:execFileSync|execSync|spawnSync|spawn|exec)\s*\(\s*["'\x60]`
+    + VCS + String.raw`["'\x60]`);
+  const SCRUB = "SCRUBBED_" + "GIT_ENV";
+
+  // WHY A GUARD AND NOT JUST THE FIX. This is the second time: the scrub was
+  // written into the file that NOTICED the damage (absence-scan.test.mjs, after
+  // the 2026-08-05 incident) and never swept to the file that CAUSED it. The
+  // identity named in that write-up — user.name=t, user.email=t@t — belongs to
+  // hook-worktree-edit-guard.test.mjs, which was still spawning git with an
+  // inherited environment months later. A fix applied per-file is a fix that
+  // drifts; only a definition plus a sweep closes the class.
+  const shared = readFileSync(join(testDir, "git-env.mjs"), "utf8");
+  assert.ok(shared.includes(`export const ${SCRUB}`),
+    `test/git-env.mjs no longer exports ${SCRUB}, so this guard polices a name ` +
+    `nothing defines and its green means nothing`);
+
+  const bare = [];
+  for (const f of readdirSync(testDir).filter((n) => n.endsWith(".test.mjs"))) {
+    const src = stripComments(readFileSync(join(testDir, f), "utf8"));
+    if (SPAWNS.test(src) && !src.includes(SCRUB)) bare.push(f);
+  }
+  assert.deepEqual(bare, [],
+    `these files spawn git with the runner's environment inherited. cwd does NOT ` +
+    `win against an exported GIT_DIR, so their "scratch" repos resolve to whatever ` +
+    `repository the runner was pointed at — git init sets core.bare=true on it and ` +
+    `git config writes the fixture identity into it:\n  ${bare.join("\n  ")}`);
+});
+
 test("the suite derives its parallelism from the machine", () => {
   const script = JSON.parse(readFileSync(join(testDir, "..", "package.json"), "utf8")).scripts?.test ?? "";
   // Premise. A renamed or rewritten script must not let the assertion below

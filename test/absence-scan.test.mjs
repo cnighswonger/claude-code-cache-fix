@@ -17,6 +17,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { SCRUBBED_GIT_ENV } from "./git-env.mjs";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -134,30 +135,8 @@ test("the allowlist covers the LEDGER watermark file and nothing else in the cor
 
 // --- CLI ---------------------------------------------------------------------
 
-// Git's own env overrides cwd, so a scratch repo built with `cwd: dir` and an
-// INHERITED environment is not scratch at all: under an exported GIT_DIR every
-// `git init` / `git config` below resolves to whatever repo the runner was
-// pointed at. Git exports exactly that into hooks — relative `.git` for a
-// main-tree push, ABSOLUTE for a worktree push — so this file, run from a
-// pre-push hook, wrote `user.name=t` / `user.email=t@t` into the REAL config,
-// and `git init` on a git-dir not named `.git` guesses bare-ness and added
-// `core.bare=true` on top. That is the 2026-08-05 incident, and it recurred
-// the same day from a plain `GIT_DIR=… node --test` invocation, which is the
-// evidence that hardening the pre-push hook alone was not the fix: the hazard
-// belongs to any runner with these set, so the scrub belongs HERE, at the
-// spawn, where no caller can forget it.
-//
-// Undefined, not empty string: `GIT_DIR=""` is still "set" to git.
-const SCRUBBED_GIT_ENV = {
-  ...process.env,
-  GIT_DIR: undefined,
-  GIT_WORK_TREE: undefined,
-  GIT_INDEX_FILE: undefined,
-  GIT_COMMON_DIR: undefined,
-  GIT_OBJECT_DIRECTORY: undefined,
-  GIT_ALTERNATE_OBJECT_DIRECTORIES: undefined,
-  GIT_CEILING_DIRECTORIES: undefined,
-};
+// The git-spawn environment lives in one place now — see test/git-env.mjs
+// for the incident that made it shared rather than per-file.
 
 const run = (args, cwd) =>
   spawnSync(process.execPath, [TOOL, ...args], { cwd, encoding: "utf-8", env: SCRUBBED_GIT_ENV });
