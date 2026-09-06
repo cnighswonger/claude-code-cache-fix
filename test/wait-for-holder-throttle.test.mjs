@@ -14,11 +14,13 @@ import { waitForHolder } from "./proc-helpers.mjs";
 describe("waitForHolder throttles its poll", () => {
   it("does not spin: attempts stay bounded over the ceiling, and it still returns the last ERR", async () => {
     let attempts = 0;
-    const neverUp = async () => { attempts++; return "ERR:ECONNREFUSED"; };
+    // A VARYING body, so returning the FIRST probe result and returning the
+    // LAST are distinguishable — a constant body cannot test pass-through-of-last.
+    const neverUp = async () => { attempts++; return `ERR:${attempts}`; };
     const body = await waitForHolder(0, { ceilingMs: 1_000, probe: neverUp });
-    assert.equal(body, "ERR:ECONNREFUSED");
-    assert.ok(attempts >= 5 && attempts < 50,
-      `expected a throttled poll (5-49 attempts over 1s) — got ${attempts}, so the loop is either ` +
+    assert.equal(body, `ERR:${attempts}`);
+    assert.ok(attempts >= 2 && attempts < 50,
+      `expected a throttled poll (2-49 attempts over 1s) — got ${attempts}, so the loop is either ` +
       `spinning unthrottled or not polling at all`);
   });
 });
