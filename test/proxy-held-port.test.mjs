@@ -11,7 +11,7 @@ import { tmpdir, availableParallelism } from "node:os";
 import { join, dirname } from "node:path";
 
 import { sourceFingerprintSync } from "../proxy/source-fingerprint.mjs";
-import { HOP_ENV, OURS, cmdOf, freePort as takePort, listeners, onPort } from "./proc-helpers.mjs";
+import { HOP_ENV, OURS, cmdOf, freePort as takePort, killOurs, listeners, onPort } from "./proc-helpers.mjs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
@@ -212,7 +212,7 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
   const killProxy = () => {
     const pid = proxyPid();
     assert.ok(pid, "no proxy child to kill, so nothing was restarted");
-    process.kill(pid, "SIGKILL");
+    killOurs(pid);
   };
   try {
     const up = Date.now() + 20_000;
@@ -580,7 +580,7 @@ it("keeps the port and backs off when a proxy that had served stops starting", a
       const kid = Number(out.trim().split("\n").filter(Boolean)
         .find((q) => /scratch-fake-server-/.test(cmdOf(q))));
       assert.ok(Number.isInteger(kid) && kid > 1, "the fake proxy never started, so this measures nothing");
-      process.kill(kid, "SIGKILL");
+      killOurs(kid);
       // Long enough for an UNBACKED-OFF loop to blow the ceiling: at the 25ms
       // base the ladder tops out at 500ms, so ~1.2s admits at most a handful of
       // tries and a spinner would land dozens. Measured both ways below.
@@ -820,7 +820,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
           `ephemeral port nothing will reclaim`);
       } finally {
         try { holder.kill("SIGKILL"); } catch {}
-        if (kid > 1) { try { process.kill(kid, "SIGKILL"); } catch {} }
+        if (kid > 1) killOurs(kid);   // `> 1` is not ownership — see killOurs()
         // THE SUCCESSOR THIS CASE CAUSED. A child whose holder dies does not
         // simply exit — it spawns a DETACHED replacement on the advertised port,
         // which is the whole point of the self-heal. That successor is nobody's
@@ -849,11 +849,22 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
             // The holder is the listener's parent when there is one; killing it
             // first stops the ladder that would replace what we are about to
             // kill.
+            // `parent > 1` IS NOT AN OWNERSHIP TEST, and this is the line that
+            // killed a developer's desktop four times in one afternoon. An
+            // orphan does NOT reparent to pid 1 on a machine running a systemd
+            // USER manager: that manager is a child subreaper, so it inherits
+            // the orphan and `ps -o ppid=` returns ITS pid — 63 live processes
+            // here name it as their parent, this repo's own proxy among them.
+            // SIGKILLing it makes pid 1 tear down the whole session cgroup:
+            // every editor, browser and terminal, mid-work. CI never saw it
+            // because a container really does reparent to 1, which is why the
+            // assumption survived. Ownership is the command line, never the
+            // position in the tree.
             let parent = 0;
             try { parent = Number(execFileSync("ps", ["-p", pid, "-o", "ppid="],
                     { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim()); } catch {}
-            if (parent > 1) { try { process.kill(parent, "SIGKILL"); } catch {} }
-            try { process.kill(Number(pid), "SIGKILL"); } catch {}
+            if (parent > 1) killOurs(parent);
+            killOurs(pid);
           }
           await new Promise((r) => setTimeout(r, 200));
         }
@@ -962,7 +973,24 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
             try { target = Number(execFileSync("ps", ["-o", "ppid=", "-p", String(pid)],
                                                { encoding: "utf8" }).trim()) || pid; } catch {}
             if (target <= 1) target = pid;
-            try { process.kill(target, "SIGTERM"); } catch {}
+            // THE PARENT IS NOT COVERED BY listeners(). That filter established
+            // that the LISTENER is ours; `ps -o ppid=` then walks to a pid
+            // nothing has checked, and `target <= 1` tests liveness, not
+            // ownership. On a machine whose orphans reparent to a systemd USER
+            // manager — a child subreaper — a detached fixture's parent IS that
+            // manager.
+            //
+            // SIGTERM there is not a stop, it is a LOGOUT. systemd(1): "systemd
+            // user managers will start the exit.target unit when this signal is
+            // received. This is mostly equivalent to systemctl --user start
+            // exit.target". Measured 2026-08-20: a desktop session went down
+            // five seconds into a suite run, the journal showing "Activating
+            // special unit Exit the Session", and the kernel audit held no
+            // record — a rule armed for SIGKILL cannot see a SIGTERM.
+            //
+            // NOT wrapped in try/catch: the throw IS the mechanism. Catching it
+            // here restores the silence that let this run unattributed.
+            killOurs(target, "SIGTERM");
           }
           await new Promise((r) => setTimeout(r, 800));
         }
@@ -1194,7 +1222,24 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
             try { target = Number(execFileSync("ps", ["-o", "ppid=", "-p", String(pid)],
                                                { encoding: "utf8" }).trim()) || pid; } catch {}
             if (target <= 1) target = pid;
-            try { process.kill(target, "SIGTERM"); } catch {}
+            // THE PARENT IS NOT COVERED BY listeners(). That filter established
+            // that the LISTENER is ours; `ps -o ppid=` then walks to a pid
+            // nothing has checked, and `target <= 1` tests liveness, not
+            // ownership. On a machine whose orphans reparent to a systemd USER
+            // manager — a child subreaper — a detached fixture's parent IS that
+            // manager.
+            //
+            // SIGTERM there is not a stop, it is a LOGOUT. systemd(1): "systemd
+            // user managers will start the exit.target unit when this signal is
+            // received. This is mostly equivalent to systemctl --user start
+            // exit.target". Measured 2026-08-20: a desktop session went down
+            // five seconds into a suite run, the journal showing "Activating
+            // special unit Exit the Session", and the kernel audit held no
+            // record — a rule armed for SIGKILL cannot see a SIGTERM.
+            //
+            // NOT wrapped in try/catch: the throw IS the mechanism. Catching it
+            // here restores the silence that let this run unattributed.
+            killOurs(target, "SIGTERM");
           }
           await new Promise((r) => setTimeout(r, 800));
         }
@@ -1274,7 +1319,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
             try { kid = Number(execFileSync("pgrep", ["-P", String(launcher.pid)], { encoding: "utf8" })
                                 .trim().split("\n").filter(Boolean)
                                 .find((q) => /scratch-fake-server-/.test(cmdOf(q)))); } catch {}
-            if (kid > 1) { try { process.kill(kid, "SIGKILL"); } catch {} }
+            if (kid > 1) killOurs(kid);   // `> 1` is not ownership — see killOurs()
           }, 250);
           await hammer;
 
@@ -2230,7 +2275,7 @@ describe("deploy watcher (CACHE_FIX_WATCH_DEPLOY_MS)", () => {
       assert.ok(before, "the stand-in proxy never started, so this measures nothing");
       // The race made deterministic: the child goes at the moment the new bytes
       // land, so the respawn re-reads the file it is supposed to be announcing.
-      try { process.kill(before, "SIGKILL"); } catch { }
+      killOurs(before);
       await writeFile(serverFile, serving + "\n// deployed mid-restart\n");
       assert.ok(await saidWithin(stderr, 30_000),
         "a deploy landed while the proxy was restarting and nothing said so. The new " +
@@ -2254,7 +2299,7 @@ describe("deploy watcher (CACHE_FIX_WATCH_DEPLOY_MS)", () => {
     await withFakeProxy(serving, async ({ launcher, stderr }) => {
       const before = await settleFor(launcher, 0, 8_000);
       assert.ok(before, "the stand-in proxy never started");
-      try { process.kill(before, "SIGKILL"); } catch { }
+      killOurs(before);
       const after = await settleFor(launcher, before, 8_000);
       assert.ok(after && after !== before,
         "no respawn happened, so this measured nothing — the case needs a real restart");
@@ -2321,7 +2366,7 @@ describe("deploy watcher (CACHE_FIX_WATCH_DEPLOY_MS)", () => {
       const before = await settleFor(launcher, 0, 8_000);
       assert.ok(before, "the stand-in proxy never started");
       await writeFile(serverFile, serving + "\n// operator is editing\n");
-      try { process.kill(before, "SIGKILL"); } catch { }
+      killOurs(before);
       const after = await settleFor(launcher, before, 8_000);
       assert.ok(after && after !== before,
         "no respawn happened, so this measured nothing — the case needs a real restart");

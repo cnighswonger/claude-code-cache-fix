@@ -907,28 +907,54 @@ test("the launcher parses a child-ready line from any address family", () => {
     `never marks the child served:\n  ${bad.join("\n  ")}`);
 });
 
-test("no test file asks lsof who holds a port", () => {
-  // ASSEMBLED, so the needle never appears whole in THIS file. Spelled out, the
-  // detector matched its own source and reported the guard as the violation.
-  const NEEDLE = 'execFileSync("' + 'lsof"';
-  // The ONE legitimate call lives in proc-helpers.mjs, which is not a .test.mjs
-  // — so any hit here is a cleanup that went around listeners() and its OURS
-  // filter. Four files did exactly that once, and two of them then walked UP to
-  // the listener's parent and sent SIGTERM; a stranger's parent is this runner.
-  //
-  // This used to also pin a copy of the OURS regex in every file that had one.
-  // There are no copies now: one definition cannot drift from itself, so the
-  // only thing left to police is a NEW inline call.
+test("no test file asks lsof who holds a port without filtering the answer", () => {
+  // ASSEMBLED, so no needle appears whole in THIS file — which is itself one of
+  // the .test.mjs files swept below. Spelled out, the detector matched its own
+  // source and reported the guard as the violation.
+  const TOOL = "ls" + "of";
+  // EVERY CALL FORM, not one spelling of one. The previous version matched the
+  // literal `execFileSync("` + tool, and a second inline call written with
+  // `spawn(` sat in this tree reading as clean. The guard's NAME claimed the
+  // class while its predicate covered a single spelling — so the one file that
+  // had gone around listeners() was invisible to the guard written for exactly
+  // that, and the comment below said the class was closed.
+  const ASKS = new RegExp(
+    String.raw`\b(?:execFileSync|execSync|spawnSync|spawn|exec)\s*\(\s*["'\x60]`
+    + TOOL + String.raw`["'\x60]`);
+  // A PORT IS NOT OWNERSHIP. lsof answers with whoever holds the number, and
+  // freePort() hands the same number to a neighbouring file. So a raw call is
+  // permitted only where every pid it yields reaches killOurs(), which resolves
+  // the command line and refuses anything that is not one of ours. The raw call
+  // itself is legitimate where a DEADLINE is wanted, which the shared helper's
+  // execFileSync cannot give — what must never be skipped is the filter.
+  const FILTER = "kill" + "Ours(";
+  // And loopback-scoped: `-iTCP:<port>` matches ANY interface, so the answer can
+  // name a process that merely holds the same port number on another address.
+  const SCOPED = "@127.0.0.1:";
+  // The ONE shared call lives in proc-helpers.mjs, which is not a .test.mjs.
+  // Four files went around it once, and two of them then walked UP to the
+  // listener's parent and signalled it. That walk is the reason this guard
+  // exists: on a host whose orphans reparent to a systemd USER manager, the
+  // parent of one of our own listeners IS that manager, and SIGTERM there is a
+  // logout, not a stop (systemd(1), exit.target). Measured 2026-08-20.
   const helper = stripComments(readFileSync(join(testDir, "proc-helpers.mjs"), "utf8"));
-  assert.ok(helper.includes(NEEDLE) && helper.split(NEEDLE).length - 1 === 1,
-    "proc-helpers.mjs no longer holds the single lsof call — either it moved, in " +
-    "which case this guard now polices nothing, or the detector broke");
+  assert.equal((helper.match(new RegExp(ASKS, "g")) || []).length, 1,
+    "proc-helpers.mjs no longer holds exactly one shared lsof call — either it " +
+    "moved, in which case this guard now polices nothing, or the detector broke");
 
-  const bad = readdirSync(testDir).filter((f) => f.endsWith(".test.mjs"))
-    .filter((f) => stripComments(readFileSync(join(testDir, f), "utf8")).includes(NEEDLE));
-  assert.deepEqual(bad, [],
-    `these files ask lsof directly instead of going through listeners(), so nothing ` +
-    `filters the pid before it reaches process.kill():\n  ${bad.join("\n  ")}`);
+  const unfiltered = [], unscoped = [];
+  for (const f of readdirSync(testDir).filter((n) => n.endsWith(".test.mjs"))) {
+    const src = stripComments(readFileSync(join(testDir, f), "utf8"));
+    if (!ASKS.test(src)) continue;
+    if (!src.includes(FILTER)) unfiltered.push(f);
+    if (!src.includes(SCOPED)) unscoped.push(f);
+  }
+  assert.deepEqual(unfiltered, [],
+    `these files ask lsof directly and never reach killOurs(), so nothing filters ` +
+    `the pid before it is signalled:\n  ${unfiltered.join("\n  ")}`);
+  assert.deepEqual(unscoped, [],
+    `these files ask lsof without ${SCOPED}, so the answer can name a listener on ` +
+    `another interface that merely shares the port number:\n  ${unscoped.join("\n  ")}`);
 });
 
 test("the suite derives its parallelism from the machine", () => {

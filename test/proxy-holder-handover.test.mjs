@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { OURS, cmdOf, freePort as takePort, listeners, onPort } from "./proc-helpers.mjs";
+import { OURS, cmdOf, freePort as takePort, killOurs, listeners, onPort } from "./proc-helpers.mjs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
@@ -165,7 +165,7 @@ describe("holder handover (SIGUSR2)", () => {
         `${relays.length} standby relays hold the port after a handover; one is the contract, ` +
         `two both arm when the lineage dies and take turns dropping connections`);
       for (const p of listeners(port).filter((q) => /\brun-service\b|server\.mjs/.test(cmdOf(q)))) {
-        try { process.kill(Number(p), "SIGKILL"); } catch { }
+        killOurs(p);
       }
       const by = Date.now() + 15_000;
       let after = await probe(port);
@@ -608,7 +608,7 @@ describe("holder handover (SIGUSR2)", () => {
       assert.ok(listeners(port).some((p) => /gap-relay/.test(cmdOf(p))),
         `no standby relay is on the port before the kill, so nothing could survive it. ` +
         `Launcher stderr: ${JSON.stringify(err.slice(-300))}`);
-      for (const p of doomed) { try { process.kill(Number(p), "SIGKILL"); } catch { } }
+      for (const p of doomed) { killOurs(p); }
 
       // The standby polls before it arms, so give it the window it asks for.
       const by = Date.now() + 15_000;

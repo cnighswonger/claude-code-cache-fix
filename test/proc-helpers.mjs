@@ -26,6 +26,35 @@ import net from "node:net";
 // binaries have.
 export const OURS = /\/(?:bin|proxy)\/[\w.-]+\.mjs\b/;
 
+// AND THE SUITE'S OWN STAND-INS, which that predicate cannot see. Cases here
+// write a fake proxy into a fresh temp dir and run it — a real process, ours by
+// construction, whose path contains neither `bin/` nor `proxy/`. The launcher
+// stand-in escaped only by accident of LOCATION: its copy lands in `bin/`, so it
+// matched, while its server did not. Measured as five reds in CI run
+// 32409699496, every one of them killOurs() refusing to signal a fake proxy the
+// case had spawned itself moments earlier — a guard firing on legitimate work,
+// which is the failure that trains the `catch {}` this guard forbids.
+//
+// The evidence here is STRONGER than a path segment, not weaker, which is what
+// makes this a widening rather than a softening. Stand-in names are built from
+// `${process.pid}-${++fakeSeq}` (proxy-held-port.test.mjs), so a command line
+// carrying OUR pid inside a filename WE generated cannot belong to a stranger.
+// A bare `scratch-fake-server-` match could, and is deliberately not what this
+// does. Rebuilt per call rather than frozen at import, so a forked runner cannot
+// inherit its parent's claim.
+//
+// Scope, so the next reader does not widen further by analogy: this reaches
+// killOurs() ONLY. listeners() and ours() answer "which PROXY holds this port",
+// where a stand-in is not wanted, and every case needing its own stand-in
+// already finds it from the launcher it spawned.
+const scratchOurs = () =>
+  new RegExp(`\\bscratch-(?:launcher|fake-server)-${process.pid}-\\d+\\.mjs\\b`);
+
+/** Is this command line one of ours — our binaries, or our own stand-ins? */
+export function isOurs(cmd) {
+  return OURS.test(cmd) || scratchOurs().test(cmd);
+}
+
 // The command line of a pid, or "" if it is gone. Every case has to tell a
 // holder from a proxy from a standby relay, and they are only distinguishable
 // by what they are running.
@@ -117,6 +146,58 @@ export const HOP_ENV = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"
                         "ALL_PROXY", "all_proxy",
                         "CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_REQUIRE_HOP",
                         "CACHE_FIX_FALLBACK_PROXIES"];
+
+// THE ONLY WAY THIS SUITE MAY SIGNAL A PID IT DID NOT SPAWN.
+//
+// A raw `process.kill(n, "SIGKILL")` over a pid list is one bad list away from
+// killing something that is not ours, and the machine gives no second chance:
+// a run here SIGKILLed `systemd --user`, which made PID 1 tear down the whole
+// session cgroup — every editor, browser and terminal on the desktop, four
+// times in one afternoon. The kernel audit record named the sender as this
+// suite's own runner; which call site passed the pid is STILL UNKNOWN, and
+// that is exactly why the check belongs at the choke point rather than at the
+// site someone suspects.
+//
+// THROWS rather than skipping, because a silent skip would have hidden this
+// for another four collapses. The throw carries the pid and its command line,
+// so the next occurrence is a red test naming the offender instead of a lost
+// desktop. `child.kill()` on a handle this process spawned is unaffected — it
+// cannot name a stranger — and needs no guard.
+export function killOurs(pid, signal = "SIGKILL") {
+  const n = Number(pid);
+  // NEGATIVE FIRST, or this branch is unreachable: every negative also fails
+  // `n <= 1`, so ordering it second made it dead code that read as a guard.
+  // Caught by the two-sided probe that proved this function, not by review.
+  if (Number.isInteger(n) && n < 0) {
+    throw new Error(`refusing to signal ${n}: a negative pid is a process-GROUP kill, ` +
+                    `and the group id is not ours to assume. Signal the members.`);
+  }
+  if (!Number.isInteger(n) || n <= 1) {
+    throw new Error(`refusing to signal pid ${JSON.stringify(pid)}: ` +
+                    `not a pid. Number("") and Number(undefined) are both 0, and ` +
+                    `process.kill(0, …) signals this runner's entire process group.`);
+  }
+  // GONE IS NOT AN OFFENCE. A cleanup sweep races the processes it reaps, so
+  // an empty command line means the pid died on its own — return false and let
+  // the loop continue. Throwing here would make every ordinary sweep red and
+  // train the `catch {}` that silences the real case below.
+  const cmd = cmdOf(n).trim();
+  if (!cmd) return false;
+  // ALIVE AND NOT OURS IS THE DEFECT, and it is LOUD by design: a silent skip
+  // is what let this run four times before anyone knew where it came from.
+  if (!isOurs(cmd)) {
+    throw new Error(`refusing to ${signal} pid ${n}: it is alive and its command ` +
+                    `line is not one of ours.\n` +
+                    `  command: ${cmd}\n` +
+                    `  ours:    ${OURS}\n` +
+                    `  or our own stand-ins: ${scratchOurs()}\n` +
+                    `This is the guard that exists because this suite SIGKILLed the ` +
+                    `session manager and took the desktop down with it. Filter the ` +
+                    `pid at its source; do not catch this.`);
+  }
+  process.kill(n, signal);
+  return true;
+}
 
 // THE CLEANUP SET: everything on this port, listening or not. listeners() alone
 // misses a standby that has handed its listen on — measured, ten such orphans at
