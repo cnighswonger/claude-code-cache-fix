@@ -164,57 +164,7 @@ A single stderr line is emitted per processed request when the pipeline did anyt
 
 See `docs/directives/proxy-image-guard-pipeline.md` for the full spec, including the precedence matrix for every documented combination of legacy + new env vars.
 
-### 10. `messages-cache-breakpoint` (order 410) — opt-in via `CACHE_FIX_INJECT_MESSAGES_BREAKPOINT=1`
-
-**What it fixes:** Anthropic's prompt cache supports up to 4 `cache_control` markers per request, but Claude Code currently only places three of them. The third — at the boundary between auto-injected `messages[0]` content (hooks, skills, project CLAUDE.md, deferred-tools, MCP server descriptions) and the first real user content — is missing entirely. Without it, every change inside the auto-injected span busts the cache for everything that follows. wadabum's analysis on [anthropics/claude-code#47098](https://github.com/anthropics/claude-code/issues/47098) projected ~6,500 token savings per fresh-session first turn from adding the marker.
-
-**ON (`CACHE_FIX_INJECT_MESSAGES_BREAKPOINT=1`):** Runs once per request at order 410, immediately after `cache-control-normalize` (so we count markers against a normalized baseline):
-
-1. Validate request shape — `messages[0]` must be a `user` message with array content. Otherwise skip with `unexpected_role_or_shape`.
-2. Count existing markers across `system[]` and all `messages[].content[]`. Skip if zero (non-CC baseline) or already at 4 (would 400 the request).
-3. Walk `messages[0].content` and classify each block. The first matching signature wins, in order: hooks → skills → CLAUDE.md → deferred-tools → MCP. Take the LAST auto-injected position as the boundary.
-4. Inject `cache_control: { type: "ephemeral", ttl: "1h" }` on that block. Already-marked boundaries are not overwritten.
-
-**OFF (default):** Extension fires but exits early; no telemetry, no mutation. Default off until validated against community data.
-
-**Boundary detection signatures** (case-sensitive substring/regex on text content):
-
-| Block kind | Signature |
-|------------|-----------|
-| Hooks | `<system-reminder>` opening AND `hook success` substring |
-| Skills | `<system-reminder>` opening AND (`<available-skills>` OR `<plugin-skills>`) |
-| Project CLAUDE.md | `<system-reminder>` wrapper AND regex `Contents of /[^\n]*?CLAUDE\.md` (anchored on absolute paths) |
-| Deferred tools | exact `<deferred-tools>` tag substring |
-| MCP | `<mcp-resources>` tag OR `Available MCP servers:` literal |
-
-Signatures are intentionally narrow — user prose mentioning any of these tokens classifies as `user` content, not auto-injected. Under-detection means we miss the optimization on a turn; over-detection would inject mid-user-content, fragmenting the cache.
-
-**Diagnostic dump (`CACHE_FIX_DUMP_MESSAGES_HEAD=<path>`):** Independent of injection. Writes a JSONL line per request capturing per-block kind, first 200 chars of text, and `cache_control` presence. Read-only — no body mutation. Provides the fixture source for verifying boundary detection in production traffic.
-
-**Telemetry surface (`ctx.meta.messagesBreakpointStats`):**
-```js
-{
-  enabled, injected,
-  boundary_idx,                              // -1 if no boundary found
-  boundary_block_kind,                       // hooks | skills | claude_md | deferred_tools | mcp_resources | null
-  blocks_examined,
-  existing_marker_count,                     // pre-injection count across system[] + messages[].content[]
-  skip_reason,                               // null when injected
-}
-```
-
-`skip_reason` is one of: `boundary_not_found`, `boundary_already_marked`, `no_existing_markers`, `at_marker_limit`, `unexpected_role_or_shape`.
-
-A single stderr line is emitted when enabled (both injection and skip paths) so users can verify the extension is firing:
-
-```
-[messages-breakpoint] injected boundary_idx=3 kind=claude_md existing_markers=3
-[messages-breakpoint] skipped reason=at_marker_limit existing_markers=4
-```
-
-See `docs/directives/proxy-messages-cache-breakpoint.md` for the full spec.
-
-### 11. `microcompact-stability` (order 350) — opt-in via `CACHE_FIX_DUMP_MICROCOMPACT=<path>` and/or `CACHE_FIX_NORMALIZE_MICROCOMPACT=1`
+### 10. `microcompact-stability` (order 350) — opt-in via `CACHE_FIX_DUMP_MICROCOMPACT=<path>` and/or `CACHE_FIX_NORMALIZE_MICROCOMPACT=1`
 
 **What it fixes:** When CC's `time_based_microcompact` (or the 90-minute cold-compact path via `FDY()`) fires, it replaces old `tool_result` content with a sentinel string. The original content is gone for cache purposes — that loss is unrecoverable from the proxy. But the sentinel itself may carry volatile fields (timestamps, IDs) that change between microcompact runs even when no new content was added, busting the cache for everything *after* the sentinel position. This extension normalizes the sentinel to a byte-stable canonical form so the "second microcompact, no new content" case stops churning the cache. Phase 1 only; Phase 2 (snapshot-and-restore) is deferred to v3.5.0+ pending production data from Phase 1.
 
@@ -261,7 +211,7 @@ A single stderr line is emitted on enabled invocations that did something observ
 
 See `docs/directives/proxy-microcompact-cache-stability.md` for the full spec.
 
-### 12. `read-dedupe` (order 380) — opt-in via `CACHE_FIX_READ_DEDUPE=1`
+### 11. `read-dedupe` (order 380) — opt-in via `CACHE_FIX_READ_DEDUPE=1`
 
 **What it fixes:** In long Read-heavy sessions (build loops, doc-iterating agents, test triage), the same file is re-read across many turns and each `Read` tool_result carries the full file body. Once the cache prefix breaks for any reason, the proxy pays full input-token cost for every redundant copy. Empirically this also correlates with the SNR-collapse pattern that drives unrecoverable 500 errors (Lead reconfirm on CC 2.1.128: SNR 0.27 / 184 duplicate Reads in a single session, worse than the original 2026-04 incident referenced in issue #85).
 

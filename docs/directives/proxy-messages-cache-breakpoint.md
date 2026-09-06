@@ -1,8 +1,16 @@
 # Directive: messages[0] cache breakpoint #3 injection
 
+> **Superseded — retained as a design record, not as current behaviour.**
+> `insertion-normalization` (#272, merged 2026-08-05) covers this directive's
+> rationale by recognising a message across re-serializations through content
+> identity, rather than pinning its position with a `cache_control` marker —
+> and so without spending the 4th breakpoint slot, which the API caps at four
+> per request and Claude Code already occupies three of. The extension
+> described below was removed from `main`; `main` does not match this document.
+
 **Issue:** #12
 **Branch:** `directive/messages-cache-breakpoint`
-**Stage:** directive
+**Stage:** superseded (was: directive)
 **Milestone:** v3.4.0 (P1)
 
 ## Goal

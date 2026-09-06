@@ -216,10 +216,6 @@ test("[pipeline #21] CACHE_FIX_TTL_MAIN=none + detected 5m → detection still f
   assert.equal(ctx.meta._ttlTier, "5m");
 
   // No ttl field injected by ttl-management — env "none" suppresses.
-  // (Note: messages-cache-breakpoint at order 410 may inject its own
-  // breakpoint-3 marker carrying ttl=1h independent of ttl-management; that's
-  // a separate code path. We assert specifically that ttl-management's
-  // injection on the canonical marker did not run.)
   assert.equal(ctx.body.system[0].cache_control.ttl, undefined,
     "ttl-management must not inject on system when env=none");
 });

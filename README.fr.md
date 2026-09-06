@@ -889,24 +889,6 @@ Opt-in via env var ; default-off :
 export CACHE_FIX_SESSION_MIRROR=on
 ```
 
-## Points d'arrêt de cache (mode proxy, opt-in)
-
-Le prompt cache d'Anthropic supporte jusqu'à **quatre** marqueurs `cache_control` par requête. Claude Code utilise actuellement trois sur quatre ; le troisième (entre contenu auto-injecté `messages[0]` et le premier vrai contenu utilisateur) manque entièrement.
-
-Le proxy peut injecter le marqueur manquant en opt-in.
-
-```bash
-export CACHE_FIX_INJECT_MESSAGES_BREAKPOINT=1
-```
-
-L'injection est conservatrice : elle ne tire que quand la requête porte déjà 1–3 marqueurs.
-
-Une env var diagnostic-only dump la forme structurelle de `messages[0]` :
-
-```bash
-export CACHE_FIX_DUMP_MESSAGES_HEAD=/tmp/messages-head.jsonl
-```
-
 ## Stabilité microcompact (mode proxy, opt-in)
 
 Après ~90 minutes idle, le `time_based_microcompact` de Claude Code remplace l'ancien contenu `tool_result` par une chaîne sentinelle. Le contenu original est perdu ; cette partie est irrécupérable depuis le proxy. Mais la sentinelle elle-même peut porter un timestamp embarqué, ce qui signifie qu'un second passage microcompact écrit des octets différents.

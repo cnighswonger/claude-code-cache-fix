@@ -124,8 +124,6 @@ Proxy mode uses extension configuration in `proxy/extensions.json`. These env va
 | `CACHE_FIX_TTL_MAIN` | `1h` | TTL for main-thread requests: `1h`, `5m`, or `none` |
 | `CACHE_FIX_TTL_SUBAGENT` | `1h` | TTL for subagent requests: `1h`, `5m`, or `none` |
 | `CACHE_FIX_DUMP_BREAKPOINTS` | unset | Path to dump cache breakpoint structure (diagnostic for #12) |
-| `CACHE_FIX_INJECT_MESSAGES_BREAKPOINT` | unset | (proxy) Inject the missing breakpoint #3 cache_control marker on `messages[0]` auto-injected boundary. `=1` enables. |
-| `CACHE_FIX_DUMP_MESSAGES_HEAD` | unset | (proxy) Path for diagnostic JSONL dump of `messages[0].content` shape. Read-only — no mutation. Provides fixture source for breakpoint #3 boundary detection. |
 | `CACHE_FIX_DUMP_MICROCOMPACT` | unset | (proxy) Path for diagnostic JSONL dump of CC's `time_based_microcompact` sentinel. Read-only — no mutation. |
 | `CACHE_FIX_NORMALIZE_MICROCOMPACT` | unset | (proxy) Enable sentinel normalization (`=1` opts in). Mutates Mode A matches to canonical byte-stable form. |
 | `CACHE_FIX_MICROCOMPACT_NORMALIZED` | `[Old tool result content cleared]` | (proxy) Override the canonical replacement string. |

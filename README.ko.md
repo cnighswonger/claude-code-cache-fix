@@ -1092,29 +1092,6 @@ export CACHE_FIX_SESSION_MIRROR=on
 
 최악의 경우 디스크 사용량 계산은 [docs/disk-usage.md](docs/disk-usage.md)를 참조하세요.
 
-## 캐시 브레이크포인트 (프록시 모드, 선택적)
-
-Anthropic의 프롬프트 캐시는 요청당 최대 **네 개**의 `cache_control` 마커를 지원합니다. Claude Code는 현재 네 개 중 세 개를 사용합니다; 세 번째(자동 주입된 `messages[0]` 콘텐츠 — 훅, 스킬, 프로젝트 CLAUDE.md, 지연 도구, MCP 서버 설명 — 및 첫 번째 실제 사용자 콘텐츠 사이)는 완전히 누락되어 있습니다. 이 마커가 없으면 자동 주입된 범위 내의 모든 변경이 이후 모든 것을 캐시에 파괴합니다. wadabum은 이 추가로 인해 새로운 세션 첫 번째 턴에서 ~6,500 토큰 절약을 예측했습니다 ([anthropics/claude-code#47098](https://github.com/anthropics/claude-code/issues/47098)).
-
-프록시는 선택적으로 누락된 마커를 주입할 수 있습니다. 커뮤니티 데이터에 대해 유효성 검사 전까지 기본적으로 꺼져 있습니다.
-
-```sh
-export CACHE_FIX_INJECT_MESSAGES_BREAKPOINT=1
-```
-
-주입은 보수적입니다: 요청이 이미 1–3개의 마커(전형적인 CC 모양)를 포함할 때만 작동하며, 요청이 4개 마커 한도에 도달했거나(400 발생) 0개 마커(에이전트 SDK / API 직접 모양)인 경우 거부합니다. 경계 감지는 모든 다섯 가지 관찰된 자동 주입 블록 종류 — 훅, 스킬, CLAUDE.md, 지연 도구, MCP — 및 마지막 자동 주입 블록에 마커를 배치합니다.
-
-진단 전용 환경 변수는 요청을 수정하지 않고 `messages[0]`의 구조적 모양을 덤프합니다:
-
-```sh
-export CACHE_FIX_DUMP_MESSAGES_HEAD=/tmp/messages-head.jsonl
-```
-
-| 환경 변수 | 기본값 | 목적 |
-|---|---|---|
-| `CACHE_FIX_INJECT_MESSAGES_BREAKPOINT` | 설정되지 않음 | 브레이크포인트 #3 주입 활성화 (`=1` 선택적) |
-| `CACHE_FIX_DUMP_MESSAGES_HEAD` | 설정되지 않음 | `messages[0].content` 모양의 진단 JSONL 덤프 — 읽기 전용, 수정 없음 |
-
 ## 마이크로 컴팩트 안정성 (프록시 모드, 선택적)
 
 약 90분 유휴 후, Claude Code의 `time_based_microcompact`(그리고 `FDY()`에 의해 트리거된 냉 컴팩트 경로)는 오래된 `tool_result` 콘텐츠를 센티넬 문자열로 대체합니다. 원래 콘텐츠는 캐시 목적에서는 사라졌으며, 이 부분은 프록시에서 복구할 수 없습니다. 하지만 센티넬 자체는 포함된 타임스탬프(`[Old tool result content cleared at 2026-04-30T13:42:11Z]`)를 포함할 수 있으며, 이는 동일한 이미지가 지워진 위치에 대해 *두 번째* 마이크로 컴팩트를 실행하면 다른 바이트를 쓰게 되어 해당 위치 이후 모든 것을 캐시에 파괴합니다. 이 확장은 복구 가능한 절반을 다룹니다: 센티넬을 바이트 안정적인 표준 형식으로 정규화하여 반복 마이크로 컴팩트가 캐시를 뒤섞지 않도록 합니다. **1단계만** — 진단 + 선택적 정규화. 2단계(원래 tool_result 콘텐츠의 스냅샷 및 복원)는 v3.5.0+에서 1단계 프로덕션 데이터를 기다리며 연기됩니다.

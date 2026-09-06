@@ -1093,29 +1093,6 @@ export CACHE_FIX_SESSION_MIRROR=on
 
 参见 [docs/disk-usage.md](docs/disk-usage.md) 获取最坏情况磁盘占用会计。
 
-## 缓存断点（代理模式，可选）
-
-Anthropic 的提示缓存支持每个请求最多 **四个** `cache_control` 标记。Claude Code 目前使用其中的三个；第三个（在自动注入的 `messages[0]` 内容 —— 钩子、技能、项目 CLAUDE.md、延迟工具、MCP 服务器描述 —— 和第一个真实用户内容之间）完全缺失。没有该标记，自动注入范围内的每次更改都会破坏后续所有缓存。wadabum 预测添加它可节省 ~6,500 token 每次新鲜会话首次轮次（[anthropics/claude-code#47098](https://github.com/anthropics/claude-code/issues/47098)）。
-
-代理可以在选择时注入缺失的标记。默认关闭，直到与社区数据验证：
-
-```sh
-export CACHE_FIX_INJECT_MESSAGES_BREAKPOINT=1
-```
-
-注入是保守的：它只在请求已携带 1–3 个标记（典型 CC 形状）时触发，并拒绝如果请求达到 4 标记限制（会 400）或零标记（Agent SDK / API 直接形状此扩展不构建）时。边界检测覆盖所有五种观察到的自动注入块类型 —— 钩子、技能、CLAUDE.md、延迟工具、MCP —— 并将标记放在最后一个自动注入块上。
-
-仅诊断环境变量转储 `messages[0]` 的结构形状以用于夹具来源，而不修改请求：
-
-```sh
-export CACHE_FIX_DUMP_MESSAGES_HEAD=/tmp/messages-head.jsonl
-```
-
-| 环境变量 | 默认值 | 目的 |
-|---|---|---|
-| `CACHE_FIX_INJECT_MESSAGES_BREAKPOINT` | 未设置 | 启用断点 #3 注入（`=1` 选择）。 |
-| `CACHE_FIX_DUMP_MESSAGES_HEAD` | 未设置 | 诊断 JSONL 转储 `messages[0].content` 形状 —— 只读，无修改。 |
-
 ## 微压缩稳定性（代理模式，可选）
 
 在 ~90 分钟空闲后，Claude Code 的 `time_based_microcompact`（和由 `FDY()` 触发的冷压缩路径）会用哨兵字符串替换旧 `tool_result` 内容。原始内容对缓存目的已消失；那部分无法从代理恢复。但哨兵本身可以携带嵌入的时间戳（`[Old tool result content cleared at 2026-04-30T13:42:11Z]`），这意味着对同一已清除位置的 *第二次* 微压缩写入不同字节 —— 即使没有添加新内容，也会破坏该位置之后的所有缓存。

@@ -1205,29 +1205,6 @@ Storage layout: `<DIR>/<sessionFilename(sessionId)>/<timestamp>.jsonl`. Session 
 
 See [docs/disk-usage.md](docs/disk-usage.md) for the worst-case disk-footprint accounting.
 
-## Cache breakpoints (proxy mode, opt-in)
-
-Anthropic's prompt cache supports up to **four** `cache_control` markers per request. Claude Code currently uses three of the four; the third (between auto-injected `messages[0]` content — hooks, skills, project CLAUDE.md, deferred tools, MCP server descriptions — and the first real user content) is missing entirely. Without that marker, every change inside the auto-injected span busts the cache for everything that follows. wadabum projected ~6,500 token savings per fresh-session first turn from adding it ([anthropics/claude-code#47098](https://github.com/anthropics/claude-code/issues/47098)).
-
-The proxy can inject the missing marker on opt-in. Default off until validated against community data.
-
-```sh
-export CACHE_FIX_INJECT_MESSAGES_BREAKPOINT=1
-```
-
-The injection is conservative: it only fires when the request already carries 1–3 markers (typical CC shape) and refuses if the request is at the 4-marker limit (would 400) or has zero markers (Agent SDK / API-direct shape this extension isn't built for). Boundary detection covers all five observed auto-injected block kinds — hooks, skills, CLAUDE.md, deferred-tools, MCP — and lands the marker on the LAST auto-injected block.
-
-A diagnostic-only env var dumps the structural shape of `messages[0]` for fixture sourcing without mutating the request:
-
-```sh
-export CACHE_FIX_DUMP_MESSAGES_HEAD=/tmp/messages-head.jsonl
-```
-
-| Env var | Default | Purpose |
-|---------|---------|---------|
-| `CACHE_FIX_INJECT_MESSAGES_BREAKPOINT` | unset | Enable breakpoint #3 injection (`=1` opt-in). |
-| `CACHE_FIX_DUMP_MESSAGES_HEAD` | unset | Diagnostic JSONL dump of `messages[0].content` shape — read-only, no mutation. |
-
 ## Microcompact stability (proxy mode, opt-in)
 
 After ~90 minutes idle, Claude Code's `time_based_microcompact` (and the cold-compact path triggered by `FDY()`) replaces old `tool_result` content with a sentinel string. The original content is gone for cache purposes; that part is unrecoverable from the proxy. But the sentinel itself can carry an embedded timestamp (`[Old tool result content cleared at 2026-04-30T13:42:11Z]`), which means a *second* microcompact pass against the same already-cleared position writes different bytes — busting the cache for everything after that position even though no new content was added.
