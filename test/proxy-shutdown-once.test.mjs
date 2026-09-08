@@ -12,24 +12,16 @@
 // node gives each FILE its own process, which is the whole mechanism.
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import http from "node:http";
 import net from "node:net";
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { OURS, cmdOf, freePort, listeners } from "./proc-helpers.mjs";
+import { OURS, cmdOf, freePort, listeners, waitForHolder } from "./proc-helpers.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const launcherPath = join(here, "..", "bin", "claude-via-proxy.mjs");
 const serverPath = join(here, "..", "proxy", "server.mjs");
-
-const probe = (port) => new Promise((res) => {
-  const r = http.get({ host: "127.0.0.1", port, path: "/health", agent: false, timeout: 8_000 },
-                     (s) => { s.resume(); s.on("end", () => res(s.statusCode === 200 ? "ok" : `ERR:${s.statusCode}`)); });
-  r.on("error", (e) => res(`ERR:${e.code}`));
-  r.on("timeout", () => { r.destroy(); res("ERR:ETIMEDOUT"); });
-});
 
 describe("shutdown runs once per stop", () => {
   // A SUPERVISED STOP DELIVERS MORE THAN ONE SIGNAL, AND THE BODY MUST RUN ONCE.
@@ -65,9 +57,7 @@ describe("shutdown runs once per stop", () => {
     let out = "";
     holder.stdout.on("data", (d) => { out += d; });
     try {
-      const up = Date.now() + 25_000;
-      let body = await probe(port);
-      while (body.startsWith("ERR:") && Date.now() < up) body = await probe(port);
+      const body = await waitForHolder(port);
       assert.equal(body, "ok", "the holder never came up, so nothing was measured");
 
       // The proxy CHILD, which is what a control-group signal reaches directly.
