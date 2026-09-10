@@ -69,7 +69,11 @@ function stripContentBlocks(messages) {
   };
 }
 
-export { isContinueTrailerBlock, isBookkeepingReminder, stripContentBlocks };
+// BOOKKEEPING_PATTERNS is exported so a sibling extension can strip the SAME
+// content in a location this one does not reach — CC emits these as whole
+// role:system messages as well as wrapped blocks. Reuse, not a second copy that
+// goes stale when a pattern is added here.
+export { isContinueTrailerBlock, isBookkeepingReminder, stripContentBlocks, BOOKKEEPING_PATTERNS };
 
 export default {
   name: "content-strip",
