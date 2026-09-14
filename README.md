@@ -1404,7 +1404,7 @@ Default-off subsystem that makes the cache-fix proxy the single, proactive, lock
 
 The race: Anthropic's refresh tokens rotate on every use. Each successful refresh returns a new access token AND a new refresh token, invalidating the prior one; reusing a consumed refresh token is treated as theft and revokes the whole family. When N clients share one `~/.claude/.credentials.json` and the access token expires (~8h cadence), two clients can race to POST the same refresh token — the server sees the reuse and revokes both. After that, the file's refresh token is dead; only interactive `/login` recovers.
 
-Recent Claude Code binaries (2.1.148+) ship a cross-process `~/.claude/.oauth_refresh.lock` via `proper-lockfile`, but with a 10-second stale-break window. A refresh POST that runs longer than 10s lets a waking client proceed lock-less and POST the same token — the race fires anyway.
+Recent Claude Code binaries (2.1.148+) ship a cross-process `~/.claude/.oauth_refresh.lock` via `proper-lockfile`, holding it with a 60-second stale-break window and a 5-second heartbeat (measured directly off 2.1.269 through 2.1.271). A holder that's merely slow but alive keeps its heartbeat running, so the lock never goes stale under it — the hole is a holder whose heartbeat itself stalls past 60s (the process hangs or dies), letting a waking client stale-break the lock and POST the same token — the race fires anyway.
 
 This extension makes the proxy the proactive single-refresher: it keeps the shared token fresh AND holds the client's own `.oauth_refresh.lock` during its refresh, so a waking client finds a fresh token and short-circuits without POSTing. Exactly one party reaches the token endpoint → no double-spend → no family revocation.
 
@@ -1421,7 +1421,7 @@ export CACHE_FIX_OAUTH_REFRESH=on
 | `CACHE_FIX_OAUTH_TOKEN_URL` | `https://platform.claude.com/v1/oauth/token` | Token endpoint (test override) |
 | `CACHE_FIX_OAUTH_REFRESH_MARGIN_MS` | 7200000 (2h) | Refresh when expiry is within this window |
 | `CACHE_FIX_OAUTH_TICK_MS` | 300000 (5min) | Check interval |
-| `CACHE_FIX_OAUTH_POST_TIMEOUT_MS` | 8000 | Hard refresh-POST deadline; **must stay below the client's 10000 ms stale-break** |
+| `CACHE_FIX_OAUTH_POST_TIMEOUT_MS` | 8000 | Hard refresh-POST deadline; **must stay below the client's 60 000 ms stale window** |
 
 The `CACHE_FIX_OAUTH_POST_TIMEOUT_MS` ceiling is load-bearing. The refresh POST has an `AbortController` timer covering both headers AND the response body read. On timeout the outcome is UNKNOWN — the server may or may not have rotated the token — so the proxy does NOT write, does NOT retry, emits a distinct `oauth_refresh_timeout` event, and backs off for at least one full stale window before any next attempt. The ordering guarantees that if the proxy ever loses the timing race, it loses by *not POSTing again*, never by POSTing concurrently.
 

@@ -1289,7 +1289,7 @@ export CACHE_FIX_UPSTREAM_ERROR_LOG=on
 
 경쟁: Anthropic의 갱신 토큰은 모든 사용 시 회전됩니다. 성공적인 갱신은 새로운 액세스 토큰과 새로운 갱신 토큰을 반환하여 이전 토큰을 무효화합니다; 소비된 갱신 토큰을 재사용하는 것은 도둑질로 간주되어 전체 패밀리를 회수합니다. N 클라이언트가 하나의 `~/.claude/.credentials.json`을 공유하고 액세스 토큰이 만료되면(~8h 주기), 두 클라이언트가 동일한 갱신 토큰을 POST할 수 있습니다 — 서버는 재사용을 감지하고 둘 다 회수합니다. 이후 파일의 갱신 토큰은 죽습니다; 오직 대화형 `/login`만 복구합니다.
 
-최근 Claude Code 바이너리(2.1.148+)는 `proper-lockfile`을 통해 교차 프로세스 `~/.claude/.oauth_refresh.lock`을 제공하지만, 10초 스테일-브레이크 창이 있습니다. 10초 이상 실행되는 갱신 POST는 깨어난 클라이언트가 잠금 없이 진행하고 동일한 토큰을 POST하여 경쟁이 다시 발생합니다.
+최근 Claude Code 바이너리(2.1.148+)는 `proper-lockfile`을 통해 교차 프로세스 `~/.claude/.oauth_refresh.lock`을 제공하며, 60초 스테일-브레이크 창과 5초 하트비트로 유지됩니다(2.1.269~2.1.271에서 직접 측정). 느리기만 하고 살아있는 보유자는 하트비트가 계속 돌기 때문에 잠금이 스테일 상태가 되지 않습니다. 구멍은 하트비트 자체가 60초 넘게 멈춘 보유자(프로세스가 멈추거나 죽은 경우)뿐이며, 이 경우 깨어난 클라이언트가 잠금을 스테일-브레이크하고 동일한 토큰을 POST하여 경쟁이 다시 발생합니다.
 
 이 확장은 프록시가 적극적인 단일-갱신자로 만듭니다: 공유 토큰을 갱신하고, 갱신 중에 클라이언트의 자체 `.oauth_refresh.lock`을 유지하므로, 깨어난 클라이언트는 새로운 토큰을 발견하고 POST하지 않고 단절합니다. 정확히 하나의 파티가 토큰 엔드포인트에 도달 → 이중 지출 없음 → 패밀리 회수 없음.
 
@@ -1306,7 +1306,7 @@ export CACHE_FIX_OAUTH_REFRESH=on
 | `CACHE_FIX_OAUTH_TOKEN_URL` | `https://platform.claude.com/v1/oauth/token` | 토큰 엔드포인트 (테스트 재정의) |
 | `CACHE_FIX_OAUTH_REFRESH_MARGIN_MS` | 7200000 (2h) | 만료가 이 창 내에 있을 때 갱신 |
 | `CACHE_FIX_OAUTH_TICK_MS` | 300000 (5min) | 확인 간격 |
-| `CACHE_FIX_OAUTH_POST_TIMEOUT_MS` | 8000 | 하드 갱신-POST 마감; **클라이언트의 10000 ms 스테일-브레이크보다 작아야 합니다** |
+| `CACHE_FIX_OAUTH_POST_TIMEOUT_MS` | 8000 | 하드 갱신-POST 마감; **클라이언트의 60 000 ms 스테일 창보다 작아야 합니다** |
 
 `CACHE_FIX_OAUTH_POST_TIMEOUT_MS`는 부하가 있습니다. 갱신 POST에는 헤더와 응답 본문 읽기를 포함하는 `AbortController` 타이머가 있습니다. 시간 초과 시 결과는 알 수 없습니다 — 서버가 토큰을 회전했는지 여부 — 따라서 프록시는 기록하지 않으며 재시도하지 않으며, 별도의 `oauth_refresh_timeout` 이벤트를 발생시키고 다음 시도 전에 최소한 하나의 전체 스테일 창을 백오프합니다. 타이밍 경쟁에서 프록시가 손실되는 경우, *다시 POST하지 않고* 손실됩니다.
 

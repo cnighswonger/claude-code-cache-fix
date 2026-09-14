@@ -42,23 +42,27 @@ const CLIENT_ID_DEFAULT = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 // remote-bridge / code-session calls that required user:sessions:claude_code.
 const SCOPE_FALLBACK = "user:inference user:profile";
 
+// The client's real lock window — measured directly off Claude Code 2.1.269,
+// 2.1.270 and 2.1.271 (2026-09-14).
+const CLIENT_STALE_WINDOW_MS = 60_000;
+const CLIENT_UPDATE_MS = 5_000;
+
 // proper-lockfile compatibility settings — must match the client's call shape
 // byte-for-byte. CRITICAL: lockfilePath points at .oauth_refresh.lock (the
 // client's lockfile name), NOT at .credentials.json.lock (proper-lockfile's
 // default-derived name). Without lockfilePath set, lock(credPath) would lock
 // ${credPath}.lock and silently lose mutual exclusion against the client.
 // realpath:false because the credential file is a real regular file (we
-// don't need realpath resolution and it adds a stat). stale:10000 matches
-// the client's 10s stale-break window.
+// don't need realpath resolution and it adds a stat).
 function lockOpts() {
   return {
     lockfilePath: join(dirname(credPath()), ".oauth_refresh.lock"),
     realpath: false,
-    stale: 10_000,
+    stale: CLIENT_STALE_WINDOW_MS,
+    update: CLIENT_UPDATE_MS,
     retries: 0, // we manage retry timing ourselves via the tick interval
   };
 }
-const CLIENT_STALE_WINDOW_MS = 10_000;
 
 let _interval = null;
 let _running = false; // in-process serialize: an ongoing tick blocks the next
@@ -211,11 +215,13 @@ async function postRefresh(refreshToken, deadlineMs, credScopes) {
   });
   // CRITICAL (Codex r1 blocker 2): the AbortController must remain armed
   // across both the response-headers wait AND the body read. A server can
-  // flush 200 OK headers in 1 s then stall the body past 10 s — that path
-  // would leave the proxy holding the lock while the client stale-breaks,
-  // exactly the second-refresher scenario §2a exists to prevent. So we
-  // keep `signal: ac.signal` (which the fetch body reader honors) and only
-  // clearTimeout after `res.text()` has resolved or rejected.
+  // flush 200 OK headers in 1 s then stall the body indefinitely; without
+  // this deadline the proxy would hold the lock (and its own tick loop)
+  // for the life of that connection. The proxy's own 5 s heartbeat keeps
+  // its held lock from going stale on its own, so what this deadline
+  // bounds is the UNKNOWN-outcome window (§2a), not a stale-break. So we
+  // keep `signal: ac.signal` (which the fetch body reader honors) and
+  // only clearTimeout after `res.text()` has resolved or rejected.
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), deadlineMs);
   let res;

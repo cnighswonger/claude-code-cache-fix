@@ -15,7 +15,7 @@
 import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, symlinkSync, chmodSync, existsSync, readdirSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, symlinkSync, chmodSync, existsSync, readdirSync, utimesSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import properLockfile from "proper-lockfile";
@@ -253,7 +253,7 @@ describe("oauth refresher — §2a hard refresh deadline (load-bearing)", () => 
     const ev = lastEvent();
     assert.equal(ev.event, "oauth_refresh_timeout");
     assert.ok(ev.deadline_ms > 0);
-    assert.ok(ev.backoff_ms >= 10000, "back-off at least one stale window (10s)");
+    assert.ok(ev.backoff_ms >= 60_000, "back-off at least one stale window (60s)");
 
     let retried = false;
     mockHandler = (_req, res) => {
@@ -349,7 +349,8 @@ describe("oauth refresher — Codex r1 blocker 1: client-compatible lock path", 
     const clientLockOpts = {
       lockfilePath: lockPath,
       realpath: false,
-      stale: 10_000,
+      stale: 60_000,
+      update: 5_000,
       retries: 0,
     };
     const clientRelease = await properLockfile.lock(credPath, clientLockOpts);
@@ -370,6 +371,36 @@ describe("oauth refresher — Codex r1 blocker 1: client-compatible lock path", 
         ".credentials.json.lock must not exist; proxy must use .oauth_refresh.lock only");
     } finally {
       await clientRelease();
+    }
+  });
+
+  it("a holder whose heartbeat stalled 15s is still the owner under the client's 60s window", async () => {
+    writeCred(freshCredDueForRefresh());
+
+    // Simulate the client holding its real lock, then its heartbeat stalling:
+    // age the lock's mtime 15s without the client's 5s toucher having run.
+    const clientLockOpts = {
+      lockfilePath: lockPath,
+      realpath: false,
+      stale: 60_000,
+      update: 5_000,
+      retries: 0,
+      onCompromised: () => {}, // no-op: a stolen lock must not crash this test
+    };
+    const clientRelease = await properLockfile.lock(credPath, clientLockOpts);
+    try {
+      const past = new Date(Date.now() - 15_000);
+      utimesSync(lockPath, past, past);
+
+      let posted = false;
+      mockHandler = (_req, res) => { posted = true; res.writeHead(200); res.end("{}"); };
+      await __runTickForTests();
+      assert.equal(posted, false,
+        "proxy must NOT POST: a 15s-stale heartbeat is still within the client's 60s stale window");
+      assert.equal(lastEvent().event, "oauth_lock_contended",
+        "proxy must treat the 15s-old lock as still held, not as abandoned");
+    } finally {
+      try { await clientRelease(); } catch {}
     }
   });
 

@@ -1292,7 +1292,7 @@ export CACHE_FIX_UPSTREAM_ERROR_LOG=on
 
 竞争：Anthropic 的刷新令牌在每次使用时旋转。每次成功刷新返回新的访问令牌和新的刷新令牌，使先前令牌失效；重用已消耗的刷新令牌被视为盗窃并撤销整个家族。当 N 个客户端共享一个 `~/.claude/.credentials.json` 并且访问令牌过期（~8h 频率），两个客户端可以竞争 POST 相同的刷新令牌 —— 服务器看到重用并撤销两者。之后，文件中的刷新令牌死亡；只有交互式 `/login` 可以恢复。
 
-最近的 Claude Code 二进制（2.1.148+）通过 `proper-lockfile` 在跨进程共享 `~/.claude/.oauth_refresh.lock`，但有 10 秒过期窗口。运行时间超过 10s 的刷新 POST 允许唤醒客户端在无锁情况下继续并 POST 相同令牌 —— 竞争仍然发生。
+最近的 Claude Code 二进制（2.1.148+）通过 `proper-lockfile` 在跨进程共享 `~/.claude/.oauth_refresh.lock`，持有时用 60 秒过期窗口并每 5 秒更新一次心跳（2.1.269 至 2.1.271 实测）。仅仅运行缓慢但仍存活的持有者，其心跳会持续更新，因此锁不会过期。漏洞只在心跳本身停滞超过 60 秒时出现（进程挂起或死亡），此时唤醒的客户端会将锁判定为过期并夺取，再 POST 相同的令牌 —— 竞争仍然发生。
 
 此扩展使代理成为主动单一刷新器：它保持共享令牌新鲜，并在刷新期间持有客户端自己的 `.oauth_refresh.lock`，因此唤醒客户端会发现新鲜令牌并短路而不 POST。恰好一个方达到令牌端点 → 无双重支出 → 无家族撤销。
 
@@ -1309,7 +1309,7 @@ export CACHE_FIX_OAUTH_REFRESH=on
 | `CACHE_FIX_OAUTH_TOKEN_URL` | `https://platform.claude.com/v1/oauth/token` | 令牌端点（测试覆盖） |
 | `CACHE_FIX_OAUTH_REFRESH_MARGIN_MS` | 7200000 (2h) | 当到期在该窗口内时刷新 |
 | `CACHE_FIX_OAUTH_TICK_MS` | 300000 (5min) | 检查间隔 |
-| `CACHE_FIX_OAUTH_POST_TIMEOUT_MS` | 8000 | 硬刷新 POST 死线；**必须低于客户端的 10000 ms 过期窗口** |
+| `CACHE_FIX_OAUTH_POST_TIMEOUT_MS` | 8000 | 硬刷新 POST 死线；**必须低于客户端的 60 000 ms 过期窗口** |
 
 `CACHE_FIX_OAUTH_POST_TIMEOUT_MS` 是负载承载。刷新 POST 有 `AbortController` 计时器覆盖头和响应体读取。超时后结果是未知 —— 服务器可能或可能没有旋转令牌 —— 因此代理不写入，不重试，发出不同的 `oauth_refresh_timeout` 事件，并在任何下一次尝试前至少等待一个完整过期窗口。排序保证如果代理在计时竞争中失败，它通过 *不 POST 再次* 而不是并发 POST。
 
