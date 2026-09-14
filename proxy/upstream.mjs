@@ -495,8 +495,16 @@ export function buildUpstreamUrl(base, clientUrl) {
   return new URL(trimmedBase + relative);
 }
 
-export async function forwardRequest(clientReq, body, signal) {
-  const upstreamUrl0 = buildUpstreamUrl(config.upstream, clientReq.url);
+// `upstreamBase` is an optional per-request override of config.upstream, set by
+// an extension via ctx.meta.upstreamOverride and passed through by
+// handleMessages (which honours it only when CACHE_FIX_UPSTREAM_OVERRIDE=on).
+// Unset → config.upstream; buildUpstreamUrl's base-path concatenation applies
+// either way. Everything below this line — hop resolution, CACHE_FIX_REQUIRE_HOP,
+// buildUpstreamHeaders — reads the RESOLVED url, so an overridden target gets
+// the same egress policy as the configured one rather than a private path
+// around it.
+export async function forwardRequest(clientReq, body, signal, upstreamBase) {
+  const upstreamUrl0 = buildUpstreamUrl(upstreamBase || config.upstream, clientReq.url);
   // Resolve the hop BEFORE building the request: a hop that is off gets routed
   // around here, so a session wired to this proxy never sees the outage. With
   // no fallbacks configured this returns the configured hop unchanged and costs

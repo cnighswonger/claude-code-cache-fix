@@ -447,6 +447,7 @@ All proxy settings are controlled via environment variables. Set them before sta
 | `CACHE_FIX_PROXY_PORT` | `9801` | Listen port |
 | `CACHE_FIX_PROXY_BIND` | `127.0.0.1` | Bind address |
 | `CACHE_FIX_PROXY_UPSTREAM` | `https://api.anthropic.com` | Upstream URL. Change to chain another proxy (e.g. `http://localhost:8080`) |
+| `CACHE_FIX_UPSTREAM_OVERRIDE` | unset | Set to `on` to let an extension redirect a single request to a different upstream base by setting `ctx.meta.upstreamOverride` in its `onRequest` hook. Default off, and off means the field is ignored rather than an error. Opt in deliberately: the redirected request carries your API key and full prompt body to that target, and the target's response is relayed back to Claude Code unmodified. Reverse-proxy mode only — requests that arrive through forward-proxy mode's CONNECT tunnel do not consult it. |
 | `CACHE_FIX_FORWARD_PROXY` | unset | Set to `on` for forward-proxy mode (HTTP CONNECT + selective MITM of the upstream host) so the client points `HTTPS_PROXY` at the proxy instead of `ANTHROPIC_BASE_URL`, keeping Remote Control enabled. See [Forward-proxy mode](#forward-proxy-mode-keeps-remote-control-working). |
 | `CACHE_FIX_CA_DIR` | `~/.claude/cache-fix-ca` | Directory for the forward-proxy CA/leaf cert (generated once on first start). The client trusts `ca.pem` via `NODE_EXTRA_CA_CERTS`. |
 | `CACHE_FIX_PROXY_TIMEOUT` | `600000` | Request timeout in milliseconds |
