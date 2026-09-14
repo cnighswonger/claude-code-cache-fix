@@ -177,7 +177,16 @@ async function handleMessages(clientReq, clientRes) {
     if (!clientRes.writableEnded) abortController.abort();
   });
 
-  const pre = await preForward(clientReq, clientRes, abortController, extSnapshot, "messages");
+  // `path` is the request line, verbatim. Extensions that key on the ENDPOINT
+  // cannot otherwise see it: server.mjs dispatches any POST /v1/messages* here
+  // (subpaths included), and the pipeline's `routes: ["messages"]` default
+  // filters by ROUTE, not by subpath — so /v1/messages/count_tokens and
+  // /v1/messages/batches arrive indistinguishable from a real turn. An
+  // extension that snapshots per-session state would bind a token-count
+  // probe's shape to the same tenant key the next real turn uses.
+  // handleBootstrap's call already carries its own audit baseMeta and is
+  // deliberately left alone.
+  const pre = await preForward(clientReq, clientRes, abortController, extSnapshot, "messages", { path: clientReq.url });
   if (pre.handled) {
     debugLog("[PROXY] handled internally without upstream request",
              "method:", clientReq.method, "url:", clientReq.url,
