@@ -95,6 +95,18 @@ describe("stream.mjs", () => {
     assert.equal(telemetry.model, "claude-sonnet-4-20250514");
   });
 
+  it("decodes a multibyte UTF-8 character split across a chunk boundary", async () => {
+    const telemetry = createTelemetryRecord();
+    const line = 'data: {"type":"content_block_delta","delta":{"text":"안녕"}}\n\n';
+    const fullBuf = Buffer.from(line, "utf8");
+    const splitAt = Buffer.byteLength(line.slice(0, line.indexOf("안"))) + 1; // mid-sequence of "안"
+    const upstream = mockUpstream([fullBuf.subarray(0, splitAt), fullBuf.subarray(splitAt)]);
+    const client = mockClientRes();
+    await streamResponse(upstream, client.res, telemetry);
+    assert.equal(client.written(), line);
+    assert.ok(!client.written().includes("�"));
+  });
+
   it("handles backpressure via drain", async () => {
     const telemetry = createTelemetryRecord();
     let drainCalled = false;

@@ -83,9 +83,9 @@ async function processLine(line, clientRes, telemetry, extSnapshot, meta, respon
 
 export async function streamResponse(upstreamRes, clientRes, telemetry, extSnapshot, meta, responseHeaders) {
   let buffer = "";
+  upstreamRes.setEncoding("utf8");
 
-  for await (const chunk of upstreamRes) {
-    const text = chunk.toString();
+  for await (const text of upstreamRes) {
     buffer += text;
 
     const lines = buffer.split("\n");
