@@ -174,6 +174,149 @@ test("ensureCA: reuses the CA across calls (does not rotate the root)", () => {
   });
 });
 
+// A CA minted before 84ba7c2 (no keyUsage), with a leaf signed by it: a pair the
+// pre-84ba7c2 ready() serves as it stands. `extras` are alternative extra argv
+// for the CA mint and the first the host's openssl accepts wins: LibreSSL cannot
+// spell `subjectKeyIdentifier=none`, but it does not add one either. The argv
+// from before 84ba7c2 carried no -addext at all. Returns the openssl runner.
+const KU = ["-addext", "keyUsage=critical,keyCertSign,cRLSign"];
+function plantLegacyCA(dir, { subject = "cache-fix forward-proxy CA", extras = [[]], leaf = true } = {}) {
+  const sh = (args) => spawnSync("openssl", args, { cwd: dir, encoding: "utf8" });
+  const ok = (args) => { const r = sh(args); assert.equal(r.status, 0, r.stderr); };
+  assert.ok(extras.some((x) => sh(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", "ca.key",
+                                   "-out", "ca.pem", "-days", "3650", "-subj", `/CN=${subject}`, ...x]).status === 0),
+            "the fixture CA mint failed");
+  if (leaf) {
+    ok(["genrsa", "-out", "leaf.key", "2048"]);
+    ok(["req", "-new", "-key", "leaf.key", "-out", "leaf.csr", "-subj", "/CN=api.anthropic.com"]);
+    writeFileSync(join(dir, "leaf.ext"), "subjectAltName=DNS:api.anthropic.com\nextendedKeyUsage=serverAuth\n");
+    ok(["x509", "-req", "-in", "leaf.csr", "-CA", "ca.pem", "-CAkey", "ca.key", "-set_serial", "0x01",
+        "-out", "leaf.pem", "-days", "3650", "-extfile", "leaf.ext"]);
+  }
+  return sh;
+}
+const snapshot = (dir) => Object.fromEntries(["ca.pem", "ca.key", "leaf.pem", "leaf.key"].map(
+  (f) => [f, existsSync(join(dir, f)) ? readFileSync(join(dir, f)) : null]));
+
+// The reuse path above must not carry a CA minted before the extensions a strict
+// verifier requires (Python 3.13's default context sets VERIFY_X509_STRICT).
+// Every install whose CA predates 84ba7c2 serves a CA with no keyUsage, and
+// every leaf re-signed under it fails `openssl verify -x509_strict` with "CA
+// cert does not include key usage extension"; a plain verify passes, so node
+// never noticed. Re-certifying (same key, same subject) fixes it without the
+// rotation that would orphan a running session's captured bundle: the OLD CA
+// must still verify the NEW leaf, asked of a real handshake, which is the
+// client's own verifier.
+for (const { fault, absent, extras } of [
+  { fault: "no keyUsage", absent: "X509v3 Key Usage", extras: [[]] },
+  { fault: "no subjectKeyIdentifier", absent: "X509v3 Subject Key Identifier",
+    extras: [[...KU, "-addext", "subjectKeyIdentifier=none"], KU] },
+]) {
+  test(`ensureCA: a reused CA with ${fault} is re-certified from the same key`, async (t) => {
+    await withCA({}, async (dir) => {
+      const sh = plantLegacyCA(dir, { extras });
+      const text = () => sh(["x509", "-in", "ca.pem", "-noout", "-text"]).stdout;
+      // Only a verifier that genuinely cannot express the fault skips; a failed mint failed above.
+      if (text().includes(absent)) return t.skip(`openssl cannot mint a CA with ${fault}`);
+      const caKeyBefore = readFileSync(join(dir, "ca.key"));
+      const oldCa = readFileSync(join(dir, "ca.pem"));
+
+      const r = ensureCA();
+
+      assertValidPair(r);
+      assert.ok(text().includes(absent), `the re-issued ca.pem still lacks ${absent}`);
+      assert.equal(sh(["verify", "-x509_strict", "-CAfile", "ca.pem", "leaf.pem"]).status, 0,
+                   "the re-signed leaf still fails a strict verifier");
+      const old = await handshakeViaExtraCerts(oldCa.toString(), r);
+      assert.equal(old.ok, true,
+                   `the OLD CA no longer verifies the new leaf: a running session's bundle is orphaned (${old.err})`);
+      const spki = (pem) => new X509Certificate(pem).publicKey.export({ type: "spki", format: "der" });
+      assert.equal(Buffer.compare(spki(readFileSync(join(dir, "ca.pem"))), spki(oldCa)), 0, "the CA key was rotated");
+      assert.equal(Buffer.compare(readFileSync(join(dir, "ca.key")), caKeyBefore), 0, "ca.key changed");
+    });
+  });
+}
+
+// Only a CA that is OURS is ever re-issued: ca.key present, the same key as
+// ca.pem, our subject. Anything else is left exactly as the base treated it. If
+// ready() demanded strictness of such a CA the generator would never touch it,
+// every start would re-mint the leaf and a concurrent starter would wait out
+// caLockWaitMs; and a missing ca.key must not become a fresh key mint, which is
+// a silent rotation of a pair the base served.
+for (const { name, opts, after } of [
+  { name: "a foreign subject", opts: { subject: "other" } },
+  { name: "a ca.key that is another key", after: (sh) => sh(["genrsa", "-out", "ca.key", "2048"]) },
+  { name: "no ca.key", after: (sh, dir) => rmSync(join(dir, "ca.key")) },
+]) {
+  test(`ensureCA: a non-strict CA with ${name} and a valid leaf is left byte-identical`, () => {
+    withCA({}, (dir) => {
+      const sh = plantLegacyCA(dir, opts);
+      if (after) after(sh, dir);
+      const before = snapshot(dir);
+
+      const r = ensureCA();
+
+      assert.deepEqual(snapshot(dir), before, "a CA the generator does not own was rewritten");
+      assert.equal(Buffer.compare(r.cert, before["leaf.pem"]), 0, "the existing leaf was not served");
+    });
+  });
+}
+
+// ...and a CA we leave alone may lack an SKI: the leaf is still minted under it.
+// `authorityKeyIdentifier=keyid:always` (and, on OpenSSL 3.0, plain `keyid`) makes
+// that a hard failure ("unable to get issuer keyid"), which would fall the proxy
+// back to reverse mode.
+test("ensureCA: a foreign CA with no SKI still gets a leaf", (t) => {
+  withCA({}, (dir) => {
+    const sh = plantLegacyCA(dir, { subject: "other", leaf: false,
+                                    extras: [[...KU, "-addext", "subjectKeyIdentifier=none"], KU] });
+    if (sh(["x509", "-in", "ca.pem", "-noout", "-text"]).stdout.includes("Subject Key Identifier")) {
+      return t.skip("openssl cannot mint a CA with no subjectKeyIdentifier");
+    }
+    const before = snapshot(dir);
+    const r = ensureCA();
+    assertValidPair(r);
+    assert.equal(Buffer.compare(readFileSync(join(dir, "ca.pem")), before["ca.pem"]), 0, "a foreign ca.pem was rewritten");
+  });
+});
+
+// Re-certifying is an upgrade, never a precondition. Where the base served the
+// pair, a re-certification that cannot run serves it still, with one stderr line,
+// instead of throwing: attachForwardProxy turns a throw into reverse mode, which
+// is a Rule 0 break on a hot swap.
+for (const { name, skip, inject } of [
+  { name: "openssl is not on PATH", inject: () => {
+      const saved = process.env.PATH;
+      process.env.PATH = scratchDir("fwd-nopath-");
+      return () => { process.env.PATH = saved; };
+    } },
+  { name: "the CA dir is read-only", skip: process.getuid?.() === 0, inject: (dir) => {
+      chmodSync(dir, 0o500);
+      return () => chmodSync(dir, 0o700);
+    } },
+]) {
+  test(`ensureCA: serves the existing pair when ${name}`, { skip }, (t) => {
+    withCA({ CACHE_FIX_CA_LOCK_WAIT_MS: "5000" }, (dir) => {
+      const sh = plantLegacyCA(dir);
+      if (sh(["x509", "-in", "ca.pem", "-noout", "-text"]).stdout.includes("X509v3 Key Usage")) return t.skip("openssl cannot mint a CA with no keyUsage");
+      const before = snapshot(dir);
+      const restore = inject(dir);
+      const write = process.stderr.write;
+      let said = "";
+      process.stderr.write = (s) => { said += s; return true; };
+      let r;
+      const t0 = Date.now();
+      try { r = ensureCA(); } finally { process.stderr.write = write; restore(); }
+
+      // A lock nobody can take has nothing to wait for: the start must not cost caLockWaitMs.
+      assert.ok(Date.now() - t0 < 2500, `waited ${Date.now() - t0} ms on a lock that cannot be taken`);
+      assert.equal(Buffer.compare(r.cert, before["leaf.pem"]), 0, "the existing leaf was not served");
+      assert.deepEqual(snapshot(dir), before, "a failed re-certification changed the pair");
+      assert.match(said, /re-certify/, `no stderr line named the failure: ${said}`);
+    });
+  });
+}
+
 // Blocker #1 (never generate without the lock): a .gen.lock owned by a LIVE
 // process means a generator is really working (or wedged) — after the bounded
 // wait, ensureCA must refuse to generate over it rather than fall through,

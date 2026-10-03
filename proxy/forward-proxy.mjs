@@ -35,6 +35,9 @@ function upstreamHost() {
 // The extra host we MITM (besides the upstream) to accelerate large downloads.
 const DOWNLOADS_HOST = "downloads.claude.ai";
 
+// The subject of the root CA we mint, and how we recognise a CA as ours.
+const CA_CN = "cache-fix forward-proxy CA";
+
 // Whether download-rewrite is BOTH enabled (opt-in) AND has a usable bucket
 // discovered from the client binary. Only then do we MITM downloads.claude.ai;
 // with no bucket we leave it blind-tunneled, so a discovery miss degrades to
@@ -95,16 +98,38 @@ export function ensureCA() {
   // fails tls.createSecureContext() at handshake time. Prove the on-disk key
   // matches the on-disk cert (public keys equal) before treating them as ready,
   // so a mixed-generation pair is regenerated instead of served.
-  const leafKeyMatchesCert = () => {
+  const keyMatchesCert = (certFile, keyFile) => {
     try {
-      const certPub = new X509Certificate(readFileSync(leafPem)).publicKey.export({ type: "spki", format: "der" });
-      const keyPub = createPublicKey(readFileSync(leafKey)).export({ type: "spki", format: "der" });
+      const certPub = new X509Certificate(readFileSync(certFile)).publicKey.export({ type: "spki", format: "der" });
+      const keyPub = createPublicKey(readFileSync(keyFile)).export({ type: "spki", format: "der" });
       return Buffer.compare(keyPub, certPub) === 0;
     } catch { return false; }
   };
-  const ready = () =>
+  // A CA of ours must carry keyUsage and SKI or a strict verifier refuses every
+  // leaf. Checked in-process, no spawn inside ready()'s 100 ms loop: node has no
+  // keyUsage accessor (its `keyUsage` is the EKU) and LibreSSL lacks `x509 -ext`,
+  // so look for the two extension OIDs in the DER. Unparseable reads false.
+  const caIsStrict = () => {
+    try {
+      const der = new X509Certificate(readFileSync(caPem)).raw;
+      return [0x0f, 0x0e].every((o) => der.includes(Buffer.from([0x06, 0x03, 0x55, 0x1d, o])));
+    } catch { return false; }
+  };
+  // OURS = our subject, and ca.key is the key of ca.pem. Only such a CA is ever
+  // re-issued. Any other (an operator's CA, a lost or foreign ca.key, an
+  // unreadable file) is left as the base treated it, and ready() must not ask it
+  // for strictness: the generator would never touch it, so every start would
+  // re-mint the leaf, and a missing ca.key would turn into a fresh key mint.
+  const ourCA = () => {
+    try {
+      return new X509Certificate(readFileSync(caPem)).subject === `CN=${CA_CN}` && keyMatchesCert(caPem, caKey);
+    } catch { return false; }
+  };
+  const needsRecert = () => !caIsStrict() && ourCA();
+  const pairReady = () =>
     existsSync(caPem) && existsSync(leafPem) && existsSync(leafKey) &&
-    leafCoversAllHosts() && leafKeyMatchesCert();
+    leafCoversAllHosts() && keyMatchesCert(leafPem, leafKey);
+  const ready = () => pairReady() && !needsRecert();
   // Every successful return goes through here: normalize private-key modes to
   // 0600 even on reuse — openssl defaults are not guaranteed, and a preexisting
   // operator-supplied ca.key must not stay world-readable just because this
@@ -112,6 +137,15 @@ export function ensureCA() {
   const publish = () => {
     for (const f of [caKey, leafKey]) { try { chmodSync(f, 0o600); } catch {} }
     return { caPath: caPem, key: readFileSync(leafKey), cert: readFileSync(leafPem) };
+  };
+  // Re-certifying is an upgrade, never a precondition. Where the base served
+  // this pair (pairReady), a re-certification that cannot run (no openssl on a
+  // service PATH, an unwritable CA dir, a lock that never frees) serves it still
+  // and says why: a throw reaches attachForwardProxy as reverse mode, which a
+  // hot swap must never see.
+  const serveAsIs = (why) => {
+    process.stderr.write(`[forward-proxy] could not re-certify the CA (${why}); serving the existing pair\n`);
+    return publish();
   };
   if (ready()) {
     return publish();
@@ -158,7 +192,9 @@ export function ensureCA() {
     // Synchronous sleep via Atomics.wait (no busy-spin, no external `sleep`).
     const sleep100 = () => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100); } catch {} };
     const deadline = Date.now() + config.caLockWaitMs;
-    while (!ready() && Date.now() < deadline) sleep100();
+    // Only while the lock EXISTS: a lock that never could be created (an unwritable
+    // dir) or that its owner released without publishing has nothing to wait for.
+    while (!ready() && existsSync(lock) && Date.now() < deadline) sleep100();
     if (ready()) return publish();
     // Timed out. Reclaim ONLY a stale lock (owner dead); a live owner means a
     // generator is still working (or wedged) — throwing is the safe answer, and
@@ -168,9 +204,10 @@ export function ensureCA() {
       haveLock = acquire(); // may lose to another reclaimer; that's fine
     }
     if (!haveLock) {
+      if (pairReady()) return serveAsIs(`CA lock ${lock} not acquired`);
       throw new Error(
-        `cache-fix forward-proxy: CA generation lock ${lock} still held after ` +
-        `${config.caLockWaitMs}ms; refusing to generate without owning the lock`,
+        `cache-fix forward-proxy: CA generation lock ${lock} not acquired ` +
+        `(waited up to ${config.caLockWaitMs}ms); refusing to generate without owning the lock`,
       );
     }
   }
@@ -202,19 +239,21 @@ export function ensureCA() {
       maxBuffer: 1 << 20,
     });
 
-    // Reuse an existing root CA; only mint a new one on first run. Regenerating
-    // the root here is a bug: the client trusts the CA via a NODE_EXTRA_CA_CERTS
-    // bundle captured at its OWN startup, so rotating ca.pem/ca.key (e.g. when a
-    // new SAN forces a leaf re-issue) orphans every running session's trust and
-    // breaks TLS with "certificate verify failed". The leaf is always re-minted
-    // (SANs may have changed); the root is reused so the trust bundle stays
-    // valid across restarts. `CACHE_FIX_CA_FORCE_ROTATE=1` opts into a full
-    // rotation (e.g. suspected key compromise) at the cost of that break.
+    // Reuse an existing root KEY; only mint a new one on first run. ROTATING it
+    // is a bug: the client trusts the CA via a NODE_EXTRA_CA_CERTS bundle
+    // captured at its OWN startup, so a new ca.key orphans every running
+    // session's trust ("certificate verify failed"). RE-CERTIFYING does not: a
+    // new ca.pem from the SAME ca.key and subject leaves the captured cert
+    // verifying every leaf signed under it. A CA lacking the extensions below is
+    // re-certified, never rotated. The leaf is always re-minted (SANs may have
+    // changed). `CACHE_FIX_CA_FORCE_ROTATE=1` opts into a rotation (a new key,
+    // e.g. suspected compromise) at the cost of that break.
     const haveCA = existsSync(caPem) && existsSync(caKey) &&
                    process.env.CACHE_FIX_CA_FORCE_ROTATE !== "1";
-    const caPemSrc = haveCA ? caPem : tmp("ca.pem");
+    const caOk = haveCA && !needsRecert();
+    const caPemSrc = caOk ? caPem : tmp("ca.pem");
     const caKeySrc = haveCA ? caKey : tmp("ca.key");
-    if (!haveCA) {
+    if (!caOk) {
       // keyUsage is not decoration. RFC 5280 4.2.1.3 says a CA certificate
       // SHOULD carry keyUsage with keyCertSign, and verifiers have started
       // enforcing that SHOULD: without it they refuse the chain with "CA cert
@@ -234,17 +273,27 @@ export function ensureCA() {
       // the leaf below passes them, and a silently-ignored extension is how this
       // shipped unnoticed in the first place. The test asserts the extension is
       // ON the minted certificate, not that the flag was passed.
-      run(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", tmp("ca.key"), "-out", tmp("ca.pem"),
-           "-days", "3650", "-subj", "/CN=cache-fix forward-proxy CA",
+      //
+      // Likewise subjectKeyIdentifier: a LibreSSL 3.3.6 mint has none, and the
+      // leaf then lacks SKI and AKI (strict errors 86 and 85).
+      run(["req", "-x509",
+           ...(haveCA ? ["-new", "-key", caKey] : ["-newkey", "rsa:2048", "-nodes", "-keyout", tmp("ca.key")]),
+           "-out", tmp("ca.pem"), "-days", "3650", "-subj", `/CN=${CA_CN}`,
            "-addext", "basicConstraints=critical,CA:TRUE",
-           "-addext", "keyUsage=critical,keyCertSign,cRLSign"]);
+           "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+           "-addext", "subjectKeyIdentifier=hash"]);
     }
     run(["genrsa", "-out", tmp("leaf.key"), "2048"]);
     const csr = tmp("leaf.csr");
     run(["req", "-new", "-key", tmp("leaf.key"), "-out", csr, "-subj", `/CN=${host}`]);
     const ext = tmp("leaf.ext");
     const sanLine = hosts.map((h) => `DNS:${h}`).join(",");
-    writeFileSync(ext, `subjectAltName=${sanLine}\nextendedKeyUsage=serverAuth\n`);
+    // keyid,issuer: for a CA with no SKI (an operator's, left alone) OpenSSL 3.0
+    // fails plain `keyid` and `keyid:always` ("unable to get issuer keyid") unless
+    // `issuer` is named. With an SKI the AKI stays keyid alone, so leaves survive
+    // a same-key re-certification of our own CA.
+    writeFileSync(ext, `subjectAltName=${sanLine}\nextendedKeyUsage=serverAuth\n` +
+                       "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n");
     // -set_serial (random positive 128-bit) instead of -CAcreateserial: the
     // latter derives the serial filename from the -CA path, and macOS LibreSSL
     // truncates an absolute path at the first '.' (…/j.lee8/…/ca.pem → /Users/j
@@ -254,16 +303,19 @@ export function ensureCA() {
     const serial = "0x00" + randomBytes(16).toString("hex");
     run(["x509", "-req", "-in", csr, "-CA", caPemSrc, "-CAkey", caKeySrc, "-set_serial", serial,
          "-out", tmp("leaf.pem"), "-days", "3650", "-extfile", ext]);
-    // Atomic publish. The existence guard keys on ca.pem+leaf.pem+leaf.key, so
-    // publish those last. When reusing the CA, ca.pem/ca.key already exist and
-    // MUST NOT be touched (that is the whole point of the reuse) — only the leaf
-    // is renamed into place.
-    if (!haveCA) {
-      renameSync(tmp("ca.key"), caKey);
-      renameSync(tmp("ca.pem"), caPem);
-    }
+    // Atomic publish. ca.pem goes LAST: a RE-CERTIFICATION flips ready() on that
+    // rename, so a peer never sees a re-issued CA beside the old leaf. A rotation
+    // (CACHE_FIX_CA_FORCE_ROTATE=1) keeps a window where a peer reads the old
+    // ca.pem beside the new leaf: ready() checks no chain, and a rotation breaks
+    // running sessions by design. A reused ca.key MUST NOT be touched, nor a
+    // ca.pem that is already fine.
+    if (!haveCA) renameSync(tmp("ca.key"), caKey);
     renameSync(tmp("leaf.key"), leafKey);
     renameSync(tmp("leaf.pem"), leafPem);
+    if (!caOk) renameSync(tmp("ca.pem"), caPem);
+  } catch (err) {
+    if (!pairReady()) throw err;
+    return serveAsIs(String(err.message).split("\n")[0]);
   } finally {
     for (const n of ["ca.key", "ca.pem", "leaf.key", "leaf.pem", "leaf.csr", "leaf.ext"]) {
       try { rmSync(tmp(n), { force: true }); } catch {}
