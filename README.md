@@ -348,6 +348,8 @@ Detects your platform and writes the appropriate config:
 - **Linux** → `~/.config/systemd/user/cache-fix-proxy.service` (systemd user unit)
 - **macOS** → `~/Library/LaunchAgents/com.cnighswonger.cache-fix-proxy.plist` (launchd agent)
 
+The service needs `lsof` on `PATH`: `run-service` finds the process holding its port with it.
+
 The output prints the next-step commands to enable and start the service. On Linux:
 
 ```bash
@@ -357,7 +359,7 @@ systemctl --user enable --now cache-fix-proxy-healthcheck.timer   # auto-recover
 sudo loginctl enable-linger $USER   # optional: start on boot, not just on login
 ```
 
-**Auto-recovery (Linux):** `install-service` also drops a healthcheck companion (`cache-fix-proxy-healthcheck.service` + `.timer`). The timer fires every 2 minutes; the oneshot service runs `curl -fs http://127.0.0.1:<port>/health` and `systemctl --user start cache-fix-proxy.service` if the probe fails. This recovers the proxy from any stop — clean or unclean, expected or unexpected — within 2 minutes. Background: `Restart=on-failure` doesn't fire on clean stops, so before this companion existed, a `systemctl stop` from any source (including unidentified ones during an Anthropic outage on 2026-04-25) would leave the proxy down indefinitely. macOS doesn't need the companion — launchd's `KeepAlive` already auto-restarts on any exit.
+**Auto-recovery (Linux):** `install-service` also drops a healthcheck companion (`cache-fix-proxy-healthcheck.service` + `.timer`). The timer fires every 2 minutes; the oneshot service runs `curl -fs http://127.0.0.1:<port>/health` and `systemctl --user start cache-fix-proxy.service` if the probe fails. This recovers the proxy from any stop — clean or unclean, expected or unexpected — within 2 minutes. Background: `Restart=on-failure` doesn't fire on clean stops, so before this companion existed, a `systemctl stop` from any source (including unidentified ones during an Anthropic outage on 2026-04-25) would leave the proxy down indefinitely. macOS doesn't need the companion — launchd's `KeepAlive` restarts the agent after a failed exit (a handover exits 0 and is not restarted).
 
 On macOS:
 
@@ -367,9 +369,9 @@ launchctl enable gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 ```
 
-The installed config picks up `CACHE_FIX_PROXY_PORT`, `CACHE_FIX_PROXY_UPSTREAM`, and `CACHE_FIX_DEBUG` from the env at install time. Re-run `install-service --force` to regenerate after env changes, or edit the service file directly. Pair with `cache-fix-proxy uninstall-service` to remove cleanly (stops, disables, deletes).
+The installed config picks up `CACHE_FIX_PROXY_PORT`, `CACHE_FIX_PROXY_UPSTREAM`, `CACHE_FIX_DEBUG`, the upstream hop (`CACHE_FIX_UPSTREAM_PROXY`, defaulting to the install-time `HTTPS_PROXY`), `NO_PROXY`, `CACHE_FIX_FALLBACK_PROXIES` and `CACHE_FIX_WATCH_DEPLOY_MS` (default `5000`; swaps the proxy child when `proxy/` changes on disk) from the env at install time. To change one, run `cache-fix-proxy uninstall-service`, then `install-service` with the new env and the steps above (a changed unit never reaches the serving proxy, and the uninstall ends it, so this cuts once). `uninstall-service` alone removes the service cleanly (stops, disables, deletes).
 
-The service runs `cache-fix-proxy server` in the foreground, which is just the proxy without the wrapper-mode claude launcher.
+The service runs `cache-fix-proxy run-service`, the port holder: it supervises the proxy and keeps the address across a crash or a reload.
 
 **Manual (any platform):**
 
@@ -538,54 +540,55 @@ v4.0.0 flips `CACHE_FIX_THINKING_SANITIZE` from default-off to default-on. The v
 
 The flip is backed by 7 days of prod dogfood (37 sessions, zero `cannot be modified` 400s, cache hit-rate aggregate 94.66% vs 92.44% baseline). See [PR #201](https://github.com/cnighswonger/claude-code-cache-fix/pull/201) for the validation data and [#63147](https://github.com/anthropics/claude-code/issues/63147) for upstream context.
 
-Picking up a new extension or a code change to an existing one in v4.0.0 requires a supervisor-level proxy restart. There are two upgrade flows depending on whether you also want to opt back into hot-reload.
+Picking up a new extension or a code change to an existing one in v4.0.0 requires handing the running proxy over to the new code (Flow 1; no restart needed) or, to change the service's settings, an uninstall and reinstall (Flow 2; it cuts once). There are two upgrade flows depending on whether you also want to opt back into hot-reload.
 
 ### Flow 1 — code-only npm upgrade (recommended default)
 
-Your existing systemd unit / launchd plist is unchanged; only the proxy code on disk is updated by npm. Restart the running process to pick up the new code.
+Your existing systemd unit / launchd plist is unchanged; only the proxy code on disk is updated by npm. Hand the running process over to the new code; a handover keeps the port accepting throughout, while a restart refuses connections for a moment.
 
 **Linux (systemd user unit):**
 
 ```
 npm install -g claude-code-cache-fix@4
-systemctl --user restart cache-fix-proxy
+systemctl --user reload cache-fix-proxy || systemctl --user start cache-fix-proxy
 ```
 
-No `daemon-reload` required — the unit file content is unchanged.
+No `daemon-reload` required — the unit file content is unchanged. After the first reload the serving process is a successor the unit no longer tracks, so `reload` alone works once; `start` then hands over to it (and does nothing when the `proxy/` and `bin/` trees are the same).
 
 **macOS (launchd user agent):**
 
 ```
 npm install -g claude-code-cache-fix@4
-launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
+launchctl kill SIGUSR2 gui/$(id -u)/com.cnighswonger.cache-fix-proxy || launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 ```
 
-`kickstart` re-execs the agent under the existing plist.
+The signal hands the agent over while its original process lives; afterwards `kickstart` (without `-k`, which restarts) does it.
+
+A unit or plist installed by an earlier version runs the bare proxy and has no reload. Migrate it once with `cache-fix-proxy install-service --force`, `systemctl --user daemon-reload`, `systemctl --user restart cache-fix-proxy` (launchd: `bootout` + `bootstrap`); that one restart is the last time the port refuses connections.
 
 ### Flow 2 — opt back into hot-reload at the supervisor layer
 
-Run if you actively use hot-reload (e.g., you drop custom extensions into the extensions dir on a live proxy and want them picked up without restart). This rewrites the unit / plist so `CACHE_FIX_HOT_RELOAD=on` is set every time the supervisor starts the proxy.
+Run if you actively use hot-reload (e.g., you drop custom extensions into the extensions dir on a live proxy and want them picked up without restart). This rewrites the unit / plist so `CACHE_FIX_HOT_RELOAD=on` is set every time the supervisor starts the proxy. A changed unit never reaches the serving proxy (`reload` and `start` hand over only when the `proxy/` or `bin/` tree changed), so the service is uninstalled first: `uninstall-service` ends the running proxy, and this one cuts once.
 
 **Linux (systemd user unit):**
 
 ```
+cache-fix-proxy uninstall-service
 CACHE_FIX_HOT_RELOAD=on cache-fix-proxy install-service
 systemctl --user daemon-reload
-systemctl --user restart cache-fix-proxy
+systemctl --user enable --now cache-fix-proxy
+systemctl --user enable --now cache-fix-proxy-healthcheck.timer
 ```
-
-`daemon-reload` is required because the unit file content changed.
 
 **macOS (launchd user agent):**
 
 ```
+cache-fix-proxy uninstall-service
 CACHE_FIX_HOT_RELOAD=on cache-fix-proxy install-service
-launchctl bootout gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cnighswonger.cache-fix-proxy.plist
+launchctl enable gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 ```
-
-`bootout` + `bootstrap` is required because the plist contents changed — `kickstart` alone does not pick up plist changes.
 
 **Note on the hot-reload tradeoff:** even on the opt-in path, the ESM stale-import race remains possible on long-running processes. If you hit a degraded `/health` (returns 503 + `{status:"degraded",...}`), a process restart is the only recovery; the proxy logs a `[CRITICAL]` hint when this happens. See [#197](https://github.com/cnighswonger/claude-code-cache-fix/pull/197) for the observability layer.
 

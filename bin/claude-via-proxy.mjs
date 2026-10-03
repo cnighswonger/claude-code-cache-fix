@@ -672,13 +672,18 @@ function otherHolderOn(port) {
   for (const p of pids) {
     let line = "";
     try {
-      line = probe("ps", ["-p", String(p), "-o", "etimes=,command="]).trim();
+      // etime, not etimes: BSD ps (macOS) has no etimes, so this probe failed
+      // there and every candidate was skipped. etime is on both.
+      line = probe("ps", ["-p", String(p), "-o", "etime=,command="]).trim();
     } catch { continue; }
     if (!/\brun-service\b/.test(line)) continue;
-    // etimes is SECONDS ALIVE, so larger means older. Ours is whatever this
-    // process has been up; a tie goes to the incumbent, which is the safe way
-    // round — the surplus one leaving is free, two holders is not.
-    const theirs = Number(line.split(/\s+/)[0]);
+    // SECONDS ALIVE, so larger means older. Ours is whatever this process has
+    // been up; a tie goes to the incumbent, which is the safe way round — the
+    // surplus one leaving is free, two holders is not. The field is
+    // `[[dd-]hh:]mm:ss` or a bare second count. Inline: the test that lifts
+    // this function by source injects no name for a helper.
+    const theirs = line.split(/\s+/)[0].split(/[-:]/).reverse()
+      .reduce((s, n, i) => s + Number(n) * [1, 60, 3600, 86400][i], 0);
     if (!Number.isFinite(theirs) || theirs < Math.floor(process.uptime())) continue;
     // AGE IS NOT ENOUGH. Every incumbent outlives a process that just started,
     // so age alone fired on every deploy: the NEW code called itself surplus and
@@ -757,6 +762,13 @@ function fingerprintPath(port) {
   return join(tmpdir(), `cache-fix-proxy-${port}.sha256`);
 }
 
+// THE RECORD IS proxy/'s HASH AND THIS HOLDER'S OWN bin/ HASH. The watcher
+// republishes proxy/'s on every swap, so proxy/ alone read "same" to a start on a
+// newer bin/: it exited as surplus and the holder's code never reached the
+// lineage. Now that start finds "not same", the bind fails EADDRINUSE and
+// takeOver() SIGUSR2s the incumbent, as a reload does. Not folded into
+// codeFingerprint(): the watcher's "unreadable" warning reads it.
+//
 // Temp + rename: a reader that opens this mid-write would compare against a
 // truncated hash and retire a healthy proxy.
 function publishFingerprint(port) {
@@ -764,7 +776,7 @@ function publishFingerprint(port) {
   if (!fp) return;
   const path = fingerprintPath(port);
   try {
-    writeFileSync(`${path}.${process.pid}`, fp);
+    writeFileSync(`${path}.${process.pid}`, `${fp} ${HOLDER_TREE}`);
     renameSync(`${path}.${process.pid}`, path);
   } catch { /* best effort: an unwritable tmpdir must not stop a proxy starting */ }
 }
@@ -778,8 +790,8 @@ function runningOurCode(port) {
   try { theirs = readFileSync(fingerprintPath(port), "utf8").trim(); } catch { return null; }
   if (!theirs) return null;                       // no record: cannot tell
   const ours = codeFingerprint(PROXY_DIR);
-  if (!ours) return null;                         // cannot read our own: same
-  return theirs === ours;
+  if (!ours || !HOLDER_TREE) return null;         // cannot read our own: same
+  return theirs === `${ours} ${HOLDER_TREE}`;
 }
 
 function holdPort(rest) {
@@ -1956,7 +1968,7 @@ async function dispatch() {
         "Subcommands:\n" +
         "  (no subcommand)        Spawn the proxy + launch claude with ANTHROPIC_BASE_URL set.\n" +
         "                         Pass any claude args after optional --proxy-port / --proxy-upstream.\n" +
-        "  server                 Run just the proxy in the foreground (for systemd/launchd ExecStart).\n" +
+        "  server                 Run just the proxy in the foreground.\n" +
         "  run-service            What install-service's unit does, without a service manager:\n" +
         "                         holds the port, restarts the proxy under it, and exits 0\n" +
         "                         when one is already serving. For hosts with no systemd or\n" +

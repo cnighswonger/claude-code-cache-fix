@@ -238,6 +238,8 @@ cache-fix-proxy install-service
 - **Linux** → `~/.config/systemd/user/cache-fix-proxy.service` (systemd 사용자 유닛)
 - **macOS** → `~/Library/LaunchAgents/com.cnighswonger.cache-fix-proxy.plist` (launchd 에이전트)
 
+서비스에는 `PATH`에 `lsof`가 필요합니다: `run-service`가 이것으로 자신의 포트를 점유한 프로세스를 찾습니다.
+
 출력은 서비스를 활성화하고 시작하는 다음 단계 명령어를 출력합니다. Linux에서:
 
 ```bash
@@ -247,7 +249,7 @@ systemctl --user enable --now cache-fix-proxy-healthcheck.timer   # 자동 복�
 sudo loginctl enable-linger $USER   # 선택: 로그인 시가 아닌 부팅 시 시작
 ```
 
-**자동 복구 (Linux):** `install-service`는 건강 검사 동반자(`cache-fix-proxy-healthcheck.service` + `.timer`)를 추가합니다. 타이머는 2분마다 작동하며, 단일 실행 서비스는 `curl -fs http://127.0.0.1:<port>/health`를 실행하고 프로브가 실패하면 `systemctl --user start cache-fix-proxy.service`를 실행합니다. 이는 2분 내에 모든 중단(정상 또는 비정상, 예상 또는 예상치 못한)에서 프록시를 복구합니다. 배경: `Restart=on-failure`는 정상 종료 시 작동하지 않으므로 이 동반자가 없었을 때 어떤 출처의 `systemctl stop` (2026-04-25 Anthropic 다운 중에도 불명확한 출처)은 프록시를 무기한 다운시켰습니다. macOS는 동반자가 필요하지 않습니다 — launchd의 `KeepAlive`가 모든 종료 시 자동 재시작합니다.
+**자동 복구 (Linux):** `install-service`는 건강 검사 동반자(`cache-fix-proxy-healthcheck.service` + `.timer`)를 추가합니다. 타이머는 2분마다 작동하며, 단일 실행 서비스는 `curl -fs http://127.0.0.1:<port>/health`를 실행하고 프로브가 실패하면 `systemctl --user start cache-fix-proxy.service`를 실행합니다. 이는 2분 내에 모든 중단(정상 또는 비정상, 예상 또는 예상치 못한)에서 프록시를 복구합니다. 배경: `Restart=on-failure`는 정상 종료 시 작동하지 않으므로 이 동반자가 없었을 때 어떤 출처의 `systemctl stop` (2026-04-25 Anthropic 다운 중에도 불명확한 출처)은 프록시를 무기한 다운시켰습니다. macOS는 동반자가 필요하지 않습니다 — launchd의 `KeepAlive`가 실패한 종료 후 에이전트를 재시작합니다(인계는 0으로 종료하므로 재시작하지 않습니다).
 
 macOS에서:
 
@@ -257,9 +259,9 @@ launchctl enable gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 ```
 
-설치된 구성은 설치 시 환경 변수에서 `CACHE_FIX_PROXY_PORT`, `CACHE_FIX_PROXY_UPSTREAM`, `CACHE_FIX_DEBUG`를 읽습니다. 환경 변수 변경 후 `install-service --force`를 재실행하여 재생성하거나 직접 서비스 파일을 편집합니다. `cache-fix-proxy uninstall-service`와 함께 사용하여 깨끗하게 제거(중지, 비활성화, 삭제)할 수 있습니다.
+설치된 구성은 설치 시 환경 변수에서 `CACHE_FIX_PROXY_PORT`, `CACHE_FIX_PROXY_UPSTREAM`, `CACHE_FIX_DEBUG`, 업스트림 홉(`CACHE_FIX_UPSTREAM_PROXY`, 기본값은 설치 시점의 `HTTPS_PROXY`), `NO_PROXY`, `CACHE_FIX_FALLBACK_PROXIES`, `CACHE_FIX_WATCH_DEPLOY_MS`(기본값 `5000`, 디스크에서 `proxy/`가 바뀌면 프록시 자식 프로세스를 교체)를 읽습니다. 변경하려면 `cache-fix-proxy uninstall-service`를 실행한 뒤 새 환경 변수와 위 단계로 `install-service`를 다시 실행합니다(변경된 유닛은 서비스 중인 프록시에 도달하지 않으며, 제거가 그 프록시를 종료하므로 한 번 끊깁니다). `uninstall-service`만 실행하면 깨끗하게 제거(중지, 비활성화, 삭제)됩니다.
 
-서비스는 `cache-fix-proxy server`를 포그라운드에서 실행하며, 이는 래퍼 모드의 claude 래퍼가 아닌 프록시 자체입니다.
+서비스는 `cache-fix-proxy run-service`를 실행합니다. 이는 포트 홀더로, 프록시를 감독하며 크래시나 reload가 있어도 주소를 유지합니다.
 
 **수동 (모든 플랫폼):**
 
@@ -427,54 +429,55 @@ v4.0.0은 `CACHE_FIX_THINKING_SANITIZE`를 기본적으로 꺼진 상태에서 �
 
 이 변경은 7일간의 프로덕션 강아지 테스트(37개 세션, 0개 `cannot be modified` 400, 캐시 히트율 평균 94.66% vs 92.44% 베이스라인)를 기반으로 합니다. [PR #201](https://github.com/cnighswonger/claude-code-cache-fix/pull/201)에서 유효성 데이터와 [#63147](https://github.com/anthropics/claude-code/issues/63147)의 상류 컨텍스트를 참조하세요.
 
-v4.0.0에서 새 확장을 추가하거나 기존 확장에 코드 변경을 적용하려면 관리자 수준의 프록시 재시작이 필요합니다. 핫리로드를 다시 활성화하려는 경우에 따라 두 가지 업그레이드 흐름이 있습니다.
+v4.0.0에서 새 확장을 추가하거나 기존 확장에 코드 변경을 적용하려면 실행 중인 프록시를 새 코드로 인계하거나(흐름 1, 재시작 불필요) 서비스 설정을 바꾸기 위한 제거 후 재설치(흐름 2, 한 번 끊김)가 필요합니다. 핫리로드를 다시 활성화하려는 경우에 따라 두 가지 업그레이드 흐름이 있습니다.
 
 ### 흐름 1 — 코드 전용 npm 업그레이드 (권장 기본값)
 
-기존 systemd 유닛 / launchd plist는 변경되지 않으며, 디스크의 프록시 코드만 npm으로 업데이트됩니다. 새 코드를 가져오려면 실행 중인 프로세스를 재시작하세요.
+기존 systemd 유닛 / launchd plist는 변경되지 않으며, 디스크의 프록시 코드만 npm으로 업데이트됩니다. 새 코드를 가져오려면 실행 중인 프로세스를 새 코드로 인계하세요. 인계하는 동안 포트는 계속 연결을 받지만, 재시작하면 잠시 연결을 거부합니다.
 
 **Linux (systemd 사용자 유닛):**
 
 ```
 npm install -g claude-code-cache-fix@4
-systemctl --user restart cache-fix-proxy
+systemctl --user reload cache-fix-proxy || systemctl --user start cache-fix-proxy
 ```
 
-`daemon-reload`는 필요하지 않으며, 유닛 파일 내용은 변경되지 않았습니다.
+`daemon-reload`는 필요하지 않으며, 유닛 파일 내용은 변경되지 않았습니다. 첫 번째 reload 이후에는 서비스 중인 프로세스가 유닛이 더 이상 추적하지 않는 후속 프로세스이므로 `reload`만으로는 한 번만 동작하며, 이후에는 `start`가 그 프로세스에 인계합니다(`proxy/`와 `bin/` 트리가 모두 같으면 아무 일도 하지 않습니다).
 
 **macOS (launchd 사용자 에이전트):**
 
 ```
 npm install -g claude-code-cache-fix@4
-launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
+launchctl kill SIGUSR2 gui/$(id -u)/com.cnighswonger.cache-fix-proxy || launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 ```
 
-`kickstart`는 기존 plist 하위에서 에이전트를 다시 실행합니다.
+신호는 원래 프로세스가 살아 있는 동안 에이전트를 인계하며, 그 이후에는 `kickstart`(재시작인 `-k` 없이)가 인계합니다.
+
+이전 버전이 설치한 유닛 또는 plist는 홀더 없이 프록시를 직접 실행하며 reload가 없습니다. `cache-fix-proxy install-service --force`, `systemctl --user daemon-reload`, `systemctl --user restart cache-fix-proxy`(launchd: `bootout` + `bootstrap`)로 한 번 마이그레이션하세요. 이 재시작 한 번이 포트가 연결을 거부하는 마지막 순간입니다.
 
 ### 흐름 2 — 관리자 레벨에서 핫리로드 재활성화
 
-핫리로드를 활성화하는 경우(예: 사용 중인 프록시에 사용자 확장을 확장 디렉토리에 배치하고 재시작 없이 선택하려는 경우), 다음 작업을 실행하세요. 이 작업은 유닛 / plist를 재작성하여 관리자가 프록시를 시작할 때마다 `CACHE_FIX_HOT_RELOAD=on`이 설정되도록 합니다.
+핫리로드를 활성화하는 경우(예: 사용 중인 프록시에 사용자 확장을 확장 디렉토리에 배치하고 재시작 없이 선택하려는 경우), 다음 작업을 실행하세요. 이 작업은 유닛 / plist를 재작성하여 관리자가 프록시를 시작할 때마다 `CACHE_FIX_HOT_RELOAD=on`이 설정되도록 합니다. 변경된 유닛은 서비스 중인 프록시에 전달되지 않으므로(`reload`와 `start`는 `proxy/` 또는 `bin/` 트리가 바뀐 경우에만 인계합니다) 서비스를 먼저 제거합니다. `uninstall-service`가 실행 중인 프록시를 종료하므로 한 번 끊깁니다.
 
 **Linux (systemd 사용자 유닛):**
 
 ```
+cache-fix-proxy uninstall-service
 CACHE_FIX_HOT_RELOAD=on cache-fix-proxy install-service
 systemctl --user daemon-reload
-systemctl --user restart cache-fix-proxy
+systemctl --user enable --now cache-fix-proxy
+systemctl --user enable --now cache-fix-proxy-healthcheck.timer
 ```
-
-유닛 파일 내용이 변경되었으므로 `daemon-reload`가 필요합니다.
 
 **macOS (launchd 사용자 에이전트):**
 
 ```
+cache-fix-proxy uninstall-service
 CACHE_FIX_HOT_RELOAD=on cache-fix-proxy install-service
-launchctl bootout gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cnighswonger.cache-fix-proxy.plist
+launchctl enable gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 ```
-
-plist 내용이 변경되었으므로 `bootout` + `bootstrap`이 필요합니다 — `kickstart`만으로는 plist 변경사항을 인식하지 못합니다.
 
 **핫리로드 트레이드오프에 대한 참고:** 선택 경로에서도 장시간 실행 프로세스에서는 ESM 스테일 임포트 경쟁이 발생할 수 있습니다. `/health`가 저하된 경우(503 + `{status:"degraded",...}` 반환) 유일한 복구 방법은 프로세스 재시작이며, 프록시는 이때 `[CRITICAL]` 힌트를 기록합니다. 관측성 계층은 [#197](https://github.com/cnighswonger/claude-code-cache-fix/pull/197)에서 확인하세요.
 

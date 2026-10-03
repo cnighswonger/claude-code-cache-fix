@@ -5,10 +5,17 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart={{NODE}} {{SERVER_PATH}}
+ExecStart={{NODE}} {{LAUNCHER_PATH}} run-service
+# Reload = SIGUSR2: a new run-service adopts the port with no gap. A stop must
+# end only the holder (KillMode=process), leaving a standby carrying the port.
+ExecReload=/bin/kill -USR2 $MAINPID
+KillMode=process
+KillSignal=SIGTERM
+# Not "always": a handover or an already-held start exits 0.
 Restart=on-failure
-RestartSec=5
+RestartSec=0
 Environment=CACHE_FIX_PROXY_PORT={{PORT}}
+{{PROXY_ENV_LINES}}
 {{UPSTREAM_LINE}}
 {{CA_FILE_LINE}}
 {{REJECT_UNAUTHORIZED_LINE}}

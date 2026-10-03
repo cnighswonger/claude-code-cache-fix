@@ -5,7 +5,7 @@ import net from "node:net";
 import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { writeFile, rm } from "node:fs/promises";
-import { readdirSync, readFileSync, existsSync, mkdirSync, mkdtempSync, writeFileSync, rmSync, utimesSync } from "node:fs";
+import { readdirSync, readFileSync, existsSync, mkdirSync, mkdtempSync, writeFileSync, renameSync, rmSync, utimesSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir, availableParallelism } from "node:os";
 import { join, dirname } from "node:path";
@@ -45,6 +45,13 @@ const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", 
 // them, so the body is tested before the code.
 const OUTAGE = { REFUSED: "refused", RESET: "reset", DEGRADED: "degraded" };
 function classify(body) {
+  // A NUMBER IS NOT AN OUTAGE, AND MUST NOT BE A TypeError EITHER. Six of this
+  // file's seven probes resolve `ERR:${e.code}`; the seventh resolves a bare
+  // statusCode on success, and its caller filters out 200 and hands the rest
+  // here. Measured on CI Node 22: one 502 reached this line and the case died
+  // as `body.startsWith is not a function` — a crash where the answer is
+  // simply "that was a reply, not an outage".
+  if (typeof body !== "string") return null;
   if (!body.startsWith("ERR:")) return null;
   if (/"carrying"\s*:\s*"gap-relay"/.test(body)) return null;
   if (/"status"\s*:\s*"degraded"/.test(body)) return OUTAGE.DEGRADED;
@@ -123,7 +130,32 @@ async function freePort() {
 // one and suite-collection.test.mjs records that hypothesis REJECTED.
 const CONCURRENCY = Math.max(1, Math.floor(availableParallelism() / 2));
 
+// What an incumbent's publishFingerprint writes, LIFTED from the launcher rather
+// than hand-written: the record's format belongs to the code, and a row that
+// writes it itself keeps passing against a format the code no longer produces.
+// holderTree is the incumbent's own bin/ identity (HOLDER_TREE at its load).
+const publishRecord = (fpFns, { srcDir, record, dir }, holderTree = "t") =>
+  // eslint-disable-next-line no-new-func
+  Function("sourceFingerprintSync", "PROXY_DIR", "HOLDER_TREE", "writeFileSync", "renameSync",
+           "join", "tmpdir", "process", `${fpFns}\nreturn publishFingerprint(9901);`)(
+    sourceFingerprintSync, srcDir, holderTree, writeFileSync, renameSync, () => record, () => dir,
+    { pid: process.pid });
+
 describe("held port (CACHE_FIX_HOLD_PORT)", { concurrency: CONCURRENCY }, () => {
+
+  // THE SEVENTH PROBE RESOLVES A NUMBER. Six of this file's probes resolve
+  // `ERR:${e.code}`; the one at the forced-kill case resolves a bare statusCode
+  // on success, and its caller filters out 200 and hands the rest to classify().
+  // A 502 therefore reaches it as a Number. Pinned as a unit case because the
+  // path only opens when a non-200 is actually observed — CI Node 22 saw one and
+  // the case died as `body.startsWith is not a function`, three runners apart
+  // from where it was introduced.
+  it("classify survives a probe that answers with a status code", () => {
+    assert.equal(classify(502), null, "a status code is a reply, not an outage");
+    assert.equal(classify(200), null);
+    assert.equal(classify("ERR:ECONNREFUSED"), OUTAGE.REFUSED);
+    assert.equal(classify("ECONNRESET"), null, "no ERR: prefix means it is not ours to classify");
+  });
 // The default is declared in proxy/config.mjs and repeated in the launcher.
 // If they drift, an unset CACHE_FIX_PROXY_PORT binds one port while callers
 // dial the other.
@@ -1486,7 +1518,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       writeFileSync(ours, "// build A\n");
       writeFileSync(sibling, "// helper A\n");
       const record = join(dir, `cache-fix-proxy-${9901}.sha256`);
-      const sha = () => sourceFingerprintSync(srcDir);
+      const publish = (holderTree) => publishRecord(fpFns, { srcDir, record, dir }, holderTree);
 
       // The incumbent published what IT booted with; we hash what WE would run.
       //
@@ -1506,7 +1538,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       // so the message is the only thing that separates them for an operator,
       // and a fixture that discards it passes against silence.
       const said = [];
-      const decide = (lsofOut = "4241\n4242\n") => {
+      const decide = (lsofOut = "4241\n4242\n", holderTree = "t") => {
         const fake = {
           execFileSync: (cmd, args) => {
             if (cmd === "lsof") return lsofOut;
@@ -1529,15 +1561,15 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         // sourceFingerprintSync IS A FREE VARIABLE OF THE LIFTED SOURCE now, and
         // this harness has been broken four times by exactly that step. The REAL
         // one is injected, not a stub: it is the algorithm under test.
-        return Function("execFileSync", "PROXY_DIR", "readFileSync", "createHash", "join", "tmpdir", "process", "sourceFingerprintSync",
+        return Function("execFileSync", "PROXY_DIR", "readFileSync", "createHash", "join", "tmpdir", "process", "sourceFingerprintSync", "HOLDER_TREE",
           `${bindFn}${probeFn}\n${fpFns}\n${warnFns}\n${verdictFn}\n${rule}\nreturn holderPidOn(9901);`)(
-            fake.execFileSync, srcDir, readFileSync, createHash, () => record, () => dir, proc, sourceFingerprintSync);
+            fake.execFileSync, srcDir, readFileSync, createHash, () => record, () => dir, proc, sourceFingerprintSync, holderTree);
       };
 
       try {
         // Same bytes: nothing to do. A run-service that churned here would
         // restart a healthy proxy on every shell.
-        writeFileSync(record, sha());
+        publish();
         assert.equal(decide(), "holder",
           "a holder already running THIS build must be left alone");
 
@@ -1555,17 +1587,27 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         // build" here, so the incoming launcher declined the takeover and the
         // old code kept serving. Nothing in the log said so, because from the
         // fingerprint's point of view there had been no deploy at all.
-        writeFileSync(record, sha());
+        publish();
         assert.equal(decide(), "holder", "control: nothing changed yet");
         writeFileSync(sibling, "// helper B\n");
         assert.equal(decide(), 4241,
           "a deploy that changed a file OTHER than server.mjs was invisible — " +
           "the takeover was declined and the old build kept serving");
 
+        // A BIN/-ONLY DEPLOY. The record carried proxy/'s hash alone, and the
+        // watcher republishes it the moment proxy/ is swapped, so a start on a new
+        // bin/ read "same" and the holder's own code never reached the lineage.
+        publish("old");
+        assert.equal(decide(undefined, "new"), 4241,
+          "a bin/-only update was read as the same build — the takeover was declined " +
+          "and the holder kept serving its old code");
+        publish("new");
+        assert.equal(decide(undefined, "new"), "holder", "control: same bin/ and proxy/ is left alone");
+
         // mtime moved, bytes identical: must NOT churn. `touch`, a rebuild that
         // reproduces, a restored backup. cswap's pin recycled a healthy daemon
         // on exactly this.
-        writeFileSync(record, sha());
+        publish();
         const t = Date.now() / 1000 + 3600;
         utimesSync(ours, t, t);
         utimesSync(sibling, t, t);
@@ -1603,7 +1645,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         // succeeds — measured, reverting it leaves 65/65 green. Gated anyway,
         // because the cost is one comparison and the wrong answer is a silent
         // no-op deploy. Do not read the rows below as covering it.
-        writeFileSync(record, sha());
+        publish();
         assert.equal(decide("4242\n"), "holder",
           "via the parent lookup, a holder on THIS build was not left alone");
         writeFileSync(ours, "// build C\n");
@@ -1660,7 +1702,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       writeFileSync(ours, "// build A\n");
       writeFileSync(sibling, "// helper A\n");
       const record = join(dir, "cache-fix-proxy-9901.sha256");
-      const sha = () => sourceFingerprintSync(srcDir);
+      const publish = (holderTree) => publishRecord(fpFns, { srcDir, record, dir }, holderTree);
       const lsofArgs = [];
       // What the rule wrote to stderr. Captured rather than ignored: after the
       // end-to-end measurement below, the MESSAGE is the behaviour this row
@@ -1670,7 +1712,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       // PROXY_DIR is a parameter so one row can point it at a tree that is not
       // there — the second way runningOurCode answers "cannot tell", and the one
       // the message used to misattribute.
-      const decideWith = (proxyDir, lsofThrows) => {
+      const decideWith = (proxyDir, lsofThrows, holderTree = "t") => {
         const fake = (cmd, args) => {
           if (cmd === "lsof") {
             lsofArgs.push(args.join(" "));
@@ -1690,9 +1732,9 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         // eslint-disable-next-line no-new-func
         // The REAL sourceFingerprintSync, injected: it is a free variable of the
         // lifted source and it is the algorithm this case exists to exercise.
-        return Function("execFileSync", "PROXY_DIR", "readFileSync", "createHash", "join", "tmpdir", "process", "sourceFingerprintSync",
+        return Function("execFileSync", "PROXY_DIR", "readFileSync", "createHash", "join", "tmpdir", "process", "sourceFingerprintSync", "HOLDER_TREE",
           `${bindFn}${probeFn}\n${warnFns}\n${fpFns}\n${rule}\nreturn otherHolderOn(9901);`)(
-            fake, proxyDir, readFileSync, createHash, () => record, () => dir, proc, sourceFingerprintSync);
+            fake, proxyDir, readFileSync, createHash, () => record, () => dir, proc, sourceFingerprintSync, holderTree);
       };
       const decide = () => decideWith(srcDir);
 
@@ -1700,7 +1742,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       try {
         // Same bytes: a second run-service IS surplus and must go. Without this
         // an idempotent `run-service` would put a second holder on the address.
-        writeFileSync(record, sha());
+        publish();
         assert.equal(decide(), 4242,
           "a second run-service on the SAME build did not recognise itself as surplus");
 
@@ -1716,18 +1758,30 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         // files under proxy/) look identical, so the NEW code called itself
         // surplus and left. Both callers of runningOurCode had it, so a fix at
         // one of them would have left this one still wrong.
-        writeFileSync(record, sha());
+        publish();
         assert.equal(decide(), 4242, "control: nothing changed yet");
         writeFileSync(sibling, "// helper B\n");
         assert.equal(decide(), 0,
           "a deploy that changed a file OTHER than server.mjs made the NEW code " +
           "call itself surplus and leave — the old holder kept serving");
 
+        // A BIN/-ONLY DEPLOY, the same hole from the other caller: proxy/ is
+        // swapped and republished by the watcher, only the holder's own code
+        // differs, and the newcomer called itself surplus and left.
+        publish("old");
+        assert.equal(decideWith(srcDir, undefined, "new"), 0,
+          "a bin/-only update called itself surplus — the old holder kept serving its old code");
+        publish("new");
+        assert.equal(decideWith(srcDir, undefined, "new"), 4242,
+          "control: the same bin/ and proxy/ is still the surplus copy");
+        assert.equal(decideWith(srcDir, undefined, ""), 4242,
+          "an unreadable bin/ hash of our own read as a different build instead of unknown");
+
         // NO RECORD (/tmp swept under a healthy long-lived holder). The answer
         // stays "surplus" because returning 0 was measured to change no outcome
         // — takeOver() reads the same unknown as "holder" and exits 0 anyway —
         // so what this row pins is the LINE, not the value.
-        writeFileSync(record, sha());
+        publish();
         said.length = 0;
         assert.equal(decide(), 4242, "premise: with a matching record this IS the surplus copy");
         assert.deepEqual(said, [],
@@ -1748,7 +1802,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         // about: the record is present and valid, and OUR OWN server.mjs is
         // unreadable. Same null, opposite cause — a message that blames the
         // record sends an operator to /tmp to debug a broken install.
-        writeFileSync(record, sha());
+        publish();
         const gone = join(dir, "not-here.mjs");
         said.length = 0;
         assert.equal(decideWith(gone), 4242, "premise: an unreadable own build still reads as unknown");
@@ -1770,7 +1824,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         // told: on a box with no usable lsof, every launcher reads "no other
         // holder", none is surplus, and the pileup this rule exists to prevent
         // returns — in silence.
-        writeFileSync(record, sha());
+        publish();
 
         said.length = 0;
         assert.equal(decideWith(ours, { status: 1, stdout: "", stderr: "" }), 0,

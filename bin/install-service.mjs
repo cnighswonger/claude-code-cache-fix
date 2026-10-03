@@ -8,21 +8,48 @@
 //
 // Pure helpers exported for tests; orchestration lives in main().
 
-import { readFile, writeFile, mkdir, unlink, stat } from "node:fs/promises";
-import { spawn } from "node:child_process";
+import { readFile, writeFile, mkdir, unlink, stat, chmod } from "node:fs/promises";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
 import { homedir, platform } from "node:os";
+import { setTimeout as sleep } from "node:timers/promises";
 import { systemdEscape, xmlEscape } from "../proxy/helpers.mjs";
+import { upstreamPointsAtSelf } from "../proxy/server.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const TEMPLATE_DIR = resolve(__dirname, "..", "templates");
 const SERVER_PATH = resolve(__dirname, "..", "proxy", "server.mjs");
+// The unit runs `run-service` (holds the port, supervises the proxy), not the bare proxy.
+const LAUNCHER_PATH = resolve(__dirname, "claude-via-proxy.mjs");
 
 function getDefaults() {
+  const port = validatePort(process.env.CACHE_FIX_PROXY_PORT || "9801");
+  // run-service drops HTTPS_PROXY/HTTP_PROXY unless CACHE_FIX_UPSTREAM_PROXY is
+  // set, so the install-time hop is captured under that name (proxy/config.mjs
+  // precedence) or the service dials direct. A fallback that names the
+  // service's own port (a shell wired through this proxy) is no hop: the child
+  // refuses it at start and run-service respawns it for ever. HTTP_PROXY is
+  // not a fallback: config.mjs reads it for plain-http targets only.
+  let upstreamProxy = process.env.CACHE_FIX_UPSTREAM_PROXY || "";
+  if (!upstreamProxy) {
+    const name = ["HTTPS_PROXY", "https_proxy"].find((k) => process.env[k]);
+    upstreamProxy = process.env[name] || "";
+    if (upstreamPointsAtSelf(upstreamProxy, port)) {
+      process.stderr.write(
+        `[install-service] warning: ${name} names this proxy's own port (${port}); not captured as the upstream hop. ` +
+          `Set CACHE_FIX_UPSTREAM_PROXY to the real hop and install again.\n`,
+      );
+      upstreamProxy = "";
+    }
+  }
   return {
-    port: validatePort(process.env.CACHE_FIX_PROXY_PORT || "9801"),
+    port,
     upstream: process.env.CACHE_FIX_PROXY_UPSTREAM || "",
+    upstreamProxy,
+    noProxy: process.env.NO_PROXY || process.env.no_proxy || "",
+    fallbackProxies: process.env.CACHE_FIX_FALLBACK_PROXIES || "",
+    watchDeployMs: process.env.CACHE_FIX_WATCH_DEPLOY_MS || "5000",
     caFile: process.env.CACHE_FIX_PROXY_CA_FILE || "",
     rejectUnauthorized: process.env.CACHE_FIX_PROXY_REJECT_UNAUTHORIZED || "",
     debug: process.env.CACHE_FIX_DEBUG || "",
@@ -93,12 +120,20 @@ function getPaths(plat = platform()) {
       configFile: "com.cnighswonger.cache-fix-proxy.plist",
       label: "com.cnighswonger.cache-fix-proxy",
       logDir: join(homedir(), "Library", "Logs"),
-      // launchd's KeepAlive already auto-restarts the agent on any exit
-      // (clean or unclean), so a separate healthcheck isn't needed on macOS.
+      // launchd's KeepAlive (SuccessfulExit=false) restarts the agent on any unclean
+      // exit (a handover exits 0), so a separate healthcheck isn't needed on macOS.
     };
   }
   return { kind: "unsupported", platform: plat };
 }
+
+// The captured proxy wiring, set values only (an unset one renders no line).
+const proxyEnv = (vars) => [
+  ["CACHE_FIX_UPSTREAM_PROXY", vars.upstreamProxy],
+  ["NO_PROXY", vars.noProxy],
+  ["CACHE_FIX_FALLBACK_PROXIES", vars.fallbackProxies],
+  ["CACHE_FIX_WATCH_DEPLOY_MS", vars.watchDeployMs],
+].filter(([, v]) => v);
 
 function renderSystemdTemplate(template, vars) {
   const upstreamLine = vars.upstream
@@ -124,10 +159,14 @@ function renderSystemdTemplate(template, vars) {
   const requiresLine = vars.requires
     ? `Requires=${vars.requires}\nAfter=${vars.requires}`
     : "";
+  const proxyEnvLines = proxyEnv(vars)
+    .map(([k, v]) => `Environment=${k}=${systemdEscape(v)}`).join("\n");
   return template
     .replaceAll("{{NODE}}", vars.node)
-    .replaceAll("{{SERVER_PATH}}", vars.serverPath)
+    .replaceAll("{{LAUNCHER_PATH}}", vars.launcherPath)
     .replaceAll("{{PORT}}", vars.port)
+    // A function replacement: a proxy URL's credentials may hold `$&`, `$$`.
+    .replaceAll("{{PROXY_ENV_LINES}}", () => proxyEnvLines)
     .replaceAll("{{UPSTREAM_LINE}}", upstreamLine)
     .replaceAll("{{CA_FILE_LINE}}", caFileLine)
     .replaceAll("{{REJECT_UNAUTHORIZED_LINE}}", rejectUnauthorizedLine)
@@ -159,10 +198,13 @@ function renderLaunchdTemplate(template, vars) {
   const forwardProxyPlist = vars.forwardProxy
     ? `        <key>CACHE_FIX_FORWARD_PROXY</key>\n        <string>${vars.forwardProxy}</string>`
     : "";
+  const proxyEnvPlist = proxyEnv(vars)
+    .map(([k, v]) => `        <key>${k}</key>\n        <string>${xmlEscape(v)}</string>`).join("\n");
   return template
     .replaceAll("{{NODE}}", vars.node)
-    .replaceAll("{{SERVER_PATH}}", vars.serverPath)
+    .replaceAll("{{LAUNCHER_PATH}}", vars.launcherPath)
     .replaceAll("{{PORT}}", vars.port)
+    .replaceAll("{{PROXY_ENV_PLIST}}", () => proxyEnvPlist)
     .replaceAll("{{UPSTREAM_PLIST}}", upstreamPlist)
     .replaceAll("{{CA_FILE_PLIST}}", caFilePlist)
     .replaceAll("{{REJECT_UNAUTHORIZED_PLIST}}", rejectUnauthorizedPlist)
@@ -200,6 +242,13 @@ function runCmd(cmd, args, opts = {}) {
   });
 }
 
+// The unit / plist carries the install-time HTTPS_PROXY, credentials included. writeFile's mode
+// applies only when it creates the file, so a file --force overwrites is made 0600 BEFORE the write.
+const writePrivate = async (path, text) => {
+  await chmod(path, 0o600).catch((e) => { if (e.code !== "ENOENT") throw e; });
+  await writeFile(path, text, { mode: 0o600 });
+};
+
 async function installSystemd({ paths, defaults, force = false } = {}) {
   paths = paths || getPaths("linux");
   defaults = defaults || getDefaults();
@@ -218,12 +267,12 @@ async function installSystemd({ paths, defaults, force = false } = {}) {
   );
   const rendered = renderSystemdTemplate(template, {
     node: process.execPath,
-    serverPath: SERVER_PATH,
+    launcherPath: LAUNCHER_PATH,
     requires: "",
     ...defaults,
   });
   await mkdir(paths.configDir, { recursive: true });
-  await writeFile(targetPath, rendered);
+  await writePrivate(targetPath, rendered);
 
   // Healthcheck companion: oneshot service + timer. Auto-recovery from any
   // proxy stop, including clean stops where Restart=on-failure does NOT fire
@@ -314,12 +363,12 @@ async function installLaunchd({ paths, defaults, force = false } = {}) {
   );
   const rendered = renderLaunchdTemplate(template, {
     node: process.execPath,
-    serverPath: SERVER_PATH,
+    launcherPath: LAUNCHER_PATH,
     logDir: paths.logDir,
     ...defaults,
   });
   await mkdir(paths.configDir, { recursive: true });
-  await writeFile(targetPath, rendered);
+  await writePrivate(targetPath, rendered);
   return { ok: true, path: targetPath };
 }
 
@@ -364,14 +413,38 @@ async function uninstallLaunchd({ paths } = {}) {
   return { ok: true, path: targetPath };
 }
 
-async function install({ force = false } = {}) {
-  const paths = getPaths();
+// A changed unit never reaches the serving lineage: start finds a holder on the
+// same proxy/ and bin/ trees and exits as surplus. Only an uninstall ends the lineage.
+const CHANGE_SETTINGS =
+  "To change an installed service's settings, run `cache-fix-proxy uninstall-service`, then install-service " +
+  "with the new settings and the steps above; the uninstall ends the running proxy, so this one cuts.\n";
+
+async function install({ force = false, plat } = {}) {
+  const paths = getPaths(plat);
   if (paths.kind === "unsupported") {
+    let port, upstreamProxy;
+    try {
+      ({ port, upstreamProxy } = getDefaults());
+    } catch (err) {
+      return reportFsError("install-service", err);
+    }
+    // run-service exits 2 without a port, and drops an ambient HTTPS_PROXY unless the hop is named.
+    // The line must run as printed: the hop only when captured, every value single-quoted for POSIX sh.
+    const shq = (s) => `'${s.replaceAll("'", "'\\''")}'`;
+    const hop = upstreamProxy ? ` CACHE_FIX_UPSTREAM_PROXY=${shq(upstreamProxy)}` : "";
     process.stderr.write(
       `[install-service] Unsupported platform: ${paths.platform}\n` +
-        `Manual install: run \`node ${SERVER_PATH}\` under your platform's service manager.\n`,
+        `Manual install: run \`CACHE_FIX_PROXY_PORT=${port}${hop} ${shq(process.execPath)} ${shq(LAUNCHER_PATH)} run-service\` under your platform's service manager.\n`,
     );
     return 1;
+  }
+  // run-service finds the process holding its port with lsof; without it a
+  // takeover exits 0 and `start` silently does nothing.
+  if (spawnSync("lsof", ["-v"], { stdio: "ignore", timeout: 5000 }).error) {
+    process.stderr.write(
+      "[install-service] warning: lsof could not be run (is it on PATH?); run-service needs it to " +
+        "find the process holding its port, so install lsof or a takeover will do nothing.\n",
+    );
   }
   if (paths.kind === "systemd") {
     let r;
@@ -399,7 +472,12 @@ async function install({ force = false } = {}) {
         `  systemctl --user daemon-reload\n` +
         `  systemctl --user enable --now cache-fix-proxy\n` +
         `  systemctl --user enable --now cache-fix-proxy-healthcheck.timer  # auto-recovery if proxy is ever stopped\n` +
-        `  loginctl enable-linger ${process.env.USER || "<your-user>"}      # optional: start on boot vs login\n`,
+        `  loginctl enable-linger ${process.env.USER || "<your-user>"}      # optional: start on boot vs login\n\n` +
+        `After a package update, hand over instead of restarting (a handover keeps the port accepting throughout; a restart refuses connections for a moment):\n` +
+        `  systemctl --user reload cache-fix-proxy || systemctl --user start cache-fix-proxy\n` +
+        `Why both: after the first reload the serving holder is a successor the unit no longer tracks, so reload alone works once; start hands over to it, or does nothing when the proxy/ and bin/ trees are the same.\n` +
+        CHANGE_SETTINGS +
+        `Needs lsof on PATH: run-service uses it to find the process holding the port.\n`,
     );
     return 0;
   }
@@ -420,7 +498,12 @@ async function install({ force = false } = {}) {
         `Next steps:\n` +
         `  launchctl bootstrap gui/$(id -u) ${r.path}\n` +
         `  launchctl enable gui/$(id -u)/com.cnighswonger.cache-fix-proxy\n` +
-        `  launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy\n`,
+        `  launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy\n\n` +
+        `After a package update, hand over instead of restarting (a handover keeps the port accepting throughout; a restart refuses connections for a moment):\n` +
+        `  launchctl kill SIGUSR2 gui/$(id -u)/com.cnighswonger.cache-fix-proxy || launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy\n` +
+        `Why both: after the first handover the serving holder is a successor the job no longer tracks, so the signal works once; kickstart (no -k) hands over to it, or does nothing when the proxy/ and bin/ trees are the same.\n` +
+        CHANGE_SETTINGS +
+        `Needs lsof on PATH: run-service uses it to find the process holding the port.\n`,
     );
     return 0;
   }
@@ -441,8 +524,52 @@ function reportFsError(prefix, err) {
   return 1;
 }
 
-async function uninstall() {
-  const paths = getPaths();
+// Any address: the bind is set by the unit, a drop-in or the manager's environment, and only the
+// command line says whose a listener is. One whose ps cannot be read is skipped.
+const OURS = /\brun-service\b|proxy\/server\.mjs|gap-relay\.mjs/;
+const listeners = (port) => {
+  const r = spawnSync("lsof", ["-nP", "-t", `-iTCP:${port}`, "-sTCP:LISTEN"], { encoding: "utf-8", timeout: 5000 });
+  const ours = (pid) => OURS.test(spawnSync("ps", ["-o", "command=", "-p", pid], { encoding: "utf-8", timeout: 5000 }).stdout || "");
+  return { error: r.error, pids: (r.stdout || "").split("\n").filter(Boolean).filter(ours) };
+};
+
+// SIGHUP every process of ours listening on the installed unit's port. After the first
+// reload the serving lineage is a detached successor the supervisor no longer
+// tracks (launchd: the job has no PID), so only the port finds it. The holder,
+// the proxy child and a standby all hold that socket and all release on SIGHUP;
+// stop's SIGTERM would leave a standby carrying it. The holder keeps the socket
+// while its child drains, and a reinstall started inside that window exits as
+// surplus and leaves nothing serving, so wait (up to drainMs) until none of ours holds the port.
+async function endLineage(paths, drainMs) {
+  const unitText = await readFile(join(paths.configDir, paths.configFile), "utf-8").catch(() => null);
+  if (unitText === null) return; // nothing installed, nothing to signal
+  const port = /CACHE_FIX_PROXY_PORT(?:=|<\/key>\s*<string>)(\d+)/.exec(unitText)?.[1] ?? "9801"; // the proxy's default, not getDefaults(): it throws on a bad env
+  let { error, pids } = listeners(port);
+  if (error) {
+    const lead = `[uninstall-service] warning: lsof could not be run (is it on PATH?), so the proxy on port ${port} could not be found; `;
+    if (paths.kind === "systemd") {
+      process.stderr.write(lead + "the unit's processes are asked to release by SIGHUP instead, and without lsof nothing waits for the port to free.\n");
+      await runCmd("systemctl", ["--user", "kill", "-s", "HUP", "cache-fix-proxy"]);
+    } else {
+      process.stderr.write(lead + "the port may stay held.\n");
+    }
+    return;
+  }
+  for (const pid of pids) {
+    try { process.kill(Number(pid), "SIGHUP"); } catch { /* already gone */ }
+  }
+  for (const deadline = Date.now() + drainMs; pids.length && Date.now() < deadline;) {
+    await sleep(100);
+    const r = listeners(port);
+    if (!r.error) pids = r.pids; // a failed listing (its 5 s timeout) leaves the port counted as held
+  }
+  if (pids.length) {
+    process.stderr.write(`[uninstall-service] warning: port ${port} is still held by pid ${pids.join(", ")} after ${drainMs / 1000} s; continuing.\n`);
+  }
+}
+
+async function uninstall({ plat, drainMs = 10000 } = {}) {
+  const paths = getPaths(plat);
   if (paths.kind === "unsupported") {
     process.stderr.write(`[uninstall-service] Unsupported platform: ${paths.platform}\n`);
     return 1;
@@ -452,6 +579,7 @@ async function uninstall() {
     // doesn't immediately restart the proxy we're about to stop.
     await runCmd("systemctl", ["--user", "stop", "cache-fix-proxy-healthcheck.timer"]);
     await runCmd("systemctl", ["--user", "disable", "cache-fix-proxy-healthcheck.timer"]);
+    await endLineage(paths, drainMs);
     // Then stop + disable the main service.
     await runCmd("systemctl", ["--user", "stop", "cache-fix-proxy"]);
     await runCmd("systemctl", ["--user", "disable", "cache-fix-proxy"]);
@@ -475,6 +603,7 @@ async function uninstall() {
   }
   if (paths.kind === "launchd") {
     const targetPath = join(paths.configDir, paths.configFile);
+    await endLineage(paths, drainMs);
     await runCmd("launchctl", ["bootout", `gui/${process.getuid()}`, targetPath]);
     let r;
     try {

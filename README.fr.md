@@ -218,6 +218,8 @@ Détecte votre plateforme et écrit la configuration appropriée :
 - **Linux** → `~/.config/systemd/user/cache-fix-proxy.service` (unité utilisateur systemd)
 - **macOS** → `~/Library/LaunchAgents/com.cnighswonger.cache-fix-proxy.plist` (agent launchd)
 
+Le service a besoin de `lsof` dans le `PATH` : `run-service` s'en sert pour trouver le processus qui tient son port.
+
 Sur Linux :
 
 ```bash
@@ -227,6 +229,8 @@ systemctl --user enable --now cache-fix-proxy-healthcheck.timer   # auto-recover
 sudo loginctl enable-linger $USER   # optional: start on boot, not just on login
 ```
 
+**Auto-récupération (Linux) :** `install-service` dépose aussi un compagnon de vérification de santé (`cache-fix-proxy-healthcheck.service` + `.timer`). Le timer se déclenche toutes les 2 minutes ; le service oneshot exécute `curl -fs http://127.0.0.1:<port>/health`, puis `systemctl --user start cache-fix-proxy.service` si la sonde échoue. Cela remet le proxy en marche après tout arrêt, propre ou non, attendu ou non, en moins de 2 minutes. Contexte : `Restart=on-failure` ne se déclenche pas sur un arrêt propre ; avant ce compagnon, un `systemctl stop` de n'importe quelle origine (y compris des origines non identifiées pendant une panne d'Anthropic le 2026-04-25) laissait le proxy arrêté indéfiniment. macOS n'a pas besoin du compagnon : le `KeepAlive` de launchd relance l'agent après une sortie en échec (un passage de relais sort avec 0 et n'est pas relancé).
+
 Sur macOS :
 
 ```bash
@@ -234,6 +238,10 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cnighswonger.cache-f
 launchctl enable gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 ```
+
+La configuration installée reprend de l'environnement, au moment de l'installation, `CACHE_FIX_PROXY_PORT`, `CACHE_FIX_PROXY_UPSTREAM`, `CACHE_FIX_DEBUG`, le proxy amont (`CACHE_FIX_UPSTREAM_PROXY`, qui vaut par défaut le `HTTPS_PROXY` de l'installation), `NO_PROXY`, `CACHE_FIX_FALLBACK_PROXIES` et `CACHE_FIX_WATCH_DEPLOY_MS` (défaut `5000` ; remplace le processus enfant du proxy quand `proxy/` change sur disque). Pour en changer un, lancez `cache-fix-proxy uninstall-service`, puis `install-service` avec le nouvel environnement et les étapes ci-dessus (une unité modifiée n'atteint jamais le proxy en service, et la désinstallation le termine : cela coupe une fois). `uninstall-service` seul retire proprement le service (arrête, désactive, supprime).
+
+Le service exécute `cache-fix-proxy run-service`, le détenteur du port : il supervise le proxy et garde l'adresse lors d'un crash ou d'un reload.
 
 **Manuel (toute plateforme) :**
 
@@ -376,38 +384,49 @@ v4.0.0 bascule `CACHE_FIX_THINKING_SANITIZE` de default-off à default-on. La v1
 
 ### Flux 1 — mise à jour npm code seul (recommandé par défaut)
 
-Votre unité systemd existante / plist launchd est inchangée ; seul le code proxy sur disque est mis à jour par npm. Redémarrez le processus en cours pour prendre le nouveau code.
+Votre unité systemd existante / plist launchd est inchangée ; seul le code proxy sur disque est mis à jour par npm. Passez le relais du processus en cours au nouveau code ; un passage de relais garde le port à l'écoute en permanence, alors qu'un redémarrage refuse les connexions un instant.
 
 **Linux (systemd user unit) :**
 
 ```bash
 npm install -g claude-code-cache-fix@4
-systemctl --user restart cache-fix-proxy
+systemctl --user reload cache-fix-proxy || systemctl --user start cache-fix-proxy
 ```
+
+Après le premier reload, le processus qui sert est un successeur que l'unité ne suit plus : `reload` seul ne marche donc qu'une fois, puis `start` lui passe le relais (et ne fait rien si les arbres `proxy/` et `bin/` sont identiques).
 
 **macOS (launchd user agent) :**
 
 ```bash
 npm install -g claude-code-cache-fix@4
-launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
+launchctl kill SIGUSR2 gui/$(id -u)/com.cnighswonger.cache-fix-proxy || launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 ```
 
+Le signal passe le relais tant que le processus d'origine est vivant ; ensuite `kickstart` (sans `-k`, qui redémarre) s'en charge.
+
+Une unité ou un plist installé par une version antérieure exécute le proxy nu et n'a pas de reload. Migrez-le une fois avec `cache-fix-proxy install-service --force`, `systemctl --user daemon-reload`, `systemctl --user restart cache-fix-proxy` (launchd : `bootout` + `bootstrap`) ; ce redémarrage unique est la dernière fois que le port refuse les connexions.
+
 ### Flux 2 — réactivation du hot-reload au niveau superviseur
+
+Une unité modifiée n'atteint jamais le proxy en service (`reload` et `start` ne passent le relais que si l'arbre `proxy/` ou `bin/` a changé) : on désinstalle donc d'abord le service. `uninstall-service` termine le proxy en cours, et cela coupe une fois.
 
 **Linux :**
 
 ```bash
+cache-fix-proxy uninstall-service
 CACHE_FIX_HOT_RELOAD=on cache-fix-proxy install-service
 systemctl --user daemon-reload
-systemctl --user restart cache-fix-proxy
+systemctl --user enable --now cache-fix-proxy
+systemctl --user enable --now cache-fix-proxy-healthcheck.timer
 ```
 
 **macOS :**
 
 ```bash
+cache-fix-proxy uninstall-service
 CACHE_FIX_HOT_RELOAD=on cache-fix-proxy install-service
-launchctl bootout gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cnighswonger.cache-fix-proxy.plist
+launchctl enable gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 ```
 

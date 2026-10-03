@@ -238,6 +238,8 @@ cache-fix-proxy install-service
 - **Linux** → `~/.config/systemd/user/cache-fix-proxy.service`（systemd 用户单元）
 - **macOS** → `~/Library/LaunchAgents/com.cnighswonger.cache-fix-proxy.plist`（launchd 代理）
 
+服务需要 `PATH` 中有 `lsof`：`run-service` 用它查找占用其端口的进程。
+
 输出会打印启用和启动服务的后续命令。在 Linux 上：
 
 ```bash
@@ -247,7 +249,7 @@ systemctl --user enable --now cache-fix-proxy-healthcheck.timer   # 自动恢复
 sudo loginctl enable-linger $USER   # 可选：在开机时启动，而非仅在登录时启动
 ```
 
-**自动恢复（Linux）：** `install-service` 还会放置一个健康检查伴生项（`cache-fix-proxy-healthcheck.service` + `.timer`）。定时器每 2 分钟触发一次；oneshot 服务运行 `curl -fs http://127.0.0.1:<port>/health`，如果探测失败则执行 `systemctl --user start cache-fix-proxy.service`。这可以在 2 分钟内从任何停止中恢复代理——无论是正常还是异常、预期还是意外的停止。背景说明：`Restart=on-failure` 不会在正常停止时触发，所以在有此伴生项之前，任何来源的 `systemctl stop`（包括 2026 年 4 月 25 日 Anthropic 宕机期间的不明来源停止）都会让代理无限期宕机。macOS 不需要伴生项——launchd 的 `KeepAlive` 已经会在任何退出时自动重启。
+**自动恢复（Linux）：** `install-service` 还会放置一个健康检查伴生项（`cache-fix-proxy-healthcheck.service` + `.timer`）。定时器每 2 分钟触发一次；oneshot 服务运行 `curl -fs http://127.0.0.1:<port>/health`，如果探测失败则执行 `systemctl --user start cache-fix-proxy.service`。这可以在 2 分钟内从任何停止中恢复代理——无论是正常还是异常、预期还是意外的停止。背景说明：`Restart=on-failure` 不会在正常停止时触发，所以在有此伴生项之前，任何来源的 `systemctl stop`（包括 2026 年 4 月 25 日 Anthropic 宕机期间的不明来源停止）都会让代理无限期宕机。macOS 不需要伴生项——launchd 的 `KeepAlive` 会在失败退出后重启代理（交接以 0 退出，不会被重启）。
 
 在 macOS 上：
 
@@ -257,9 +259,9 @@ launchctl enable gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 ```
 
-安装的配置会在安装时从环境变量中读取 `CACHE_FIX_PROXY_PORT`、`CACHE_FIX_PROXY_UPSTREAM` 和 `CACHE_FIX_DEBUG`。在环境变量变更后，重新运行 `install-service --force` 以重新生成，或直接编辑服务文件。配合 `cache-fix-proxy uninstall-service` 可干净移除（停止、禁用、删除）。
+安装的配置会在安装时从环境变量中读取 `CACHE_FIX_PROXY_PORT`、`CACHE_FIX_PROXY_UPSTREAM`、`CACHE_FIX_DEBUG`、上游跳点（`CACHE_FIX_UPSTREAM_PROXY`，默认取安装时的 `HTTPS_PROXY`）、`NO_PROXY`、`CACHE_FIX_FALLBACK_PROXIES` 和 `CACHE_FIX_WATCH_DEPLOY_MS`（默认 `5000`；磁盘上的 `proxy/` 变化时会替换代理子进程）。要更改其中之一，先运行 `cache-fix-proxy uninstall-service`，再用新的环境变量和上述步骤运行 `install-service`（更改后的单元不会到达正在服务的代理，而卸载会结束该代理，因此会中断一次）。单独运行 `uninstall-service` 可干净移除（停止、禁用、删除）。
 
-该服务在前台运行 `cache-fix-proxy server`，这仅是代理本身，不含包装模式的 claude 启动器。
+该服务运行 `cache-fix-proxy run-service`，即端口持有者：它监督代理，并在崩溃或 reload 期间保持该地址。
 
 **手动方式（任意平台）：**
 
@@ -427,54 +429,55 @@ v4.0.0 将 `CACHE_FIX_THINKING_SANITIZE` 从默认关闭翻转为默认开启。
 
 翻转由 7 天的生产狗粮测试支持（37 个会话，零 `cannot be modified` 400，缓存命中率平均 94.66% vs 92.44% 基线）。参见 [PR #201](https://github.com/cnighswonger/claude-code-cache-fix/pull/201) 获取验证数据和 [#63147](https://github.com/anthropics/claude-code/issues/63147) 的上游上下文。
 
-在 v4.0.0 中，添加新扩展或对现有扩展进行代码更改需要监督级代理重启。根据您是否也想要恢复热重载，有两种升级流程。
+在 v4.0.0 中，添加新扩展或对现有扩展进行代码更改，需要将运行中的代理交接给新代码（流程 1，无需重启）或为更改服务设置而卸载后重新安装（流程 2，中断一次）。根据您是否也想要恢复热重载，有两种升级流程。
 
 ### 流程 1 —— 仅代码 npm 升级（推荐默认）
 
-您现有的 systemd 单元 / launchd plist 不变；只有磁盘上的代理代码通过 npm 更新。重启运行的进程以获取新代码。
+您现有的 systemd 单元 / launchd plist 不变；只有磁盘上的代理代码通过 npm 更新。将运行的进程交接给新代码以获取它；交接期间端口始终保持接受连接，而重启会在片刻内拒绝连接。
 
 **Linux (systemd 用户单元)：**
 
 ```
 npm install -g claude-code-cache-fix@4
-systemctl --user restart cache-fix-proxy
+systemctl --user reload cache-fix-proxy || systemctl --user start cache-fix-proxy
 ```
 
-无需 `daemon-reload` —— 单元文件内容不变。
+无需 `daemon-reload` —— 单元文件内容不变。首次 reload 之后，提供服务的进程是单元不再跟踪的后继进程，因此单独 `reload` 只能生效一次；之后由 `start` 向它交接（`proxy/` 和 `bin/` 树都相同时什么也不做）。
 
 **macOS (launchd 用户代理)：**
 
 ```
 npm install -g claude-code-cache-fix@4
-launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
+launchctl kill SIGUSR2 gui/$(id -u)/com.cnighswonger.cache-fix-proxy || launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 ```
 
-`kickstart` 在现有 plist 下重新执行代理。
+原进程仍存活时，该信号完成代理交接；此后由 `kickstart`（不带表示重启的 `-k`）完成。
+
+由早期版本安装的单元或 plist 运行的是裸代理，没有 reload。请用 `cache-fix-proxy install-service --force`、`systemctl --user daemon-reload`、`systemctl --user restart cache-fix-proxy` 迁移一次（launchd：`bootout` + `bootstrap`）；这一次重启就是该端口最后一次拒绝连接。
 
 ### 流程 2 —— 在监督层恢复热重载
 
-如果您积极使用热重载（例如，您在运行的代理中将自定义扩展放入扩展目录并希望它们在不重启的情况下被拾取），请运行此操作。这会重写单元 / plist，使每次监督者启动代理时都设置 `CACHE_FIX_HOT_RELOAD=on`。
+如果您积极使用热重载（例如，您在运行的代理中将自定义扩展放入扩展目录并希望它们在不重启的情况下被拾取），请运行此操作。这会重写单元 / plist，使每次监督者启动代理时都设置 `CACHE_FIX_HOT_RELOAD=on`。更改后的单元不会到达正在服务的代理（`reload` 和 `start` 仅在 `proxy/` 或 `bin/` 树变化时才交接），因此先卸载服务：`uninstall-service` 会结束正在运行的代理，这会中断一次。
 
 **Linux (systemd 用户单元)：**
 
 ```
+cache-fix-proxy uninstall-service
 CACHE_FIX_HOT_RELOAD=on cache-fix-proxy install-service
 systemctl --user daemon-reload
-systemctl --user restart cache-fix-proxy
+systemctl --user enable --now cache-fix-proxy
+systemctl --user enable --now cache-fix-proxy-healthcheck.timer
 ```
-
-需要 `daemon-reload`，因为单元文件内容已更改。
 
 **macOS (launchd 用户代理)：**
 
 ```
+cache-fix-proxy uninstall-service
 CACHE_FIX_HOT_RELOAD=on cache-fix-proxy install-service
-launchctl bootout gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cnighswonger.cache-fix-proxy.plist
+launchctl enable gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 launchctl kickstart gui/$(id -u)/com.cnighswonger.cache-fix-proxy
 ```
-
-需要 `bootout` + `bootstrap`，因为 plist 内容已更改 —— 仅 `kickstart` 不会拾取 plist 更改。
 
 **关于热重载权衡的注意：** 即使在选择路径上，长时间运行的进程仍可能遇到 ESM 停滞导入竞争。如果遇到降级的 `/health`（返回 503 + `{status:"degraded",...}`），唯一恢复方法是进程重启；代理会在发生时记录 `[CRITICAL]` 提示。参见 [#197](https://github.com/cnighswonger/claude-code-cache-fix/pull/197) 获取可观测性层。
 

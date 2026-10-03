@@ -7,8 +7,12 @@
     <key>ProgramArguments</key>
     <array>
         <string>{{NODE}}</string>
-        <string>{{SERVER_PATH}}</string>
+        <string>{{LAUNCHER_PATH}}</string>
+        <string>run-service</string>
     </array>
+    <!-- A reload's detached successor and draining proxy must outlive the job's process. -->
+    <key>AbandonProcessGroup</key>
+    <true/>
     <key>EnvironmentVariables</key>
     <dict>
         <key>CACHE_FIX_PROXY_PORT</key>
@@ -19,6 +23,7 @@
 {{DEBUG_PLIST}}
 {{HOT_RELOAD_PLIST}}
 {{FORWARD_PROXY_PLIST}}
+{{PROXY_ENV_PLIST}}
     </dict>
     <key>WorkingDirectory</key>
     <string>{{WORKING_DIR}}</string>
