@@ -79,7 +79,7 @@ A new proxy extension `auto-1m-guard` that operates on outbound requests:
 | Mode | env var | Behavior |
 |---|---|---|
 | `off` | `CACHE_FIX_AUTO_1M_GUARD=off` | Extension no-op; request passes unchanged. |
-| `warn` (default) | unset or `CACHE_FIX_AUTO_1M_GUARD=warn` | Detect `context-1m-2025-08-07` in the outbound `anthropic-beta` header. If present, stash `ctx.meta._auto1mGuard = { auto_1m_detected: true, auto_1m_action: "warn", auto_1m_advice: <text> }` and write a one-line stderr message visible in proxy logs. Do not modify the request. |
+| `warn` (default) | unset or `CACHE_FIX_AUTO_1M_GUARD=warn` | Detect `context-1m-2025-08-07` in the outbound `anthropic-beta` header. If present, stash `ctx.meta._auto1mGuard = { auto_1m_detected: true, auto_1m_action: "warn", auto_1m_advice: <text> }` and write a one-line stderr message visible in proxy logs. That line is latched to the first detection for the LIFE OF THE PROCESS — the advice never changes, so repeating it per request buries the log. The latch is registry-keyed on `globalThis`, so an extension reload does not re-arm it. Do not modify the request. |
 | `strip` (opt-in) | `CACHE_FIX_AUTO_1M_GUARD=strip` | Detect AND remove `context-1m-2025-08-07` from the `anthropic-beta` header before the request goes out. Stash the same flat object with `auto_1m_action: "stripped"`. |
 
 The session-JSON annotation lives at `ctx.meta._auto1mGuard`, written by the cache-telemetry extension's existing spread-into-JSON pattern (the same channel session-health and thinking-block-sanitize already use).

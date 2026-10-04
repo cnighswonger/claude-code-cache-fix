@@ -4,6 +4,7 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { runOnRequest } from "../proxy/pipeline.mjs";
 import ext, {
   resolveCaptureKey,
   buildCaptureRecord,
@@ -177,4 +178,46 @@ test("request records carry a join id", () => {
   const r = buildCaptureRecord(ctx, new Date(), "cap999");
   assert.equal(r.id, "cap999");
   assert.ok(r.body, "the request record still carries the body it always did");
+});
+
+test("request-capture: enabled — records the Messages API only, never another route", async () => {
+  // Scope has two halves and neither was pinned: the pipeline's route filter
+  // (no `routes` here, so it defaults to messages) and this file's body gate.
+  // Distinct session ids: _bootWrittenFor is module-scoped, so a mutation that
+  // makes one of these write cannot burn a sibling case's boot record.
+  const dir = await mkdtemp(join(tmpdir(), "capture-test-"));
+  const prevConfig = process.env.CLAUDE_CONFIG_DIR;
+  const prevFlag = process.env.CACHE_FIX_REQUEST_CAPTURE;
+  process.env.CLAUDE_CONFIG_DIR = dir;
+  process.env.CACHE_FIX_REQUEST_CAPTURE = "1";
+  try {
+    // Inner half — an UNTAGGED caller, which the route filter admits, so only the
+    // body gate is left.
+    await ext.onRequest({
+      body: { events: [{ type: "worker_started", at: 1 }] },
+      headers: { "x-session-id": "scope-check" },
+    });
+    assert.deepEqual(await readdir(dir), [],
+      "a non-Messages body was captured — the corpus would carry shapes replay cannot drive");
+
+    // Outer half — a MESSAGES body on the bootstrap route, so the gate above
+    // cannot be what drops it. Declaring `routes` here would widen the corpus.
+    await runOnRequest(
+      { ...makeCtx({ headers: { "x-session-id": "scope-route" } }), meta: { route: "bootstrap" } },
+      [ext],
+    );
+    assert.deepEqual(await readdir(dir), [],
+      "the bootstrap route reached the capture hook");
+
+    // PREMISE, so the case cannot pass because capture was simply off: the same
+    // setup with a Messages body must write.
+    await ext.onRequest(makeCtx({ headers: { "x-session-id": "scope-premise" } }));
+    assert.ok((await readdir(dir)).length, "premise: capture is on, so a Messages body must write");
+  } finally {
+    if (prevConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = prevConfig;
+    if (prevFlag === undefined) delete process.env.CACHE_FIX_REQUEST_CAPTURE;
+    else process.env.CACHE_FIX_REQUEST_CAPTURE = prevFlag;
+    await rm(dir, { recursive: true, force: true });
+  }
 });

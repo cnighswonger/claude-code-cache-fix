@@ -1,10 +1,13 @@
-// request-capture — record full request bodies for offline replay.
+// request-capture — record MESSAGES-API request bodies for offline replay.
 //
-// Directive: docs/directives/proxy-request-capture-replay.md (stage 1).
-// The proxy is the only component that sees every request byte-for-byte;
-// until this extension, it threw the bodies away, so every pipeline
-// change could only be validated against synthetic fixtures or live
-// traffic. Captures feed tools/replay.mjs and tools/cache-sim.mjs.
+// The proxy sees every request byte-for-byte; until this extension, it threw
+// the bodies away, so every pipeline change could only be validated against
+// synthetic fixtures or live traffic.
+//
+// SCOPE — the outer half is the pipeline's, not this file's: the extension
+// declares no `routes`, so runOnRequest's default of ["messages"] skips the hook
+// for every other tagged route, /api/claude_cli/bootstrap included. The body
+// gate below is what scopes an UNTAGGED caller, which appliesToRoute admits.
 //
 // Order 60 — after bootstrap-defense (45) and ttl-tier-detect (75 is
 // AFTER, fine: it only reads), before cc-version-normalize (90), the
@@ -256,6 +259,12 @@ export default {
     "~/.claude/cache-fix-captures/<key>-requests.jsonl for offline " +
     "replay and cache simulation",
   enabled: false, // overridden by extensions.json
+  // Declared, not inherited. runOnRequest defaults to exactly this, so the
+  // value is a no-op -- but the SCOPE note at the top of this file reasons
+  // about it, and an inherited default is invisible to anyone widening the
+  // corpus. jsonl-session-mirror and image-retry-circuit-breaker spell it out
+  // for the same reason.
+  routes: ["messages"],
   order: 60,
 
   async onRequest(ctx) {

@@ -45,7 +45,12 @@ const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", 
 // them, so the body is tested before the code.
 const OUTAGE = { REFUSED: "refused", RESET: "reset", DEGRADED: "degraded" };
 function classify(body) {
-  if (!body.startsWith("ERR:")) return null;
+    // EVERY CALLER HANDS THIS AN `ERR:` BODY. Three sites test the prefix
+    // before calling; the fourth's probe now produces that shape. Guarding on
+    // `typeof` here instead of fixing that probe is what silenced the TypeError
+    // that was the only signal the two disagreed -- and left the refusal count
+    // provably zero in the case that exists to count refusals.
+    if (!body.startsWith("ERR:")) return null;
   if (/"carrying"\s*:\s*"gap-relay"/.test(body)) return null;
   if (/"status"\s*:\s*"degraded"/.test(body)) return OUTAGE.DEGRADED;
   if (/ECONNREFUSED|ETIMEDOUT|HUNG/.test(body)) return OUTAGE.REFUSED;
@@ -122,6 +127,42 @@ async function freePort() {
 // why it survived every local run. Arithmetic, not a CI fix: it was proposed as
 // one and suite-collection.test.mjs records that hypothesis REJECTED.
 const CONCURRENCY = Math.max(1, Math.floor(availableParallelism() / 2));
+
+describe("classify's input contract", () => {
+  // THE MISMATCH THAT SHIPPED. `classify` keys on an `ERR:` prefix, and one of
+  // its four callers was fed a probe that resolved a bare status NUMBER and a
+  // bare errno STRING. Every classification came back null, so the refusal
+  // count in a case named for counting refusals was provably zero -- and the
+  // only signal was a TypeError, which a `typeof` guard then removed.
+  //
+  // Asserted as a CONTRACT rather than through the outage case, because that
+  // case bounds refusals at <= 2 and cannot go red until three real ones
+  // arrive. Nothing about the shape disagreement needs an outage to observe.
+  it("classifies the ERR: shapes a probe emits, and nothing else", () => {
+    for (const [body, want] of [
+      ["ERR:ECONNREFUSED", OUTAGE.REFUSED],
+      ["ERR:ETIMEDOUT", OUTAGE.REFUSED],
+      ["ERR:ECONNRESET", OUTAGE.RESET],
+      ["ERR:503 {}", OUTAGE.RESET],
+    ]) assert.equal(classify(body), want, `classify(${body})`);
+
+    // THE OTHER HALF, and the one that was actually broken: an unprefixed
+    // value is not classifiable, so a probe resolving one silently empties
+    // every count taken from it.
+    for (const bare of ["ECONNREFUSED", "ETIMEDOUT", "ECONNRESET"])
+      assert.equal(classify(bare), null,
+        `classify(${bare}) must be null -- a probe resolving a bare errno ` +
+        `makes every outage count zero, which reads as "no outages"`);
+  });
+
+  // A DEGRADED BODY IS NOT AN OUTAGE, and it is 503 like a real one -- the
+  // control that keeps the case above from passing on a classify that returned
+  // a truthy value for everything.
+  it("does not count the gap relay's deliberate 503 as an outage", () => {
+    assert.equal(classify('ERR:503 {"carrying":"gap-relay"}'), null);
+    assert.equal(classify('ERR:503 {"status":"degraded"}'), OUTAGE.DEGRADED);
+  });
+});
 
 describe("held port (CACHE_FIX_HOLD_PORT)", { concurrency: CONCURRENCY }, () => {
 // The default is declared in proxy/config.mjs and repeated in the launcher.
@@ -1237,14 +1278,39 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         'if (fd === null) { process.stderr.write("no LISTEN_FDS\\n"); process.exit(1); }\n' +
         's.listen({ fd }, () => process.stdout.write("proxy listening on 127.0.0.1:0\\n"));\n',
         async ({ launcher, port }) => {
+          // THE SAME SHAPE AS THE OTHER THREE PROBES IN THIS FILE. `classify`
+          // reads a BODY and keys on an `ERR:` prefix, so a probe resolving a
+          // bare status number or a bare errno makes every classification null
+          // and the refusal assert below true by construction. Measured on what
+          // this probe can produce: cut=[503,503,ECONNREFUSED,ECONNRESET,
+          // ETIMEDOUT,404] -> classify all null -> refused=[] -> the assert
+          // passes holding three real refusals, in a case named for counting.
           const get = () => new Promise((res) => {
-            http.get({ host: "127.0.0.1", port, path: "/health", timeout: 3_000 }, (r) => {
-              r.resume(); r.on("end", () => res(r.statusCode));
-            }).on("error", (e) => res(e.code));
+            const q = http.get({ host: "127.0.0.1", port, path: "/health", timeout: 15_000 }, (r) => {
+              let b = ""; r.on("data", (d) => (b += d));
+              r.on("end", () => res(r.statusCode === 200 ? "ok" : `ERR:${r.statusCode} ${b.slice(0, 160)}`));
+            });
+            q.on("error", (e) => res(`ERR:${e.code}`));
+            // RESOLVE, never merely fire: `timeout` does not abort the request,
+            // so an unhandled one leaves this promise pending and the hammer
+            // below stops at that iteration for good.
+            //
+            // AND 15s, BECAUSE THIS PROCESS STALLS, NOT THE STAND-IN. The file
+            // runs its cases concurrently in one process, and a sibling's
+            // synchronous lsof/ps (proc-helpers.mjs) blocks its event loop for
+            // seconds. The stand-in has already answered, but timers run before
+            // the socket is read when the loop resumes, so a short value times
+            // out a request that succeeded. Measured under 4 concurrent copies of
+            // this file: stalls up to 9.7s, so 1s (5d2159f) reds the readiness
+            // assert and so would 3s. 15s is 1.5x that; only a real hang gets here.
+            q.on("timeout", () => { q.destroy(); res("ERR:ETIMEDOUT"); });
           });
-          const up = Date.now() + 10_000;
-          while (Date.now() < up && (await get()) !== 200) await new Promise((r) => setTimeout(r, 50));
-          assert.equal(await get(), 200, "the stand-in never came up behind the holder");
+          const up = Date.now() + 25_000;
+          // Assert the loop's last value: a second get() after "ok" is one more
+          // chance to time out on a stall.
+          let v;
+          while (Date.now() < up && (v = await get()) !== "ok") await new Promise((r) => setTimeout(r, 50));
+          assert.equal(v, "ok", "the stand-in never came up behind the holder");
 
           const seen = [];
           const hammer = (async () => {
@@ -1278,7 +1344,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
           }, 250);
           await hammer;
 
-          const cut = seen.filter((c) => c !== 200);
+          const cut = seen.filter((c) => c !== "ok");
           // A REFUSAL means the address had no owner, and a session that baked
           // HTTPS_PROXY at exec is stranded. The holder exists to make that
           // rare — but on a FORCED kill it cannot make it zero, and asserting
@@ -1859,8 +1925,11 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       const p = spawn(process.execPath, [launcherPath, "run-service"], { env, stdio: ["ignore", "pipe", "pipe"] });
       let err = "";
       p.stderr.on("data", (d) => { err += d; });
+      // "close", not "exit": under load "exit" fires before the child's stderr is
+      // read (measured: err === "" at "exit" in 82 of 120 concurrent copies, the
+      // message there at "close"). "close" waits for the stdio to drain.
       const code = await Promise.race([
-        new Promise((r) => p.on("exit", (c) => r(c))),
+        new Promise((r) => p.on("close", (c) => r(c))),
         new Promise((r) => setTimeout(() => r("HUNG"), 25_000)),
       ]);
       try { p.kill("SIGKILL"); } catch {}
