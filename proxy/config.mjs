@@ -28,6 +28,20 @@ const config = {
   bind: process.env.CACHE_FIX_PROXY_BIND || "127.0.0.1",
   get upstream() { return process.env.CACHE_FIX_PROXY_UPSTREAM || "https://api.anthropic.com"; },
   timeout: envInt("CACHE_FIX_PROXY_TIMEOUT", 600_000),
+  // A keep-alive socket idle longer than this is destroyed rather than handed
+  // back out of the pool, well under a typical hop's own keep-alive timeout.
+  // Non-getter, like `timeout` above: read once, an env knob for a test to set
+  // before the first import (this repo's own test-seam idiom, see caLockWaitMs).
+  idleTimeoutMs: envInt("CACHE_FIX_UPSTREAM_IDLE_TIMEOUT_MS", 240_000),
+  // Bounds only the CONNECT/handshake phase (dial -> 'connect'/'secureConnect'),
+  // never the wait for a first response byte — that stays on `timeout` above.
+  // 0 = off. A getter, unlike `timeout`: tests flip the env per case.
+  get upstreamConnectTimeoutMs() { return envInt("CACHE_FIX_UPSTREAM_CONNECT_TIMEOUT_MS", 30_000); },
+  // A pooled socket older than this is destroyed when released, never mid-request.
+  // The idle timeout above cannot bound a socket reused more often than that, so
+  // without this a hop re-pointed to a new instance keeps its old tunnels for ever.
+  // 0 = off. A getter, like the budget above: read per socket, so tests flip it.
+  get upstreamSocketMaxLifetimeMs() { return envInt("CACHE_FIX_UPSTREAM_SOCKET_MAX_LIFETIME_MS", 300_000); },
   extensionsDir: process.env.CACHE_FIX_EXTENSIONS_DIR || join(__dirname, "extensions"),
   extensionsConfig: process.env.CACHE_FIX_EXTENSIONS_CONFIG || join(__dirname, "extensions.json"),
   debug: process.env.CACHE_FIX_DEBUG === "1",
