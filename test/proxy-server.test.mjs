@@ -5,7 +5,8 @@ import net from "node:net";
 import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { mkdir, writeFile, rm } from "node:fs/promises";
-import { readdirSync, readFileSync } from "node:fs";
+import fs, { readdirSync, readFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { startProxy, upstreamPointsAtSelf } from "../proxy/server.mjs";
@@ -186,6 +187,50 @@ describe("hot-reload opt-in (#196)", () => {
           await handle.close();
         }
       });
+    });
+  });
+
+  it("CACHE_FIX_HOT_RELOAD=on: a failed watcher start is reported and the proxy still serves", async () => {
+    await withHotReloadEnv("on", async (captured) => {
+      await withExtDir(async ({ dir, cfg }) => {
+        // inotify exhaustion: fs.watch throws ENOSPC. The watcher imports the
+        // named `watch`, so the live binding is re-synced after each patch.
+        const realWatch = fs.watch;
+        fs.watch = () => { throw Object.assign(new Error("ENOSPC: watch"), { code: "ENOSPC" }); };
+        syncBuiltinESMExports();
+        let handle;
+        try {
+          handle = await startProxy({ port: 0, extensionsDir: dir, extensionsConfig: cfg });
+          assert.ok(
+            captured.some((s) => s.includes("[cache-fix] hot-reload FAILED (watcher off): ENOSPC")),
+            `expected the watcher failure on stderr, got ${JSON.stringify(captured)}`,
+          );
+          const status = await new Promise((resolve) => {
+            http.get({ host: "127.0.0.1", port: handle.port, path: "/health" }, (r) => { r.resume(); resolve(r.statusCode); });
+          });
+          assert.equal(status, 200, "the proxy must still serve with the watcher off");
+        } finally {
+          fs.watch = realWatch;
+          syncBuiltinESMExports();
+          await handle?.close();
+        }
+      });
+    });
+  });
+
+  it("a failed extensions load is reported and the proxy still serves", async () => {
+    await withHotReloadEnv(undefined, async (captured) => {
+      const missing = join(tmpdir(), `no-such-ext-dir-${process.pid}-${Date.now()}`);
+      const handle = await startProxy({ port: 0, extensionsDir: missing, extensionsConfig: join(missing, "extensions.json") });
+      try {
+        assert.ok(
+          captured.some((s) => s.includes("[cache-fix] extensions load FAILED (serving none): ENOENT")),
+          `expected the load failure on stderr, got ${JSON.stringify(captured)}`,
+        );
+        assert.ok(handle.port > 0, "the proxy must still boot");
+      } finally {
+        await handle.close();
+      }
     });
   });
 

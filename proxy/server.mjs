@@ -1005,10 +1005,13 @@ export async function startProxy(options = {}) {
   let listenFd = options.fd ?? inheritedFd();
 
   let watcher = null;
-  try {
-    await loadExtensions(extensionsDir, extensionsConfig);
-    if (watch) watcher = startWatcher(extensionsDir, extensionsConfig);
-  } catch {}
+  // Two blocks: neither failure hides the other, and the proxy boots either way.
+  try { await loadExtensions(extensionsDir, extensionsConfig); }
+  catch (err) { process.stderr.write(`[cache-fix] extensions load FAILED (serving none): ${err.code || err.message}\n`); }
+  if (watch) {
+    try { watcher = startWatcher(extensionsDir, extensionsConfig); }
+    catch (err) { process.stderr.write(`[cache-fix] hot-reload FAILED (watcher off): ${err.code || err.message}\n`); }
+  }
 
   const server = createProxyServer();
 
