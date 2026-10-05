@@ -11,7 +11,7 @@ import { tmpdir, availableParallelism } from "node:os";
 import { join, dirname } from "node:path";
 
 import { sourceFingerprintSync } from "../proxy/source-fingerprint.mjs";
-import { HOP_ENV, OURS, cmdOf, freePort as takePort, listeners, onPort } from "./proc-helpers.mjs";
+import { HOP_ENV, OURS, cmdOf, freePort as takePort, hit, listeners, onPort, verdict } from "./proc-helpers.mjs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
@@ -357,19 +357,21 @@ it("cuts nothing on the held port while the proxy restarts", async () => {
 // by whichever process wins, so a serial probe reads 100% healthy against a
 // holder losing a fifth of everything. Measured before the fix, 200 concurrent
 // requests: hung=36 acceptedByHolder=36, exactly 1:1.
-it("serves every concurrent request while nothing restarts", async () => {
+it("serves every concurrent request while nothing restarts", async (t) => {
   await withHeldPort(async ({ port }) => {
-    const one = () => new Promise((res) => {
-      const r = http.get({ host: "127.0.0.1", port, path: "/health", agent: false }, (q) => {
-        let b = ""; q.on("data", (d) => (b += d));
-        q.on("end", () => res(q.statusCode === 200 ? "ok" : `ERR:${q.statusCode} ${b.slice(0, 160)}`));
-      });
-      // Well under the 8s a hung accept would cost, and far above a served
-      // request on loopback: the failure this catches is unbounded, not slow.
-      r.setTimeout(3_000, () => { r.destroy(); res("HUNG"); });
-      r.on("error", (e) => res(e.code || "ERR"));
-    });
-    const out = await Promise.all(Array.from({ length: 200 }, one));
+    // ONE overall deadline, not a cut at 3 s. A starved or paused proxy child
+    // still ACCEPTS every connection and answers late (child stopped 5 s: 200 of
+    // 200 connected, 0 answered at 3 s, 200 at 5.1 s, none lost): a slow box. This
+    // case catches a holder that accepts and NEVER answers. `late` shows a slow
+    // box without making it red.
+    const t0 = Date.now();
+    let late = 0;
+    const out = await Promise.all(Array.from({ length: 200 }, async () => {
+      const v = await verdict(hit(port), 20_000);
+      if (v === "ok" && Date.now() - t0 > 3_000) late++;
+      return v;
+    }));
+    t.diagnostic(`${late} of 200 requests were answered after 3s`);
     const bad = out.filter((r) => r !== "ok");
     assert.equal(bad.length, 0,
       `${bad.length} of 200 concurrent requests were not served: ` +

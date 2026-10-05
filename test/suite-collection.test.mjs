@@ -172,7 +172,8 @@ test("every hop-bearing env the relay reads is scrubbed by the fixtures", () => 
 // several byte-identical probe closures, and the first fix reached three of
 // them while two kept returning a bare code. A fourth copy is one paste away.
 test("every /health probe carries the body it failed with", () => {
-  const src = readFileSync(join(testDir, "proxy-held-port.test.mjs"), "utf8");
+  const src = ["proxy-held-port.test.mjs", "proc-helpers.mjs"]
+    .map((f) => readFileSync(join(testDir, f), "utf8")).join("\n");
   const bare = [...src.matchAll(/`ERR:\$\{[qr]\.statusCode\}`/g)];
   assert.equal(bare.length, 0,
     `${bare.length} probe(s) return a bare ERR:<code>; append the body ` +

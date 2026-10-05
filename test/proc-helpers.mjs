@@ -11,6 +11,7 @@
 
 import { execFileSync } from "node:child_process";
 import { readdirSync, readFileSync } from "node:fs";
+import http from "node:http";
 import net from "node:net";
 
 // NEVER SIGNAL A PID WE KNOW ONLY BY PORT. freePort() binds 0, reads the number
@@ -124,3 +125,16 @@ export const HOP_ENV = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"
 // file's readiness assertion times out on the CPU and ports they hold. See
 // ours() for the mechanism and the two markers it reads.
 export const onPort = (port) => [...new Set([...listeners(port), ...ours(port)])];
+
+export const hit = (port) => http.get({ host: "127.0.0.1", port, path: "/health", agent: false });
+// "ok", "ERR:<status> <body>", an error code, or "HUNG" once `ms` pass in silence.
+export const verdict = (r, ms) => new Promise((res) => {
+  r.on("response", (q) => {
+    let b = ""; q.on("data", (d) => (b += d));
+    q.on("end", () => res(q.statusCode === 200 ? "ok" : `ERR:${q.statusCode} ${b.slice(0, 160)}`));
+  });
+  // Timers run before the poll phase, so after a runner stall a reply that is
+  // already on the socket would read as HUNG. One turn lets it be delivered first.
+  r.setTimeout(ms, () => setImmediate(() => { r.destroy(); res("HUNG"); }));
+  r.on("error", (e) => res(e.code || "ERR"));
+});
