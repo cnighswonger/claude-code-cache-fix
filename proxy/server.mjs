@@ -64,6 +64,38 @@ function debugLog(...args) {
   try { appendFileSync(path, line); } catch {}
 }
 
+// A 502 handed to a client used to leave no record of why: the three
+// forwardRequest catches below only logged through debugLog, which is
+// gated on CACHE_FIX_DEBUG=1 and off by default on every host. Same
+// [cache-fix] stderr convention as the holder/hop lines elsewhere in this
+// file and in upstream.mjs — not debug-gated, so the reason survives
+// without anyone having turned debug logging on. Default ON; set
+// CACHE_FIX_GATEWAY_ERROR_LOG=off to silence it. Env read per call, same
+// as debugLog and CACHE_FIX_SELF_HEAL.
+//
+// Path only (no query, no headers, no body — a query can carry values
+// debugLog's own discipline wouldn't put on stderr either; an absolute-form
+// target in forward mode carries an authority, possibly with userinfo) with
+// any session id folded to `cse_<id>`, so a route that names a specific
+// session doesn't put that id in a mode-644 stderr file.
+function reportUpstreamError(err, method, url) {
+  if (process.env.CACHE_FIX_GATEWAY_ERROR_LOG === "off") return;
+  // parseAbsoluteForm only recognizes http(s)://. Every other non-origin-form
+  // shape (ftp://, a malformed http:// that fails URL parse, `//host/path`)
+  // fell through to the raw target string, putting its authority — userinfo
+  // included — on stderr. RFC 7230 origin-form (a single leading `/`, not
+  // `//`) is the only shape that reaches these handlers legitimately.
+  const urlStr = String(url || "");
+  const route = (
+    parseAbsoluteForm(url)?.pathname
+    ?? (urlStr.startsWith("/") && !urlStr.startsWith("//") ? urlStr.split("?")[0] : "<non-origin-form>")
+  ).replace(/cse_[A-Za-z0-9]+/g, "cse_<id>");
+  const code = err?.code ? `${err.code} ` : "";
+  process.stderr.write(
+    `[cache-fix] upstream error -> 502: ${code}${err?.message ?? err} for ${method} ${route}\n`,
+  );
+}
+
 function collectBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -204,6 +236,7 @@ async function handleMessages(clientReq, clientRes) {
   } catch (err) {
     debugLog("[PROXY] forwardRequest error:", err.message);
     if (abortController.signal.aborted) return;
+    reportUpstreamError(err, clientReq.method, clientReq.url);
     clientRes.writeHead(502, { "content-type": "application/json" });
     clientRes.end(JSON.stringify({ error: "upstream_error", message: err.message }));
     return;
@@ -321,6 +354,7 @@ async function handleBootstrap(clientReq, clientRes) {
       const errCtx = { status: 502, headers: {}, body: null, meta };
       await runOnResponse(errCtx, extSnapshot);
     }
+    reportUpstreamError(err, clientReq.method, clientReq.url);
     clientRes.writeHead(502, { "content-type": "application/json" });
     clientRes.end(JSON.stringify({ error: "upstream_error", message: err.message }));
     return;
@@ -533,6 +567,7 @@ async function handlePassthrough(clientReq, clientRes) {
     debugLog("[PROXY] passthrough forwardRequest error:", err.message, "url:", clientReq.url);
     if (abortController.signal.aborted) return;
     if (!clientRes.headersSent) {
+      reportUpstreamError(err, method, clientReq.url);
       clientRes.writeHead(502, { "content-type": "application/json" });
       clientRes.end(JSON.stringify({ error: "upstream_error", message: err.message }));
     }

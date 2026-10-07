@@ -342,6 +342,7 @@ curl http://127.0.0.1:9801/health
 | `CACHE_FIX_EXTENSIONS_DIR` | `proxy/extensions/` | 扩展 `.mjs` 文件目录 |
 | `CACHE_FIX_EXTENSIONS_CONFIG` | `proxy/extensions.json` | 扩展配置文件 |
 | `CACHE_FIX_DEBUG` | `0` | 启用调试日志 |
+| `CACHE_FIX_GATEWAY_ERROR_LOG` | `on` | 每当代理因上游连接失败向客户端返回 502 时，记录一行 `[cache-fix] upstream error -> 502: ...` stderr 日志（错误、方法、路由；会话 ID 已脱敏）。设为 `off` 可禁用。 |
 | `CACHE_FIX_HOT_RELOAD` | 未设置 | 设置为 `on` 以启用进程内扩展热重载。自 v4.0.0 起默认关闭 —— 参见 [从 v3.x 升级](#upgrading-from-v3x) 了解详情和监督者重启流程。 |
 | `CACHE_FIX_READ_DEDUPE` | 未设置 | 设置为 `1` 以去重重复的 `Read` 工具结果，这些结果在轮次中重新出现且未更改。保持第一次出现完整；替换后续字节相同的（基于 `file_path` + 内容 + `offset` + `limit`）为稳定指针行。默认关闭；在会话中选择性启用以验证后再广泛推广。参见 [扩展影响指南](docs/extension-impact-guide.md)。 |
 | `CACHE_FIX_ADVISOR_PLAN` | 未设置 | `tools/tier-advisor.mjs` 的计划覆盖 —— 一个 `max-5x`, `max-20x`, `pro`。绕过启发式计划检测。参见 [层级顾问](docs/tier-advisor.md)。 |

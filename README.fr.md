@@ -315,6 +315,7 @@ Tous les paramètres du proxy sont contrôlés via des variables d'environnement
 | `CACHE_FIX_EXTENSIONS_DIR` | `proxy/extensions/` | Répertoire des extensions `.mjs` |
 | `CACHE_FIX_EXTENSIONS_CONFIG` | `proxy/extensions.json` | Fichier de config des extensions |
 | `CACHE_FIX_DEBUG` | `0` | Activer le log de débogage |
+| `CACHE_FIX_GATEWAY_ERROR_LOG` | `on` | Journalise une ligne stderr `[cache-fix] upstream error -> 502: ...` (erreur, méthode, route ; identifiants de session masqués) chaque fois que le proxy renvoie un 502 au client suite à un échec de connexion en amont. Mettre à `off` pour désactiver. |
 | `CACHE_FIX_HOT_RELOAD` | non défini | Mettre à `on` pour le hot-reload in-process |
 
 ### Environnements d'entreprise (proxys, CA personnalisées)

@@ -342,6 +342,7 @@ curl http://127.0.0.1:9801/health
 | `CACHE_FIX_EXTENSIONS_DIR` | `proxy/extensions/` | 확장 `.mjs` 파일 디렉토리 |
 | `CACHE_FIX_EXTENSIONS_CONFIG` | `proxy/extensions.json` | 확장 구성 파일 |
 | `CACHE_FIX_DEBUG` | `0` | 디버그 로깅 활성화 |
+| `CACHE_FIX_GATEWAY_ERROR_LOG` | `on` | 프록시가 업스트림 연결 실패로 클라이언트에 502를 반환할 때마다 `[cache-fix] upstream error -> 502: ...` stderr 한 줄을 기록합니다 (오류, 메서드, 경로; 세션 ID는 마스킹됨). 비활성화하려면 `off`로 설정합니다. |
 | `CACHE_FIX_HOT_RELOAD` | 설정되지 않음 | 프로세스 내 확장 핫리로드를 활성화하려면 `on`으로 설정. v4.0.0부터 기본적으로 꺼져 있습니다 — 자세한 내용과 관리자 재시작 흐름은 [v3.x 업그레이드](#upgrading-from-v3x) 참조. |
 | `CACHE_FIX_READ_DEDUPE` | 설정되지 않음 | 반복되는 `Read` 도구 결과를 중복 제거하려면 `1`로 설정합니다. 이는 턴 간에 변경되지 않은 재등장한 결과입니다. 첫 번째 발생은 유지하고, 이후 동일한 바이트(키: `file_path` + 내용 + `offset` + `limit`)를 안정적인 포인터 라인으로 대체합니다. 기본적으로 꺼져 있으며, 보다 넓게 확산하기 전에 세션별로 선택적으로 활성화합니다. [확장 영향 가이드](docs/extension-impact-guide.md) 참조. |
 | `CACHE_FIX_ADVISOR_PLAN` | 설정되지 않음 | `tools/tier-advisor.mjs`의 계획 재정의 — `max-5x`, `max-20x`, `pro` 중 하나. 휴리스틱 계획 감지를 우회합니다. [계층 어드바이저](docs/tier-advisor.md) 참조. |
