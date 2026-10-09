@@ -1,8 +1,8 @@
 # Disk usage — proxy-written files
 
 This document covers the disk-footprint accounting for files cache-fix-proxy
-writes outside of `~/.claude/usage.jsonl` (which is the meter's surface, not
-the proxy's). See the individual extension docs for behavior; this doc is the
+writes, including the meter's `usage.jsonl` (trimmed by the proxy's retention
+prune). See the individual extension docs for behavior; this doc is the
 single place that adds up worst-case bytes per default configuration.
 
 | Extension | Path(s) | Default rotation / retention | Worst-case footprint (defaults) |
@@ -11,6 +11,7 @@ single place that adds up worst-case bytes per default configuration.
 | `image-retry-circuit-breaker` | `~/.claude/image-retry-events.jsonl` (+ `.1`) | 5 MB single-tier | ≤ 10 MB |
 | `jsonl-session-mirror` (default-off) | `~/.claude/session-mirrors/<sessionFilename>/*.jsonl` + `~/.claude/session-mirrors/session-mirror-events.jsonl` | See below | See below |
 | `cache-telemetry` | `~/.claude/quota-status/sessions/*.json` | TTL sweep (`CACHE_FIX_QUOTA_STATUS_TTL_DAYS`, default 30) | Bounded by # sessions × small per-file payload |
+| `usage-log` (default-off) | `~/.claude/usage.jsonl` | Row-age prune (`CACHE_FIX_USAGE_LOG_RETENTION_DAYS`, default 30), at most once per day per proxy process | Retention days × rows per day |
 
 ## `jsonl-session-mirror`
 

@@ -459,6 +459,7 @@ All proxy settings are controlled via environment variables. Set them before sta
 | `CACHE_FIX_ADVISOR_UPGRADE_THRESHOLD` | `80` | Projected-Q7d percent that triggers an `UPGRADE` recommendation from tier-advisor. |
 | `CACHE_FIX_ADVISOR_DOWNGRADE_THRESHOLD` | `20` | Projected-Q7d percent that triggers a `DOWNGRADE` recommendation from tier-advisor (paired with the `DOWNGRADE_WEEKS` consecutive-weeks gate). |
 | `CACHE_FIX_ADVISOR_DOWNGRADE_WEEKS` | `2` | Consecutive completed weeks under the downgrade threshold required before tier-advisor recommends downgrade. Single-week dips never trigger; single-week spikes DO trigger upgrade (cost-of-being-throttled asymmetry). |
+| `CACHE_FIX_USAGE_LOG_RETENTION_DAYS` | `30` | Whole days of `usage.jsonl` rows the `usage-log` extension keeps. Older rows are pruned at most once per day per proxy process; a value that is not a positive integer gives the default. |
 
 ### Corporate environments (proxies, custom CAs)
 
@@ -1333,7 +1334,7 @@ See [docs/monitoring.md](docs/monitoring.md) for full details, debug mode, prefi
 
 ### `usage-log` extension and the `MeterRowSchema v:1` wire format
 
-The `usage-log` extension (opt-in via `proxy/extensions.json`) appends one JSON line per API response to `~/.claude/usage.jsonl`. The row shape is `MeterRowSchema v:1` — the cross-repo contract validated by [`claude-code-meter`](https://github.com/cnighswonger/claude-code-meter)'s strict schema. Every field below is captured per call:
+The `usage-log` extension (opt-in via `proxy/extensions.json`) appends one JSON line per API response to `~/.claude/usage.jsonl`. The row shape is `MeterRowSchema v:1` — the cross-repo contract validated by [`claude-code-meter`](https://github.com/cnighswonger/claude-code-meter)'s strict schema. Rows older than `CACHE_FIX_USAGE_LOG_RETENTION_DAYS` (default 30) are pruned, at most once per day per proxy process. Every field below is captured per call:
 
 | Field | Type | Source |
 |---|---|---|

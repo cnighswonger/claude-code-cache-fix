@@ -348,6 +348,7 @@ curl http://127.0.0.1:9801/health
 | `CACHE_FIX_ADVISOR_UPGRADE_THRESHOLD` | `80` | 触发层级顾问推荐升级的预测 Q7d 百分比。 |
 | `CACHE_FIX_ADVISOR_DOWNGRADE_THRESHOLD` | `20` | 触发层级顾问推荐降级的预测 Q7d 百分比（与 `DOWNGRADE_WEEKS` 连续周数门控配对）。 |
 | `CACHE_FIX_ADVISOR_DOWNGRADE_WEEKS` | `2` | 在层级顾问推荐降级前，需要连续完成的周数低于降级阈值。单周下降从不触发；单周峰值确实会触发升级（被限制的成本不对称性）。 |
+| `CACHE_FIX_USAGE_LOG_RETENTION_DAYS` | `30` | `usage-log` 扩展保留 `usage.jsonl` 行的整数天数。更早的行由每个代理进程最多每天清理一次；不是正整数的值使用默认值。 |
 
 ### 企业环境（代理、自定义 CA）
 

@@ -348,6 +348,7 @@ curl http://127.0.0.1:9801/health
 | `CACHE_FIX_ADVISOR_UPGRADE_THRESHOLD` | `80` | 계층 어드바이저가 업그레이드 권고를 트리거하는 예상 Q7d 백분율입니다. |
 | `CACHE_FIX_ADVISOR_DOWNGRADE_THRESHOLD` | `20` | 계층 어드바이저가 다운그레이드 권고를 트리거하는 예상 Q7d 백분율 (연속 주 수준과 함께 사용). |
 | `CACHE_FIX_ADVISOR_DOWNGRADE_WEEKS` | `2` | 계층 어드바이저가 다운그레이드 권고를 하기 전에 연속적으로 낮은 임계값 아래의 주 수입니다. 단일 주 감소는 트리거되지 않으며, 단일 주 피크는 업그레이드를 트리거합니다 (비용 비대칭성). |
+| `CACHE_FIX_USAGE_LOG_RETENTION_DAYS` | `30` | `usage-log` 확장이 보관하는 `usage.jsonl` 행의 일수(정수)입니다. 이보다 오래된 행은 프록시 프로세스당 하루에 최대 한 번 삭제됩니다. 양의 정수가 아닌 값은 기본값을 사용합니다. |
 
 ### 기업 환경 (프록시, 사용자 CA)
 
