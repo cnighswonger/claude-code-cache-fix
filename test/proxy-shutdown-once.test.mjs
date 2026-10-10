@@ -217,7 +217,14 @@ describe("shutdown runs once per stop", () => {
     // closing it — also measured, a bail inserted above `let ended` stayed
     // green. Only the callback's opening brace is above everything the body can
     // contain, so that is where the region has to start.
-    const anchor = src.indexOf("setTimeout(() => {", src.indexOf("active.close().finally"));
+    //
+    // RE-ANCHORED when the watchdog stopped being a bare setTimeout: the
+    // handover arm ends on a stall predicate rather than a ceiling, so the body
+    // was lifted into a named `forceClose` that both arms call. The old anchor
+    // refused rather than matching something else, which is why this test is
+    // written to fail loudly on a move instead of silently covering the wrong
+    // region.
+    const anchor = src.indexOf("const forceClose = (", src.indexOf("active.close().finally"));
     assert.ok(anchor > 0, "the watchdog callback moved — re-anchor this test");
     const watchdogRegion = src.slice(anchor);
     const assigned = /const code = ([^;]+);/.exec(watchdogRegion)?.[1];

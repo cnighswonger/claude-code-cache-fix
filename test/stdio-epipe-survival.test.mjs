@@ -28,6 +28,7 @@ import net from "node:net";
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { withDeadline } from "./child-deadline.mjs";
+import "./proc-helpers.mjs"; // pins CACHE_FIX_HANDOVER_ENV for the holder this file boots
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 

@@ -162,6 +162,21 @@ test("every hop-bearing env the relay reads is scrubbed by the fixtures", () => 
     "a fixture still scrubs a hand-written proxy list instead of ...HOP_ENV");
 });
 
+// A HOLDER THIS SUITE BOOTS READS THE OPERATOR'S handover file at every proxy spawn;
+// proc-helpers pins it for each file that imports it. Static, because a box with no
+// such file runs green either way.
+test("every file that boots a holder pins the handover file", () => {
+  const helpers = readFileSync(join(testDir, "proc-helpers.mjs"), "utf8");
+  assert.ok(/^process\.env\.CACHE_FIX_HANDOVER_ENV = /m.test(helpers),
+    "proc-helpers no longer pins CACHE_FIX_HANDOVER_ENV, so every holder the suite boots reads the operator's file");
+  const unpinned = readdirSync(testDir).filter((f) => f.endsWith(".test.mjs")).filter((f) => {
+    const src = readFileSync(join(testDir, f), "utf8");
+    return /"run-service"|CACHE_FIX_HOLD_PORT: "on"/.test(src) && !/proc-helpers\.mjs|CACHE_FIX_HANDOVER_ENV/.test(src);
+  });
+  assert.deepEqual(unpinned, [],
+    `these files boot a holder without importing proc-helpers.mjs or setting CACHE_FIX_HANDOVER_ENV: ${unpinned.join(", ")}`);
+});
+
 // A PROBE THAT DROPS THE STATUS BODY COSTS AN INVESTIGATION. /health has two
 // 503 authors — the relay carrying an address with no proxy behind it, and a
 // proxy reporting failed extensions — and the code alone names neither. CI run
@@ -437,6 +452,41 @@ test("the SIGUSR2 successor is told the port it must bind", () => {
   assert.match(opts, /CACHE_FIX_PROXY_PORT\s*:\s*String\(/,
     "CACHE_FIX_PROXY_PORT is present but not built from a value — the successor " +
     "needs the port this holder actually bound, not a literal or a passthrough");
+
+  // ORDER IS THE WHOLE GUARD. Move the spread after the pinned keys and nothing
+  // fails at runtime; the file simply starts winning over them.
+  assert.match(opts, /env:\s*\{\s*\.\.\.handoverEnv\(/,
+    "the handover env re-read is not the FIRST entry of the successor's env " +
+    "object — anything the file sets now wins over the keys this holder pins, " +
+    "including the port it is bound to and the orphan guard it must drop");
+
+  // The mechanism the message cannot fit: the adopted socket is unchanged, but
+  // listen() still stores the value as _host and every downstream label is built
+  // from that — so the socket would be right and everything naming it wrong.
+  assert.match(opts, /CACHE_FIX_PROXY_BIND\s*:/,
+    "the successor's env does not pin CACHE_FIX_PROXY_BIND. The adopted socket " +
+    "keeps the predecessor's address, so a bind from the handover file does not " +
+    "take effect but does mislabel HELD_HOST, the proxy child and /health");
+
+  // A HOLDER IS NOT A STANDBY, and the handover file can now say otherwise. The
+  // successor carries what it is given into openGap(), whose env clears
+  // HOLDER_TREE and HELD_BY but not this — and gap-relay reads CACHE_FIX_STANDBY
+  // === "1" to take the standby branch, which then refuses for want of
+  // STANDBY_PARENT. The gap would be armed and relaying nothing, in the window
+  // it exists to cover.
+  // AND THE PATH TO THE FILE ITSELF, or the file moves its own trust anchor: a
+  // CACHE_FIX_HANDOVER_ENV written here points every later handover at a path
+  // outside the config dir, and because absence means inherit, reverting the
+  // original file does not undo it.
+  assert.match(opts, /CACHE_FIX_HANDOVER_ENV\s*:/,
+    "the successor's env does not pin CACHE_FIX_HANDOVER_ENV, so the handover " +
+    "file can relocate the handover file -- permanently, and out of reach of " +
+    "whoever tightens the original");
+
+  assert.match(opts, /CACHE_FIX_STANDBY\s*:\s*undefined/,
+    "the successor's env does not clear CACHE_FIX_STANDBY. The handover file can " +
+    "set it, and the successor hands it to its own gap relay, which takes the " +
+    "standby branch and refuses — an armed gap that carries nothing");
 });
 
 test("a failed SIGUSR2 handover recovers, from both failure modes, through the ladder", () => {
@@ -801,7 +851,9 @@ test("the self-heal successor keeps a way to report", () => {
   const close = src.indexOf(".unref()", at);
   assert.ok(close > at, "the self-heal spawn's call no longer ends in .unref() — re-anchor this guard");
   const opts = src.slice(at, close);
-  const stdio = /stdio:\s*("[^"]*"|\[[^\]]*\])/.exec(opts);
+  // THE WHOLE ARRAY, nested brackets included: a spread such as `...(x ? [3] : [])`
+  // ended a plain `[^\]]*` at its first `]` and left a truncated array that parsed.
+  const stdio = /stdio:\s*("[^"]*"|\[(?:[^\[\]]|\[[^\]]*\])*\])/.exec(opts);
   assert.ok(stdio, "the self-heal spawn no longer names its stdio at all");
   assert.notEqual(stdio[1], '"ignore"',
     'the self-heal successor is spawned with stdio "ignore", so the holder it ' +
@@ -979,7 +1031,8 @@ test("the suite derives its parallelism from the machine", () => {
     .filter((f) => /^\s*(?:export\s+)?const\s+CONCURRENCY\b/m
       .test(readFileSync(join(testDir, f), "utf8")))
     .sort();
-  assert.deepEqual(bounded, ["proxy-held-port.test.mjs", "proxy-wrapper.test.mjs"],
+  assert.deepEqual(bounded,
+    ["proxy-held-port.test.mjs", "proxy-wrapper.test.mjs", "shutdown-exit-code.test.mjs"],
     `the set of files declaring a CONCURRENCY bound changed: ${bounded.join(", ") || "(none)"}. ` +
     `A new one is fine — add it here and make it derive from availableParallelism(). ` +
     `A missing one means the bound was renamed, and this guard stopped watching it.`);

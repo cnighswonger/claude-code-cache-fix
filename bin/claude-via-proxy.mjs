@@ -11,6 +11,7 @@ import net from "node:net";
 import { EventEmitter } from "node:events";
 import { getSystemErrorName } from "node:util";
 import { bundleUsable, carriesOurCA, salvageBundle } from "./ca-trust.mjs";
+import { handoverEnv, handoverEnvPath } from "./handover-env.mjs";
 import { sourceFingerprintSync } from "../proxy/source-fingerprint.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -160,7 +161,18 @@ class HolderSocket extends EventEmitter {
         // started: every deploy hands the port on, and a successor that skipped
         // it left the address with nothing behind the proxy again.
         this.openStandby();
+        // THE DEAD HOLDER'S STANDBY, retired without a cut. Nothing releases it
+        // on this path, and a second armed acceptor on one socket is the 60-of-125
+        // reset shape. SIGHUP closes its server and lets what it carries finish;
+        // we hold the socket, so closing it opens no window. A proxy is never
+        // signalled here, only a gap-relay that is not ours. AFTER `listening`:
+        // the scan shells out, and connections that arrive meanwhile queue with
+        // nobody accepting, on every deploy, including the ones that find nothing.
+        const own = this._standby?.pid;
         queueMicrotask(() => this.emit("listening"));
+        setImmediate(() => {
+          for (const p of relaysOn(this._port, own)) { try { process.kill(p, "SIGHUP"); } catch { } }
+        });
         return this;
       }
       try { adopted.close(); } catch { }
@@ -523,10 +535,17 @@ function holderVerdict(port, pid) {
   return same !== false ? "holder" : pid;
 }
 
+// One of our listeners in `ps`, by the NAME of an entry point we launch or the npm
+// shim; not any .mjs under a bin/ or proxy/, which signals another package's script.
+// test/proc-helpers.mjs OURS is a different rule for a different job (a test's sweep).
+const OUR_CMD = /(?:^|[\s/])(?:proxy\/server\.mjs|bin\/(?:claude-via-proxy|gap-relay)\.mjs|cache-fix-proxy)(?:\s|$)/;
+
 // Returns "holder" when the owner is a holder of ours (nothing to do), a pid
-// when it is something else we may ask to stop, or null when we cannot tell —
-// and NULL MEANS LEAVE IT ALONE. Signalling a pid we did not identify is how a
-// deploy comes to kill an unrelated service that happened to be on the port.
+// when it is something of ours we may ask to stop, "stranger" when listeners
+// are there and none is ours (a FAILURE: it is never signalled, and null would
+// exit 0), or null when we cannot tell — and NULL MEANS LEAVE IT ALONE.
+// Signalling a pid we did not identify is how a deploy comes to kill an
+// unrelated service that happened to be on the port.
 function holderPidOn(port) {
   let out = "";
   try {
@@ -567,7 +586,11 @@ function holderPidOn(port) {
     }
     return cmdOf.get(pid);
   };
-  for (const p of pids) {
+  // OURS BY COMMAND LINE, before anything below can name a pid to signal. An
+  // unreadable one (`ps` timed out, the pid went away) is "cannot tell".
+  const mine = pids.filter((p) => OUR_CMD.test(psOf(p)));
+  if (!mine.length) return pids.some((p) => psOf(p) !== "") ? "stranger" : null;
+  for (const p of mine) {
     if (/\brun-service\b/.test(psOf(p))) return holderVerdict(port, p);
   }
   // NOT THE STANDBY, unless it is all there is. lsof returns ascending pid order
@@ -580,8 +603,8 @@ function holderPidOn(port) {
   // standby must still be releasable, so it stays eligible when nothing else is.
   // An empty answer means the pid is gone, which is not "a real proxy" — the
   // old code reached the same verdict through its catch.
-  const real = pids.filter((p) => { const c = psOf(p); return c !== "" && !/gap-relay/.test(c); });
-  const pid = (real.length ? real : pids)[0];
+  const real = mine.filter((p) => !/gap-relay/.test(psOf(p)));
+  const pid = (real.length ? real : mine)[0];
   // A holder of ours is running the `run-service` SUBCOMMAND. Nothing weaker
   // works: the rule was "names our launcher and is not server.mjs", and the
   // incumbent a real deploy meets is
@@ -627,6 +650,21 @@ function holderPidOn(port) {
     if (/\brun-service\b/.test(psOf(ppid))) return holderVerdict(port, ppid);
   }
   return pid;
+}
+
+// Every gap-relay LISTENing on <port> but `except` and ourselves: every process
+// holding an adopted socket is in lsof's answer, this one included. The relay is
+// matched as its SCRIPT path, not the word: "gap-relay" anywhere in a command
+// line is also an install path that merely contains it.
+function relaysOn(port, except) {
+  let out = "";
+  try {
+    out = probe("lsof", ["-nP", "-t", `-iTCP@${lsofAddr()}:${port}`, "-sTCP:LISTEN"]);
+  } catch { return []; }
+  return out.trim().split("\n").map(Number).filter((p) => {
+    if (!Number.isInteger(p) || p <= 1 || p === except || p === process.pid) return false;
+    try { return /\/bin\/gap-relay\.mjs(?:\s|$)/.test(probe("ps", ["-p", String(p), "-o", "command="])); } catch { return false; }
+  });
 }
 
 // Another `run-service` that already holds this address, older than us.
@@ -978,8 +1016,21 @@ function holdPort(rest) {
           // 9901."
           //
           // We are bound to the number, so there is nothing to guess.
-          env: { ...process.env, CACHE_FIX_HOLDER_HANDOVER: "1", LISTEN_FDS: "1",
+          env: { ...handoverEnv(process.env), CACHE_FIX_HOLDER_HANDOVER: "1", LISTEN_FDS: "1",
                  CACHE_FIX_PROXY_PORT: String(holder._port || port),
+                 // AND THE BIND: the successor ADOPTS this socket, so a bind from
+                 // the file cannot move it but would still relabel _host, and every
+                 // downstream name (HELD_HOST, the proxy child, /health) with it.
+                 CACHE_FIX_PROXY_BIND: bindAddr(),
+                 // AND THE PATH TO THE FILE, or the file moves its own trust
+                 // anchor: a CACHE_FIX_HANDOVER_ENV written there points every
+                 // later handover somewhere else, and since absence means
+                 // inherit, reverting the original file cannot take it back.
+                 CACHE_FIX_HANDOVER_ENV: handoverEnvPath(),
+                 // AND A HOLDER IS NOT A STANDBY. openGap() sheds HOLDER_TREE and
+                 // HELD_BY the same way; this one only became reachable when the
+                 // env above stopped being ours alone.
+                 CACHE_FIX_STANDBY: undefined,
                  CACHE_FIX_EXIT_WITH_PARENT: "0" },
         });
         // WE LEAVE WHEN THE SUCCESSOR EXISTS, not when we have asked for one.
@@ -1009,11 +1060,24 @@ function holdPort(rest) {
         // mutually exclusive, so nothing reaches recovery after departure today;
         // it is kept so a future reordering cannot quietly re-arm a holder that
         // has already handed the address on.
+        // SIGUSR2 IS THE HANDOVER'S OWN WORD, and it has to be its own: this
+        // block rewrites every stop to SIGHUP, so SIGHUP cannot also mean "a
+        // successor is already serving". The proxy picks its drain budget on
+        // the difference — 5 s where a supervisor waits serially, half an hour
+        // where nothing waits on it at all.
+        //
+        // SAFE ONLY BECAUSE `child` IS ALWAYS OURS. A proxy with no SIGUSR2
+        // handler takes node's default and dies outright, cutting everything
+        // with no drain — the hazard deploy.sh guards with a holder_tree check
+        // before signalling a holder it did not start. Here the only assignment
+        // that creates a child spawns SERVER_PATH from beside this file, so it
+        // cannot predate the handler. Adopting a proxy we did not spawn would
+        // make this line fatal.
         successor.once("spawn", () => {
           // The child under us keeps serving until IT is replaced by the
           // successor's own child; nothing here interrupts the accept path.
           if (child && child.exitCode === null && !child.signalCode) {
-            try { child.kill("SIGHUP"); } catch { }
+            try { child.kill("SIGUSR2"); } catch { }
           }
           left = true;
           settle(0);
@@ -1228,6 +1292,9 @@ function holdPort(rest) {
           `${spawningHash.slice(0, 12)}); this restart picks it up\n`);
       }
       bootedHash = spawningHash;
+      // Re-read at EVERY proxy spawn (watch swap, restart), not only at a SIGUSR2, and
+      // before closeGap(): a slow read must not sit in the window with nothing accepting.
+      const fileEnv = handoverEnv(process.env);
       // The gap listener must let go before the child can listen on the
       // inherited fd: two handles may BIND one port, but only one may LISTEN —
       // measured, holding it across the spawn gave "socket handover refused
@@ -1266,7 +1333,11 @@ function holdPort(rest) {
         // holder's own lsof probes (which DO honour bindAddr) could not see it
         // either. config.bind also feeds /health's upstream_is_self, so the
         // loop check was answering about an address we do not serve.
-        env: { ...process.env, CACHE_FIX_PROXY_PORT: "0", CACHE_FIX_PROXY_BIND: bindAddr(),
+        // The file's pins repeat the successor's (a self-healed holder inherits this env),
+        // except EXIT_WITH_PARENT: the child keeps this holder's own, never a file's.
+        env: { ...fileEnv, CACHE_FIX_PROXY_PORT: "0", CACHE_FIX_PROXY_BIND: bindAddr(),
+               CACHE_FIX_HANDOVER_ENV: handoverEnvPath(), CACHE_FIX_STANDBY: undefined,
+               CACHE_FIX_EXIT_WITH_PARENT: process.env.CACHE_FIX_EXIT_WITH_PARENT,
                CACHE_FIX_HELD_PORT: String(holder._port || port), CACHE_FIX_HELD_BY: String(process.pid),
                // OUR OWN BYTES, so the holder's version is observable instead of
                // inferred. The proxy already publishes proxy_tree and a checker
@@ -1337,6 +1408,24 @@ function holdPort(rest) {
         if (!retired && line.includes("releasing the listening socket")) {
           retired = true;
           if (child === me) child = null;
+          // A STOP ENDS HERE, NOT AT THE CHILD'S EXIT. The proxy has just closed
+          // its listening socket; from this line it owns nothing but the replies
+          // it still owes. Waiting for those is what forced a ceiling onto the
+          // child — it could not afford patience while a stop was blocked on it.
+          // Its budget keys on being held (server.mjs `unwaited`), so the two
+          // cannot be separated.
+          //
+          // Two cross-file invariants make the orphaned drainer safe, and
+          // nothing else records either:
+          //   - a released proxy must not resurrect the lineage
+          //     (server.mjs `if (releasingPort) return`), or the orphan returns
+          //     as a rival holder
+          //   - it must exit 0, not 75. A launchd agent with
+          //     `KeepAlive = { SuccessfulExit = false }` restarts a non-zero exit
+          //
+          // reclaim() and spawnWhenReady() below already return early while
+          // stopping, so this returns past nothing.
+          if (stopping) return settle(0);
           // "(handed off)" means the proxy already put its own successor on the
           // socket before announcing, and that successor is serving right now.
           // Reclaiming would take the port from a live proxy and spawning would
@@ -1598,7 +1687,7 @@ function holdPort(rest) {
     const takeOver = () => {
       const incumbent = holderPidOn(port);
       if (incumbent === "holder") return settle(0);   // ours already; nothing to do
-      if (!incumbent) return settle(0);               // cannot identify it: leave it alone
+      if (incumbent === "stranger" || !incumbent) return leaveAlone(incumbent);
       // ASK A HOLDER TO HAND THE PORT ON RATHER THAN DROP IT.
       //
       // A holder can spawn our replacement itself and pass it this very socket,
@@ -1630,12 +1719,25 @@ function holdPort(rest) {
       release();
     };
 
+    // The two answers that end the run WITHOUT a signal, said once here rather than
+    // in the polled holderPidOn(). A stranger fails (1). An unreadable incumbent
+    // exits 0 so a healthy holder of ours under fork pressure does not fail a
+    // start, and says so, since that 0 otherwise reads as "already running it".
+    const leaveAlone = (verdict) => {
+      warn(verdict === "stranger"
+        ? `[cache-fix] ${port} is held by a process that is not one of ours; leaving it alone\n`
+        : `[cache-fix] ${port}: could not read the command line of any process holding it; nothing was ` +
+          `signalled or started. If this was a deploy, it has NOT taken effect.\n`);
+      return settle(verdict === "stranger" ? 1 : 0);
+    };
+
     // The older route: ask the incumbent to let go, then bind what it drops.
     // Whatever arrives here cannot hand a socket on, so the port is unowned for
     // as long as our child takes to boot.
     const release = () => {
       const incumbent = holderPidOn(port);
-      if (incumbent === "holder" || !incumbent) return settle(0);
+      if (incumbent === "holder") return settle(0);
+      if (incumbent === "stranger" || !incumbent) return leaveAlone(incumbent);
       try { process.kill(incumbent, "SIGHUP"); } catch { return settle(0); }
       // Retry the bind until it lands. The incumbent drains first, so this is
       // not a fixed wait — a busy proxy takes longer and we simply keep asking.
@@ -1654,7 +1756,7 @@ function holdPort(rest) {
         if (Date.now() - asked > 500) {
           asked = Date.now();
           const still = holderPidOn(port);
-          if (still && still !== "holder") { try { process.kill(still, "SIGHUP"); } catch { } }
+          if (Number.isInteger(still)) { try { process.kill(still, "SIGHUP"); } catch { } }
         }
         if (Date.now() > deadline) {
           process.stderr.write(

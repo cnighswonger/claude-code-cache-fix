@@ -17,6 +17,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
 import { spawn } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { freePort } from "./proc-helpers.mjs";
@@ -103,7 +104,7 @@ async function withRelay(chain, fn, extraEnv = {}) {
     while (!/gap-relay carrying/.test(err) && Date.now() < up) await new Promise((r) => setTimeout(r, 50));
     assert.match(err, /gap-relay carrying/,
       `the relay never took the socket, so nothing below was measured; stderr: ${JSON.stringify(err.slice(-200))}`);
-    await fn({ port: carrierPort, stderr: () => err });
+    await fn({ port: carrierPort, stderr: () => err, relay });
   } finally {
     try { relay.kill("SIGKILL"); } catch {}
   }
@@ -478,4 +479,76 @@ test("dials an https:// hop over TLS, and an http:// hop in the clear", async ()
       });
     } finally { origin.srv.close(); hop.srv.close(); }
   }
+});
+
+// A SIGHUP RETIRES A STANDBY WITHOUT CUTTING WHAT IT CARRIES. The holder that
+// adopts a dead holder's socket asks the stale standby to go, and the default
+// SIGHUP action killed it mid-tunnel: every CONNECT it had armed to carry died
+// with it. Closing the server stops accepting at once and the process leaves
+// when the last carried connection ends.
+test("SIGHUP stops accepting but finishes the tunnels it carries", async () => {
+  const origin = net.createServer((c) => {
+    let n = 0;
+    const t = setInterval(() => { c.write("x"); if (++n === 20) { clearInterval(t); c.end(); } }, 50);
+    c.on("close", () => clearInterval(t));
+    c.on("error", () => {});
+  });
+  await new Promise((r) => origin.listen(0, "127.0.0.1", r));
+  try {
+    await withRelay("", async ({ port, relay }) => {
+      const left = new Promise((r) => relay.once("exit", (code, sig) => r(`${code}/${sig}`)));
+      let bytes = 0;
+      const c = net.connect(port, "127.0.0.1");
+      const closed = new Promise((r) => c.on("close", r));
+      c.on("connect", () => c.write(`CONNECT 127.0.0.1:${origin.address().port} HTTP/1.1\r\nHost: x\r\n\r\n`));
+      c.on("data", (d) => { bytes += (String(d).match(/x/g) || []).length; });
+      c.on("error", () => {});
+      for (const by = Date.now() + 5_000; bytes < 3 && Date.now() < by;) await new Promise((r) => setTimeout(r, 20));
+      assert.ok(bytes >= 3, "premise: the tunnel must be carrying bytes at the SIGHUP");
+
+      relay.kill("SIGHUP");
+      // A new connect is refused: the relay was the only descriptor on the socket.
+      // Polled, because the signal lands asynchronously and a connect queued on the
+      // closing socket is accepted or reset first (ECONNRESET, measured once).
+      const dial = () => new Promise((r) => {
+        const p = net.connect(port, "127.0.0.1");
+        p.on("connect", () => { p.destroy(); r("accepted"); });
+        p.on("error", (e) => r(e.code));
+      });
+      let again = await dial();
+      for (const by = Date.now() + 3_000; again !== "ECONNREFUSED" && Date.now() < by;) {
+        await new Promise((r) => setTimeout(r, 50));
+        again = await dial();
+      }
+      await Promise.race([closed, new Promise((r) => setTimeout(r, 5_000))]);
+      assert.equal(bytes, 20, `SIGHUP cut the tunnel at ${bytes} of 20 bytes`);
+      assert.equal(again, "ECONNREFUSED", "the relay kept accepting after SIGHUP");
+      assert.equal(await Promise.race([left, new Promise((r) => setTimeout(r, 3_000, "still running"))]), "0/null",
+        "the relay did not exit cleanly once its tunnel ended");
+    });
+  } finally { origin.close(); }
+});
+
+// AND AN UNARMED STANDBY, which has no handle and carries nothing: SIGHUP is
+// still its way out, and it must leave cleanly rather than die of the signal.
+// Linux only, because the signal can land before the handler exists and /proc is
+// what says it does (SigCgt bit 0 is SIGHUP); nothing else is observable here.
+test("SIGHUP ends an unarmed standby with exit 0", { skip: !existsSync("/proc/self/status") }, async () => {
+  const carrier = net.createServer();
+  await new Promise((r) => carrier.listen(0, "127.0.0.1", r));
+  const relay = spawn(process.execPath, [relayPath], {
+    env: { ...process.env, CACHE_FIX_STANDBY: "1", CACHE_FIX_STANDBY_PARENT: String(process.pid) },
+    stdio: ["ignore", "ignore", "ignore", carrier._handle.fd] });
+  await new Promise((r) => carrier.close(r));
+  try {
+    const caught = () => {
+      try { return (BigInt("0x" + /SigCgt:\s*([0-9a-f]+)/.exec(readFileSync(`/proc/${relay.pid}/status`, "utf8"))[1]) & 1n) === 1n; }
+      catch { return false; }
+    };
+    for (const by = Date.now() + 5_000; !caught() && Date.now() < by;) await new Promise((r) => setTimeout(r, 10));
+    assert.ok(caught(), "premise: the standby never installed its SIGHUP handler");
+    const left = new Promise((r) => relay.once("exit", (code, sig) => r(`${code}/${sig}`)));
+    relay.kill("SIGHUP");
+    assert.equal(await Promise.race([left, new Promise((r) => setTimeout(r, 3_000, "still running"))]), "0/null");
+  } finally { try { relay.kill("SIGKILL"); } catch {} }
 });

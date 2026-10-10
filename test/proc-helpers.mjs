@@ -12,6 +12,12 @@
 import { execFileSync } from "node:child_process";
 import { readdirSync, readFileSync } from "node:fs";
 import net from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+// A holder reads the operator's cache-fix-handover.env at every proxy spawn, which can
+// re-add keys a fixture deleted (HOP_ENV). Fixtures spread process.env, so pin it here.
+process.env.CACHE_FIX_HANDOVER_ENV = join(tmpdir(), "ccf-no-such-handover.env");
 
 // NEVER SIGNAL A PID WE KNOW ONLY BY PORT. freePort() binds 0, reads the number
 // and CLOSES, so the OS can hand it to a NEIGHBOURING TEST FILE — node:test runs
@@ -40,14 +46,32 @@ export const cmdOf = (pid) => {
 //
 // Filtered HERE and not at the call sites, because it already existed at some of
 // them and the rest never got it.
+//
+// lsof exits 1 on ANY error it hit (a process vanishing mid-scan under load is
+// one) and still prints the pids it found, so a throw keeps its stdout.
+//
+// `port` is one port or an array of them: a sweep over a whole file's ports is ONE
+// lsof, since each call costs ~0.5 s here. An empty set returns [] and must not
+// reach lsof, which given no port prints every listener on the box.
 export function listeners(port) {
+  const ports = [port].flat();
+  if (!ports.length) return [];
+  let out;
   try {
-    return execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN"],
-                        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
-      .trim().split("\n").filter(Boolean)
-      .filter((p) => OURS.test(cmdOf(p)));
-  } catch { return []; }
+    out = execFileSync("lsof", ["-nP", "-t", `-iTCP@127.0.0.1:${ports.join(",")}`, "-sTCP:LISTEN"],
+                       { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+  } catch (e) { out = e.stdout ?? ""; }
+  return out.trim().split("\n").filter(Boolean).filter((p) => OURS.test(cmdOf(p)));
 }
+
+// onPort() over a whole set of ports, for a file's after() sweep: ONE lsof, not one
+// per port. Port 0 is a proxy told to pick its own, never a port to sweep, so it is
+// dropped, and an empty set must not reach lsof or ours(): `Number([]) === 0` would
+// match a proxy that was given port 0.
+export const onPorts = (ports) => {
+  const ps = ports.filter((p) => Number(p) > 0);
+  return ps.length ? [...new Set([...listeners(ps), ...ps.flatMap((p) => ours(p))])] : [];
+};
 
 // EVERY FIXTURE ON A PORT, LISTENING OR NOT.
 //

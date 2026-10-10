@@ -370,6 +370,12 @@ srv.on("error", (e) => {
 
 const carry = () => srv.listen({ fd: 3 }, () => process.stderr.write("[cache-fix] gap-relay carrying\n"));
 
+// SIGHUP RETIRES US WITHOUT CUTTING WHAT WE CARRY. The default action killed an
+// armed standby mid-tunnel when a holder adopted its dead predecessor's socket.
+// close() stops accepting now and fires when the last tunnel ends; an unarmed
+// standby has none, so its callback fires at once. A repeat signal just queues.
+process.on("SIGHUP", () => srv.close(() => process.exit(0)));
+
 // STANDBY — the same relay, spawned once by the holder and then left alone,
 // accepting NOTHING until the holder is gone.
 //
