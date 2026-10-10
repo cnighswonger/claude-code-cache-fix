@@ -18,9 +18,12 @@ export const MODEL_FAMILIES = [
   { root: "mythos",            family: "mythos" },
   { root: "claude-opus-4-7",   family: "opus"   },
   { root: "claude-opus-4-8",   family: "opus"   },
+  { root: "claude-opus-5",     family: "opus"   },
   { root: "claude-sonnet-4-6", family: "sonnet" },
   { root: "claude-sonnet-4-7", family: "sonnet" },
+  { root: "claude-sonnet-5",   family: "sonnet" },
   { root: "claude-haiku-4-5",  family: "haiku"  },
+  { root: "claude-haiku-5",    family: "haiku"  },
 ];
 
 // Family classification — substring-matched against the lowercased model

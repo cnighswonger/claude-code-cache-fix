@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readFileSync, rmSync } from "node:fs";
+import { Readable, Writable } from "node:stream";
 import ext from "../proxy/extensions/session-budget-breaker.mjs";
+import { streamResponse, createTelemetryRecord } from "../proxy/stream.mjs";
 
 // Directive: docs/directives/proxy-subagent-budget-circuit-breaker.md
 // Highest-value class = the fail-open table. A block requires gate `on` + a
@@ -12,9 +14,12 @@ import ext from "../proxy/extensions/session-budget-breaker.mjs";
 const SID = "sess-abc";
 const H = (sid = SID) => ({ "x-claude-code-session-id": sid });
 // A message_start stream event carrying input+cache_creation tokens. `model` is
-// optional (cost lever prices per-model; token/rate levers ignore it).
+// optional (cost lever prices per-model; token/rate levers ignore it). The ctx
+// mirrors proxy/stream.mjs processLine, {event, meta, telemetry, responseHeaders,
+// drop}: NO request headers, so the session id rides on meta, where onRequest
+// stashed it.
 const start = (inp, cc = 0, model = undefined, sid = SID, responseHeaders = undefined) => ({
-  headers: H(sid),
+  meta: { _sbbSessionId: sid },
   responseHeaders,
   event: { type: "message_start", message: { model, usage: { input_tokens: inp, cache_creation_input_tokens: cc, output_tokens: 0, cache_read_input_tokens: 0 } } },
 });
@@ -92,7 +97,7 @@ test("gate on, ceiling set, first request (no tally yet) → forward", async () 
 test("unparseable usage does not update tally (metric-local fail-open)", async () => {
   process.env.CACHE_FIX_SESSION_BUDGET = "on";
   process.env.CACHE_FIX_SESSION_BUDGET_TOKENS = "10";
-  await ext.onStreamEvent({ headers: H(), event: { type: "message_start", message: { usage: { input_tokens: "not-a-number" } } } });
+  await ext.onStreamEvent({ meta: { _sbbSessionId: SID }, event: { type: "message_start", message: { usage: { input_tokens: "not-a-number" } } } });
   const r = await ext.onRequest(req());
   assert.equal(r, undefined, "unparseable input_tokens → tally not updated → forward");
   assert.equal(ext.__testOnly.tally(SID), undefined);
@@ -101,7 +106,7 @@ test("unparseable usage does not update tally (metric-local fail-open)", async (
 test("missing usage block → no update, forward", async () => {
   process.env.CACHE_FIX_SESSION_BUDGET = "on";
   process.env.CACHE_FIX_SESSION_BUDGET_TOKENS = "10";
-  await ext.onStreamEvent({ headers: H(), event: { type: "message_start", message: {} } });
+  await ext.onStreamEvent({ meta: { _sbbSessionId: SID }, event: { type: "message_start", message: {} } });
   const r = await ext.onRequest(req());
   assert.equal(r, undefined);
 });
@@ -151,7 +156,7 @@ test("input + cache_creation both count toward the tally", async () => {
 test("tally is per-session: session B is unaffected by session A's burn", async () => {
   process.env.CACHE_FIX_SESSION_BUDGET = "on";
   process.env.CACHE_FIX_SESSION_BUDGET_TOKENS = "100";
-  await ext.onStreamEvent({ headers: H("A"), event: { type: "message_start", message: { usage: { input_tokens: 500 } } } });
+  await ext.onStreamEvent({ meta: { _sbbSessionId: "A" }, event: { type: "message_start", message: { usage: { input_tokens: 500 } } } });
   const rA = await ext.onRequest(req("A"));
   const rB = await ext.onRequest(req("B"));
   assert.ok(rA && rA.skip === true, "A over → blocked");
@@ -203,6 +208,16 @@ test("cost lever prices cache_creation at the higher cache_write_1h rate", async
   assert.ok(r && r.skip === true, "cache_creation must be priced at cache_write_1h, not input");
   assert.ok(Math.abs(ext.__testOnly.costUsd(SID) - 1.0) < 1e-9, `expected ~$1.00, got ${ext.__testOnly.costUsd(SID)}`);
 });
+
+// 100k input tokens at the 5.5 model's $/M (Sonnet $2, Haiku $0.10); an unpriced id would read $0.
+for (const [model, usd] of [["claude-sonnet-5-5", 0.2], ["claude-haiku-5-5", 0.01]]) {
+  test(`cost lever prices ${model}, a default model, instead of failing open`, async () => {
+    process.env.CACHE_FIX_SESSION_BUDGET = "on";
+    process.env.CACHE_FIX_SESSION_BUDGET_COST_USD = "1";
+    await ext.onStreamEvent(start(100000, 0, model));
+    assert.ok(Math.abs(ext.__testOnly.costUsd(SID) - usd) < 1e-9, `expected ~$${usd}, got ${ext.__testOnly.costUsd(SID)}`);
+  });
+}
 
 test("cost lever UNDER the ceiling → forward", async () => {
   process.env.CACHE_FIX_SESSION_BUDGET = "on";
@@ -311,9 +326,29 @@ test("a throw in onStreamEvent never propagates (fail-open)", async () => {
   process.env.CACHE_FIX_SESSION_BUDGET = "on";
   process.env.CACHE_FIX_SESSION_BUDGET_TOKENS = "100";
   // event undefined → internal guards return; must not throw
-  await assert.doesNotReject(() => ext.onStreamEvent({ headers: H(), event: undefined }));
+  await assert.doesNotReject(() => ext.onStreamEvent({ meta: { _sbbSessionId: SID }, event: undefined }));
   const r = await ext.onRequest(req());
   assert.equal(r, undefined);
+});
+
+// --- Streaming accrual through the REAL stream.mjs ctx ---
+// A hand-spelled onStreamEvent ctx once carried request `headers` that the real
+// one never does, so every streamed turn accrued nothing while this suite stayed
+// green. Drive the shipped streamResponse so the ctx shape is stream.mjs's own.
+
+test("a streamed response accrues through the real stream ctx and trips the ceiling", async () => {
+  process.env.CACHE_FIX_SESSION_BUDGET = "on";
+  process.env.CACHE_FIX_SESSION_BUDGET_TOKENS = "100";
+  process.env.CACHE_FIX_SESSION_BUDGET_COST_USD = "1000";
+  const meta = { route: "messages" };
+  assert.equal(await ext.onRequest(req(SID, true, meta)), undefined);
+  const sse = `data: ${JSON.stringify(start(150, 0, "claude-opus-4-6").event)}\n\n`;
+  const sink = new Writable({ write(_c, _e, cb) { cb(); } });
+  await streamResponse(Readable.from([Buffer.from(sse)]), sink, createTelemetryRecord(), [ext], meta, {});
+  assert.equal(ext.__testOnly.tally(SID).tokens, 150, "token lever accrues");
+  assert.ok(ext.__testOnly.costUsd(SID) > 0, "cost lever accrues");
+  const r = await ext.onRequest(req(SID, true, { route: "messages" }));
+  assert.ok(r && r.skip === true, "the next streamed request must block");
 });
 
 // --- Non-streaming (stream:false) accrual: onResponse path ---

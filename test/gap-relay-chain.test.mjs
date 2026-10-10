@@ -19,9 +19,14 @@ import net from "node:net";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { freePort } from "./proc-helpers.mjs";
 
 const relayPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "gap-relay.mjs");
+
+// A DEAD HOP IS A PORT NOBODY CAN BIND, not a freed one: the kernel can hand that
+// number to the next call or the relay's carrier, and the relay folds a repeated
+// hop into one and drops its own address, so two refusals traced as one (1 !== 2
+// on CI). Below 1024 an unprivileged runner cannot bind; connecting refuses at once.
+const DEAD1 = 1, DEAD2 = 2;
 
 // An endpoint that records being reached and answers a CONNECT. Every one of
 // them records, so a failure names which was touched instead of leaving an
@@ -144,9 +149,8 @@ const connectThrough = (port, target) => new Promise((resolve) => {
 test("refuses rather than dialling direct when CACHE_FIX_REQUIRE_HOP=1", async () => {
   const touched = [];
   const origin = await endpoint("ORIGIN", touched);
-  const dead = await freePort();
   try {
-    await withRelay(`http://127.0.0.1:${dead}`, async ({ port, stderr }) => {
+    await withRelay(`http://127.0.0.1:${DEAD1}`, async ({ port, stderr }) => {
       const reply = await connectThrough(port, `127.0.0.1:${origin.port}`);
       await new Promise((r) => setTimeout(r, 400));
       assert.deepEqual(touched, [],
@@ -259,9 +263,8 @@ test("a refused first hop falls to the SECOND, not straight to a direct dial", a
   const touched = [];
   const origin = await endpoint("ORIGIN", touched);
   const hop2 = await endpoint("HOP2", touched);
-  const dead = await freePort();
   try {
-    await withRelay(`http://127.0.0.1:${dead},http://127.0.0.1:${hop2.port}`, async ({ port, stderr }) => {
+    await withRelay(`http://127.0.0.1:${DEAD1},http://127.0.0.1:${hop2.port}`, async ({ port, stderr }) => {
       const reply = await connectThrough(port, `127.0.0.1:${origin.port}`);
       await new Promise((r) => setTimeout(r, 300));
       // Carrying VIA A HOP: the hop's own reply is piped straight back, so the
@@ -284,9 +287,8 @@ test("a refused first hop falls to the SECOND, not straight to a direct dial", a
 test("direct is the LAST resort, reached only when no hop will carry", async () => {
   const touched = [];
   const origin = await endpoint("ORIGIN", touched);
-  const dead1 = await freePort(), dead2 = await freePort();
   try {
-    await withRelay(`http://127.0.0.1:${dead1},http://127.0.0.1:${dead2}`, async ({ port, stderr }) => {
+    await withRelay(`http://127.0.0.1:${DEAD1},http://127.0.0.1:${DEAD2}`, async ({ port, stderr }) => {
       const reply = await connectThrough(port, `127.0.0.1:${origin.port}`);
       await new Promise((r) => setTimeout(r, 300));
       // AND ON THE DIRECT PATH TOO, where the 200 is ours to write rather than

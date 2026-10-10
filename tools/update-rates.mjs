@@ -44,6 +44,7 @@ const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const NAME_TO_WIRE = {
   "Claude Fable 5": ["claude-fable-5"],
   "Claude Mythos 5": ["claude-mythos-5"],
+  "Claude Opus 5.5": ["claude-opus-5-5"],
   "Claude Opus 5": ["claude-opus-5"],
   "Claude Opus 4.8": ["claude-opus-4-8"],
   "Claude Opus 4.7": ["claude-opus-4-7"],
@@ -51,10 +52,13 @@ const NAME_TO_WIRE = {
   "Claude Opus 4.5": ["claude-opus-4-5-20251101"],
   "Claude Opus 4.1": ["claude-opus-4-1-20250805"],
   "Claude Opus 4": ["claude-opus-4-20250514"],
+  "Claude Sonnet 5.5": ["claude-sonnet-5-5"],
   "Claude Sonnet 5": ["claude-sonnet-5"],
   "Claude Sonnet 4.6": ["claude-sonnet-4-6"],
   "Claude Sonnet 4.5": ["claude-sonnet-4-5-20250929"],
   "Claude Sonnet 4": ["claude-sonnet-4-20250514"],
+  // ponytail: tiered on the live page, so no row parses; rates.json's up-to-100K-token entry is hand-written (over-100K is under-counted, the schema has no tiers). This row only fires if the tier is dropped.
+  "Claude Haiku 5.5": ["claude-haiku-5-5"],
   "Claude Haiku 4.5": ["claude-haiku-4-5", "claude-haiku-4-5-20251001"],
   "Claude Haiku 3.5": ["claude-haiku-3-5-20241022"],
   "Claude 3 Opus": ["claude-3-opus-20240229"],
@@ -77,10 +81,12 @@ const NAME_TO_WIRE = {
 const REQUIRED_WIRE_IDS = [
   "claude-fable-5",
   "claude-opus-5",
+  "claude-opus-5-5",
   "claude-opus-4-8",
   "claude-opus-4-7",
   "claude-opus-4-6",
   "claude-sonnet-5",
+  "claude-sonnet-5-5",
   "claude-haiku-4-5",
 ];
 
@@ -100,6 +106,16 @@ const MULTIPLIERS = { cache_write_5m: 1.25, cache_write_1h: 2, cache_read: 0.1 }
 // Published prices are rounded to the cent, so an exact multiplier check would
 // reject legitimate rows. Allow a cent of slack either way.
 const MULTIPLIER_EPSILON = 0.011;
+
+// Per-model cache_read multiplier overrides, for the rare row that documents a
+// different discount than the standard 0.1x (Claude Opus 5.5 prices cache
+// reads at 0.05x input, per the pricing page's footnote). Only the named field
+// on the named wire id is affected; every other row and every other field
+// still goes through the standard MULTIPLIERS check above.
+const CACHE_READ_MULTIPLIER_OVERRIDES = { "claude-opus-5-5": 0.05, "claude-sonnet-5-5": 0.05 };
+// Sonnet 5.5's cache-read cut ($0.20 → $0.10, Claude Code 2.1.296) is first seen on the
+// 2026-10-10 page. A page dated before that is still read at the standard 0.1x.
+const CACHE_READ_OVERRIDE_SINCE = { "claude-sonnet-5-5": Date.UTC(2026, 9, 10) };
 
 const MONTHS = {
   january: 0, february: 1, march: 2, april: 3, may: 4, june: 5,
@@ -163,23 +179,57 @@ function tableRows(html) {
   return rows;
 }
 
-const PRICE_CELL = /^\$([0-9][0-9,]*(?:\.[0-9]+)?)\s*\/\s*MTok$/;
+// A trailing footnote marker (e.g. "$0.20 / MTok 2" once the <sup>2</sup> tag
+// is stripped to plain text by tableRows()) is part of the page's own markup,
+// not a second price — allow and ignore it.
+const PRICE_CELL = /^\$([0-9][0-9,]*(?:\.[0-9]+)?)\s*\/\s*MTok(?:\s\d{1,2})?$/;
 
-// A model-pricing row is exactly: name cell + the five price columns
-// (input | 5m write | 1h write | cache read | output). This shape requirement is
+// Keywords that name each price column in the pricing table's header row
+// ("Base Input Tokens", "Input", "5m Cache Writes", "Hits and refreshes", ...).
+const COLUMNS = { input: /input/i, output: /output/i, cache_write_5m: /5m/i, cache_write_1h: /1h/i, cache_read: /hits/i };
+
+// The price fields, in column order, when this row is the pricing table's header
+// row: name cell + five cells that each name exactly one price field, every field
+// named once. Anything else (the page's first, colSpan header row; another
+// table's header; a renamed column) is null, so a header this cannot map yields
+// no rows and the run fails closed instead of reading prices by position.
+function headerCols(cells) {
+  const fields = cells.slice(1).map((c) => Object.keys(COLUMNS).filter((f) => COLUMNS[f].test(c)));
+  return fields.length === 5 && fields.every((f) => f.length === 1) && new Set(fields.flat()).size === 5
+    ? fields.flat() : null;
+}
+
+// A model-pricing row is exactly: name cell + the five price columns, in the
+// order `cols` (from the header row) names them. This shape requirement is
 // what keeps the batch-pricing table (two price cells) and the tool-use table
 // (token counts, not prices) from being mistaken for pricing rows — the old
 // first-match-anywhere scan had no such guard.
-function priceRow(cells) {
-  if (cells.length !== 6) return null;
-  const vals = [];
+function priceRow(cells, cols) {
+  if (!cols || cells.length !== 6) return null;
+  const v = {};
   for (let i = 1; i < 6; i++) {
     const m = PRICE_CELL.exec(cells[i]);
     if (!m) return null;
-    vals.push(parseFloat(m[1].replace(/,/g, "")));
+    v[cols[i - 1]] = parseFloat(m[1].replace(/,/g, ""));
   }
-  const [input, w5m, w1h, read, output] = vals;
-  return { name: cells[0], input, output, cache_read: read, cache_write_5m: w5m, cache_write_1h: w1h };
+  // Fixed key order (not column order): an unchanged page must stay a byte-identical no-op.
+  const { input, output, cache_read, cache_write_5m, cache_write_1h } = v;
+  return { name: cells[0], input, output, cache_read, cache_write_5m, cache_write_1h };
+}
+
+// Price rows of every table, each read with the column order its OWN header
+// row names (the mapping never carries over into the next table).
+function priceRows(html) {
+  const rows = [];
+  for (const [table] of html.matchAll(/<table[\s\S]*?<\/table>/g)) {
+    let cols = null;
+    for (const cells of tableRows(table)) {
+      cols = headerCols(cells) ?? cols;
+      const r = priceRow(cells, cols);
+      if (r) rows.push(r);
+    }
+  }
+  return rows;
 }
 
 // Does this row's name cell name this model — as opposed to a longer model whose
@@ -193,15 +243,19 @@ function namesModel(nameCell, display) {
 
 // Validate one row's numbers before it can reach rates.json. Returns an error
 // string (fail closed) or null when the row is trustworthy.
-function validateRates(wireId, r) {
+function validateRates(wireId, r, atMs) {
   for (const [field, v] of Object.entries(r)) {
     if (typeof v !== "number" || !Number.isFinite(v)) return `${wireId}.${field} is not a finite number`;
     if (v < MIN_PRICE || v > MAX_PRICE) return `${wireId}.${field}=${v} outside sane range $${MIN_PRICE}–$${MAX_PRICE}`;
   }
   for (const [field, mult] of Object.entries(MULTIPLIERS)) {
-    const expected = r.input * mult;
+    const effectiveMult = field === "cache_read" && wireId in CACHE_READ_MULTIPLIER_OVERRIDES &&
+      atMs >= (CACHE_READ_OVERRIDE_SINCE[wireId] ?? 0)
+      ? CACHE_READ_MULTIPLIER_OVERRIDES[wireId]
+      : mult;
+    const expected = r.input * effectiveMult;
     if (Math.abs(r[field] - expected) > MULTIPLIER_EPSILON) {
-      return `${wireId}.${field}=${r[field]} contradicts the documented ${mult}x input multiplier ` +
+      return `${wireId}.${field}=${r[field]} contradicts the documented ${effectiveMult}x input multiplier ` +
         `(input=${r.input} → expected ${expected.toFixed(4)})`;
     }
   }
@@ -212,7 +266,7 @@ function validateRates(wireId, r) {
 // Parse the model-pricing table. `atMs` is the effective date used to pick
 // between dated variants of the same model. Returns { rates, errors }.
 export function parsePricing(html, atMs = Date.now()) {
-  const rows = tableRows(html).map(priceRow).filter(Boolean);
+  const rows = priceRows(html);
   const rates = {};
   const errors = [];
 
@@ -267,7 +321,7 @@ export function parsePricing(html, atMs = Date.now()) {
 
     const { name, ...r } = chosen;
     for (const id of wireIds) {
-      const err = validateRates(id, r);
+      const err = validateRates(id, r, atMs);
       if (err) { errors.push(err); continue; }
       rates[id] = { ...r };
     }

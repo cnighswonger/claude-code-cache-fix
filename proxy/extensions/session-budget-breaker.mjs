@@ -346,8 +346,9 @@ export default {
       if (!ev || ev.type !== "message_start") return;
       const split = usageInputTokens(ev.message && ev.message.usage);
       if (split === null) return; // unparseable/missing → don't update (fail-open)
-      let sid;
-      try { sid = resolveSessionId(ctx.headers); } catch { return; }
+      // The stream ctx (proxy/stream.mjs) carries no request headers, so read
+      // the sid onRequest stashed on the shared meta, as onResponse does.
+      const sid = ctx.meta && ctx.meta._sbbSessionId;
       if (!sid) return;
       accrue(sid, split, ev.message && ev.message.model, ctx.responseHeaders);
     } catch { /* fail-open: never let accounting throw affect the request */ }

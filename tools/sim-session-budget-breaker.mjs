@@ -69,8 +69,10 @@ const reqCtx = (stream = true) => ({
   body: { model: MODEL, stream },
   meta: { route: "messages" },
 });
-const startEvent = () => ({
-  headers: { "x-claude-code-session-id": SID },
+// The stream ctx (proxy/stream.mjs) has no request headers: the sid rides on the
+// meta the request's onRequest stashed it on.
+const startEvent = (meta) => ({
+  meta,
   responseHeaders: {},
   event: { type: "message_start", message: { model: MODEL, usage: legUsage() } },
 });
@@ -139,7 +141,7 @@ async function runFanout({ concurrency, gate = "on", env = {}, stream = true }) 
         push(VCLOCK + LATENCY_MS, "ACCRUE", ctx.meta);
       }
     } else {
-      if (stream) await ext.onStreamEvent(startEvent());
+      if (stream) await ext.onStreamEvent(startEvent(ev.meta));
       else await ext.onResponse(jsonResCtx(ev.meta));
       inflight--;
       const e = ext.__testOnly.tally(SID);
@@ -228,7 +230,7 @@ async function main() {
   VCLOCK = 0;
   let foForwarded = 0, foBlocked = 0;
   for (let i = 0; i < N_LEGS; i++) {
-    await ext.onStreamEvent({ headers: { "x-claude-code-session-id": SID },
+    await ext.onStreamEvent({ meta: { _sbbSessionId: SID },
       event: { type: "message_start", message: { model: MODEL, usage: { input_tokens: "not-a-number" } } } });
     const r = await ext.onRequest(reqCtx());
     if (r && r.skip) foBlocked++; else foForwarded++;
