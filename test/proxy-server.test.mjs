@@ -11,10 +11,13 @@ import { join, dirname } from "node:path";
 import { startProxy, upstreamPointsAtSelf } from "../proxy/server.mjs";
 import { startWatcher } from "../proxy/watcher.mjs";
 import { loadExtensions, getRegistry } from "../proxy/pipeline.mjs";
-import { OURS, cmdOf, freePort as takePort, listeners, onPort } from "./proc-helpers.mjs";
+import { OURS, armLineage, cmdOf, freePort as takePort, listeners, onPort, reapStamped } from "./proc-helpers.mjs";
 
 const serverPath = join(dirname(fileURLToPath(import.meta.url)), "..", "proxy", "server.mjs");
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
+// EVENT #348. See proc-helpers.mjs's armLineage()/reapStamped() and
+// proxy-held-port.test.mjs's R3 fix, same shape.
+const lineage = armLineage("proxy-server");
 
 const usedPorts = [];
 // The shared allocator plus this file's own cleanup registry — the registry is
@@ -848,6 +851,7 @@ after(async () => {
     if (!any && i) break;
     await new Promise((r) => setTimeout(r, 700));
   }
+  await reapStamped(lineage);
 });
 
 // close() MUST RESOLVE AFTER shutdown() HAS ALREADY UNBOUND.

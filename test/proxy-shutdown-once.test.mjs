@@ -10,7 +10,7 @@
 // mutation-checked; it needed isolating, not deleting.
 //
 // node gives each FILE its own process, which is the whole mechanism.
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import net from "node:net";
@@ -18,11 +18,15 @@ import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { OURS, cmdOf, freePort, listeners } from "./proc-helpers.mjs";
+import { OURS, armLineage, cmdOf, freePort, listeners, reapStamped } from "./proc-helpers.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const launcherPath = join(here, "..", "bin", "claude-via-proxy.mjs");
 const serverPath = join(here, "..", "proxy", "server.mjs");
+// EVENT #348. See proc-helpers.mjs's armLineage()/reapStamped() and
+// proxy-held-port.test.mjs's R3 fix, same shape.
+const lineage = armLineage("proxy-shutdown-once");
+after(async () => { await reapStamped(lineage); });
 
 const probe = (port) => new Promise((res) => {
   const r = http.get({ host: "127.0.0.1", port, path: "/health", agent: false, timeout: 8_000 },

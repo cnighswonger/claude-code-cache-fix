@@ -2,6 +2,11 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { exitWithin } from "./child-deadline.mjs";
 import http from "node:http";
+import { armLineage, reapStamped } from "./proc-helpers.mjs";
+
+// See proc-helpers.mjs's armLineage()/reapStamped(): the spawn below inherits
+// the marker through `{...process.env}`.
+const lineage = armLineage("proxy-integration");
 
 let proxyPort;
 let proxyProcess;
@@ -101,6 +106,7 @@ describe("proxy integration with extensions", () => {
     }
     delete process.env.CACHE_FIX_PROXY_PORT;
     delete process.env.CACHE_FIX_PROXY_UPSTREAM;
+    await reapStamped(lineage);
   });
 
   it("health check returns ok", async () => {

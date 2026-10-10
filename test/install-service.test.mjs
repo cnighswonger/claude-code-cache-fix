@@ -1,5 +1,5 @@
 import { createServer } from "node:net";
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, writeFile, rm, readdir, mkdir } from "node:fs/promises";
 import { tmpdir, platform } from "node:os";
@@ -7,6 +7,13 @@ import { join, dirname } from "node:path";
 import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+
+import { armLineage, reapStamped } from "./proc-helpers.mjs";
+// EVENT #348. BIN's --proxy-port run below binds a real socket and opens a
+// standby the same way run-service/server do; see proc-helpers.mjs's
+// armLineage()/reapStamped() and proxy-held-port.test.mjs's R3 fix.
+const lineage = armLineage("install-service");
+after(async () => { await reapStamped(lineage); });
 
 import {
   renderSystemdTemplate,

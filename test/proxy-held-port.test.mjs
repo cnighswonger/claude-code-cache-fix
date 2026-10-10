@@ -11,7 +11,7 @@ import { tmpdir, availableParallelism } from "node:os";
 import { join, dirname } from "node:path";
 
 import { sourceFingerprintSync } from "../proxy/source-fingerprint.mjs";
-import { HOP_ENV, OURS, cmdOf, freePort as takePort, listeners, onPort } from "./proc-helpers.mjs";
+import { HOP_ENV, OURS, armLineage, cmdOf, freePort as takePort, listeners, onPort, reapStamped, stamped } from "./proc-helpers.mjs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
@@ -45,6 +45,13 @@ const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", 
 // them, so the body is tested before the code.
 const OUTAGE = { REFUSED: "refused", RESET: "reset", DEGRADED: "degraded" };
 function classify(body) {
+  // A NUMBER IS NOT AN OUTAGE, AND MUST NOT BE A TypeError EITHER. Six of this
+  // file's seven probes resolve `ERR:${e.code}`; the seventh resolves a bare
+  // statusCode on success, and its caller filters out 200 and hands the rest
+  // here. Measured on CI Node 22: one 502 reached this line and the case died
+  // as `body.startsWith is not a function` — a crash where the answer is
+  // simply "that was a reply, not an outage".
+  if (typeof body !== "string") return null;
   if (!body.startsWith("ERR:")) return null;
   if (/"carrying"\s*:\s*"gap-relay"/.test(body)) return null;
   if (/"status"\s*:\s*"degraded"/.test(body)) return OUTAGE.DEGRADED;
@@ -60,6 +67,20 @@ async function freePort() {
   usedPorts.push(p);
   return p;
 }
+
+// EVENT #348. usedPorts only ever catches a port a case HANDED OUT — the
+// "asked for an ephemeral one" case below gets its port back from the kernel
+// via CACHE_FIX_PROXY_PORT=0 and never registers it, so onPort() at the bottom
+// of this file was never even asked about it, and a survivor there (measured:
+// one `bin/gap-relay.mjs` standby, ppid 1, 10s after the runner exited) went
+// unreaped. Stamped by env instead: every spawn in this tree forwards
+// `{...process.env, ...}`, so setting this once, here, before any case spawns
+// anything, marks the whole lineage any case in this file can cause —
+// self-heal successor, standby, or a kernel-picked port nobody registered —
+// regardless of which port it ends up on. armLineage() (proc-helpers.mjs)
+// also installs the synchronous exit-time backstop: `after()` below is async
+// and can be skipped entirely by a crash before the runner reaches teardown.
+armLineage("proxy-held-port");
 
 // Its own file: every case here drives a REAL launcher holding a REAL port, so
 // a mis-signalled pid or a stuck child aborts the whole runner process. Node
@@ -124,6 +145,20 @@ async function freePort() {
 const CONCURRENCY = Math.max(1, Math.floor(availableParallelism() / 2));
 
 describe("held port (CACHE_FIX_HOLD_PORT)", { concurrency: CONCURRENCY }, () => {
+
+  // THE SEVENTH PROBE RESOLVES A NUMBER. Six of this file's probes resolve
+  // `ERR:${e.code}`; the one at the forced-kill case resolves a bare statusCode
+  // on success, and its caller filters out 200 and hands the rest to classify().
+  // A 502 therefore reaches it as a Number. Pinned as a unit case because the
+  // path only opens when a non-200 is actually observed — CI Node 22 saw one and
+  // the case died as `body.startsWith is not a function`, three runners apart
+  // from where it was introduced.
+  it("classify survives a probe that answers with a status code", () => {
+    assert.equal(classify(502), null, "a status code is a reply, not an outage");
+    assert.equal(classify(200), null);
+    assert.equal(classify("ERR:ECONNREFUSED"), OUTAGE.REFUSED);
+    assert.equal(classify("ECONNRESET"), null, "no ERR: prefix means it is not ours to classify");
+  });
 // The default is declared in proxy/config.mjs and repeated in the launcher.
 // If they drift, an unset CACHE_FIX_PROXY_PORT binds one port while callers
 // dial the other.
@@ -169,7 +204,7 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
   // measured, an exported WATCH_DEPLOY_MS turns "is off unless asked for"
   // into a failure about the shell rather than about the code.
   const env = { ...process.env };
-  for (const k of [...HOP_ENV, "LISTEN_FDS", "LISTEN_PID", "CACHE_FIX_WATCH_DEPLOY_MS", "CACHE_FIX_SELF_HEAL"]) delete env[k];
+  for (const k of [...HOP_ENV, "LISTEN_FDS", "LISTEN_PID", "CACHE_FIX_WATCH_DEPLOY_MS"]) delete env[k];
   Object.assign(env, { CACHE_FIX_HOLD_PORT: "on", CACHE_FIX_PROXY_PORT: String(port),
                        CACHE_FIX_SELF_HEAL: "off",
                        // A SIGKILLed runner runs no cleanup, so ask the holder to
@@ -1860,7 +1895,10 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       let err = "";
       p.stderr.on("data", (d) => { err += d; });
       const code = await Promise.race([
-        new Promise((r) => p.on("exit", (c) => r(c))),
+        // "close", not "exit": "exit" can fire before the stderr pipe is drained,
+        // which read the message as absent (measured: errlen=0 at exit, 56 at
+        // close 6 ms later).
+        new Promise((r) => p.on("close", (c) => r(c))),
         new Promise((r) => setTimeout(() => r("HUNG"), 25_000)),
       ]);
       try { p.kill("SIGKILL"); } catch {}
@@ -2348,6 +2386,45 @@ describe("deploy watcher (CACHE_FIX_WATCH_DEPLOY_MS)", () => {
 });
 });
 
+// EVENT #348, the gap-relay half (analyzer 2). This case never calls this
+// file's freePort() — CACHE_FIX_PROXY_PORT="0" hands the address back from the
+// kernel, exactly like "hands the BOUND port downstream" above, and a case
+// that never registers its port is invisible to the file-level after() sweep
+// below UNLESS it is found by lineage instead. It deliberately does NOT reap
+// what it leaks: that is the file-level sweep's job, and the point of this
+// case is to prove the sweep does it, not to do it twice. SIGKILL, not SIGHUP,
+// because closeStandby() only runs on SIGHUP by design (see forward() in the
+// launcher) — a plain kill leaves the standby up every time, not on a timing
+// race, so this reproduces deterministically. Recorded to
+// LEAK_PROBE_FILE, read by the harness AFTER this whole file's process exits
+// (i.e. after after() has had its turn), which is the only vantage point that
+// can tell whether the sweep actually ran.
+it("leaves a standby for the file-level sweep to find, on a port it never registered", async () => {
+  if (!process.env.LEAK_PROBE_FILE) return;   // only meaningful under the harness below
+  const lineage = process.env.CACHE_FIX_TEST_LINEAGE;
+  const env = { ...process.env, CACHE_FIX_PROXY_PORT: "0" };
+  for (const k of [...HOP_ENV, "LISTEN_FDS", "LISTEN_PID"]) delete env[k];
+  const holder = spawn(process.execPath, [launcherPath, "run-service"], { env, stdio: ["ignore", "pipe", "ignore"] });
+  let out = "";
+  holder.stdout.on("data", (d) => { out += d; });
+  const up = Date.now() + 15_000;
+  while (!/listening on/.test(out) && Date.now() < up) await new Promise((r) => setTimeout(r, 100));
+  assert.ok(/listening on/.test(out), "the holder never bound a port — this measures nothing");
+  const untilRelay = Date.now() + 5_000;
+  let relays = [];
+  while (!relays.length && Date.now() < untilRelay) {
+    relays = stamped(lineage).filter((p) => /gap-relay\.mjs/.test(cmdOf(p)));
+    if (!relays.length) await new Promise((r) => setTimeout(r, 200));
+  }
+  assert.ok(relays.length, "the holder never opened a standby — this measures nothing");
+  // The lineage rides along with the pids: a harness that only has the pids
+  // can do no better than a blind kill, and a recycled pid must still pass
+  // the marker+OURS filter before anything signals it.
+  writeFileSync(process.env.LEAK_PROBE_FILE, `${lineage}\n${relays.join(",")}`);
+  holder.kill("SIGKILL");        // bypasses every handler, including closeStandby()
+  await new Promise((r) => setTimeout(r, 500));
+});
+
 // ONE SWEEP FOR THE FILE, over the ports it handed out and nobody else's. A
 // standby relay outlives a holder that was killed rather than released — that
 // is the point of it — and while it has not armed yet it holds a socket nobody
@@ -2365,4 +2442,12 @@ after(async () => {
     if (!any && i) break;
     await new Promise((r) => setTimeout(r, 700));
   }
+
+  // A SECOND SWEEP, BY LINEAGE RATHER THAN BY PORT. EVENT #348: the "asked for
+  // an ephemeral one" case gets its bound port back from the kernel and never
+  // registers it in usedPorts, so the loop above never asks onPort() about it
+  // and a standby it left behind (measured: one, ppid 1, 10s after this file's
+  // runner exited) was never swept. stamped() finds the whole lineage this
+  // file caused by env marker instead, whatever port it landed on.
+  await reapStamped(process.env.CACHE_FIX_TEST_LINEAGE);
 });

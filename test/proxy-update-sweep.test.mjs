@@ -8,7 +8,7 @@
 // Driven as a real process, not by importing the function: the sweep is armed
 // from the script-entry path and reads its inputs from the environment, so an
 // in-process call would test neither.
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { exitWithin } from "./child-deadline.mjs";
 import http from "node:http";
@@ -17,10 +17,15 @@ import { fileURLToPath } from "node:url";
 import { mkdtempSync, writeFileSync, existsSync, mkdirSync, symlinkSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { freePort } from "./proc-helpers.mjs";
+import { armLineage, freePort, reapStamped } from "./proc-helpers.mjs";
 
 const serverPath = join(dirname(fileURLToPath(import.meta.url)), "..", "proxy", "server.mjs");
 const DELAY_MS = 300;
+// See proc-helpers.mjs's armLineage()/reapStamped() and
+// stdio-epipe-survival.test.mjs's note, same shape: both spawns below inherit
+// the marker through `{...process.env}`.
+const lineage = armLineage("proxy-update-sweep");
+after(async () => { await reapStamped(lineage); });
 
 // A stand-in release channel, so the test never depends on the network or on
 // what the real channel happens to say today.

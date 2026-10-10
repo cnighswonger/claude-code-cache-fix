@@ -8,6 +8,7 @@ import { tmpdir, availableParallelism } from "node:os";
 import { chmodSync, closeSync, existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import tls from "node:tls";
+import { armLineage, reapStamped } from "./proc-helpers.mjs";
 
 // The keep-the-merge branch needs a census that can say YES, and
 // `tls.getCACertificates` arrived in v22.15 while `engines` allows >=18. Below
@@ -21,6 +22,11 @@ import { bundleUsable } from "../bin/ca-trust.mjs";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const WRAPPER_PATH = resolve(__dirname, "../bin/claude-via-proxy.mjs");
 const SERVER_PATH = resolve(__dirname, "../proxy/server.mjs");
+
+// EVENT #348. See proc-helpers.mjs's armLineage()/reapStamped() and
+// proxy-held-port.test.mjs's R3 fix, same shape.
+const lineage = armLineage("proxy-wrapper");
+after(async () => { await reapStamped(lineage); });
 
 // Every temp dir this file makes, removed once at the end.
 //

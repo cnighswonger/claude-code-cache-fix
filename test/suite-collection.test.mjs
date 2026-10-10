@@ -126,6 +126,165 @@ test("a test that SIGKILLs a holder reaps the successor, holder first", () => {
     "that a live holder immediately replaces");
 });
 
+// EVENT #348, ROUND 4. The fix for one file (test/stdio-epipe-survival.test.mjs,
+// ledger #348 round 3) shipped with no check that keeps it — the whole class
+// (a detached standby that outlives a SIGKILLed holder) can come back the same
+// way it arrived: a new file spawns the launcher or relay and nobody notices it
+// never called armLineage()/reapStamped() (proc-helpers.mjs).
+//
+// Static, for the same reason the reaper guard above is: the sweep is cleanup
+// code, so nothing fails when a file skips it. FILE-WIDE rather than one named
+// case, because the next file to need this is not the one this guard was
+// written to watch.
+//
+// "Spawns the launcher or relay" is read off the SAME path-construction shape
+// every real spawn site in this tree uses -- `join(..., "bin", "X.mjs")` or a
+// single `"…/bin/X.mjs"` string -- with any readFileSync(...) call blanked
+// first, because two files (this one, and proxy-hop-fallback.test.mjs) name
+// that path only to read the BINARY'S OWN source as text, never to spawn it.
+// ANY SPELLING OF THE SWEEP COUNTS -- what is required is that the file reaps
+// what it spawned, not that it reaches for one helper. Exactly two spellings,
+// stated in REAP_SPELLINGS below and nowhere else, because the failure message
+// is the only description of this predicate anyone reads. Measured 2026-09-08
+// on the integrated build: proxy-holder-stop-in-flight.test.mjs was named here
+// while genuinely reaping (its exit hook removed, one gap-relay.mjs survived at
+// +20s; intact, none did), and the helpers it was told to call are on this
+// branch only, so the file could not have called them. A guard that reds a file
+// which does the thing is a guard people route around.
+//
+// KNOWN LIMIT, recorded rather than closed: this tests CO-OCCURRENCE, not
+// containment -- the kill may sit anywhere in the file rather than inside the
+// exit handler. Requiring containment would red this guard's own subject again,
+// which spells it `process.on("exit", reapStandbys)` with the kill inside the
+// NAMED FUNCTION; separating that from a decoy needs a parser, not a regex.
+//
+// Hoisted out of the sweep so the case below can put code through it directly:
+// widening this into a predicate that is always true, loosening a pairing, or
+// appending a third one, would all look exactly like a pass.
+//
+// ONE SOURCE OF TRUTH, and the message is DERIVED rather than kept in step: a
+// prose copy of the accept-set drifts the moment a pattern is tightened, and CI
+// then names a file for lacking a spelling it has -- which is the false
+// positive this guard was widened to remove, wearing the message's clothes.
+//
+// The exit hook is matched the tolerant way this file already uses at :88:
+// `process.on('exit'` and `process.on( "exit"` reap exactly as well as the
+// double-quoted, tight-spaced form, and reddening a file over its quoting is
+// the same false positive in a narrower dress.
+const REAP_SPELLINGS = [
+  [/armLineage\(/, /reapStamped\(/],
+  [/process\.on\(\s*["']exit["']/, /process\.kill\(/],
+];
+const reapsItsLineage = (code) => REAP_SPELLINGS.some(([arm, reap]) => arm.test(code) && reap.test(code));
+
+test("every test file that spawns the launcher or relay carries a lineage marker", () => {
+  // Files that mention the binaries' paths but never spawn them, with why:
+  const EXEMPT = {
+    "proxy-hop-fallback.test.mjs": "reads gap-relay.mjs's source as text (a portOf() regex extraction); never spawns the real binary",
+  };
+  // A THIRD BINARY SPAWNS detached:true TOO: proxy/server.mjs. It is also an
+  // importable module (startProxy, capOwnLog, ...), so a bare path-text match
+  // would enrol every file that only imports it and never spawns it. Scoped
+  // to the actual spawn call instead, the same shape every real spawner here
+  // uses: `spawn(process.execPath, [<target>], ...)` with the target either
+  // the literal path or the file's own `serverPath` variable.
+  const spawnsOurs = /"bin"\s*,\s*"(?:claude-via-proxy|gap-relay)\.mjs"|["'`][./]*bin\/(?:claude-via-proxy|gap-relay)\.mjs["'`]|spawn\(\s*process\.execPath,\s*\[\s*(?:serverPath|["'`][./]*proxy\/server\.mjs["'`])\s*\]/;
+  // Line comments blanked before every check below, mention or call alike:
+  // this guard's own added comments say "armLineage()/reapStamped()" in
+  // prose, in every file it arms, and a naive text match on the raw source
+  // cannot tell that from the real call it is standing next to. Not a full
+  // parse (a `//` inside a string survives as a false comment start, same
+  // known gap as everywhere else in this tree that does not reach for
+  // suite-collection.test.mjs's own stripComments()) — good enough for a
+  // guard whose subject never puts one there.
+  const decomment = (s) => s.split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+  const files = readdirSync(testDir).filter((f) => f.endsWith(".test.mjs"));
+  const missing = [];
+  let selfEnrolled;
+  for (const f of files) {
+    if (EXEMPT[f]) continue;
+    const code = decomment(readFileSync(join(testDir, f), "utf8"));
+    const stripped = code.replace(/readFileSync\([^)]*\)/g, "");
+    if (f === "suite-collection.test.mjs") selfEnrolled = spawnsOurs.test(stripped);
+    if (!spawnsOurs.test(stripped)) continue;
+    if (!reapsItsLineage(code)) missing.push(f);
+  }
+  assert.deepEqual(missing, [],
+    `these files spawn the launcher or relay and carry none of the reap spellings ` +
+    `-- ${REAP_SPELLINGS.map(([arm, reap]) => `${arm.source} with ${reap.source}`).join("; or ")} ` +
+    `-- so a standby a case leaves behind (detached, outlives a SIGKILLed holder) has ` +
+    `nothing to reap it: ${missing.join(", ")}`);
+
+  // THIS FILE MUST NOT ENROL ITSELF IN THE SWEEP IT RUNS. The predicate's case
+  // below carries every reap token as a decoy literal, so enrolment stopped
+  // being impossible and became merely absent: a future fixture that spells a
+  // bin path would enrol this file and PASS on decoys, silently. 993a2fc is
+  // this going wrong once already, caught by inspection rather than by a check.
+  //
+  // Read off the LOOP'S OWN verdict rather than recomputed. A second copy of
+  // "what counts as spawning" would go quiet, not red, the day the blanking
+  // above changes: the sweep would enrol under the new rule while this asserted
+  // under the old. `undefined` if the loop never reached this file at all, which
+  // is not `false` -- so a rename or an EXEMPT entry reds here instead of
+  // disarming the pin.
+  assert.equal(selfEnrolled, false,
+    "a fixture in this file now spells a launcher or relay path, so the sweep above " +
+    "counts this file as one that spawns them -- it spawns nothing, and it would pass " +
+    "on the decoy reap tokens its own predicate case carries (undefined here means the " +
+    "sweep never reached this file, so the pin was reading nothing)");
+});
+
+// A WIDENED GUARD THAT CATCHES NOTHING IS THE REGRESSION, and it is invisible:
+// the sweep above goes green either way, so the predicate is exercised here
+// directly. The fixtures are the reap spellings and nothing else -- the
+// predicate never reads whether the code around them looks like a spawner, and
+// a fixture that spelled a launcher path out would enrol THIS file in the sweep
+// above (measured: it did, and 993a2fc took it back out).
+//
+// HALF OF EACH PAIRING IS A NEGATIVE, because "not always true" is all a
+// no-op injection proves: loosening a pairing to an `||` leaves every positive
+// below green, and only the negatives say so.
+//
+// AND ONE NEGATIVE BELONGS TO NO PAIRING, because the ones that do cannot see a
+// THIRD entry appended to the list. `[/spawn\(/, /SIGKILL/]` passes every other
+// assert here -- the no-reap fixture has `spawn(` without SIGKILL, the kill
+// fixture has SIGKILL without `spawn(` -- while accepting a file that spawns a
+// launcher and SIGKILLs a holder and reaps nothing, which is the whole class.
+test("the lineage predicate rejects code with no reap, and no half of a pairing alone", () => {
+  // THE LIST ITSELF, because no number of fixtures can bound an open-ended one:
+  // `[/detached/, /kill\(/]` and `[/afterEach\(/, /kill/]` both pass every
+  // assertion below while accepting a file that spawns detached, kills
+  // something, and reaps nothing. Same contract this file puts on the
+  // CONCURRENCY roster at :1084 -- a new one is fine, add it HERE, deliberately.
+  assert.equal(REAP_SPELLINGS.length, 2,
+    "a reap spelling was added or dropped without a fixture pair to say what it accepts " +
+    "-- a new one is fine, add it here with a positive and a negative for each half");
+
+  assert.equal(reapsItsLineage("const h = spawn(process.execPath, [launcherPath]);"), false,
+    "code that never reaps now passes the lineage guard -- the predicate was widened " +
+    "into a no-op and the sweep above is decoration");
+  assert.equal(reapsItsLineage('spawn(launcherPath); process.kill(pid, "SIGKILL");'), false,
+    "spawning a launcher and killing it counts as reaping its lineage -- a pairing was " +
+    "appended that is satisfied by the defect this guard exists to catch");
+
+  assert.equal(reapsItsLineage('armLineage("f"); reapStamped("f");'), true,
+    "the shared proc-helpers spelling stopped counting as a reap");
+  assert.equal(reapsItsLineage('armLineage("f");'), false,
+    "arming a lineage nobody reaps counts as a reap -- the first pairing was loosened");
+  assert.equal(reapsItsLineage('reapStamped("f");'), false,
+    "reaping a lineage nobody armed counts as a reap -- the first pairing was loosened");
+
+  assert.equal(reapsItsLineage('process.on("exit", r);\nprocess.kill(q, "SIGKILL");'), true,
+    "a file's own exit-time reap stopped counting -- this is the widening itself");
+  assert.equal(reapsItsLineage("process.on( 'exit', r);\nprocess.kill(q, 'SIGKILL');"), true,
+    "the exit hook is matched by exact spelling again -- a file that quotes or spaces it " +
+    "differently reds while genuinely reaping, the false positive in a narrower dress");
+  assert.equal(reapsItsLineage('process.on("exit", r);'), false,
+    "an exit hook that kills nothing counts as a reap -- the second pairing was loosened");
+  assert.equal(reapsItsLineage('process.kill(q, "SIGKILL");'), false,
+    "a kill with no exit-time hook counts as a reap -- the second pairing was loosened");
+});
+
 // A FAILURE MESSAGE IS PUBLISHED OUTPUT. proxy-held-port's probes append the
 // 503 body to what they assert on, and the gap relay's 503 body carries the hop
 // it would forward to — so an env var that gives a child a hop and is not
@@ -929,6 +1088,26 @@ test("no test file asks lsof who holds a port", () => {
   assert.deepEqual(bad, [],
     `these files ask lsof directly instead of going through listeners(), so nothing ` +
     `filters the pid before it reaches process.kill():\n  ${bad.join("\n  ")}`);
+});
+
+// A STUB lsof MUST NAME PIDS THAT CANNOT EXIST. The launcher SIGHUPs whatever
+// lsof names, every 500 ms; the literal 4241 4242 hit a live neighbour (CI: the
+// proxy-held-port runner, exit 129) and the launcher looped to its 20 s deadline.
+test("no lsof stub names a pid that can exist", () => {
+  const PID_MAX = 4194304;   // Linux's ceiling; macOS stops at 99998
+  const live = [];
+  let seen = 0;
+  for (const f of readdirSync(testDir).filter((f) => f.endsWith(".test.mjs"))) {
+    const src = stripComments(readFileSync(join(testDir, f), "utf8"));
+    for (const m of src.matchAll(/\blsof\s*:\s*"(#!\/bin\/sh[^"]*)"/g)) {
+      seen++;
+      for (const [n] of m[1].matchAll(/\b\d{2,}\b/g)) if (Number(n) <= PID_MAX) live.push(`${f}: ${n}`);
+    }
+  }
+  assert.ok(seen > 0, "no lsof stub found: either they moved or this detector broke");
+  assert.deepEqual(live, [],
+    `these lsof stubs print a pid at or below pid_max, which the launcher then SIGHUPs ` +
+    `on whatever live process holds it:\n  ${live.join("\n  ")}`);
 });
 
 test("the suite derives its parallelism from the machine", () => {

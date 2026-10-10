@@ -13,15 +13,20 @@
 // no-hop — their measurement is that closing there trades an invisible
 // fall-open for an invisible outage, and this tunnel is the most expensive
 // place to take one.
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { freePort } from "./proc-helpers.mjs";
+import { armLineage, freePort, reapStamped } from "./proc-helpers.mjs";
 
 const relayPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "gap-relay.mjs");
+// EVENT #348. Every relay here inherits this via {...process.env, ...}; see
+// proc-helpers.mjs's armLineage()/reapStamped() and proxy-held-port.test.mjs's
+// R3 fix, same shape.
+const lineage = armLineage("gap-relay-chain");
+after(async () => { await reapStamped(lineage); });
 
 // An endpoint that records being reached and answers a CONNECT. Every one of
 // them records, so a failure names which was touched instead of leaving an

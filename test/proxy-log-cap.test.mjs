@@ -20,7 +20,7 @@
 //     ftruncateSync(2)  works, and later writes land at 0
 // So a tail cannot be preserved and the cap is a truncate. It keeps the NEWEST
 // lines, which is the half worth keeping.
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
 import { spawn } from "node:child_process";
@@ -30,8 +30,14 @@ import { tmpdir } from "node:os";
 import {
   closeSync, fstatSync, mkdtempSync, openSync, readFileSync, rmSync, statSync, writeFileSync,
 } from "node:fs";
+import { armLineage, reapStamped } from "./proc-helpers.mjs";
 
 const serverPath = join(fileURLToPath(new URL(".", import.meta.url)), "..", "proxy", "server.mjs");
+// See proc-helpers.mjs's armLineage()/reapStamped() and
+// stdio-epipe-survival.test.mjs's note, same shape: the spawn below inherits
+// the marker through `{...process.env}`.
+const lineage = armLineage("proxy-log-cap");
+after(async () => { await reapStamped(lineage); });
 
 describe("log cap", () => {
   it("truncates its own log when it is over the cap, and says so", async () => {

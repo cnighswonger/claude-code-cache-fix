@@ -22,7 +22,7 @@
 // mode, and the holder through BOTH of its dispatch doors — `server` with
 // CACHE_FIX_HOLD_PORT=on was the one an earlier fix missed while the other
 // passed, so a single holder row would have called that fixed.
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
 import { spawn } from "node:child_process";
@@ -31,18 +31,50 @@ import { withDeadline } from "./child-deadline.mjs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
+import { armLineage, reapStamped } from "./proc-helpers.mjs";
+
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+// EVENT #348. `reap()` below kills the holder's own process GROUP, but
+// openStandby() (bin/claude-via-proxy.mjs) spawns its standby `detached:
+// true` too — Node's detach starts a NEW session, so the standby is never IN
+// that group, and a SIGKILLed holder never runs closeStandby() either. The
+// two `run-service`/`server` cases just past this point are exactly the door
+// that leaves one behind (measured: two `bin/gap-relay.mjs`, ppid 1,
+// STANDBY_PARENT already dead, after a whole-suite run). Same class as
+// proxy-held-port.test.mjs's R3 fix, different file.
+const lineage = armLineage("stdio-epipe-survival");
 const reap = (p) => { try { process.kill(-p.pid, "SIGKILL"); } catch {} try { p.kill("SIGKILL"); } catch {} };
 const cleanEnv = () => {
   const env = { ...process.env };
   for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
                    "ALL_PROXY", "all_proxy", "CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_REQUIRE_HOP",
                    "CACHE_FIX_STANDBY", "LISTEN_FDS", "LISTEN_PID"]) delete env[k];
+  // ASSIGNED, not deleted: proxy/server.mjs:1519 gates on `!== "off"`, so an
+  // absent var reads as self-heal ON. A delete only clears an ambient value —
+  // where the shell already had CACHE_FIX_SELF_HEAL=off, deleting it would
+  // have turned self-heal back ON, the opposite of this file's premise.
+  Object.assign(env, { CACHE_FIX_SELF_HEAL: "off" });
   return env;
 };
 const settle = (ms) => new Promise((r) => setTimeout(r, ms));
 
 describe("a dead stdio reader does not kill the port's process", () => {
+  // cleanEnv() DELETES CACHE_FIX_SELF_HEAL rather than forcing it "off", but
+  // proxy/server.mjs:1519 gates on `!== "off"` — so where the ambient shell
+  // already exported CACHE_FIX_SELF_HEAL=off, the delete REMOVES that "off"
+  // and self-heal ends up ON, the opposite of what this file's own comment
+  // above cleanEnv() claims.
+  it("cleanEnv() forces self-heal off even when the ambient shell already set it off", () => {
+    const had = "CACHE_FIX_SELF_HEAL" in process.env;
+    const prior = process.env.CACHE_FIX_SELF_HEAL;
+    process.env.CACHE_FIX_SELF_HEAL = "off";
+    try {
+      assert.equal(cleanEnv().CACHE_FIX_SELF_HEAL, "off");
+    } finally {
+      if (had) process.env.CACHE_FIX_SELF_HEAL = prior; else delete process.env.CACHE_FIX_SELF_HEAL;
+    }
+  });
+
   // The relay is the last line of defence: if it dies the address is gone. It
   // needs a REAL socket on fd 3 — handed a pipe it exits 1 by design, which
   // would read as "killed by EPIPE" and prove nothing.
@@ -192,3 +224,10 @@ describe("a dead stdio reader does not kill the port's process", () => {
 // does this holder have", which is a number on the machine, not a shape in the
 // source. `openStandby` states the same identity rule twenty lines below and had
 // always followed it; this is the sibling that was missed in the same sweep.
+
+// ONE SWEEP FOR THE FILE, by lineage: this file had none before, so a standby
+// `reap()`'s process-group kill cannot reach (detached: true starts a new
+// session) rode past every case's own cleanup. See proc-helpers.mjs's
+// armLineage()/reapStamped() and proxy-held-port.test.mjs's R3 fix, same
+// shape.
+after(async () => { await reapStamped(lineage); });

@@ -9,9 +9,12 @@ import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { OURS, cmdOf, freePort as takePort, listeners, onPort } from "./proc-helpers.mjs";
+import { OURS, armLineage, cmdOf, freePort as takePort, listeners, onPort, reapStamped } from "./proc-helpers.mjs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
+// EVENT #348. See proc-helpers.mjs's armLineage()/reapStamped() and
+// proxy-held-port.test.mjs's R3 fix, same shape.
+const lineage = armLineage("proxy-holder-handover");
 
 // Its own file, and that is the point rather than tidiness. This case samples a
 // live port while a holder is replaced, so it is sensitive to how much else is
@@ -106,6 +109,7 @@ describe("holder handover (SIGUSR2)", () => {
       if (!any && i) break;
       await new Promise((r) => setTimeout(r, 700));
     }
+    await reapStamped(lineage);
   });
   it("hands the port to a successor without refusing a request", async () => {
     const port = await freePort();

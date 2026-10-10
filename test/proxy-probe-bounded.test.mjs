@@ -15,7 +15,7 @@
 //
 // This test replaces `lsof` with one that never returns and asserts the
 // launcher still finishes. Without a timeout on the probe it hangs forever.
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
 import { spawn } from "node:child_process";
@@ -24,7 +24,13 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { join, dirname } from "node:path";
 
+import { armLineage, reapStamped } from "./proc-helpers.mjs";
+
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
+// EVENT #348. See proc-helpers.mjs's armLineage()/reapStamped() and
+// proxy-held-port.test.mjs's R3 fix, same shape.
+const lineage = armLineage("proxy-probe-bounded");
+after(async () => { await reapStamped(lineage); });
 
 describe("probe bounding", () => {
   // ONE CASE PER HANGING COMMAND, because they sit at different depths of the
@@ -54,8 +60,9 @@ describe("probe bounding", () => {
     // sites; hanging there is what this case is for. lsof stays bounded by the
     // sibling case below, which is the one that hangs it.
     const answers = {
-      // A pid list, so execution reaches the `ps` sites below it.
-      lsof: "#!/bin/sh\nprintf '%s\\n' 4241 4242\n",
+      // A pid list, so execution reaches the `ps` sites below it. Above pid_max
+      // (Linux 4194304, macOS 99998): the launcher SIGHUPs these, so no live process may own one.
+      lsof: "#!/bin/sh\nprintf '%s\\n' 2147483646 2147483645\n",
       // Reached ONLY in the `ps` row, where lsof answers and ps hangs. In the
       // `lsof` row this is never executed: holderPidOn's `probe("lsof", …)` is
       // inside a try whose catch returns, so a timing-out lsof ends the call

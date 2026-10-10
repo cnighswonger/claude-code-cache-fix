@@ -9,9 +9,11 @@
 // The drift was already starting: `listeners` was byte-identical in three files
 // and an arrow function in a fourth, and freePort had three different shapes.
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { readdirSync, readFileSync } from "node:fs";
 import net from "node:net";
+import { constants as osConstants } from "node:os";
+import { fileURLToPath } from "node:url";
 
 // NEVER SIGNAL A PID WE KNOW ONLY BY PORT. freePort() binds 0, reads the number
 // and CLOSES, so the OS can hand it to a NEIGHBOURING TEST FILE — node:test runs
@@ -23,8 +25,10 @@ import net from "node:net";
 // here: matching `node` alone claims every node process on the box, and matching
 // a bare filename claims a test file that happens to be named for one of ours.
 // A path segment of `bin/` or `proxy/` ending in `.mjs` is what only our
-// binaries have.
-export const OURS = /\/(?:bin|proxy)\/[\w.-]+\.mjs\b/;
+// binaries have — RELATIVE too (`node proxy/server.mjs`, argv[1] with no
+// leading `/`), which is why the segment can also start at word start, not
+// only after a `/`.
+export const OURS = /(?:^|[\s/])(?:bin|proxy)\/[\w.-]+\.mjs\b/;
 
 // The command line of a pid, or "" if it is gone. Every case has to tell a
 // holder from a proxy from a standby relay, and they are only distinguishable
@@ -71,8 +75,10 @@ export function listeners(port) {
 //
 // Still filtered by OURS, for the same reason listeners() is: a port number is
 // not ownership, and freePort() hands the same number to neighbouring files.
-export function ours(port) {
-  const want = new RegExp(`CACHE_FIX_(?:HELD|PROXY)_PORT=${Number(port)}(?:\\s|$)`);
+// EVERY PID WHOSE ENVIRON MATCHES `want`, filtered by OURS. Shared by ours()
+// (keyed on a registered port) and stamped() (keyed on a lineage marker) —
+// same two platforms, same two markers to read, only the regex differs.
+function byEnv(want) {
   const out = [];
   try {
     // Linux: /proc is authoritative and needs no shell-out.
@@ -94,6 +100,85 @@ export function ours(port) {
     }
   } catch { /* no ps either: the caller falls back to listeners() */ }
   return out;
+}
+
+export function ours(port) {
+  return byEnv(new RegExp(`CACHE_FIX_(?:HELD|PROXY)_PORT=${Number(port)}(?:\\s|$)`));
+}
+
+// EVERY PROCESS DESCENDED FROM ONE TEST FILE'S RUN, by env marker rather than
+// by the port it ends up on. onPort()/ours() need a registered port; a
+// self-heal successor or a standby relay a case never asked freePort() for
+// (born on a kernel-picked port nobody recorded) is still ours to find here,
+// because every spawn in this tree forwards `{...process.env, ...}` and so
+// inherits whatever the top of the file stamped. Same two platforms as ours();
+// unverified on macOS (no live box to measure this leg on) — a case there
+// still has the port sweep above as its floor, so nothing regresses.
+export function stamped(marker) {
+  // Escaped: a marker built from a pid and Date.now() has no regex metachars
+  // today, but the marker is a caller-supplied string and `.` alone would
+  // silently widen the match to any single character in its place.
+  const safe = String(marker).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return byEnv(new RegExp(`CACHE_FIX_TEST_LINEAGE=${safe}(?:\\s|$)`));
+}
+
+// SIGHUP, THEN SIGKILL, BY LINEAGE. The shared shape of "reap what this run's
+// lineage left behind": SIGHUP is the graceful release a standby only stands
+// down on (see bin/claude-via-proxy.mjs's forward()), tried a few times, then
+// whatever is still alive gets forced. Two callers had this loop hand-copied;
+// one copy is what stays in sync.
+export async function reapStamped(marker) {
+  for (let i = 0; i < 6; i++) {
+    const survivors = stamped(marker);
+    if (!survivors.length) break;
+    for (const p of survivors) { try { process.kill(Number(p), "SIGHUP"); } catch { /* gone already */ } }
+    await new Promise((r) => setTimeout(r, 700));
+  }
+  killStamped(marker);
+}
+
+// Not ourselves: on macOS byEnv() matches OURS against command + env, so the
+// calling process (the watchdog, say) can be in its own list.
+export function killStamped(marker) {
+  for (const p of stamped(marker)) {
+    if (Number(p) === process.pid) continue;
+    try { process.kill(Number(p), "SIGKILL"); } catch { /* best effort */ }
+  }
+}
+
+// ARM A FILE'S LINEAGE, ONE CALL. `=`, not `||=`: nothing calls this with
+// CACHE_FIX_TEST_LINEAGE already set in ITS OWN env (a harness passes a
+// marker back through LEAK_PROBE_FILE, never through env), so `||=` here
+// would only ever pick up an AMBIENT value the process inherited from
+// whatever started it — widening the sweep to a marker this file never
+// chose. Installs the synchronous exit-time SIGKILL backstop over it (see the
+// note this replaces in proxy-held-port.test.mjs: `after()` is async and can
+// be skipped by a crash before teardown) and returns the marker so the
+// caller can also `await reapStamped(marker)` from its own async teardown.
+export function armLineage(name) {
+  const marker = process.env.CACHE_FIX_TEST_LINEAGE = `${name}-${process.pid}`;
+  process.on("exit", () => killStamped(marker));
+  // The backstops here run INSIDE this process, so a SIGKILL right behind a
+  // group SIGTERM cancels them (bound_wait does that; a standby relay and a
+  // successor holder outlived it). The watchdog is its own session, sees the
+  // pipe to this process close however it dies, and sweeps then.
+  const dog = spawn(process.execPath,
+    [fileURLToPath(new URL("./fixtures/lineage-watchdog.mjs", import.meta.url)), marker],
+    { detached: true, stdio: ["pipe", "ignore", "ignore"] });
+  // EMFILE leaves dog.stdin undefined, EAGAIN emits an async "error": a missing
+  // watchdog must not take the importing test file down.
+  dog.on("error", () => {});
+  dog.unref();
+  dog.stdin?.unref();
+  // SIGTERM/SIGINT/SIGHUP have a fatal DEFAULT disposition with no listener
+  // attached: the process is torn down by the kernel and the "exit" backstop
+  // above never fires. Turning the signal into a normal exit is what lets
+  // that backstop run. SIGHUP is how a killed tmux window or a dropped ssh
+  // session ends a run here, not just an interactive shell's own hangup.
+  for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+    process.once(sig, () => process.exit(128 + osConstants.signals[sig]));
+  }
+  return marker;
 }
 
 // A port nobody is listening on RIGHT NOW. It is released before the caller

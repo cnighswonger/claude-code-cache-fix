@@ -1,4 +1,4 @@
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { withDeadline } from "./child-deadline.mjs";
 import net from "node:net";
@@ -8,8 +8,15 @@ import { readFileSync } from "node:fs";
 import { forcedCloseLine } from "../proxy/server.mjs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { armLineage, reapStamped } from "./proc-helpers.mjs";
 
 const serverPath = join(dirname(fileURLToPath(import.meta.url)), "..", "proxy", "server.mjs");
+// See proc-helpers.mjs's armLineage()/reapStamped() and this file's own
+// comment above startProxyWithBadFd3(): the whole reason that spawn is
+// `detached: true` is a successor that outlives the group kill, and that
+// successor still inherits this marker through `{...process.env}`.
+const lineage = armLineage("shutdown-exit-code");
+after(async () => { await reapStamped(lineage); });
 
 // A supervised stop must exit 0 whichever path it takes. server.close() waits
 // for in-flight requests, and a live session always has one (the streaming
