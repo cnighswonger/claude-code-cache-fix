@@ -27,6 +27,11 @@ function injectTtl(block, ttlParam) {
   return block;
 }
 
+// A subagent's continue request drops the SDK prefix from its system but keeps the agent-id header, so the
+// id seen with the prefix classifies it. shortcut: capped at 1000 ids in insertion order; an evicted id's continue reads "main".
+const SUBAGENT_IDS = new Set();
+const MAX_SUBAGENT_IDS = 1000;
+
 export { detectRequestType, injectTtl };
 
 export default {
@@ -38,7 +43,12 @@ export default {
     const { body } = ctx;
     if (!body.system) return;
 
-    const requestType = detectRequestType(body.system);
+    let requestType = detectRequestType(body.system);
+    const agentId = ctx.headers?.["x-claude-code-agent-id"];
+    if (agentId && requestType === "subagent") {
+      SUBAGENT_IDS.add(agentId);
+      if (SUBAGENT_IDS.size > MAX_SUBAGENT_IDS) SUBAGENT_IDS.delete(SUBAGENT_IDS.values().next().value);
+    } else if (agentId && SUBAGENT_IDS.has(agentId)) requestType = "subagent";
     const ttlValue = requestType === "subagent" ? TTL_SUBAGENT : TTL_MAIN;
 
     if (ttlValue === "none") return;
@@ -46,17 +56,20 @@ export default {
     const detectedTier = ctx.meta?._ttlTier || "1h";
     const ttlParam = ttlValue === "5m" || detectedTier === "5m" ? "5m" : "1h";
 
-    if (Array.isArray(body.system)) {
-      body.system = body.system.map((block) => injectTtl(block, ttlParam));
-    }
+    // The API 400s on a 1h block after a 5m one (system, messages): a bare marker takes 1h when a 1h block follows it.
+    let seen1h = false;
+    const fill = (blocks) => {
+      for (let i = blocks.length - 1; i >= 0; i--) {
+        blocks[i] = injectTtl(blocks[i], seen1h ? "1h" : ttlParam);
+        seen1h ||= blocks[i].cache_control?.ttl === "1h";
+      }
+    };
 
     if (Array.isArray(body.messages)) {
-      for (const msg of body.messages) {
-        if (!Array.isArray(msg.content)) continue;
-        for (let i = 0; i < msg.content.length; i++) {
-          msg.content[i] = injectTtl(msg.content[i], ttlParam);
-        }
+      for (let i = body.messages.length - 1; i >= 0; i--) {
+        if (Array.isArray(body.messages[i].content)) fill(body.messages[i].content);
       }
     }
+    if (Array.isArray(body.system)) fill(body.system);
   },
 };

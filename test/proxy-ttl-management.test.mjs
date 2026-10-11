@@ -240,3 +240,127 @@ test("ttl-management: existing ttl='5m' marker is not overwritten", async () => 
     assert.deepEqual(ctx.body.system[0].cache_control, { type: "ephemeral", ttl: "5m" });
   });
 });
+
+// --- ordering: a ttl='1h' block must not come after a ttl='5m' block (system -> messages) ---
+
+// Effective ttl of every cache_control block in request order; a bare marker is the API's 5m.
+function ttlsInOrder(body) {
+  return [...body.system, ...body.messages.flatMap((m) => m.content)]
+    .filter((b) => b.cache_control)
+    .map((b) => b.cache_control.ttl ?? "5m");
+}
+
+function assertNo1hAfter5m(ttls) {
+  const first5m = ttls.indexOf("5m");
+  assert.ok(first5m === -1 || ttls.lastIndexOf("1h") < first5m, `1h after 5m: ${ttls}`);
+}
+
+test("ttl-management: subagent 5m, client 1h on a later assistant block → bare markers before it get 1h", async () => {
+  await withEnv({ CACHE_FIX_TTL_MAIN: undefined, CACHE_FIX_TTL_SUBAGENT: "5m" }, async (mod) => {
+    const ctx = {
+      body: {
+        system: [{ type: "text", text: SUBAGENT_PROMPT, cache_control: { type: "ephemeral" } }],
+        messages: [
+          { role: "user", content: [{ type: "text", text: "hi", cache_control: { type: "ephemeral" } }] },
+          { role: "assistant", content: [{ type: "text", text: "yo", cache_control: { type: "ephemeral", ttl: "1h" } }] },
+        ],
+      },
+      headers: {},
+      meta: {},
+    };
+    await mod.onRequest(ctx);
+    const ttls = ttlsInOrder(ctx.body);
+    assert.deepEqual(ttls, ["1h", "1h", "1h"]);
+    assertNo1hAfter5m(ttls);
+  });
+});
+
+test("ttl-management: 1h before an explicit 5m, bare tail marker → tail keeps 5m (no global 1h-wins)", async () => {
+  await withEnv({ CACHE_FIX_TTL_MAIN: undefined, CACHE_FIX_TTL_SUBAGENT: undefined }, async (mod) => {
+    const ctx = {
+      body: {
+        system: [{ type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral", ttl: "1h" } }],
+        messages: [
+          { role: "user", content: [{ type: "text", text: "a" }] },
+          { role: "assistant", content: [{ type: "text", text: "b", cache_control: { type: "ephemeral", ttl: "1h" } }] },
+          { role: "user", content: [{ type: "text", text: "c", cache_control: { type: "ephemeral", ttl: "5m" } }] },
+          { role: "user", content: [{ type: "text", text: "d", cache_control: { type: "ephemeral" } }] },
+        ],
+      },
+      headers: {},
+      meta: { _ttlTier: "5m" },
+    };
+    await mod.onRequest(ctx);
+    const ttls = ttlsInOrder(ctx.body);
+    assert.deepEqual(ttls, ["1h", "1h", "5m", "5m"]);
+    assertNo1hAfter5m(ttls);
+  });
+});
+
+test("ttl-management: subagent 5m with no 1h anywhere → system still gets 5m", async () => {
+  await withEnv({ CACHE_FIX_TTL_MAIN: undefined, CACHE_FIX_TTL_SUBAGENT: "5m" }, async (mod) => {
+    const ctx = subagentCtx();
+    await mod.onRequest(ctx);
+    assert.deepEqual(ctx.body.system[0].cache_control, { type: "ephemeral", ttl: "5m" });
+  });
+});
+
+// --- a subagent's continue request has lost the SDK prefix; the agent-id header carries the class ---
+
+const AGENT_ID = "x-claude-code-agent-id";
+const BILLING = "x-anthropic-billing-header: cc_version=2.1.296; cc_entrypoint=cli;";
+const bare = { type: "ephemeral" };
+
+const fullCtx = (id) => ({
+  body: {
+    system: [{ type: "text", text: SUBAGENT_PROMPT, cache_control: bare }],
+    messages: [{ role: "user", content: [{ type: "text", text: "go", cache_control: bare }] }],
+  },
+  headers: id ? { [AGENT_ID]: id } : {},
+  meta: {},
+});
+
+const continueCtx = (id) => ({
+  body: {
+    system: [{ type: "text", text: BILLING, cache_control: bare }],
+    messages: [
+      { role: "user", content: [{ type: "text", text: "go" }] },
+      { role: "assistant", content: [{ type: "text", text: "ok", cache_control: bare }] },
+    ],
+  },
+  headers: id ? { [AGENT_ID]: id } : {},
+  meta: {},
+});
+
+test("ttl-management: a subagent's continue request (no SDK prefix, same agent id) gets the subagent ttl", async () => {
+  await withEnv({ CACHE_FIX_TTL_MAIN: undefined, CACHE_FIX_TTL_SUBAGENT: "5m" }, async (mod) => {
+    await mod.onRequest(fullCtx("agent-a"));
+    const ctx = continueCtx("agent-a");
+    await mod.onRequest(ctx);
+    const ttls = ttlsInOrder(ctx.body);
+    assert.deepEqual(ttls, ["5m", "5m"]);
+  });
+});
+
+test("ttl-management: an agent id never seen with the SDK prefix, or no id at all, stays main", async () => {
+  await withEnv({ CACHE_FIX_TTL_MAIN: undefined, CACHE_FIX_TTL_SUBAGENT: "5m" }, async (mod) => {
+    await mod.onRequest(fullCtx("agent-a")); // another id is remembered as subagent
+    for (const id of ["teammate-b", undefined]) {
+      const ctx = continueCtx(id);
+      await mod.onRequest(ctx);
+      assert.deepEqual(ttlsInOrder(ctx.body), ["1h", "1h"], `id=${id}`);
+    }
+  });
+});
+
+test("ttl-management: the remembered subagent ids are bounded, oldest evicted first", async () => {
+  await withEnv({ CACHE_FIX_TTL_MAIN: undefined, CACHE_FIX_TTL_SUBAGENT: "5m" }, async (mod) => {
+    for (let i = 0; i <= 1000; i++) await mod.onRequest(fullCtx(`agent-${i}`));
+    const oldest = continueCtx("agent-0");
+    const newest = continueCtx("agent-1000");
+    await mod.onRequest(oldest);
+    await mod.onRequest(newest);
+    assert.deepEqual(ttlsInOrder(oldest.body), ["1h", "1h"], "oldest id was evicted");
+    assert.deepEqual(ttlsInOrder(newest.body), ["5m", "5m"], "newest id is still remembered");
+  });
+});
