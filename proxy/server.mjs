@@ -238,19 +238,20 @@ async function handleMessages(clientReq, clientRes) {
       } catch {
         responseBody = null;
       }
+      // onResponse runs for every non-streaming answer, ctx.body null when the
+      // body is not JSON (an HTML 404, say): upstream-error-log reads the raw
+      // bytes from meta. A null body is forwarded as received.
+      meta._rawResponse = rawResponse;
+      const resCtx = { status: statusCode, headers: responseHeaders, body: responseBody, meta };
+      await runOnResponse(resCtx, extSnapshot);
       if (responseBody) {
-        const resCtx = { status: statusCode, headers: responseHeaders, body: responseBody, meta };
-        await runOnResponse(resCtx, extSnapshot);
         clientRes.writeHead(statusCode, resCtx.headers);
         clientRes.end(JSON.stringify(resCtx.body));
-      } else {
-        clientRes.writeHead(statusCode, responseHeaders);
-        clientRes.end(rawResponse);
+        return;
       }
-    } else {
-      clientRes.writeHead(statusCode, responseHeaders);
-      clientRes.end(rawResponse);
     }
+    clientRes.writeHead(statusCode, responseHeaders);
+    clientRes.end(rawResponse);
     return;
   }
 

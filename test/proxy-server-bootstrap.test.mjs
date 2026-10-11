@@ -1,9 +1,10 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { setTimeout as sleep } from "node:timers/promises";
 import { startProxy } from "../proxy/server.mjs";
 
 let handle;
@@ -280,4 +281,44 @@ describe("proxy server — /api/claude_cli/bootstrap routing", () => {
     assert.equal(latest.status, 500);
     assert.equal(latest.body_bytes, Buffer.byteLength("internal error not json"));
   });
+
+  // upstream-error-log rides this fixture (real pipeline, real extensions.json):
+  // a non-2xx /v1/messages answer reaches the client byte for byte AND leaves one
+  // row carrying the body, which headers alone could not name. The second case
+  // is a body that does not parse, which must not lose its row.
+  for (const [label, status, contentType, upstreamBody, errorType, errorMessage] of [
+    ["JSON 400", 400, "application/json",
+      JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "messages.1: bad block" } }),
+      "invalid_request_error", "messages.1: bad block"],
+    ["non-JSON 404", 404, "text/html", "<html><body>404 Not Found</body></html>", null, null],
+  ]) {
+    it(`upstream-error-log: ${label} /v1/messages reaches the client unchanged and logs its body`, async () => {
+      const logPath = join(tmpHome, `upstream-errors-${status}.jsonl`);
+      process.env.CACHE_FIX_UPSTREAM_ERROR_LOG = "on";
+      process.env.CACHE_FIX_UPSTREAM_ERROR_LOG_PATH = logPath;
+      upstreamResponseFn = (_req, res) => {
+        res.writeHead(status, { "content-type": contentType });
+        res.end(upstreamBody);
+      };
+      try {
+        const res = await clientRequest("POST", "/v1/messages",
+          JSON.stringify({ model: "claude-opus-4-7", messages: [{ role: "user", content: "hi" }] }));
+        assert.equal(res.status, status);
+        assert.equal(res.body, upstreamBody);
+        // The append is not awaited in the response path: poll for the row.
+        const readRows = () => (existsSync(logPath) ? readFileSync(logPath, "utf8") : "")
+          .split("\n").filter(Boolean).map((l) => JSON.parse(l));
+        for (let i = 0; i < 400 && !readRows().length; i++) await sleep(5);
+        const rows = readRows();
+        assert.equal(rows.length, 1);
+        assert.equal(rows[0].response_status, status);
+        assert.equal(rows[0].error_type, errorType);
+        assert.equal(rows[0].error_message, errorMessage);
+        assert.equal(rows[0].body_excerpt, upstreamBody);
+      } finally {
+        delete process.env.CACHE_FIX_UPSTREAM_ERROR_LOG;
+        delete process.env.CACHE_FIX_UPSTREAM_ERROR_LOG_PATH;
+      }
+    });
+  }
 });

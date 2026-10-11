@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 
 import ext, {
   isUpstreamError,
@@ -40,6 +41,17 @@ function readLog() {
   if (!existsSync(logFile)) return [];
   return readFileSync(logFile, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
 }
+
+// onResponse appends without being awaited (the client must not wait on disk),
+// so the row lands after the hook returns: poll for it, bounded.
+async function waitForRow() {
+  for (let i = 0; i < 400 && !readLog().length; i++) await sleep(5);
+  return readLog();
+}
+
+// onResponseStart writes only for SSE (no body to wait for); every other
+// error response is written by onResponse, which has the body.
+const SSE = { "content-type": "text/event-stream" };
 
 // --- isUpstreamError ---
 
@@ -214,7 +226,7 @@ test("onResponseStart: env=on + 429 → exactly one record written", async () =>
   process.env[ENV_GATE] = "on";
   const ctx = {
     status: 429,
-    headers: { "x-should-retry": "true", "request-id": "req_e2e_001" },
+    headers: { ...SSE, "x-should-retry": "true", "request-id": "req_e2e_001" },
     meta: { _sessionId: "sess_E2E" },
   };
   await ext.onResponseStart(ctx);
@@ -227,7 +239,7 @@ test("onResponseStart: env=on + 429 → exactly one record written", async () =>
 
 test("onResponseStart: env=on + 503 → captured with has_ratelimit_headers=false", async () => {
   process.env[ENV_GATE] = "on";
-  const ctx = { status: 503, headers: {}, meta: {} };
+  const ctx = { status: 503, headers: { ...SSE }, meta: {} };
   await ext.onResponseStart(ctx);
   const rows = readLog();
   assert.equal(rows.length, 1);
@@ -239,6 +251,7 @@ test("onResponseStart: env=on + usage-limit 429 → has_ratelimit_headers=true",
   const ctx = {
     status: 429,
     headers: {
+      ...SSE,
       "anthropic-ratelimit-unified-status": "limited",
       "retry-after": "300",
     },
@@ -254,8 +267,8 @@ test("onResponseStart: env=on + usage-limit 429 → has_ratelimit_headers=true",
 
 test("onResponseStart: two distinct error responses → two records", async () => {
   process.env[ENV_GATE] = "on";
-  await ext.onResponseStart({ status: 429, headers: {}, meta: {} });
-  await ext.onResponseStart({ status: 500, headers: {}, meta: {} });
+  await ext.onResponseStart({ status: 429, headers: { ...SSE }, meta: {} });
+  await ext.onResponseStart({ status: 500, headers: { ...SSE }, meta: {} });
   const rows = readLog();
   assert.equal(rows.length, 2);
   assert.equal(rows[0].response_status, 429);
@@ -267,7 +280,7 @@ test("onResponseStart: fail-open on bad ctx — does not throw", async () => {
   // Force a throwing path by passing a non-Object meta that JSON.stringify
   // would still serialize cleanly; instead trigger via headers proxy that
   // throws on Object.keys.
-  const headers = new Proxy({}, {
+  const headers = new Proxy({ ...SSE }, {
     ownKeys() { throw new Error("synthetic"); },
   });
   const ctx = { status: 429, headers, meta: {} };
@@ -275,6 +288,65 @@ test("onResponseStart: fail-open on bad ctx — does not throw", async () => {
   await ext.onResponseStart(ctx);
   // And should not have written a record
   assert.equal(readLog().length, 0);
+});
+
+test("onResponseStart: non-SSE error → no write (onResponse owns it, with the body)", async () => {
+  process.env[ENV_GATE] = "on";
+  await ext.onResponseStart({ status: 400, headers: { "content-type": "application/json" }, meta: {} });
+  assert.equal(readLog().length, 0);
+});
+
+// --- onResponse: the error body rides in the same row ---
+
+test("onResponse: JSON error body → one row with error_type, error_message, body_excerpt; not awaited", async () => {
+  process.env[ENV_GATE] = "on";
+  const raw = JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "messages.3: bad block" } });
+  await ext.onResponse({
+    status: 400,
+    headers: { "content-type": "application/json", "request-id": "req_400_001" },
+    body: JSON.parse(raw),
+    meta: { _rawResponse: Buffer.from(raw) },
+  });
+  assert.equal(existsSync(logFile), false, "the append must not be awaited in the response path");
+  const rows = await waitForRow();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].response_status, 400);
+  assert.equal(rows[0].upstream_request_id, "req_400_001");
+  assert.equal(rows[0].error_type, "invalid_request_error");
+  assert.equal(rows[0].error_message, "messages.3: bad block");
+  assert.equal(rows[0].body_excerpt, raw);
+});
+
+test("onResponse: non-JSON error body → body_excerpt set, error_type and error_message null", async () => {
+  process.env[ENV_GATE] = "on";
+  const html = "<html><body>404 Not Found</body></html>";
+  await ext.onResponse({
+    status: 404,
+    headers: { "content-type": "text/html" },
+    body: null,
+    meta: { _rawResponse: Buffer.from(html) },
+  });
+  const rows = await waitForRow();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].response_status, 404);
+  assert.equal(rows[0].body_excerpt, html);
+  assert.equal(rows[0].error_type, null);
+  assert.equal(rows[0].error_message, null);
+});
+
+test("onResponse: body_excerpt is cut at 4096 bytes", async () => {
+  process.env[ENV_GATE] = "on";
+  await ext.onResponse({ status: 502, headers: {}, body: null, meta: { _rawResponse: Buffer.alloc(10_000, "x") } });
+  const rows = await waitForRow();
+  assert.equal(rows[0].body_excerpt, "x".repeat(4096));
+});
+
+test("onResponse: env unset → no write (a later gated-on call is the only row)", async () => {
+  await ext.onResponse({ status: 400, headers: {}, body: null, meta: { _rawResponse: Buffer.from("x") } });
+  process.env[ENV_GATE] = "on";
+  await ext.onResponse({ status: 503, headers: {}, body: null, meta: {} });
+  const rows = await waitForRow();
+  assert.deepEqual(rows.map((r) => r.response_status), [503]);
 });
 
 // --- onRequest seam ---

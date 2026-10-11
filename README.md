@@ -1394,7 +1394,7 @@ export CACHE_FIX_UPSTREAM_ERROR_LOG=on
 | `CACHE_FIX_UPSTREAM_ERROR_LOG` | `off` | Master gate — `on` activates capture |
 | `CACHE_FIX_UPSTREAM_ERROR_LOG_PATH` | `~/.claude/usage-log/upstream-errors.jsonl` | Log path override |
 
-Record fields per row: `schema_version`, `ts`, `type`, `session_id`, `requested_model`, `request_path`, `response_status`, `upstream_message`, `has_ratelimit_headers`, `ratelimit_status`, `ratelimit_overage_status`, `x_should_retry` (normalized to bool from string), `retry_after`, `upstream_request_id`, `upstream_connection_id`.
+Record fields per row: `schema_version`, `ts`, `type`, `session_id`, `requested_model`, `request_path`, `response_status`, `upstream_message`, `has_ratelimit_headers`, `ratelimit_status`, `ratelimit_overage_status`, `x_should_retry` (normalized to bool from string), `retry_after`, `upstream_request_id`, `upstream_connection_id`, `body_excerpt` (the raw response body cut at 4096 bytes; null for streaming responses), `error_type` and `error_message` (from the `error` object when the body is JSON, else null).
 
 This is a SUPERSET of the existing `rate-limit-log` extension — `rate-limit-log` only triggers on the canonical `rate_limit_error` body envelope and misses capacity-class 429s whose body shape differs; `upstream-error-log` triggers on every `status >= 400` regardless of body shape. Independent JSONL streams; analysts join on `session_id + ts`. Both can be enabled simultaneously without interference.
 

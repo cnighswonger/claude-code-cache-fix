@@ -24,13 +24,12 @@
 // classes plus 5xx). rate-limit-log remains its own narrower stream with
 // the burst-specific context fields. The two files are independent.
 //
-// Hook choice: onResponseStart, not onResponse. onResponse only fires when
-// the proxy successfully JSON-parses the response body (server.mjs:170).
-// Many non-200 responses — especially origin-level errors from Cloudflare
-// — return HTML or empty bodies that fail to parse, so onResponse would
-// silently miss them. onResponseStart fires for every non-streaming
-// response (and every SSE response too — we filter on status to skip
-// successes).
+// Hook choice: headers alone cannot name the cause of a 400/404, so the row
+// carries the body. A non-SSE error is written from onResponse, which sees the
+// body (server.mjs runs it for every non-streaming answer, ctx.body null when
+// the body is not JSON, the raw bytes on ctx.meta._rawResponse). An SSE error
+// has no body to wait for, so onResponseStart writes it with null body fields.
+// The onResponse append is not awaited: the client must not wait on disk.
 //
 // Activation: enabled:true in proxy/extensions.json + runtime env-gate
 // `CACHE_FIX_UPSTREAM_ERROR_LOG=on`. Default OFF.
@@ -40,6 +39,7 @@ import { join, dirname } from "node:path";
 import { claudeHome } from "../claude-home.mjs";
 
 const ENV_VAR = "CACHE_FIX_UPSTREAM_ERROR_LOG";
+const BODY_EXCERPT_BYTES = 4096;
 
 function logPath() {
   return process.env.CACHE_FIX_UPSTREAM_ERROR_LOG_PATH ||
@@ -122,6 +122,9 @@ export function buildRecord({ ctx, now = new Date() }) {
     retry_after: retryAfter || null,
     upstream_request_id: requestId,
     upstream_connection_id: upstreamConnectionId,
+    body_excerpt: ctx?.meta?._rawResponse?.subarray(0, BODY_EXCERPT_BYTES).toString() ?? null,
+    error_type: ctx?.body?.error?.type ?? null,
+    error_message: ctx?.body?.error?.message ?? null,
   };
 }
 
@@ -172,8 +175,19 @@ export default {
     if (process.env[ENV_VAR] !== "on") return;
     if (!isUpstreamError(ctx)) return;
     try {
+      if (!(headerLookup(ctx.headers, "content-type") || "").includes("text/event-stream")) return;
       const record = buildRecord({ ctx });
       await appendJsonl(record, logPath());
+    } catch {
+      // Fail-open: never throw to the pipeline.
+    }
+  },
+
+  async onResponse(ctx) {
+    if (process.env[ENV_VAR] !== "on") return;
+    if (!isUpstreamError(ctx)) return;
+    try {
+      appendJsonl(buildRecord({ ctx }), logPath()).catch(() => {});
     } catch {
       // Fail-open: never throw to the pipeline.
     }
