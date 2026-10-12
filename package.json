@@ -9,7 +9,8 @@
   },
   "main": "./preload.mjs",
   "bin": {
-    "cache-fix-proxy": "./bin/claude-via-proxy.mjs"
+    "cache-fix-proxy": "./bin/claude-via-proxy.mjs",
+    "cache-fix-shell-prefix": "./bin/shell-prefix.sh"
   },
   "files": [
     "preload.mjs",

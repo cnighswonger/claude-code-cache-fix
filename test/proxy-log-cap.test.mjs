@@ -30,6 +30,9 @@ import { tmpdir } from "node:os";
 import {
   closeSync, fstatSync, mkdtempSync, openSync, readFileSync, rmSync, statSync, writeFileSync,
 } from "node:fs";
+import { privateConfigDir } from "./proc-helpers.mjs";
+
+process.env.CLAUDE_CONFIG_DIR = privateConfigDir();
 
 const serverPath = join(fileURLToPath(new URL(".", import.meta.url)), "..", "proxy", "server.mjs");
 

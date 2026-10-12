@@ -137,9 +137,9 @@ Or let the launcher do both steps for you with `--remote-control`:
 cache-fix-proxy --remote-control
 ```
 
-The `--remote-control` flag is the one-command equivalent of the manual wiring above: it starts the proxy in forward-proxy mode, waits for the CA, and launches `claude` pointed at `HTTPS_PROXY` with `NODE_EXTRA_CA_CERTS` set (and adds `127.0.0.1,localhost,::1` to `NO_PROXY` so local services — e.g. HTTP/SSE-transport MCP servers on localhost — bypass the proxy rather than being routed at it; any existing `NO_PROXY` is preserved). Without the flag the launcher stays in reverse-proxy mode (sets `ANTHROPIC_BASE_URL`), unchanged. Two things worth knowing: Remote Control does a trusted-device enrollment on first connect that can need a few `/remote-control` retries (a Claude Code step that runs upstream, not a proxy failure); and enabling RC on an already-warm session costs a **single** prompt-cache rebuild (RC adds an `anthropic-beta` the cache keys on), so if you want RC, launching with `--remote-control` from the start avoids that one-time flip. `cache-fix-proxy --help` documents both.
+The `--remote-control` flag is the one-command equivalent of the manual wiring above: it starts the proxy in forward-proxy mode, waits for the CA, and launches `claude` pointed at `HTTPS_PROXY` with `NODE_EXTRA_CA_CERTS` set (and, from 4.4.0-beta.0 ([#257](https://github.com/cnighswonger/claude-code-cache-fix/pull/257)), adds `127.0.0.1,localhost,::1` to `NO_PROXY` so local services — e.g. HTTP/SSE-transport MCP servers on localhost — bypass the proxy rather than being routed at it; any existing `NO_PROXY` is preserved; 4.3.0 does not). Without the flag the launcher stays in reverse-proxy mode (sets `ANTHROPIC_BASE_URL`), unchanged. Two things worth knowing: Remote Control does a trusted-device enrollment on first connect that can need a few `/remote-control` retries (a Claude Code step that runs upstream, not a proxy failure); and enabling RC on an already-warm session costs a **single** prompt-cache rebuild (RC adds an `anthropic-beta` the cache keys on), so if you want RC, launching with `--remote-control` from the start avoids that one-time flip. `cache-fix-proxy --help` documents both.
 
-> If you wire forward-proxy mode manually (setting `HTTPS_PROXY` yourself instead of using `--remote-control`), set `NO_PROXY=127.0.0.1,localhost,::1` as well, or local HTTP-transport MCP servers and other localhost services will be routed at the cache-fix proxy and fail. stdio-transport MCP servers are unaffected (they use pipes, not the network).
+> If you wire forward-proxy mode manually (setting `HTTPS_PROXY` yourself instead of using `--remote-control`, or using it on 4.3.0), set `NO_PROXY=127.0.0.1,localhost,::1` as well, or local HTTP-transport MCP servers and other localhost services will be routed at the cache-fix proxy and fail. stdio-transport MCP servers are unaffected (they use pipes, not the network).
 
 How it works: the proxy also handles HTTP `CONNECT`. It MITMs **only** the upstream host (`api.anthropic.com`), terminating TLS with a locally-generated CA so it can run the same extension pipeline, and **blind-tunnels every other CONNECT** (mcp-proxy, telemetry, npm, ...) untouched. On first start it generates a CA under `$CLAUDE_CONFIG_DIR/cache-fix-ca/` (default `~/.claude/cache-fix-ca/`; override with `CACHE_FIX_CA_DIR`); the client must trust it via `NODE_EXTRA_CA_CERTS`. A WebSocket/Upgrade to the upstream host (e.g. `/voice`) is relayed to upstream as-is. Because base URL stays `api.anthropic.com`, all of `/api/oauth/*`, `/v1/agents`, Remote Control credential fetches, etc. pass through untouched and RC stays enabled.
 
@@ -164,32 +164,166 @@ Three ways to wire it, depending on how broadly you want the vars to apply.
 
 > **If anything else on this host also MITMs `api.anthropic.com`** — a corporate
 > TLS-inspecting agent, an account-switching pin proxy — do not use these
-> recipes. `NODE_EXTRA_CA_CERTS` takes one file, so pinning it to our CA alone
-> silently untrusts every other component. Use `--remote-control`, which
-> publishes into `ca-trust.d/` and consumes the merged bundle instead. See
+> recipes with our CA alone. `NODE_EXTRA_CA_CERTS` takes one file, so pinning it
+> to our CA alone silently untrusts every other component. Put both CAs in one
+> file ([how](#client-trust-behind-a-tls-inspecting-corporate-proxy)), or use
+> `--remote-control` with a merged bundle (needs 4.4.0-beta.0 or newer). See
 > [Coexisting with another MITM](#coexisting-with-another-mitm-on-the-same-machine-ca-trustd).
 
 ```bash
 # a) per-invocation — scoped to just this claude run
-HTTPS_PROXY=http://127.0.0.1:9801 \
+np=${NO_PROXY:-$no_proxy}; np="127.0.0.1,localhost,::1${np:+,$np}"
+HTTPS_PROXY=http://127.0.0.1:9801 NO_PROXY=$np no_proxy=$np \
 NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem \
   claude
 
-# b) whole shell — add to ~/.zshrc / ~/.bashrc (every HTTPS in that shell goes
-#    through the proxy; harmless since non-anthropic hosts are blind-tunneled,
-#    but that shell's HTTPS breaks if the proxy is ever down)
+# b) whole shell — add to ~/.zshrc / ~/.bashrc (every HTTPS in that shell, and
+#    every program Claude Code starts from it, goes through the proxy; that
+#    shell's HTTPS breaks if the proxy is ever down. Programs Claude Code starts
+#    can be kept off it: see "Keeping other programs off the proxy" below)
 export HTTPS_PROXY=http://127.0.0.1:9801
+: "${NO_PROXY:=$no_proxy}"   # adopt a lowercase-only no_proxy
+export NO_PROXY="127.0.0.1,localhost,::1${NO_PROXY:+,$NO_PROXY}"
+export no_proxy=$NO_PROXY
 export NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem
 
 # c) scoped to claude only — a shell function (recommended; avoids b's blast radius)
 claude() {
-  HTTPS_PROXY=http://127.0.0.1:9801 \
+  local np=${NO_PROXY:-$no_proxy}; np="127.0.0.1,localhost,::1${np:+,$np}"
+  HTTPS_PROXY=http://127.0.0.1:9801 NO_PROXY=$np no_proxy=$np \
   NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem \
     command claude "$@"
 }
 ```
 
+#### Client trust behind a TLS-inspecting corporate proxy
+
+If a corporate proxy inspects TLS, the hosts we blind-tunnel (everything except
+`api.anthropic.com`) come back re-signed by its root. Claude Code adds
+`NODE_EXTRA_CA_CERTS` to its built-in and system roots, so a corporate root that
+is in neither must go in the same file as our CA. Build one file holding both
+(temp file + `mv`, so nothing reads it half-written) and use it in place of
+`ca.pem` in a), b) or c):
+
+```bash
+# awk 1, not cat: it ends every input with a newline, so no certificate is torn
+awk 1 ~/.claude/cache-fix-ca/ca.pem /path/to/corporate-root.pem > ~/.claude/cache-fix-client-ca.pem.tmp &&
+  mv ~/.claude/cache-fix-client-ca.pem.tmp ~/.claude/cache-fix-client-ca.pem
+export NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-client-ca.pem   # or set it in the recipe you chose
+```
+
+A mistyped input path makes `awk` exit non-zero, so the `&&` stops before the
+`mv` and a bundle already there is left as it was.
+
+Rebuild this file whenever cache-fix regenerates its CA (the proxy does so when
+its CA directory is wiped): a copy holding the old CA makes the client distrust
+the proxy.
+
+#### Keeping other programs off the proxy
+
+In forward-proxy mode everything Claude Code starts inherits the proxy
+variables: Bash commands, hooks, MCP servers, the status line. The proxy
+blind-tunnels their non-Anthropic CONNECTs, but all of them now depend on the
+proxy being up. `cache-fix-shell-prefix` is a program for Claude Code's
+`CLAUDE_CODE_SHELL_PREFIX` setting. For what Claude Code starts it sets
+`HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, `http_proxy`, `ALL_PROXY` and
+`all_proxy` to the proxy cache-fix itself forwards to (the proxy you had before
+cache-fix), or unsets them when cache-fix has none. It leaves `NO_PROXY` alone.
+
+cache-fix writes that proxy's URL at startup to
+`${CLAUDE_CONFIG_DIR:-~/.claude}/cache-fix-state/upstream-<port>`, `<port>` being the
+port it listens on: one line, mode 0600 (the URL may carry credentials). When
+cache-fix has no such proxy it writes an empty line there. The
+file is left in place when cache-fix exits, so a new instance on that port overwrites
+it and children started in between stay covered. The program finds the file by the
+port in `HTTPS_PROXY` (`https_proxy` when that is empty), and only when it names this machine (`127.0.0.1`,
+`localhost` or `[::1]`), that is, cache-fix itself. An empty file, or a file that
+names cache-fix's own address, gives the unset. No file (any other value in
+`HTTPS_PROXY`, a pin's loopback hop, your own proxy): your proxy variables are left
+as they are.
+
+It is opt-in: nothing in cache-fix sets `CLAUDE_CODE_SHELL_PREFIX` for you. Put
+its absolute path, from `command -v cache-fix-shell-prefix` (a release that has
+it: see "Which version carries it" below), in the `env` block of `settings.json`:
+
+```json
+{ "env": { "CLAUDE_CODE_SHELL_PREFIX": "/absolute/path/to/cache-fix-shell-prefix" } }
+```
+
+Claude Code expands no `~`, `$HOME` or `${HOME}` in that value, so use the
+absolute path. When one `settings.json` is shared across machines with different
+home directories, leave the setting out of it and put
+`export CLAUDE_CODE_SHELL_PREFIX=~/...` in the shell rc instead: the shell
+expands an unquoted `~`. An `export` in an rc file reaches the sessions Claude
+Code starts itself only when its background process was started from a shell that
+read that rc. Under a node version manager the path changes with the node version.
+
+- **It reaches** the Bash tool (foreground and background), command hooks, stdio
+  MCP servers and the `statusLine` command.
+- **It does not reach** exec-form hooks, `apiKeyHelper`, `otelHeadersHelper` and
+  the other helper commands, Claude Code's own `git` and `gh`, or LSP servers.
+  Those still inherit cache-fix as their proxy, and it passes their non-Anthropic
+  CONNECTs through as a blind tunnel.
+- **A `claude` started from a Bash command** (nested, or bare in a plain shell)
+  comes back through the proxy, with trust, only if `HTTPS_PROXY`,
+  `NODE_EXTRA_CA_CERTS` (by absolute path) and `NO_PROXY` are all in the
+  `settings.json` `env` block. A session wired only by a shell function or a
+  launcher has none of them there, so put all three in that block. That block's
+  `NO_PROXY` replaces the shell's: set it to `127.0.0.1,localhost,::1` and append
+  your own hosts to that value.
+- **Bash sandbox mode** loses its own proxy under the change. That is read from
+  Claude Code's code, not measured.
+- **If the file is missing**, Bash commands exit 127, hooks error, stdio MCP
+  servers fail to start and the status line is blank. Turn the prefix off by
+  removing the line. Do not use a file-less one-line value: it breaks every stdio
+  MCP server.
+
+Measured on Claude Code 2.1.296. After a Claude Code upgrade, check it again: in
+a session with the prefix set, ask Claude to run
+`env | grep -iE '^(https?|all)_proxy='` and expect the URL in that file on every
+line, no output when the file is empty, and your own values when there is no file.
+
+**Already have a `CLAUDE_CODE_SHELL_PREFIX`?** The setting holds one program. Set
+`CACHE_FIX_PREV_SHELL_PREFIX` (same `env` block) to your previous prefix, as an
+absolute path with no arguments, and it runs after the change. A relative name, a
+missing file or a file that is not executable is skipped. With a chained prefix,
+that prefix runs the command in place of this program's own shell step, so hooks
+run under its shell, a startup file that re-exports a proxy variable is no longer
+overridden, and a previous prefix that does not `exec` its command leaves a wrapper
+process in front of each stdio MCP server, orphaned when Claude Code exits.
+
+**Which version carries it.** `cache-fix-shell-prefix` ships in releases after
+4.4.0-beta.0: it is not in 4.3.0 or 4.4.0-beta.0. On an older install, save
+[`bin/shell-prefix.sh`](https://raw.githubusercontent.com/cnighswonger/claude-code-cache-fix/main/bin/shell-prefix.sh)
+(it is on `main` once the change that adds it is merged) to any absolute path,
+`chmod +x` it, and use that path as the value.
+
+#### Using cswap-pin and cache-fix together
+
+`cswap-pin` is the account-switching pin proxy mentioned above. To have Claude
+Code talk to the pin and the pin talk to cache-fix:
+
+1. Run cache-fix in forward-proxy mode as a service:
+   `CACHE_FIX_FORWARD_PROXY=on cache-fix-proxy install-service`. It listens on
+   `127.0.0.1:9801` unless `CACHE_FIX_PROXY_PORT` says otherwise.
+2. From a plain shell, not from inside a pinned session (there the shell already
+   carries the pin as `HTTPS_PROXY`, and the pin would record itself as its own
+   upstream), pin through it:
+   `HTTPS_PROXY=http://127.0.0.1:9801 NODE_EXTRA_CA_CERTS=<a file holding cache-fix's ca.pem and, behind a TLS-inspecting proxy, your corporate root> cswap pin <N>`.
+3. Add only the pin's line to your shell rc:
+   `claude() { (cswap pin --ensure >/dev/null 2>&1 &); command claude "$@"; }`.
+   The pin writes `HTTPS_PROXY`, `https_proxy`, `ALL_PROXY` and
+   `NODE_EXTRA_CA_CERTS` into the `env` block of `~/.claude.json`, which
+   overrides cache-fix's client recipe for those keys. So do not also add that
+   recipe or use `--remote-control`; keep the service from step 1.
+4. For child processes, set one prefix, either tool's, not both.
+
 #### Coexisting with another MITM on the same machine (`ca-trust.d`)
+
+*Needs 4.4.0-beta.0 or newer (`npm install -g claude-code-cache-fix@next`).
+`npm install -g claude-code-cache-fix` installs the `latest` tag, 4.3.0 at the
+time of writing, which has no `ca-trust.d` handling: its `--remote-control`
+hands Claude `ca.pem` alone.*
 
 `NODE_EXTRA_CA_CERTS` takes exactly **one** file. If anything else on the host
 also MITMs `api.anthropic.com` and also sets that variable — a corporate agent,
@@ -213,6 +347,19 @@ bundle**: merging requires finding the ambient corporate roots, which is
 environment-specific (a Linux host may keep them outside the bundle a shell
 points at; a Mac keeps them in the keychain), and two components both rebuilding
 it would race one output.
+
+Nothing in cache-fix builds `ca-trust.pem`, so if you or another tool have not
+built it, `--remote-control` finds no bundle and hands Claude our CA alone, with
+no corporate root. To build it yourself, after one `--remote-control` launch has
+published `ca-trust.d/ccf.pem`:
+
+```bash
+cd "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+awk 1 ca-trust.d/*.pem /path/to/corporate-root.pem > ca-trust.pem.tmp &&
+  mv ca-trust.pem.tmp ca-trust.pem
+```
+
+Re-run it when a publisher's CA changes.
 
 The bundle is used only if node, handed that file, will actually verify our
 proxy's leaf. The launcher does not predict that — it asks: a child process with
@@ -244,9 +391,9 @@ not ask drops every corporate root on a machine whose bundle was fine.
 **A damaged merge does not cost the other publishers their CAs.** The damage
 lives in the merge, not in the files that fed it, so the launcher rebuilds from
 the `ca-trust.d/` publishers that still work rather than falling back to its own
-CA alone. The saving is one certificate per surviving publisher: measured on
-this box (ours plus one peer), one certificate under the old fallback against
-two under the rebuild; on a three-publisher host, one against three.
+CA alone. The saving is one certificate per surviving publisher: measured with
+ours plus one peer, one certificate under the old fallback against two under the
+rebuild; with three publishers, one against three.
 
 Both paths are fixed names under `<config>`, deliberately with no env override
 of their own. They are two halves of one rendezvous: a knob on either half alone
@@ -289,7 +436,7 @@ Failed to fetch version from .../claude-code-releases/latest after 3 attempt(s):
   unable to verify the first certificate
 ```
 
-Measured with `openssl s_client -proxy 127.0.0.1:9901 -connect downloads.claude.ai:443
+Measured with `openssl s_client -proxy 127.0.0.1:9801 -connect downloads.claude.ai:443
 -servername downloads.claude.ai`:
 
 | `CACHE_FIX_DOWNLOAD_REWRITE` | leaf CN | verify |
@@ -371,12 +518,46 @@ The installed config picks up `CACHE_FIX_PROXY_PORT`, `CACHE_FIX_PROXY_UPSTREAM`
 
 The service runs `cache-fix-proxy server` in the foreground, which is just the proxy without the wrapper-mode claude launcher.
 
-**Manual (any platform):**
+**Wiring the client (bash or zsh):** the service runs only the proxy end. For
+forward mode (install it with `CACHE_FIX_FORWARD_PROXY=on`, see
+[Forward-proxy mode](#forward-proxy-mode-keeps-remote-control-working)), add this
+function to `~/.bashrc` or `~/.zshrc`; the syntax is valid in both. The port is
+the default and the CA is the one the proxy generates on first start under the
+default `CLAUDE_CONFIG_DIR`:
 
 ```bash
-nohup cache-fix-proxy server > /tmp/cache-fix-proxy.log 2>&1 &
-echo 'export ANTHROPIC_BASE_URL=http://127.0.0.1:9801' >> ~/.bashrc
+claude() {
+  local np=${NO_PROXY:-$no_proxy}; np="127.0.0.1,localhost,::1${np:+,$np}"
+  HTTPS_PROXY=http://127.0.0.1:9801 NO_PROXY=$np no_proxy=$np \
+  NODE_EXTRA_CA_CERTS=~/.claude/cache-fix-ca/ca.pem \
+    command claude "$@"
+}
 ```
+
+Sessions Claude Code starts itself never pass through that function. Give them
+the same environment with a launcher, saved as `~/.local/bin/cache-fix-claude`
+and made executable (`chmod +x`):
+
+```sh
+#!/bin/sh
+np=${NO_PROXY:-$no_proxy}; np="127.0.0.1,localhost,::1${np:+,$np}"
+export HTTPS_PROXY=http://127.0.0.1:9801 NODE_EXTRA_CA_CERTS="$HOME/.claude/cache-fix-ca/ca.pem" \
+  NO_PROXY="$np" no_proxy="$np"
+exec "$@"
+```
+
+and named in the `env` block of `settings.json`, by absolute path:
+`{ "env": { "CLAUDE_CODE_PROCESS_WRAPPER": "/absolute/path/to/cache-fix-claude" } }`.
+That is the reliable place: an `export` in an rc file reaches the sessions
+Claude Code starts itself only when its background process was started from a
+shell that read that rc. Behind a TLS-inspecting corporate proxy, use the
+combined file from [Client trust behind a TLS-inspecting corporate
+proxy](#client-trust-behind-a-tls-inspecting-corporate-proxy) in place of
+`ca.pem` in both. If `settings.json` has an `env` block setting
+any of these variables, that block wins over what the function or launcher exports.
+
+Reverse mode (`ANTHROPIC_BASE_URL`, no Remote Control) is the
+[Quick start](#quick-start-proxy-recommended).
 
 ### Docker
 

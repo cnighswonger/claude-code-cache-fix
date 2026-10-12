@@ -833,6 +833,7 @@ test("dispatch back-compat: --proxy-port + claude-arg passes through to wrapper 
       {
         env: {
           ...process.env,
+          CLAUDE_CONFIG_DIR: dir,
           CACHE_FIX_CLAUDE_CMD: `${process.execPath} ${interceptScript}`,
         },
         timeout: 15000,

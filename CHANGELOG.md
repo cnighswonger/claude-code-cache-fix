@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- **`cache-fix-shell-prefix`, an opt-in `CLAUDE_CODE_SHELL_PREFIX` program that keeps what Claude Code starts off cache-fix.** In forward mode the Bash tool, command hooks, stdio MCP servers and the status line inherit `HTTPS_PROXY` and its siblings, so they depend on the proxy being up. This sets the six proxy variables for them to the proxy cache-fix itself forwards to, or unsets them when it has none, and leaves `NO_PROXY` alone. `cache-fix-proxy` records that URL in `${CLAUDE_CONFIG_DIR:-~/.claude}/cache-fix-state/upstream-<port>` (one line, empty when it has none, mode 0600, left in place on exit so a handover keeps children covered); with no file for the port in `HTTPS_PROXY` (a pin's hop, your own proxy) the variables are left as they are. Nothing sets the variable for you: point it at `command -v cache-fix-shell-prefix` in the `settings.json` `env` block (README, "Keeping other programs off the proxy"). `CACHE_FIX_PREV_SHELL_PREFIX` chains an existing prefix after it.
+
 ### Changed
 
 - **`CACHE_FIX_REQUIRE_HOP=1` now covers the relayed `/v1/messages` route, not just the two `CONNECT` paths.** With the variable set and no chain hop reachable, that route previously dialled `api.anthropic.com` directly — carrying the caller's API key past the boundary the variable exists to enforce, while the `CONNECT` paths correctly refused. It now answers `502` instead, matching them. This is a new user-visible outcome on the primary route: an operator who sets the variable, configures no fallbacks and has no reachable proxy will see requests refused where they previously succeeded, which is what the flag asks for. Unset (the default) nothing changes. Hosts exempted by `NO_PROXY` stay exempt — that is an operator saying "this one is direct on purpose". Three egress sites still do not consult the variable: `storageAgent()`, the update-channel probe, and `fallbackToOrigin()`. The first two issue our own requests and carry no client headers. The third forwards the client's headers verbatim to `downloads.claude.ai` on the opt-in download-rewrite path — it is enumerated here rather than claimed harmless.

@@ -23,6 +23,9 @@ import { mkdtemp, writeFile, chmod, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { join, dirname } from "node:path";
+import { privateConfigDir } from "./proc-helpers.mjs";
+
+process.env.CLAUDE_CONFIG_DIR = privateConfigDir();
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 

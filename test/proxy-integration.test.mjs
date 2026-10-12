@@ -2,6 +2,9 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { exitWithin } from "./child-deadline.mjs";
 import http from "node:http";
+import { privateConfigDir } from "./proc-helpers.mjs";
+
+process.env.CLAUDE_CONFIG_DIR = privateConfigDir();
 
 let proxyPort;
 let proxyProcess;

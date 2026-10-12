@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import https from "node:https";
 import { pathToFileURL, URL } from "node:url";
 import config from "./config.mjs";
-import { forwardRequest, parseAbsoluteForm, getAgent, fallbackProxyUrls, lastHop, directLast, defaultPort } from "./upstream.mjs";
+import { forwardRequest, parseAbsoluteForm, getAgent, fallbackProxyUrls, selectProxyUrl, lastHop, directLast, defaultPort } from "./upstream.mjs";
 import { streamResponse, createTelemetryRecord } from "./stream.mjs";
 import { loadExtensions, snapshotRegistry, runOnRequest, runOnResponseStart, runOnResponse, getFailedExtensions } from "./pipeline.mjs";
 import { startWatcher } from "./watcher.mjs";
@@ -17,7 +17,7 @@ import { publishableGates } from "./gate-allowlist.mjs";
 // CACHE_FIX_DEBUG_LOG). Self-gated on CACHE_FIX_DEBUG=1; a no-op otherwise.
 // Env is read on every call so tests (and operators flipping the flag at
 // runtime) see live behavior — same pattern as image-strip's #98 gate.
-import { appendFileSync, fstatSync, ftruncateSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, writeSync } from "node:fs";
+import { appendFileSync, fstatSync, ftruncateSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -1152,6 +1152,29 @@ export async function startProxy(options = {}) {
   };
 }
 
+// WHERE THE PROXY WE FORWARD TO IS WRITTEN DOWN, for bin/shell-prefix.sh. What Claude
+// Code starts (a Bash command, a hook) is given that proxy instead of ours, so it does
+// not depend on this process being up. One line, keyed by the port actually bound
+// (config.port is 0 under the held-port descriptor). 0600: the URL may carry credentials.
+// No upstream (we dial direct): an empty line, which overwrites a predecessor's URL. The
+// file's absence is a different answer: no cache-fix owns that port, so the reader leaves
+// its proxy variables alone. Never removed on exit, so a successor on the same port
+// overwrites it and children started across a handover stay covered. Written from the
+// script entry only, like the sweep below: an embedder's startProxy() touches no home dir.
+function publishUpstream(port) {
+  const file = join(claudeHome(), "cache-fix-state", `upstream-${port}`);
+  const url = selectProxyUrl(true) || fallbackProxyUrls()[0] || "";
+  const tmp = `${file}.tmp.${process.pid}`;
+  try {
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(tmp, `${url}\n`, { mode: 0o600 });
+    renameSync(tmp, file);
+  } catch (err) {
+    process.stderr.write(`[cache-fix] could not write ${file}: ${err.message}\n`);
+    try { rmSync(tmp, { force: true }); } catch {}
+  }
+}
+
 // CLI entrypoint — preserves the v3.x behavior of `node proxy/server.mjs`
 // (used by `cache-fix-proxy server` and by `fork(SERVER_PATH)` in the
 // wrapper). When this module is imported as a library, none of this runs.
@@ -1610,6 +1633,7 @@ if (invokedAsScript) {
   startProxy()
     .then((handle) => {
       active = handle;
+      publishUpstream(handle.port);
       say(process.stdout, `proxy listening on ${handle.address}:${handle.port}\n`);
       sweepUpdateFossil();
     })

@@ -11,7 +11,9 @@ import { tmpdir, availableParallelism } from "node:os";
 import { join, dirname } from "node:path";
 
 import { sourceFingerprintSync } from "../proxy/source-fingerprint.mjs";
-import { HOP_ENV, OURS, cmdOf, freePort as takePort, listeners, onPort } from "./proc-helpers.mjs";
+import { HOP_ENV, OURS, cmdOf, freePort as takePort, listeners, onPort, privateConfigDir } from "./proc-helpers.mjs";
+
+process.env.CLAUDE_CONFIG_DIR = privateConfigDir();
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
@@ -1987,9 +1989,11 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       // full suite while passing alone, because something else had created it.
       // Asserting a global path can only ever measure the machine's history.
       const tmp = mkdtempSync(join(tmpdir(), "ccf-port0-"));
+      const cfg = join(tmp, "cfg");
       const env = { ...process.env, CACHE_FIX_PROXY_PORT: "0", CACHE_FIX_SELF_HEAL: "off",
-                    TMPDIR: tmp };
+                    TMPDIR: tmp, CLAUDE_CONFIG_DIR: cfg };
       for (const k of [...HOP_ENV, "LISTEN_FDS", "LISTEN_PID", "CACHE_FIX_HOLD_PORT"]) delete env[k];
+      env.CACHE_FIX_FALLBACK_PROXIES = "http://up.invalid:3128";
       const p = spawn(process.execPath, [launcherPath, "run-service"], { env, stdio: ["ignore", "pipe", "pipe"] });
       let out = "";
       p.stdout.on("data", (d) => { out += d; });
@@ -2015,6 +2019,12 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         assert.equal(existsSync(join(tmp, "cache-fix-proxy-0.sha256")), false,
           "the record was named for the REQUESTED port, so every port-0 install on this " +
           "box shares one file and none of them describes the port it serves");
+
+        // The upstream file is keyed the same way: the port bound, never the 0 asked for.
+        assert.equal(readFileSync(join(cfg, "cache-fix-state", `upstream-${bound}`), "utf8"),
+          "http://up.invalid:3128\n", `no upstream file for the bound port ${bound}`);
+        assert.equal(existsSync(join(cfg, "cache-fix-state", "upstream-0")), false,
+          "the upstream file was named for the REQUESTED port 0");
 
         // And the child is told the address it is serving, because its self-heal
         // reads this as "the advertised port" when the holder dies.

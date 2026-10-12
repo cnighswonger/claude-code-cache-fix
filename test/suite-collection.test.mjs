@@ -1161,3 +1161,22 @@ test("the suite derives its parallelism from the machine", () => {
   }
 });
 
+
+// A PROXY STARTED FROM ITS SCRIPT ENTRY WRITES UNDER THE CONFIG DIR: upstream-<port> for
+// shell-prefix.sh, and our CA in forward mode. A spawn that inherits the runner's
+// CLAUDE_CONFIG_DIR leaves both in the developer's real ~/.claude on every run (measured:
+// three `upstream-<port>` files per run of the proxy-spawning files, one carrying
+// credentials). The roster is derived: a file that spawns a process and names a proxy entry.
+// proxy-server-debug-log only import()s the module, which writes nothing.
+test("every file that spawns a script-entry proxy gives it a private config dir", () => {
+  const src = (f) => readFileSync(join(testDir, f), "utf8");
+  const spawners = readdirSync(testDir).filter((f) => f.endsWith(".test.mjs")
+    && f !== "proxy-server-debug-log.test.mjs"
+    && /\b(?:spawn|fork|spawnSync|execFile\w*)\(/.test(src(f))
+    && /claude-via-proxy|proxy\/server\.mjs|launcherPath|serverPath|SERVER_PATH|WRAPPER_PATH/.test(src(f)));
+  assert.ok(spawners.length >= 10,
+    `only ${spawners.length} file(s) spawn a script-entry proxy (10 when written): a file moved or this detector broke`);
+  const bare = spawners.filter((f) => !/privateConfigDir\(|CLAUDE_CONFIG_DIR\s*[:=]/.test(src(f)));
+  assert.deepEqual(bare, [],
+    `these spawn a proxy that writes under CLAUDE_CONFIG_DIR and never set one (privateConfigDir() in proc-helpers.mjs): ${bare.join(", ")}`);
+});

@@ -10,8 +10,10 @@
 // and an arrow function in a fourth, and freePort had three different shapes.
 
 import { execFileSync } from "node:child_process";
-import { readdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import net from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 // NEVER SIGNAL A PID WE KNOW ONLY BY PORT. freePort() binds 0, reads the number
 // and CLOSES, so the OS can hand it to a NEIGHBOURING TEST FILE — node:test runs
@@ -117,6 +119,17 @@ export const HOP_ENV = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"
                         "ALL_PROXY", "all_proxy",
                         "CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_REQUIRE_HOP",
                         "CACHE_FIX_FALLBACK_PROXIES"];
+
+// A CONFIG DIR OF ITS OWN, for a test file whose children are proxies started from their
+// script entry. Those write upstream-<port> (shell-prefix.sh reads it) and, in forward
+// mode, our CA under CLAUDE_CONFIG_DIR, which otherwise is the developer's real ~/.claude.
+// A test file is its own process, so it sets this once on process.env and the children
+// inherit it. Removed when that process exits.
+export function privateConfigDir() {
+  const dir = mkdtempSync(join(tmpdir(), "ccf-cfg-"));
+  process.on("exit", () => rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
 
 // THE CLEANUP SET: everything on this port, listening or not. listeners() alone
 // misses a standby that has handed its listen on — measured, ten such orphans at

@@ -30,6 +30,9 @@ import { readFileSync } from "node:fs";
 import { withDeadline } from "./child-deadline.mjs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { privateConfigDir } from "./proc-helpers.mjs";
+
+process.env.CLAUDE_CONFIG_DIR = privateConfigDir();
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const reap = (p) => { try { process.kill(-p.pid, "SIGKILL"); } catch {} try { p.kill("SIGKILL"); } catch {} };

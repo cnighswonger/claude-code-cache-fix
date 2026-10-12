@@ -17,6 +17,9 @@ import tls from "node:tls";
 const canCountCAs = typeof tls.getCACertificates === "function";
 // The launcher's own trust question, asked the same way it asks it.
 import { bundleUsable } from "../bin/ca-trust.mjs";
+import { privateConfigDir } from "./proc-helpers.mjs";
+
+process.env.CLAUDE_CONFIG_DIR = privateConfigDir();
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const WRAPPER_PATH = resolve(__dirname, "../bin/claude-via-proxy.mjs");

@@ -11,7 +11,7 @@ import { join, dirname } from "node:path";
 import { startProxy, upstreamPointsAtSelf } from "../proxy/server.mjs";
 import { startWatcher } from "../proxy/watcher.mjs";
 import { loadExtensions, getRegistry } from "../proxy/pipeline.mjs";
-import { OURS, cmdOf, freePort as takePort, listeners, onPort } from "./proc-helpers.mjs";
+import { OURS, cmdOf, freePort as takePort, listeners, onPort, privateConfigDir } from "./proc-helpers.mjs";
 
 const serverPath = join(dirname(fileURLToPath(import.meta.url)), "..", "proxy", "server.mjs");
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
@@ -436,7 +436,7 @@ describe("zero-downtime reload", () => {
 
     const env = { ...process.env,
       CACHE_FIX_PROXY_UPSTREAM: `http://127.0.0.1:${upPort}`,
-      LISTEN_FDS: "1" };
+      LISTEN_FDS: "1", CLAUDE_CONFIG_DIR: privateConfigDir() };
     // Ambient proxy vars would send this test's own requests through a real
     // proxy on the developer's box, which hangs forever.
     // ALL_PROXY too, not just the http/https pair: node consults it as a fallback,

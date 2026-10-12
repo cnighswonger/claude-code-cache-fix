@@ -8,6 +8,9 @@ import { readFileSync } from "node:fs";
 import { forcedCloseLine } from "../proxy/server.mjs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { privateConfigDir } from "./proc-helpers.mjs";
+
+process.env.CLAUDE_CONFIG_DIR = privateConfigDir();
 
 const serverPath = join(dirname(fileURLToPath(import.meta.url)), "..", "proxy", "server.mjs");
 
