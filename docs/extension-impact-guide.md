@@ -357,13 +357,13 @@ This fails the request entirely. Common triggers: hi-res manuscript scans, retin
 
 ### Git-status stripping (`CACHE_FIX_STRIP_GIT_STATUS`)
 
-**What it fixes:** CC injects live `git status` output into the system prompt on every call. Any file edit changes git status → system prompt changes → entire prefix cache busts.
+**What it fixes:** CC injected a `git status` block into the system prompt (through at least 2.1.270). Before 2.1.267, or with `--system-prompt-snapshot off`, it was re-rendered on every call: any file edit changed git status → system prompt changed → entire prefix cache busted. Since 2.1.267 the prompt is recorded once per session (measured frozen across a tracked-file edit on 2.1.268 and 2.1.270), so this fix now only strips a git-status block that no longer changes between calls.
 
 **Better alternative:** Use the CC native flag `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1` instead of this preload fix. Same effect, no interceptor needed.
 
 **Measured impact:**
 - @wadabum validated: 18-token `cache_creation` across git state changes with the flag set (vs thousands without).
-- Saves ~1,800 tokens per call (~7,180 chars of git instructions removed from system prompt + Bash tool description).
+- Saves about 650 tokens per session (gitStatus ~953 chars plus a ~580-char attribution block, both in the first user message), plus 147 tokens shared across sessions (a 4-line `# Git` section in the Bash tool description). Measured on CC 2.1.301, where the block no longer sits in the system prompt.
 
 ## Validating Impact Yourself
 

@@ -1994,8 +1994,10 @@ globalThis.fetch = async function (url, options) {
 
       // Optimization: strip volatile git-status from system prompt
       // CC injects live git-status output (branch, changed files, recent commits)
-      // into a system text block. This changes on every file edit, busting the
-      // entire prefix cache. Opt-in via CACHE_FIX_STRIP_GIT_STATUS=1.
+      // into a system text block. Before CC 2.1.267 (or with --system-prompt-snapshot
+      // off) it was re-rendered every call, so any file edit busted the entire
+      // prefix cache; since 2.1.267 the prompt is recorded once per session and
+      // the block is frozen. Opt-in via CACHE_FIX_STRIP_GIT_STATUS=1.
       // The model can still run `git status` via Bash tool when it needs context.
       if (STRIP_GIT_STATUS && shouldApplyFix("git_status") && payload.system && Array.isArray(payload.system)) {
         let stripped = 0;

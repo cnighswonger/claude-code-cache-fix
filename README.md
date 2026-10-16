@@ -840,7 +840,7 @@ When the server downgrades your TTL to 5m (quota-aware downgrade at Q5h ≥ 100%
 
 ### Recommended: disable git-status injection
 
-Claude Code injects live `git status` into the system prompt on every call. Any file edit changes the git status, which busts the entire prefix cache. Disabling this saves ~1,800 tokens per call:
+Claude Code injected a `git status` block into the system prompt (through at least 2.1.270). Since 2.1.267 the system prompt is recorded once per session and reused on every call (CHANGELOG 2.1.267: `--system-prompt-snapshot off` is the opt-out that renders it fresh per request; 2.1.269 refreshes the git status after a compaction, where the cache is rebuilt anyway), so a file edit no longer changes the prefix between calls: measured frozen across a tracked-file edit on 2.1.268 and 2.1.270. On older binaries, or with `--system-prompt-snapshot off`, the block was re-rendered on every call and any file edit busted the entire prefix cache. By 2.1.301 the git context sits in the first user message instead, written once per session (measured on 2.1.301). Disabling it saves about 650 tokens per session, plus 147 tokens shared across sessions (a 4-line `# Git` section in the Bash tool description):
 
 ```bash
 export CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1

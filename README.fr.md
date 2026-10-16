@@ -605,7 +605,7 @@ Quand le serveur rétrograde votre TTL à 5m (rétrogradation quota-aware à Q5h
 
 ### Recommandé : désactiver l'injection git-status
 
-Claude Code injecte le `git status` live dans le prompt système à chaque appel. Toute édition de fichier change le git status, ce qui bust tout le cache préfixe. Désactiver ceci économise ~1 800 tokens par appel :
+Claude Code injectait un bloc `git status` dans le prompt système (au moins jusqu'à la 2.1.270). Depuis 2.1.267, le prompt système est enregistré une seule fois par session et réutilisé (CHANGELOG 2.1.267 : `--system-prompt-snapshot off` est l'option qui le re-rend à chaque requête ; 2.1.269 ne rafraîchit le git status qu'après une compaction, où le cache est de toute façon reconstruit). Une édition de fichier ne change donc plus le préfixe entre deux appels : mesuré figé sur une édition de fichier suivi entre 2.1.268 et 2.1.270. Sur les binaires plus anciens, ou avec `--system-prompt-snapshot off`, le bloc était re-rendu à chaque appel et toute édition de fichier cassait tout le cache préfixe. Sur la 2.1.301, le contexte git se trouve à la place dans le premier message utilisateur, écrit une fois par session (mesuré sur la 2.1.301). Le désactiver économise environ 650 tokens par session, plus 147 tokens partagés entre sessions (une section `# Git` de 4 lignes dans la description de l'outil Bash) :
 
 ```bash
 export CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1

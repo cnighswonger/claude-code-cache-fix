@@ -32,6 +32,8 @@
 
 - **`CACHE_FIX_DOWNLOAD_REWRITE=on` disables `claude update` entirely**, which the flag's name does not suggest. Rewriting a download URL requires MITM-ing `downloads.claude.ai`, whose release client pins public roots only, so the version check fails before anything downloads. It cannot be narrowed to the binary path (MITM is decided per host at `CONNECT`, and the version check shares the host) and no client-side override reaches that client. Documented with the measurement in the README.
 
+- **The git-status recommendation no longer claims every file edit busts the prefix cache.** Since Claude Code 2.1.267 the system prompt is recorded once per session (`--system-prompt-snapshot off` is the opt-out; 2.1.269 refreshes the git status only after a compaction), and the block measured frozen across a tracked-file edit on 2.1.268 and 2.1.270. The flag now saves about 650 tokens per session (the git context sits in the first user message on 2.1.301) plus 147 shared across sessions; the every-edit bust applies to older binaries or the opt-out. README (four languages), the extension impact guide and the `preload.mjs` comment now say so.
+
 ## [4.4.0-beta.0] - 2026-08-07
 
 Headline: **the attribution series.** This release is dominated by ten weeks of work from [@Gunther-Schulz](https://github.com/Gunther-Schulz) on one question — *when a cache bust happens, whose fault is it?* — and the answer turned out to require instrumenting the request path before we could fix anything on it. Two of the resulting features change what the proxy sends upstream. All are additive; nothing on the wire changes for an operator who sets no new env vars.
