@@ -731,7 +731,7 @@ chmod +x ~/.claude/hooks/quota-statusline.sh
 
 ### 推荐：禁用 git-status 注入
 
-Claude Code 在每次调用时将实时 `git status` 注入系统提示。任何文件编辑都会改变 git status，破坏整个前缀缓存。禁用此操作可节省 ~1,800 token 每次调用：
+在 2.1.267 之前，Claude Code 在每次调用时将实时 `git status` 注入系统提示，因此任何文件编辑都会破坏整个前缀缓存。自 2.1.267 起（在 2.1.301 上测得），git 上下文每个会话只写入一次（位于第一条用户消息中），文件编辑不再重写系统提示。禁用此操作每个会话可节省约 650 token，另有 147 token 在会话间共享（Bash 工具描述中 4 行的 `# Git` 部分）：
 
 ```bash
 export CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1
