@@ -185,8 +185,6 @@ function parseHeaders(headers) {
   const get = (key) => headers[key] || "";
   const num = (key) => parseFloat(get(key)) || 0;
 
-  const q5h_util = num("anthropic-ratelimit-unified-5h-utilization");
-  const q7d_util = num("anthropic-ratelimit-unified-7d-utilization");
   const q5h_reset = parseInt(get("anthropic-ratelimit-unified-5h-reset")) || 0;
   const q7d_reset = parseInt(get("anthropic-ratelimit-unified-7d-reset")) || 0;
   const status = get("anthropic-ratelimit-unified-status") || get("anthropic-ratelimit-unified-5h-status");
@@ -194,6 +192,13 @@ function parseHeaders(headers) {
   const overage_util = num("anthropic-ratelimit-unified-overage-utilization");
   const overage_reset = parseInt(get("anthropic-ratelimit-unified-overage-reset")) || 0;
   const unified_reset = parseInt(get("anthropic-ratelimit-unified-reset")) || 0;
+  // A window whose utilization header is absent is left out, never written as 0.
+  const win = (w, resets_at) => {
+    const utilization = parseFloat(get(`anthropic-ratelimit-unified-${w}-utilization`));
+    return Number.isFinite(utilization) ? { utilization, pct: Math.round(utilization * 100), resets_at } : null;
+  };
+  const five_hour = win("5h", q5h_reset);
+  const seven_day = win("7d", q7d_reset);
   const fallback_pct = get("anthropic-ratelimit-unified-fallback-percentage");
   const representative = get("anthropic-ratelimit-unified-representative-claim");
   const surpassed = get("anthropic-ratelimit-unified-7d-surpassed-threshold");
@@ -216,8 +221,8 @@ function parseHeaders(headers) {
   }
 
   return {
-    five_hour: { utilization: q5h_util, pct: Math.round(q5h_util * 100), resets_at: q5h_reset },
-    seven_day: { utilization: q7d_util, pct: Math.round(q7d_util * 100), resets_at: q7d_reset },
+    ...(five_hour && { five_hour }),
+    ...(seven_day && { seven_day }),
     status: status || "unknown",
     overage_status: overage_status || "unknown",
     peak_hour: peak,

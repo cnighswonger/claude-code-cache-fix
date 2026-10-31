@@ -388,13 +388,42 @@ test("6a. overage-billing account: writes files when only unified/overage-reset 
     assert.ok(existsSync(accountPath), "account.json written for overage-billing account");
     assert.ok(existsSync(sessPath), "session file written for overage-billing account");
     const acc = JSON.parse(readFileSync(accountPath, "utf8"));
-    assert.strictEqual(acc.five_hour.pct, 0, "five_hour.pct is 0 (no 5h quota for this account)");
-    assert.strictEqual(acc.seven_day.pct, 0, "seven_day.pct is 0 (no 7d quota for this account)");
+    assert.ok(!("five_hour" in acc), "five_hour is omitted (no 5h quota for this account), not 0");
+    assert.ok(!("seven_day" in acc), "seven_day is omitted (no 7d quota for this account), not 0");
     assert.strictEqual(acc.status, "allowed");
     assert.strictEqual(acc.overage_status, "allowed");
     const sess = JSON.parse(readFileSync(sessPath, "utf8"));
     assert.strictEqual(sess.cache.ttl_tier, "1h", "1h TTL when cache_read > 0");
     assert.ok(parseFloat(sess.cache.hit_rate) > 0, "hit_rate populated");
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("6b. a reply with 7d headers and no 5h headers omits five_hour from the file", async () => {
+  const env = setupTmpHome();
+  try {
+    const { ["anthropic-ratelimit-unified-5h-utilization"]: _u, ["anthropic-ratelimit-unified-5h-reset"]: _r, ...no5h } = QUOTA_HEADERS;
+    await driveResponse({ requestHeaders: { "x-claude-code-session-id": "no5h" }, responseHeaders: no5h });
+    const acc = JSON.parse(readFileSync(join(env.home, ".claude", "quota-status", "account.json"), "utf8"));
+    assert.ok(!("five_hour" in acc), "no five_hour key on disk, not null and not 0");
+    assert.strictEqual(acc.seven_day.pct, 15);
+    assert.strictEqual(acc.status, "allowed");
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("6c. a 5h utilization of 0 is a reading, not an absence", async () => {
+  const env = setupTmpHome();
+  try {
+    await driveResponse({
+      requestHeaders: { "x-claude-code-session-id": "zero5h" },
+      responseHeaders: { ...QUOTA_HEADERS, "anthropic-ratelimit-unified-5h-utilization": "0" },
+    });
+    const acc = JSON.parse(readFileSync(join(env.home, ".claude", "quota-status", "account.json"), "utf8"));
+    assert.strictEqual(acc.five_hour.pct, 0);
+    assert.strictEqual(acc.five_hour.resets_at, 1776960600);
   } finally {
     env.cleanup();
   }

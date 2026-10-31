@@ -88,10 +88,14 @@ try:
 except Exception:
     sess = {}
 
-q5h = acc.get('five_hour', {}).get('pct', 0)
-q7d = acc.get('seven_day', {}).get('pct', 0)
-q5h_reset = acc.get('five_hour', {}).get('resets_at', 0)
-q7d_reset = acc.get('seven_day', {}).get('resets_at', 0)
+# A window the account does not have is absent (no key, or null from an older
+# writer, or no pct): its segment is skipped, never drawn as 0%.
+five = acc.get('five_hour') or {}
+seven = acc.get('seven_day') or {}
+q5h = five.get('pct')
+q7d = seven.get('pct')
+q5h_reset = five.get('resets_at') or 0
+q7d_reset = seven.get('resets_at') or 0
 status = acc.get('status', '')
 overage = acc.get('overage_status', '')
 ts = sess.get('timestamp') or acc.get('timestamp', '')
@@ -179,8 +183,12 @@ def format_window(name, pct, elapsed_sec, window_secs, secs_left, min_elapsed_se
 elapsed_5h, left_5h = window_view(q5h_reset, 5 * SECS_PER_HR)
 elapsed_7d, left_7d = window_view(q7d_reset, 7 * SECS_PER_DAY)
 
-label = format_window('Q5h', q5h, elapsed_5h, 5 * SECS_PER_HR, left_5h, BURN_WARMUP_SEC)
-label += ' | ' + format_window('Q7d', q7d, elapsed_7d, 7 * SECS_PER_DAY, left_7d, BURN_WARMUP_SEC)
+windows = []
+if q5h is not None:
+    windows.append(format_window('Q5h', q5h, elapsed_5h, 5 * SECS_PER_HR, left_5h, BURN_WARMUP_SEC))
+if q7d is not None:
+    windows.append(format_window('Q7d', q7d, elapsed_7d, 7 * SECS_PER_DAY, left_7d, BURN_WARMUP_SEC))
+label = ' | '.join(windows)
 if overage == 'active':
     label += ' | OVERAGE'
 
@@ -251,7 +259,7 @@ try:
 except Exception:
     pass
 
-print(label)
+print(re.sub(r'^ \| ', '', label))  # no window at all: nothing to lead the other segments
 PYEOF
 )
 

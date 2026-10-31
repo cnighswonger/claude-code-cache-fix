@@ -582,3 +582,37 @@ test("T7 (security #108). injection in non-session_id fields is also inert", () 
     env.cleanup();
   }
 });
+
+// Key presence decides: accounts without a 5h limit have no five_hour key.
+
+function renderAccount(acc, session) {
+  const env = setupHome();
+  try {
+    writeFileSync(env.account, JSON.stringify({ status: "allowed", overage_status: "allowed", timestamp: FORMAT_NOW_ISO, ...acc }));
+    if (session) writeFileSync(join(env.sessionsDir, "x.json"), session);
+    const r = runScript(env.home, '{"session_id":"x"}');
+    assert.equal(r.status, 0, r.stderr);
+    return r.stdout.trim();
+  } finally {
+    env.cleanup();
+  }
+}
+
+test("T18 (absent window). no five_hour key: no Q5h segment, Q7d leads without a separator", () => {
+  const out = renderAccount({ seven_day: { pct: 53 } });
+  assert.match(out, /^Q7d \[█████░░░░░\] 53%/);
+  assert.doesNotMatch(out, /Q5h/);
+});
+
+test("T19 (absent window). a null five_hour from an older writer is absent, not a crash", () => {
+  const out = renderAccount({ five_hour: null, seven_day: { pct: 53 } });
+  assert.match(out, /^Q7d /);
+  assert.doesNotMatch(out, /Q5h/);
+});
+
+test("T20 (absent window). five_hour without a pct is absent; no window at all leaves no leading separator", () => {
+  assert.doesNotMatch(renderAccount({ five_hour: {}, seven_day: { pct: 53 } }), /Q5h/);
+  const out = renderAccount({}, SESSION_JSON);
+  assert.match(out, /^TTL:1h/);
+  assert.doesNotMatch(out, /Q5h|Q7d/);
+});
