@@ -28,6 +28,7 @@ import net from "node:net";
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { withDeadline } from "./child-deadline.mjs";
+import { DEAD_HOP } from "./proc-helpers.mjs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -55,11 +56,7 @@ describe("a dead stdio reader does not kill the port's process", () => {
     // configured it goes straight to the origin and says nothing, so the case
     // would pass against a relay with no guard at all. Measured: without this,
     // removing the guard entirely left the relay alive and the test green.
-    const deadHop = net.createServer();
-    await new Promise((r) => deadHop.listen(0, "127.0.0.1", r));
-    const deadPort = deadHop.address().port;
-    await new Promise((r) => deadHop.close(r));          // nothing listens there now
-    const env = { ...cleanEnv(), CACHE_FIX_FALLBACK_PROXIES: `http://127.0.0.1:${deadPort}` };
+    const env = { ...cleanEnv(), CACHE_FIX_FALLBACK_PROXIES: DEAD_HOP };
     const relay = spawn(process.execPath, [join(root, "bin", "gap-relay.mjs")],
                         { cwd: root, env, detached: true,
                           stdio: ["ignore", "pipe", "pipe", sock._handle.fd] });

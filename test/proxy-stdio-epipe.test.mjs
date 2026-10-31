@@ -24,7 +24,6 @@ import http from "node:http";
 import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { join, dirname } from "node:path";
-import { freePort } from "./proc-helpers.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const childPath = join(here, "fixtures", "stdio-epipe-child.mjs");
@@ -52,19 +51,19 @@ const get = (port, path) => new Promise((resolve) => {
 
 describe("stdio EPIPE", () => {
   it("keeps serving after its stdout/stderr reader goes away", async () => {
-    const port = await freePort();
-    const env = { ...process.env };
+    const env = { ...process.env, STDIO_EPIPE_CHILD: "1" };
     // An ambient proxy would send this test's own request somewhere real.
     for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
                      "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"]) delete env[k];
 
-    const child = spawn(process.execPath, [childPath, String(port)],
+    const child = spawn(process.execPath, [childPath],
                         { env, stdio: ["pipe", "pipe", "pipe"] });
     try {
-      await new Promise((res, rej) => {
+      const port = await new Promise((res, rej) => {
         const to = setTimeout(() => rej(new Error("child never reported listening")), 20_000);
         child.stdout.on("data", (d) => {
-          if (/listening/.test(String(d))) { clearTimeout(to); res(); }
+          const m = /listening (\d+)/.exec(String(d));
+          if (m) { clearTimeout(to); res(Number(m[1])); }
         });
         child.on("error", rej);
         child.on("exit", (c) => rej(new Error(`child exited early, code=${c}`)));

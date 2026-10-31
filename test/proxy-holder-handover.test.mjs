@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { OURS, cmdOf, freePort as takePort, listeners, onPort } from "./proc-helpers.mjs";
+import { DEAD_HOP, OURS, cmdOf, freePort as takePort, listeners, sweepTargets } from "./proc-helpers.mjs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
@@ -98,10 +98,8 @@ describe("holder handover (SIGUSR2)", () => {
   after(async () => {
     for (let i = 0; i < 6; i++) {
       let any = false;
-      for (const port of usedPorts) {
-        for (const q of onPort(port)) {
-          try { process.kill(Number(q), "SIGHUP"); any = true; } catch { }
-        }
+      for (const q of sweepTargets(usedPorts)) {
+        try { process.kill(Number(q), "SIGHUP"); any = true; } catch { }
       }
       if (!any && i) break;
       await new Promise((r) => setTimeout(r, 700));
@@ -164,7 +162,7 @@ describe("holder handover (SIGUSR2)", () => {
       assert.equal(relays.length, 1,
         `${relays.length} standby relays hold the port after a handover; one is the contract, ` +
         `two both arm when the lineage dies and take turns dropping connections`);
-      for (const p of listeners(port).filter((q) => /\brun-service\b|server\.mjs/.test(cmdOf(q)))) {
+      for (const p of sweepTargets([port]).filter((q) => /\brun-service\b|server\.mjs/.test(cmdOf(q)))) {
         try { process.kill(Number(p), "SIGKILL"); } catch { }
       }
       const by = Date.now() + 15_000;
@@ -186,7 +184,7 @@ describe("holder handover (SIGUSR2)", () => {
       // that guard is what makes the handover free — so it has to be reaped by
       // the address it holds. SIGHUP, never SIGTERM: SIGTERM means "hand on".
       for (let i = 0; i < 5; i++) {
-        const held = listeners(port);
+        const held = sweepTargets([port]);
         if (!held.length) break;
         for (const p of held) {
           const pid = Number(p);
@@ -258,11 +256,19 @@ describe("holder handover (SIGUSR2)", () => {
       assert.ok(ok,
         "the port is served but nothing supervises it — a handover successor skipped the " +
         "self-heal, so this lineage can never put a holder back and the next crash is an outage");
-      assert.equal(await probe(port), "ok", "the port did not survive losing its holder");
+      // supervised() turns true when the new holder BINDS; until its proxy takes
+      // the port the gap relay answers 503 on purpose, so wait for the 200.
+      const until = Date.now() + 15_000;
+      let after = await probe(port);
+      while (after !== "ok" && Date.now() < until) {
+        await new Promise((r) => setTimeout(r, 200));
+        after = await probe(port);
+      }
+      assert.equal(after, "ok", "the port did not survive losing its holder");
     } finally {
       try { holder.kill("SIGKILL"); } catch { }
       for (let i = 0; i < 6; i++) {
-        const held = listeners(port);
+        const held = sweepTargets([port]);
         if (!held.length) break;
         for (const p of held) {
           const pid = Number(p);
@@ -371,7 +377,7 @@ describe("holder handover (SIGUSR2)", () => {
     } finally {
       try { holder.kill("SIGKILL"); } catch { }
       for (let i = 0; i < 5; i++) {
-        const held = listeners(port);
+        const held = sweepTargets([port]);
         if (!held.length) break;
         for (const p of held) {
           const pid = Number(p);
@@ -506,14 +512,14 @@ describe("holder handover (SIGUSR2)", () => {
       // AND THE ADDRESS STILL RETIRES. That is the other half of the same harm:
       // a standby that ignored the release word would make every stray port
       // permanent by a different route.
-      for (const p of listeners(port)) { try { process.kill(Number(p), "SIGHUP"); } catch { } }
+      for (const p of sweepTargets([port])) { try { process.kill(Number(p), "SIGHUP"); } catch { } }
       await new Promise((r) => setTimeout(r, 1_500));
       assert.deepEqual(listeners(port), [],
         "the address survived SIGHUP, so a released port cannot be retired at all");
     } finally {
       try { holder.kill("SIGKILL"); } catch { }
       for (let i = 0; i < 5; i++) {
-        const held = listeners(port);
+        const held = sweepTargets([port]);
         if (!held.length) break;
         for (const p of held) {
           const pid = Number(p);
@@ -565,7 +571,7 @@ describe("holder handover (SIGUSR2)", () => {
                      "CACHE_FIX_HOLD_PORT", "CACHE_FIX_WATCH_DEPLOY_MS",
                      "CACHE_FIX_FALLBACK_PROXIES"]) delete env[k];
     // A port nobody listens on, which is what a stopped privoxy leaves behind.
-    if (deadHop) env.CACHE_FIX_FALLBACK_PROXIES = `http://127.0.0.1:${await freePort()}`;
+    if (deadHop) env.CACHE_FIX_FALLBACK_PROXIES = DEAD_HOP;
     // STDERR KEPT. The launcher writes "standby relay gone (…)" precisely for
     // this case, and discarding it made "the standby never spawned" and "the
     // standby never armed" produce the same message — one flake here was
@@ -600,7 +606,7 @@ describe("holder handover (SIGUSR2)", () => {
       // Kill the supervisor AND the proxy, and nothing else. Killing the standby
       // too would be killing the only thing that can survive this, which is not
       // the case under test.
-      const doomed = listeners(port).filter((p) => /\brun-service\b|server\.mjs/.test(cmdOf(p)));
+      const doomed = sweepTargets([port]).filter((p) => /\brun-service\b|server\.mjs/.test(cmdOf(p)));
       assert.equal(doomed.length, 2,
         `premise: a holder and a child must both be on the port, found ${doomed.length}`);
       // AND THE THING THAT HAS TO SURVIVE THEM IS ALREADY THERE. Without this
@@ -620,9 +626,9 @@ describe("holder handover (SIGUSR2)", () => {
         JSON.stringify(err.slice(-300)));
     } finally {
       try { holder.kill("SIGKILL"); } catch { }
-      for (const p of listeners(port)) { try { process.kill(Number(p), "SIGHUP"); } catch { } }
+      for (const p of sweepTargets([port])) { try { process.kill(Number(p), "SIGHUP"); } catch { } }
       await new Promise((r) => setTimeout(r, 300));
-      for (const p of listeners(port)) { try { process.kill(Number(p), "SIGKILL"); } catch { } }
+      for (const p of sweepTargets([port])) { try { process.kill(Number(p), "SIGKILL"); } catch { } }
       await new Promise((r) => origin.close(r));
     }
   });
@@ -753,9 +759,9 @@ describe("holder handover (SIGUSR2)", () => {
       assert.match(reply, /^HTTP\/1\.1 200 /, `the hop's answer never came back: ${reply}`);
     } finally {
       try { holder.kill("SIGKILL"); } catch { }
-      for (const q of onPort(port)) { try { process.kill(Number(q), "SIGHUP"); } catch { } }
+      for (const q of sweepTargets([port])) { try { process.kill(Number(q), "SIGHUP"); } catch { } }
       await new Promise((r) => setTimeout(r, 300));
-      for (const q of onPort(port)) { try { process.kill(Number(q), "SIGKILL"); } catch { } }
+      for (const q of sweepTargets([port])) { try { process.kill(Number(q), "SIGKILL"); } catch { } }
       await new Promise((r) => hop.close(r));
     }
   });
@@ -947,7 +953,7 @@ describe("holder handover (SIGUSR2)", () => {
     } finally {
       try { holder.kill("SIGTERM"); } catch { }
       for (let i = 0; i < 5; i++) {
-        const held = listeners(p2);
+        const held = sweepTargets([p2]);
         if (!held.length) break;
         for (const q of held) {
           const pid = Number(q);

@@ -11,7 +11,7 @@ import { tmpdir, availableParallelism } from "node:os";
 import { join, dirname } from "node:path";
 
 import { sourceFingerprintSync } from "../proxy/source-fingerprint.mjs";
-import { HOP_ENV, OURS, cmdOf, freePort as takePort, listeners, onPort } from "./proc-helpers.mjs";
+import { DEAD_HOP, HOP_ENV, OURS, cmdOf, freePort as takePort, listeners, sweepTargets, triesWithin } from "./proc-helpers.mjs";
 
 const launcherPath = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "claude-via-proxy.mjs");
 
@@ -53,6 +53,11 @@ function classify(body) {
 }
 
 const usedPorts = [];
+// A MARKER PER CASE. The cases of this file run side by side in one runner and share its
+// lineage, and freePort() can hand one case a number a sibling has just let go. Every
+// process a case launches carries its number in CACHE_FIX_TEST_CASE, and the case's own
+// sweeps select through `sweepTargets(ports, caseId)`: what bears that number, nothing else.
+let caseSeq = 0;
 // The shared allocator plus this file's own cleanup registry — the registry is
 // file-local (its after() hook sweeps it), the allocation is not.
 async function freePort() {
@@ -155,8 +160,9 @@ it("holds the same default port the proxy would bind, and only when unset", () =
 // held-port tests need all three; `get` answers "ERR:<code> <body>" rather than
 // throwing so a caller can count failures instead of catching them — and the
 // body is what names which of /health's two 503 authors replied.
-async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
-  const port = await freePort();          // a real number: the holder owns the ADVERTISED port
+async function withHeldPort(fn, { subcommand = "server", extraEnv = {}, port: taken } = {}, tries = 3) {
+  const port = taken ?? await freePort();          // a real number: the holder owns the ADVERTISED port
+  const caseId = ++caseSeq;
   // Self-heal OFF by default. A proxy whose holder was SIGKILLed spawns a
   // REPLACEMENT holder about a second later, and nothing in a test tracks that
   // grandchild — measured, three leaked per run of this file, reparented to
@@ -171,7 +177,7 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
   const env = { ...process.env };
   for (const k of [...HOP_ENV, "LISTEN_FDS", "LISTEN_PID", "CACHE_FIX_WATCH_DEPLOY_MS", "CACHE_FIX_SELF_HEAL"]) delete env[k];
   Object.assign(env, { CACHE_FIX_HOLD_PORT: "on", CACHE_FIX_PROXY_PORT: String(port),
-                       CACHE_FIX_SELF_HEAL: "off",
+                       CACHE_FIX_SELF_HEAL: "off", CACHE_FIX_TEST_CASE: String(caseId),
                        // A SIGKILLed runner runs no cleanup, so ask the holder to
                        // notice and go. Production does the opposite on purpose:
                        // wire.zsh backgrounds it and the shell exits, so ppid 1 is
@@ -179,6 +185,13 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
                        CACHE_FIX_EXIT_WITH_PARENT: "1", ...extraEnv });
   const launcher = spawn(process.execPath, [launcherPath, subcommand], { env, stdio: ["ignore", "pipe", "pipe"] });
   const exited = new Promise((r) => launcher.on("exit", () => r(true)));
+  const closed = new Promise((r) => launcher.on("close", r));
+  // WHAT THE LAUNCHER SAID, so a start that fails can name it: the fixture used
+  // to read neither pipe, and a readiness failure then said "ERR:ECONNREFUSED"
+  // for a launcher that had printed exactly why it stopped.
+  let said = "", warned = "";
+  launcher.stdout.on("data", (d) => (said = (said + d).slice(-2_000)));
+  launcher.stderr.on("data", (d) => (warned = (warned + d).slice(-2_000)));
   // 200 OR IT IS NOT THE PROXY. The gap relay answers /health too, with a 503
   // and a JSON body of its own, so a readiness loop that took any body finished
   // against the relay that covers a cold start — measured, six cases in this
@@ -192,10 +205,13 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
   // ERR:503" named neither, and the case reproduces on no local run — 9 of 9
   // green, 8 of them under saturating load.
   const get = () => new Promise((res) => {
-    http.get({ host: "127.0.0.1", port, path: "/health", timeout: 8_000 }, (r) => {
+    const q = http.get({ host: "127.0.0.1", port, path: "/health", timeout: 8_000 }, (r) => {
       let b = ""; r.on("data", (d) => (b += d));
       r.on("end", () => res(r.statusCode === 200 ? b : `ERR:${r.statusCode} ${b.slice(0, 160)}`));
-    }).on("error", (e) => res(`ERR:${e.code}`));
+    });
+    q.on("error", (e) => res(`ERR:${e.code}`));
+    // A listener that never answers must RESOLVE this, not hang it.
+    q.on("timeout", () => { q.destroy(); res("ERR:ETIMEDOUT"); });
   });
   // pgrep, never a pid arithmetic shortcut: `process.kill(0, ...)` signals the
   // caller's whole process group — the test runner included — and Number("")
@@ -214,12 +230,38 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
     assert.ok(pid, "no proxy child to kill, so nothing was restarted");
     process.kill(pid, "SIGKILL");
   };
+  // UP IS AN EVENT, NOT A 20 s WAIT. The launcher says "proxy listening on" and
+  // /health then answers 200; a launcher that EXITS first is never going to, so
+  // that fails at once with what it printed. Only a launcher that stays up and
+  // silent runs into the outer bound, and its message carries the last body.
+  // CI run 37414320731 (node 18): a bare "Unexpected token E in JSON" after
+  // 20 s, the ERR body thrown away by JSON.parse and the launcher's stderr unread.
+  let busy = false;
   try {
-    const up = Date.now() + 20_000;
-    let body = await get();
-    while (body.startsWith("ERR:") && Date.now() < up) body = await get();
-    assert.equal(JSON.parse(body).status, "ok", "the held port never came up");
-    await fn({ get, killProxy, proxyPid, launcher, exited, port });
+    const by = Date.now() + 60_000;
+    for (;;) {
+      const r = await Promise.race([get(), exited.then(() => null)]);
+      if (r === null) {
+        await Promise.race([closed, new Promise((q) => setTimeout(q, 5_000))]);   // 'exit' can beat the last stderr chunk
+        // A neighbour took the number freePort() let go: it is no longer ours to
+        // sweep (the after() sweep SIGHUPs our own children and this runner's
+        // lineage on a registered port, which a sibling case's launcher is), retried
+        // or not, so it leaves the list before anything throws.
+        const inUse = /EADDRINUSE/.test(warned);
+        const i = usedPorts.indexOf(port);
+        if (inUse && i >= 0) usedPorts.splice(i, 1);
+        busy = tries > 1 && inUse;
+        assert.ok(busy, `the launcher exited before the held port came up. stdout: ${said} stderr: ${warned}`);
+        break;
+      }
+      if (!r.startsWith("ERR:") && /proxy listening on/.test(said)) {
+        assert.match(r, /"status":\s*"ok"/, `a 200 that is not the proxy's: ${r}`);
+        break;
+      }
+      assert.ok(Date.now() < by, `the held port never came up and the launcher is still running; last probe: ${r}. stdout: ${said} stderr: ${warned}`);
+      await new Promise((q) => setTimeout(q, 50));
+    }
+    if (!busy) await fn({ get, killProxy, proxyPid, launcher, exited, port, caseId });
   } finally {
     // SIGTERM first: SIGKILL cannot be forwarded, so the proxy would outlive
     // its parent and keep this file's event loop alive on its pipes.
@@ -236,29 +278,19 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
     // SIGHUP, not SIGTERM: SIGTERM is the signal that means "hand the socket on",
     // so it would breed the next successor and this loop would never drain.
     for (let i = 0; i < 5 && !process.env.CCF_TEST_NO_REAP; i++) {
-      const owners = listeners(port);
+      // THROUGH THIS CASE'S MARKER. freePort() hands the same number out again
+      // once the OS recycles it, so "whoever listens on my port" can be a
+      // NEIGHBOUR's live launcher — measured: reaping by port alone killed the
+      // holder in "gives the port up when the proxy never starts" mid-run, and it
+      // went red having spawned 4 of the 5 proxies it counts. The runner's lineage
+      // does not tell them apart: every case of this file carries it.
+      const owners = sweepTargets([port], caseId);
       if (!owners.length) break;
-      let signalled = 0;
-      for (const o of owners) {
-        const pid = Number(o);
-        if (!Number.isInteger(pid) || pid <= 1) continue;
-        // ONLY an orphan. freePort() hands the same number out again once the
-        // OS recycles it, so "whoever listens on my port" can be a NEIGHBOUR's
-        // live launcher — measured: reaping by port alone killed the holder in
-        // "gives the port up when the proxy never starts" mid-run, and it went
-        // red having spawned 4 of the 5 proxies it counts. A leaked successor is
-        // detached and always reparented to init; every live fixture's process
-        // still has the test runner above it.
-        let ppid = 0;
-        try { ppid = Number(execFileSync("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8" }).trim()); }
-        catch { continue; }
-        if (ppid !== 1) continue;
-        try { process.kill(pid, "SIGHUP"); signalled++; } catch {}
-      }
-      if (!signalled) break;
+      for (const o of owners) { try { process.kill(Number(o), "SIGHUP"); } catch {} }
       await new Promise((r) => setTimeout(r, 300));
     }
   }
+  if (busy) return withHeldPort(fn, { subcommand, extraEnv }, tries - 1);
 }
 
 // The launcher holds the advertised port and relays, so a proxy that dies
@@ -271,7 +303,7 @@ async function withHeldPort(fn, { subcommand = "server", extraEnv = {} } = {}) {
 // taking 3000 ephemeral ports collided on 855 of ~2400 distinct ones. node:test
 // runs FILES concurrently in their own processes, so the thing that took our
 // number can be another RUNNER, and several of them listen in-process. Every
-// caller of listeners() in this file turns its result into
+// sweep in this file starts from listeners() and turns what it keeps into
 // `process.kill(pid, "SIGHUP")` — and node's default action for SIGHUP is to
 // terminate, so the neighbour dies with `signal: 'SIGHUP'`, `error: 'test
 // failed'`, and NO CASE FAILING INSIDE IT. That is CI run 32087202771 exactly.
@@ -295,12 +327,83 @@ setInterval(() => {}, 1e9);
     await new Promise((r) => victim.stdout.once("data", r));
     assert.deepEqual(listeners(port), [],
       `listeners() handed back pid ${victim.pid} — a test-runner process that does ` +
-      `nothing but hold the number freePort() let go. Every caller here signals what ` +
+      `nothing but hold the number freePort() let go. Every sweep here starts from what ` +
       `this returns, so that is a whole neighbouring FILE killed by this one.`);
   } finally {
     try { victim.kill("SIGKILL"); } catch { }
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// A PORT WITHHELDPORT GAVE UP ON IS NOT THE FILE'S TO SWEEP: after() sweeps every
+// usedPorts number, so a number a neighbour took (EADDRINUSE, retry on a fresh
+// one) must leave the list or the sweep keeps reading the neighbour's launcher.
+// Staged with a listener of our own on a registered number (`port` is that seam):
+// nothing is signalled, the list is what is read.
+async function withNeighbour(fn) {
+  const squatter = net.createServer();
+  await new Promise((r) => squatter.listen(0, "127.0.0.1", r));
+  try { await fn(squatter.address().port); } finally { squatter.close(); }
+}
+
+it("drops a port a neighbour took from the sweep list when it retries on another", async () => {
+  await withNeighbour(async (taken) => {
+    usedPorts.push(taken);
+    let got;
+    await withHeldPort(async ({ port }) => { got = port; }, { port: taken });
+    assert.ok(got && got !== taken, "control: the launcher came up on the number the neighbour held, so nothing was retried");
+    assert.ok(!usedPorts.includes(taken), `${taken} was given up on but is still in the list the after() sweep SIGHUPs`);
+  });
+});
+
+// On the LAST try the same EADDRINUSE is not retried but thrown, and the number
+// is the neighbour's all the same.
+it("drops a port a neighbour took from the sweep list on the last try too", async () => {
+  await withNeighbour(async (taken) => {
+    usedPorts.push(taken);
+    await assert.rejects(withHeldPort(async () => {}, { port: taken }, 1), /exited before the held port came up/);
+    assert.ok(!usedPorts.includes(taken), `${taken} was given up on but is still in the list the after() sweep SIGHUPs`);
+  });
+});
+
+// splice(indexOf(x), 1) with x absent is splice(-1, 1): the LAST registered port,
+// some other case's, silently leaves the list. Read as the start index of every
+// splice, because the list itself is being pushed to by cases running beside this.
+it("drops only the port it gave up on, never the last one registered", async () => {
+  await withNeighbour(async (taken) => {
+    const splice = usedPorts.splice;
+    const starts = [];
+    usedPorts.splice = (start, ...rest) => { starts.push(start); return splice.call(usedPorts, start, ...rest); };
+    let got;
+    try { await withHeldPort(async ({ port }) => { got = port; }, { port: taken }); }
+    finally { delete usedPorts.splice; }
+    assert.ok(got && got !== taken, "control: nothing was retried, so the give-up path never ran");
+    assert.deepEqual(starts.filter((s) => s < 0), [], "a splice started at -1: it dropped the last registered port");
+  });
+});
+
+// The forced-kill case's probe. classify() takes strings only: this answers "ok"
+// on a 200, else "ERR:<status> <body>" or "ERR:<code>".
+const healthGet = (port) => new Promise((res) => {
+  http.get({ host: "127.0.0.1", port, path: "/health", timeout: 3_000 }, (r) => {
+    let b = ""; r.on("data", (d) => (b += d));
+    r.on("end", () => res(r.statusCode === 200 ? "ok" : `ERR:${r.statusCode} ${b.slice(0, 160)}`));
+  }).on("error", (e) => res(`ERR:${e.code}`));
+});
+
+it("hands classify only strings, and counts a refusal, from the forced-kill probe", async () => {
+  const answer = (status, body) => new Promise((res) => {
+    const srv = http.createServer((q, r) => { r.statusCode = status; r.end(body); });
+    srv.listen(0, "127.0.0.1", () => res(srv));
+  });
+  const gap = await answer(503, '{"carrying":"gap-relay"}');
+  const bad = await answer(502, "bad gateway");
+  const dead = Number(new URL(DEAD_HOP).port);    // below every bind-to-0 number: ECONNREFUSED
+  try {
+    assert.equal(await healthGet(dead).then(classify), OUTAGE.REFUSED, "an unowned port is a refusal");
+    assert.equal(await healthGet(gap.address().port).then(classify), null, "a carrying gap is not an outage");
+    assert.equal(await healthGet(bad.address().port).then(classify), OUTAGE.RESET, "a 502 is a cut");
+  } finally { gap.close(); bad.close(); }
 });
 
 it("cuts nothing on the held port while the proxy restarts", async () => {
@@ -449,6 +552,7 @@ async function withFakeProxy(serverSrc, fn, { watchMs, selfHeal = "" } = {}) {
   await writeFile(copy, readFileSync(launcherPath, "utf8").replace(
     /const SERVER_PATH = .*/, `const SERVER_PATH = ${JSON.stringify(failing)};`));
   const port = await freePort();
+  const caseId = ++caseSeq;
   // The backoff ladder is what these cases measure, and at its 250ms default
   // they measure it by sleeping through it — 22s of the file's runtime. The
   // seam shrinks the RUNGS, not the count, so the shape under assertion (does
@@ -457,6 +561,7 @@ async function withFakeProxy(serverSrc, fn, { watchMs, selfHeal = "" } = {}) {
   for (const k of [...HOP_ENV, "LISTEN_FDS", "LISTEN_PID", "CACHE_FIX_WATCH_DEPLOY_MS", "CACHE_FIX_SELF_HEAL"]) delete env[k];
   Object.assign(env, { CACHE_FIX_HOLD_PORT: "on", CACHE_FIX_PROXY_PORT: String(port),
                        CACHE_FIX_RESTART_BASE_MS: "25", CACHE_FIX_SELF_HEAL: selfHeal || "off",
+                       CACHE_FIX_TEST_CASE: String(caseId),
                        ...(watchMs ? { CACHE_FIX_WATCH_DEPLOY_MS: String(watchMs) } : {}) });
   // An ambient LISTEN_FDS sends the launcher down the socket-activation path
   // instead of the holder, and an ambient proxy var routes its own requests
@@ -476,7 +581,7 @@ async function withFakeProxy(serverSrc, fn, { watchMs, selfHeal = "" } = {}) {
     s.listen({ port, host: "127.0.0.1" }, () => s.close(() => r(false)));
   });
   try {
-    await fn({ launcher, port, bound, stderr: () => err, serverFile: failing });
+    await fn({ launcher, port, bound, stderr: () => err, serverFile: failing, caseId });
   } finally {
     // SIGTERM FIRST, and wait for it. SIGKILL cannot be forwarded, so a killed
     // launcher leaves its proxy running — and that grandchild holds the pipes
@@ -500,7 +605,7 @@ async function withFakeProxy(serverSrc, fn, { watchMs, selfHeal = "" } = {}) {
     // visible when it arms, which takes its poll plus its silence window —
     // measured, a single immediate pass left 14 of them alive across one run.
     for (let i = 0; i < 6; i++) {
-      const held = listeners(port);
+      const held = sweepTargets([port], caseId);
       if (i && !held.length) break;
       for (const q of held) { try { process.kill(Number(q), "SIGHUP"); } catch { } }
       await new Promise((r) => setTimeout(r, 600));
@@ -517,7 +622,7 @@ async function withFakeProxy(serverSrc, fn, { watchMs, selfHeal = "" } = {}) {
 // respawning, and the port must still be takeable by anything that asks.
 it("gives the port up when the proxy never starts", async () => {
   await withFakeProxy('process.stderr.write("simulated\\n"); process.exit(1);\n',
-    async ({ launcher, port, bound, stderr }) => {
+    async ({ launcher, port, bound, stderr, caseId }) => {
       // 30s, and the number is the cost of FIVE NODE STARTUPS — not of the
       // backoff, which the fixture already shrinks to 25ms rungs. Measured:
       // 5,943ms alone, 8,053ms inside the file, against a cap that was 8,000 —
@@ -547,7 +652,7 @@ it("gives the port up when the proxy never starts", async () => {
       // AND THE ADDRESS STILL RETIRES, which is the other half of the same
       // harm: a standby that ignored the release word would hold every port a
       // failed launcher ever touched, forever.
-      for (const q of onPort(port)) { try { process.kill(Number(q), "SIGHUP"); } catch { } }
+      for (const q of sweepTargets([port], caseId)) { try { process.kill(Number(q), "SIGHUP"); } catch { } }
       const gone = Date.now() + 5_000;
       while (await bound() && Date.now() < gone) await new Promise((r) => setTimeout(r, 100));
       assert.equal(await bound(), false, "the port survived SIGHUP, so it can never be reclaimed");
@@ -562,7 +667,7 @@ it("keeps the port and backs off when a proxy that had served stops starting", a
   await rm(flag, { force: true });
   await withFakeProxy(
     `import fs from "node:fs"; import net from "node:net";\n` +
-    `if (fs.existsSync(${JSON.stringify(flag)})) { process.stderr.write("cannot start\\n"); process.exit(1); }\n` +
+    `if (fs.existsSync(${JSON.stringify(flag)})) { process.stderr.write("cannot start " + Date.now() + "\\n"); process.exit(1); }\n` +
     `fs.writeFileSync(${JSON.stringify(flag)}, "1");\n` +
     `const s = net.createServer((c) => c.end("HTTP/1.1 200 OK\\r\\ncontent-length:2\\r\\n\\r\\nok"));\n` +
     `s.listen(0, "127.0.0.1", () => process.stdout.write("proxy listening on 127.0.0.1:" + s.address().port + "\\n"));\n`,
@@ -580,6 +685,7 @@ it("keeps the port and backs off when a proxy that had served stops starting", a
       const kid = Number(out.trim().split("\n").filter(Boolean)
         .find((q) => /scratch-fake-server-/.test(cmdOf(q))));
       assert.ok(Number.isInteger(kid) && kid > 1, "the fake proxy never started, so this measures nothing");
+      const killedAt = Date.now();
       process.kill(kid, "SIGKILL");
       // Long enough for an UNBACKED-OFF loop to blow the ceiling: at the 25ms
       // base the ladder tops out at 500ms, so ~1.2s admits at most a handful of
@@ -601,8 +707,11 @@ it("keeps the port and backs off when a proxy that had served stops starting", a
         held = await bound();
       }
       assert.equal(held, true, "the port was released while sessions were still wired to it");
-      // Backed off: an unbounded loop reaches ~40 in this window.
-      const tries = (stderr().match(/cannot start/g) || []).length;
+      // Backed off: an unbounded loop reaches ~40 in this window. Counted by the
+      // stand-in's own stamps, not by when this runner reads its stderr: a read
+      // after a neighbour's lsof stall saw 0 tries (nothing drained yet) or 15
+      // (everything since the kill).
+      const tries = await triesWithin(stderr, killedAt, 1_200);
       assert.ok(tries <= 10, `respawned ${tries} times in 1.2s — the backoff is not applied`);
     });
   await rm(flag, { force: true });
@@ -790,7 +899,9 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
     // — OOM killer, a container stop, an operator's kill -9.
     it("leaves no orphan when the holder is killed outright", async () => {
       const port = await freePort();
-      const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port), CACHE_FIX_FORWARD_PROXY: "on" };
+      const caseId = ++caseSeq;
+      const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port), CACHE_FIX_FORWARD_PROXY: "on",
+                    CACHE_FIX_TEST_CASE: String(caseId) };
       // SELF_HEAL too: this case MEASURES the self-heal, so an operator who
       // exported the off switch while debugging would turn it into a failure
       // about their shell. WATCH_DEPLOY_MS for the same reason.
@@ -843,16 +954,17 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         // So kill the holder FIRST and only then the listener: with the holder
         // gone there is nothing left to spawn another, and the sweep converges.
         for (let i = 0; i < 60; i++) {
-          const live = listeners(port);
+          const live = sweepTargets([port], caseId);
           if (!live.length) { if (i > 10) break; }
           for (const pid of live) {
-            // The holder is the listener's parent when there is one; killing it
-            // first stops the ladder that would replace what we are about to
-            // kill.
+            // The holder is the listener's parent when it is itself one of `live`;
+            // killing it first stops the ladder that would replace what we are
+            // about to kill. A parent outside `live` is a stranger's launcher or
+            // this runner, and is not ours to signal.
             let parent = 0;
             try { parent = Number(execFileSync("ps", ["-p", pid, "-o", "ppid="],
                     { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim()); } catch {}
-            if (parent > 1) { try { process.kill(parent, "SIGKILL"); } catch {} }
+            if (live.includes(String(parent))) { try { process.kill(parent, "SIGKILL"); } catch {} }
             try { process.kill(Number(pid), "SIGKILL"); } catch {}
           }
           await new Promise((r) => setTimeout(r, 200));
@@ -871,7 +983,9 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
     // advertised address before it goes.
     it("puts a new holder back on the port when the old one is killed", async () => {
       const port = await freePort();
-      const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port), CACHE_FIX_FORWARD_PROXY: "on" };
+      const caseId = ++caseSeq;
+      const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port), CACHE_FIX_FORWARD_PROXY: "on",
+                    CACHE_FIX_TEST_CASE: String(caseId) };
       for (const k of [...HOP_ENV, "LISTEN_FDS", "LISTEN_PID"]) delete env[k];
       // 200 OR IT IS NOT THE PROXY. A standby relay carrying this address answers
       // /health with a 503 and a JSON body of its own, and a helper that returned
@@ -947,11 +1061,11 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         // has had time to create it.
         await new Promise((r) => setTimeout(r, 2_000));
         for (let i = 0; i < 3; i++) {
-          // THROUGH listeners(), which is where the ours-only predicate lives.
-          // Asking lsof here got the raw answer, and the walk below then sent
-          // SIGTERM to the listener's PARENT — for a stranger that is the node
-          // test runner, so this reached further than the SIGHUP sites did.
-          const owners = listeners(port);
+          // THROUGH sweepTargets() AND THIS CASE'S MARKER: the lineage is every case's.
+          // The walk below sends SIGTERM to the listener's PARENT, and only when
+          // that parent is itself one of `owners`: for a stranger it is the node
+          // test runner, so this reaches further than the SIGHUP sites do.
+          const owners = sweepTargets([port], caseId);
           if (!owners.length) break;               // nobody of ours owns it: done
           for (const o of owners) {
             const pid = Number(o);
@@ -961,7 +1075,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
             let target = pid;
             try { target = Number(execFileSync("ps", ["-o", "ppid=", "-p", String(pid)],
                                                { encoding: "utf8" }).trim()) || pid; } catch {}
-            if (target <= 1) target = pid;
+            if (!owners.includes(String(target))) target = pid;
             try { process.kill(target, "SIGTERM"); } catch {}
           }
           await new Promise((r) => setTimeout(r, 800));
@@ -1019,8 +1133,9 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
     // a MaxListenersExceededWarning as the only clue.
     it("supervises exactly one proxy after taking the port over", async () => {
       const port = await freePort();
+      const caseId = ++caseSeq;
       const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port), CACHE_FIX_FORWARD_PROXY: "on",
-                    CACHE_FIX_SELF_HEAL: "off" };
+                    CACHE_FIX_SELF_HEAL: "off", CACHE_FIX_TEST_CASE: String(caseId) };
       for (const k of [...HOP_ENV, "LISTEN_FDS", "LISTEN_PID", "CACHE_FIX_HOLD_PORT"]) delete env[k];
       // 200 OR IT IS NOT THE PROXY. A standby relay carrying this address answers
       // /health with a 503 and a JSON body of its own, and a helper that returned
@@ -1179,11 +1294,11 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         // has had time to create it.
         await new Promise((r) => setTimeout(r, 2_000));
         for (let i = 0; i < 3; i++) {
-          // THROUGH listeners(), which is where the ours-only predicate lives.
-          // Asking lsof here got the raw answer, and the walk below then sent
-          // SIGTERM to the listener's PARENT — for a stranger that is the node
-          // test runner, so this reached further than the SIGHUP sites did.
-          const owners = listeners(port);
+          // THROUGH sweepTargets() AND THIS CASE'S MARKER: the lineage is every case's.
+          // The walk below sends SIGTERM to the listener's PARENT, and only when
+          // that parent is itself one of `owners`: for a stranger it is the node
+          // test runner, so this reaches further than the SIGHUP sites do.
+          const owners = sweepTargets([port], caseId);
           if (!owners.length) break;               // nobody of ours owns it: done
           for (const o of owners) {
             const pid = Number(o);
@@ -1193,7 +1308,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
             let target = pid;
             try { target = Number(execFileSync("ps", ["-o", "ppid=", "-p", String(pid)],
                                                { encoding: "utf8" }).trim()) || pid; } catch {}
-            if (target <= 1) target = pid;
+            if (!owners.includes(String(target))) target = pid;
             try { process.kill(target, "SIGTERM"); } catch {}
           }
           await new Promise((r) => setTimeout(r, 800));
@@ -1237,14 +1352,10 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
         'if (fd === null) { process.stderr.write("no LISTEN_FDS\\n"); process.exit(1); }\n' +
         's.listen({ fd }, () => process.stdout.write("proxy listening on 127.0.0.1:0\\n"));\n',
         async ({ launcher, port }) => {
-          const get = () => new Promise((res) => {
-            http.get({ host: "127.0.0.1", port, path: "/health", timeout: 3_000 }, (r) => {
-              r.resume(); r.on("end", () => res(r.statusCode));
-            }).on("error", (e) => res(e.code));
-          });
+          const get = () => healthGet(port);
           const up = Date.now() + 10_000;
-          while (Date.now() < up && (await get()) !== 200) await new Promise((r) => setTimeout(r, 50));
-          assert.equal(await get(), 200, "the stand-in never came up behind the holder");
+          while (Date.now() < up && (await get()) !== "ok") await new Promise((r) => setTimeout(r, 50));
+          assert.equal(await get(), "ok", "the stand-in never came up behind the holder");
 
           const seen = [];
           const hammer = (async () => {
@@ -1278,7 +1389,8 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
           }, 250);
           await hammer;
 
-          const cut = seen.filter((c) => c !== 200);
+          // A carrying gap (classify() null) is not a cut.
+          const cut = seen.filter((c) => c !== "ok" && classify(c));
           // A REFUSAL means the address had no owner, and a session that baked
           // HTTPS_PROXY at exec is stranded. The holder exists to make that
           // rare — but on a FORCED kill it cannot make it zero, and asserting
@@ -1808,8 +1920,8 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
     });
 
     it("exits 0 and starts nothing when a proxy is already serving", async () => {
-      await withHeldPort(async ({ get, port, proxyPid }) => {
-        const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port) };
+      await withHeldPort(async ({ get, port, proxyPid, caseId }) => {
+        const env = { ...process.env, CACHE_FIX_PROXY_PORT: String(port), CACHE_FIX_TEST_CASE: String(caseId) };
         for (const k of [...HOP_ENV, "LISTEN_FDS", "LISTEN_PID"]) delete env[k];
         const incumbentPid = proxyPid();
         assert.ok(incumbentPid, "premise: the first run-service must have a proxy to protect");
@@ -1860,7 +1972,7 @@ it("frees the port when signalled SIGHUP, so a claimant can take it", async () =
       let err = "";
       p.stderr.on("data", (d) => { err += d; });
       const code = await Promise.race([
-        new Promise((r) => p.on("exit", (c) => r(c))),
+        new Promise((r) => p.on("close", (c) => r(c))),
         new Promise((r) => setTimeout(() => r("HUNG"), 25_000)),
       ]);
       try { p.kill("SIGKILL"); } catch {}
@@ -2357,10 +2469,8 @@ describe("deploy watcher (CACHE_FIX_WATCH_DEPLOY_MS)", () => {
 after(async () => {
   for (let i = 0; i < 6; i++) {
     let any = false;
-    for (const port of usedPorts) {
-      for (const q of onPort(port)) {
-        try { process.kill(Number(q), "SIGHUP"); any = true; } catch { }
-      }
+    for (const q of sweepTargets(usedPorts)) {
+      try { process.kill(Number(q), "SIGHUP"); any = true; } catch { }
     }
     if (!any && i) break;
     await new Promise((r) => setTimeout(r, 700));

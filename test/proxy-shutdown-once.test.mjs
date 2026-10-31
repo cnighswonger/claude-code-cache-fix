@@ -18,7 +18,7 @@ import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { OURS, cmdOf, freePort, listeners } from "./proc-helpers.mjs";
+import { OURS, cmdOf, freePort, sweepTargets } from "./proc-helpers.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const launcherPath = join(here, "..", "bin", "claude-via-proxy.mjs");
@@ -71,7 +71,7 @@ describe("shutdown runs once per stop", () => {
       assert.equal(body, "ok", "the holder never came up, so nothing was measured");
 
       // The proxy CHILD, which is what a control-group signal reaches directly.
-      const kid = listeners(port)
+      const kid = sweepTargets([port])
         .map(Number)
         .find((q) => /server\.mjs/.test(cmdOf(q)));
       assert.ok(kid, "premise: there must be a proxy child to signal");
@@ -109,12 +109,9 @@ describe("shutdown runs once per stop", () => {
       // SIGHUP, not SIGTERM: SIGHUP is the signal that GIVES THE ADDRESS AWAY,
       // so the standby lets go of the socket instead of sitting on the port.
       for (let i = 0; i < 6; i++) {
-        const held = listeners(port);
+        const held = sweepTargets([port]);
         if (!held.length) break;
-        for (const q of held) {
-          const pid = Number(q);
-          if (Number.isInteger(pid) && pid > 1) { try { process.kill(pid, "SIGHUP"); } catch { } }
-        }
+        for (const q of held) { try { process.kill(Number(q), "SIGHUP"); } catch { } }
         await new Promise((r) => setTimeout(r, 500));
       }
     }

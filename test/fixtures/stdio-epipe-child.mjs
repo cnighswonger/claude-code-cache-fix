@@ -9,13 +9,20 @@
 // the stderr pipe FIRST. A race here would make the test pass for the wrong
 // reason: a throw that lands while stderr is still readable never reaches the
 // defect.
+//
+// `node --test` collects every .mjs under test/, this one included, and runs it
+// bare. Only a spawner that sets STDIO_EPIPE_CHILD gets a proxy; a bare run
+// would listen on stdin for ever and hang the suite.
+if (!process.env.STDIO_EPIPE_CHILD) process.exit(0);
 process.env.CACHE_FIX_FORWARD_PROXY = "on";
 
-const port = Number(process.argv[2]);
+// The port is taken at bind (0) and announced, never chosen beforehand: a number
+// picked by the parent is unowned until the child binds it, and a neighbour that
+// takes it makes the proxy's self-heal swallow the EADDRINUSE and exit 0.
 const { startProxy } = await import("../../proxy/server.mjs");
-await startProxy({ port, bind: "127.0.0.1", watch: false });
+const handle = await startProxy({ port: 0, bind: "127.0.0.1", watch: false });
 
-process.stdout.write(`listening ${port}\n`);
+process.stdout.write(`listening ${handle.port}\n`);
 
 process.stdin.on("data", () => {
   setImmediate(() => { throw new Error("stdio-epipe probe"); });

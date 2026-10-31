@@ -118,7 +118,7 @@ test("a test that SIGKILLs a holder reaps the successor, holder first", () => {
   const orphan = /it\("leaves no orphan when the holder is killed outright"[\s\S]*?\n    \}\);/.exec(src)?.[0];
   assert.ok(orphan, "the orphan case moved — this no longer guards anything");
 
-  assert.match(orphan, /listeners\(port\)/,
+  assert.match(orphan, /(?:listeners|sweepTargets)\(\[?port\]?(?:, caseId)?\)/,
     "the successor is reaped by parentage, but it is detached (ppid 1) and " +
     "`pgrep -P` cannot see it — only the port it took is a durable handle");
   assert.match(orphan, /"ppid="/,

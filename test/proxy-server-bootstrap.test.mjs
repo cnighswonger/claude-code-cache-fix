@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { startProxy } from "../proxy/server.mjs";
+import { DEAD_HOP } from "./proc-helpers.mjs";
 
 let handle;
 let proxyPort;
@@ -159,14 +160,9 @@ describe("proxy server — /api/claude_cli/bootstrap routing", () => {
     const logPath = process.env.CACHE_FIX_BOOTSTRAP_LOG_PATH;
     const sizeBefore = existsSync(logPath) ? readFileSync(logPath, "utf8").split("\n").filter(Boolean).length : 0;
 
-    // Bind an ephemeral port, close it, point upstream there → ECONNREFUSED.
-    const tmpSrv = http.createServer(() => {});
-    await new Promise((r) => tmpSrv.listen(0, "127.0.0.1", r));
-    const deadPort = tmpSrv.address().port;
-    await new Promise((r) => tmpSrv.close(r));
-
+    // Point upstream at a dead hop → ECONNREFUSED.
     const prevUpstream = process.env.CACHE_FIX_PROXY_UPSTREAM;
-    process.env.CACHE_FIX_PROXY_UPSTREAM = `http://127.0.0.1:${deadPort}`;
+    process.env.CACHE_FIX_PROXY_UPSTREAM = DEAD_HOP;
     try {
       const res = await clientRequest("POST", "/api/claude_cli/bootstrap", JSON.stringify({ version: "2.1.150" }));
       assert.equal(res.status, 502);

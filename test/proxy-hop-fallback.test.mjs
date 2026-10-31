@@ -10,7 +10,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
-import { freePort } from "./proc-helpers.mjs";
+import { DEAD_HOP } from "./proc-helpers.mjs";
 
 describe("hop fallback", () => {
   // A HOP URL MAY CARRY CREDENTIALS, AND stderr IS WORLD-READABLE.
@@ -92,8 +92,7 @@ describe("hop fallback", () => {
       // to still announce itself, or silencing the false positive has silenced
       // the true one with it. This is the assertion that earns its keep: the
       // guard above passes just as well if the report is deleted outright.
-      const deadPrimary = `http://127.0.0.1:${await freePort()}`;
-      process.env.HTTPS_PROXY = deadPrimary;
+      process.env.HTTPS_PROXY = DEAD_HOP;
       said = "";
       process.stderr.write = (s, ...rest) => { said += s; return write(s, ...rest); };
       const degraded = await resolveHop(true);
@@ -171,7 +170,7 @@ describe("hop fallback", () => {
     const srv = net.createServer();
     await new Promise((r) => srv.listen(0, "127.0.0.1", r));
     const live = `http://127.0.0.1:${srv.address().port}`;
-    const dead = `http://127.0.0.1:${await freePort()}`;
+    const dead = DEAD_HOP;
     try {
       assert.equal(await hopAlive(live), true, "a listening hop read as dead");
       // The control that matters: a probe that answers true for everything
@@ -233,7 +232,7 @@ describe("hop fallback", () => {
     const srv = net.createServer();
     await new Promise((r) => srv.listen(0, "127.0.0.1", r));
     const live = `http://127.0.0.1:${srv.address().port}`;
-    const dead = `http://127.0.0.1:${await freePort()}`;
+    const dead = DEAD_HOP;
     // The PRIMARY comes from the ambient environment, and this box has a live
     // one — the first version of this case resolved to the operator's real pin
     // hop and asserted against it. Scrub every name config.httpsProxy reads.
@@ -334,7 +333,7 @@ describe("hop fallback", () => {
   // pass the first half.
   it("does not stamp direct_last when CACHE_FIX_REQUIRE_HOP refuses the dial", async () => {
     const { resolveHop, directLast } = await import("../proxy/upstream.mjs");
-    const dead = `http://127.0.0.1:${await freePort()}`;
+    const dead = DEAD_HOP;
     const ENV = ["CACHE_FIX_UPSTREAM_PROXY", "CACHE_FIX_REQUIRE_HOP", "HTTPS_PROXY", "https_proxy",
                  "HTTP_PROXY", "http_proxy", "CACHE_FIX_FALLBACK_PROXIES", "CACHE_FIX_CHAIN_GRACE_MS"];
     const prior = Object.fromEntries(ENV.map((k) => [k, process.env[k]]));
@@ -364,7 +363,7 @@ describe("hop fallback", () => {
 
   it("refuses fast rather than waiting out a timeout", async () => {
     const { hopAlive } = await import("../proxy/upstream.mjs");
-    const dead = `http://127.0.0.1:${await freePort()}`;
+    const dead = DEAD_HOP;
     const t0 = Date.now();
     await hopAlive(dead, 5_000);
     const took = Date.now() - t0;
