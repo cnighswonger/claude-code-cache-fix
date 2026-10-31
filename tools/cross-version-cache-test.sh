@@ -14,7 +14,7 @@
 #
 # Safety:
 #   - Uses Haiku exclusively (~$0.006/call at Haiku 4.5 rates; full test at ~30 calls = ~$0.20)
-#   - No deliberate quota burn; exits gracefully if Q5h > 80% at start
+#   - No deliberate quota burn; exits gracefully if quota (highest of 5h/7d) > 80% at start
 #   - Runs against fixed seed prompt to keep per-call overhead minimal
 #   - Does not trigger overage, does not pin quota state for the session
 #
@@ -97,22 +97,26 @@ for v in "${VERSIONS[@]}"; do
     fi
 done
 
-# Quota safety check — abort if Q5h is already high
-Q5H=$(python3 -c "
+# Quota safety check: abort if quota is already high. An account with no 5h
+# limit has no five_hour key, so read the highest pct of the windows present.
+quota_pct() {
+    python3 -c "
 import json
 try:
     q = json.load(open('$HOME/.claude/quota-status/account.json'))
-    print(q['five_hour']['pct'])
+    print(max((q.get(w) or {}).get('pct') or 0 for w in ('five_hour', 'seven_day')))
 except Exception:
     print(0)
-" 2>/dev/null || echo 0)
+" 2>/dev/null || echo 0
+}
+QUOTA=$(quota_pct)
 
-if [[ "$Q5H" -gt 80 ]]; then
-    echo "ABORT: Q5h is at ${Q5H}% — too close to cap. Test deferred." | tee -a "$SUMMARY"
+if [[ "$QUOTA" -gt 80 ]]; then
+    echo "ABORT: quota at ${QUOTA}% (highest of 5h/7d), too close to cap. Test deferred." | tee -a "$SUMMARY"
     exit 2
 fi
 
-echo "Preflight OK: Q5h at ${Q5H}%, 4 versions installed, launcher present." | tee -a "$SUMMARY"
+echo "Preflight OK: quota at ${QUOTA}% (highest of 5h/7d), 4 versions installed, launcher present." | tee -a "$SUMMARY"
 echo "" | tee -a "$SUMMARY"
 
 # Snapshot quota state at start
@@ -291,14 +295,7 @@ echo "Summary written to: $SUMMARY"
 echo ""
 echo "Raw per-version JSONLs in: $OUTPUT_DIR"
 echo ""
-if [[ "$Q5H" -lt 50 ]]; then
-    NEW_Q5H=$(python3 -c "
-import json
-try:
-    print(json.load(open('$HOME/.claude/quota-status/account.json'))['five_hour']['pct'])
-except Exception:
-    print('?')
-" 2>/dev/null)
-    echo "Q5h at start: ${Q5H}%"
-    echo "Q5h at end:   ${NEW_Q5H}%"
+if [[ "$QUOTA" -lt 50 ]]; then
+    echo "Quota at start (highest of 5h/7d): ${QUOTA}%"
+    echo "Quota at end:                      $(quota_pct)%"
 fi
