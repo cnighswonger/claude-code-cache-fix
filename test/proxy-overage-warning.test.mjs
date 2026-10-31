@@ -46,6 +46,13 @@ function mkHeaders({
   };
 }
 
+// A reply measured live from an account whose 5h limit was removed: the 7d and
+// status headers, and no 5h key at all.
+const LIVE_NO_5H = JSON.parse(await readFile(new URL("./fixtures/live-headers-no-5h.json", import.meta.url), "utf8"));
+const live = (over = {}) => ({ ...LIVE_NO_5H, ...over });
+const U7 = "anthropic-ratelimit-unified-7d-utilization";
+const COOL = { "anthropic-ratelimit-unified-status": "allowed" };
+
 // --- 1. Trigger detection ---
 
 test("1. trigger fires for allowed_warning + surpassed=0.75", () => {
@@ -500,4 +507,83 @@ test("L3. interleaved responses don't leak output_tokens between samples", async
     delete process.env.CACHE_FIX_OVERAGE_WARNING;
     delete process.env.CACHE_FIX_OVERAGE_WARNING_QUIET;
   }
+});
+
+// --- No 5h header: the 7d window stands in ---
+
+async function withEnv(fn) {
+  process.env.CACHE_FIX_OVERAGE_WARNING = "1";
+  process.env.CACHE_FIX_OVERAGE_WARNING_QUIET = "1";
+  const dir = await newTmp();
+  process.env.CACHE_FIX_OVERAGE_WARNING_DIR = dir;
+  try {
+    await fn(dir, await freshExt());
+  } finally {
+    delete process.env.CACHE_FIX_OVERAGE_WARNING;
+    delete process.env.CACHE_FIX_OVERAGE_WARNING_QUIET;
+    delete process.env.CACHE_FIX_OVERAGE_WARNING_DIR;
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+const readLines = async (dir) =>
+  (await readFile(join(dir, "overage-warnings.jsonl"), "utf8")).split("\n").filter(Boolean).map((l) => JSON.parse(l));
+
+test("N1. stderr line omits Q5h= when the 5h header is absent", () => {
+  const { snapshot, trigger } = parseTriggerFromHeaders(live());
+  assert.equal(snapshot.q5h_pct, null, "the record keeps null for an absent 5h reading");
+  const line = formatStderrLine({ ts: "t", trigger, snapshot, projection: null });
+  assert.doesNotMatch(line, /Q5h=/);
+  assert.match(line, /Q7d=96%/);
+});
+
+test("N2. a 7d-only reply records a sample and projects from the 7d slope", async () => {
+  await withEnv(async (dir, ext) => {
+    const cool = (q7d) => live({ ...COOL, [U7]: q7d });
+    const first = await runResponse(ext, cool("0.80"));
+    assert.equal(first.meta._overageSample?.q5h, 0.8, "7d utilisation is sampled when 5h is absent");
+    const second = await runResponse(ext, cool("0.81"));
+    const third = await runResponse(ext, cool("0.82"));
+    // The responses land in one millisecond; spread them a minute apart.
+    first.meta._overageSample.t -= 3 * 60_000;
+    second.meta._overageSample.t -= 2 * 60_000;
+    third.meta._overageSample.t -= 60_000;
+    await runResponse(ext, live({ [U7]: "0.83" }));
+    const [rec] = await readLines(dir);
+    assert.equal(rec.projection.window_samples, 4);
+    assert.equal(rec.projection.min_to_100, 17, "0.01 per minute from 0.83 is 17 minutes");
+    assert.equal(rec.snapshot.q5h_pct, null);
+    assert.equal(rec.snapshot.q5h_resets_at, null, "an absent 5h reset is not recorded as 0");
+  });
+});
+
+test("N3. dedup re-arms when the 7d reset changes and holds when it does not", async () => {
+  await withEnv(async (dir, ext) => {
+    for (const reset of ["1793944800", "1793944800", "1794549600"]) {
+      await runResponse(ext, live({ "anthropic-ratelimit-unified-7d-reset": reset }));
+    }
+    assert.equal((await readLines(dir)).length, 2, "same reset warns once, a new reset warns again");
+  });
+});
+
+test("N4. a 5h sample and a 7d sample never share one slope", async () => {
+  await withEnv(async (dir, ext) => {
+    const cool = mkHeaders({ status: "allowed", surpassed: "" });
+    await runResponse(ext, cool);
+    await runResponse(ext, cool);
+    await runResponse(ext, live({ [U7]: "0.83" }));
+    const [rec] = await readLines(dir);
+    assert.equal(rec.projection.window_samples, 1, "a 7d slope starts from 7d samples only");
+  });
+});
+
+test("N5. a 7d reply between 5h replies does not cost the 5h window its samples", async () => {
+  await withEnv(async (dir, ext) => {
+    const cool = mkHeaders({ status: "allowed", surpassed: "" });
+    for (let i = 0; i < 3; i++) await runResponse(ext, cool);
+    await runResponse(ext, live(COOL));
+    await runResponse(ext, mkHeaders());
+    const [rec] = await readLines(dir);
+    assert.equal(rec.projection.window_samples, 4, "three 5h samples and the warning reply");
+  });
 });

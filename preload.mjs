@@ -2647,13 +2647,17 @@ globalThis.fetch = async function (url, options) {
         }
       }
 
-      if (h5 || h7d) {
+      // An error reply loses its ratelimit headers entirely: leave the file alone.
+      if (h5 || h7d || status) {
         const quotaFile = join(homedir(), ".claude", "quota-status.json");
         let quota = {};
         try { quota = JSON.parse(readFileSync(quotaFile, "utf8")); } catch {}
         quota.timestamp = new Date().toISOString();
-        quota.five_hour = h5 ? { utilization: parseFloat(h5), pct: Math.round(parseFloat(h5) * 100), resets_at: reset5h ? parseInt(reset5h) : null } : quota.five_hour;
-        quota.seven_day = h7d ? { utilization: parseFloat(h7d), pct: Math.round(parseFloat(h7d) * 100), resets_at: reset7d ? parseInt(reset7d) : null } : quota.seven_day;
+        // A window the reply does not carry is absent, not whatever the file held before.
+        if (h5) quota.five_hour = { utilization: parseFloat(h5), pct: Math.round(parseFloat(h5) * 100), resets_at: reset5h ? parseInt(reset5h) : null };
+        else delete quota.five_hour;
+        if (h7d) quota.seven_day = { utilization: parseFloat(h7d), pct: Math.round(parseFloat(h7d) * 100), resets_at: reset7d ? parseInt(reset7d) : null };
+        else delete quota.seven_day;
         quota.status = status || null;
         quota.overage_status = overage || null;
         quota.all_headers = allAnthropicHeaders;
@@ -2684,8 +2688,9 @@ globalThis.fetch = async function (url, options) {
       let reqModel = "unknown";
       try { reqModel = JSON.parse(options?.body)?.model || "unknown"; } catch {}
       const quotaHeaders = {
-        q5h: parseFloat(response.headers.get("anthropic-ratelimit-unified-5h-utilization") || "0"),
-        q7d: parseFloat(response.headers.get("anthropic-ratelimit-unified-7d-utilization") || "0"),
+        // NaN when the header is absent; the usage record logs that as null.
+        q5h: parseFloat(response.headers.get("anthropic-ratelimit-unified-5h-utilization")),
+        q7d: parseFloat(response.headers.get("anthropic-ratelimit-unified-7d-utilization")),
         status: response.headers.get("anthropic-ratelimit-unified-status") || null,
         overage: response.headers.get("anthropic-ratelimit-unified-overage-status") || null,
       };
@@ -2819,8 +2824,8 @@ async function drainTTLFromClone(clone, model, quotaHeaders) {
         ephemeral_1h_input_tokens: cc.ephemeral_1h_input_tokens ?? 0,
         ephemeral_5m_input_tokens: cc.ephemeral_5m_input_tokens ?? 0,
         ttl_tier: ttlTier,
-        q5h_pct: quotaHeaders ? Math.round(quotaHeaders.q5h * 100) : null,
-        q7d_pct: quotaHeaders ? Math.round(quotaHeaders.q7d * 100) : null,
+        q5h_pct: Number.isFinite(quotaHeaders?.q5h) ? Math.round(quotaHeaders.q5h * 100) : null,
+        q7d_pct: Number.isFinite(quotaHeaders?.q7d) ? Math.round(quotaHeaders.q7d * 100) : null,
         peak_hour: utcDay >= 1 && utcDay <= 5 && utcHour >= 13 && utcHour < 19,
       };
       appendFileSync(USAGE_JSONL, JSON.stringify(record) + "\n");

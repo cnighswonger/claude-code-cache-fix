@@ -42,18 +42,22 @@ function debug(msg) {
 //
 // Cross-response dedup: per Q5h window (keyed by q5h_resets_at), the set
 // of thresholds we've already warned at. Window expires when q5h_resets_at
-// changes (new window = new dedup state).
+// changes (new window = new dedup state). A reply with no 5h header (accounts
+// without a 5h limit) is sampled and keyed on its 7d window instead.
 
 const WINDOW_MS = 15 * 60 * 1000;
 const WINDOW_MAX_SAMPLES = 60;
 const WARM_UP_MIN_SAMPLES = 3;
 
-const _window = []; // { t, q5h, input, cache_creation, cache_read, output }
+// One sample list per source window, so a reply from an account without a 5h
+// limit never costs a 5h account its samples (5h and 7d utilisations are not
+// comparable, and one slope never spans both).
+const _windows = { "5h": [], "7d": [] }; // { t, q5h, input, cache_creation, cache_read, output }
 let _dedupWindowResetsAt = 0;
 let _dedupThresholds = new Set();
 
 function resetState() {
-  _window.length = 0;
+  for (const w of Object.values(_windows)) w.length = 0;
   _dedupWindowResetsAt = 0;
   _dedupThresholds = new Set();
 }
@@ -107,11 +111,12 @@ export function parseTriggerFromHeaders(headers) {
     snapshot: {
       q5h_pct: q5h_util !== null ? Math.round(q5h_util * 100) : null,
       q7d_pct: q7d_util !== null ? Math.round(q7d_util * 100) : null,
-      q5h_resets_at,
+      q5h_resets_at: q5h_resets_at || null,
     },
     raw: {
       q5h_util,
       q5h_resets_at,
+      window_resets_at: q5h_resets_at || intOf("anthropic-ratelimit-unified-7d-reset"),
     },
   };
 }
@@ -187,7 +192,8 @@ export function formatStderrLine({ ts, trigger, snapshot, projection }) {
   const upgrade = trigger.upgrade_paths.length
     ? trigger.upgrade_paths.join(", ")
     : "(none)";
-  const head = `[overage-warning] ${ts} Q5h=${snapshot.q5h_pct}% Q7d=${snapshot.q7d_pct}% (surpassed ${trigger.surpassed_threshold})`;
+  const seg = (name, pct) => (pct === null ? "" : `${name}=${pct}% `);
+  const head = `[overage-warning] ${ts} ${seg("Q5h", snapshot.q5h_pct)}${seg("Q7d", snapshot.q7d_pct)}(surpassed ${trigger.surpassed_threshold})`;
   if (projection && projection.min_to_100 !== null && projection.cost_per_hr_usd_coarse !== null) {
     return `${head} — projected 100% in ~${projection.min_to_100} min, estimated continued burn ≈ $${projection.cost_per_hr_usd_coarse.toFixed(2)}/hr at API rates (coarse). Upgrade paths: ${upgrade}.`;
   }
@@ -280,10 +286,12 @@ export default {
       // Always capture quota state if the headers carry it, regardless of
       // whether THIS response's status crosses a warning threshold. Future
       // responses need warm samples to project from.
-      const q5hRaw = ctx.headers["anthropic-ratelimit-unified-5h-utilization"];
-      const q5hUtil = q5hRaw ? parseFloat(q5hRaw) : null;
-      if (q5hUtil !== null && Number.isFinite(q5hUtil)) {
-        ctx.meta._overageQuota = { q5h_util: q5hUtil };
+      for (const w of ["5h", "7d"]) {
+        const util = parseFloat(ctx.headers[`anthropic-ratelimit-unified-${w}-utilization`]);
+        if (Number.isFinite(util)) {
+          ctx.meta._overageQuota = { util, w };
+          break;
+        }
       }
 
       // Trigger eligibility latch — only set when this response is the one
@@ -311,17 +319,17 @@ export default {
       // reading, regardless of whether this response is the one that emits.
       if (ctx.event.type === "message_start" && ctx.event.message?.usage) {
         const u = ctx.event.message.usage;
-        const q5hUtil = ctx.meta?._overageQuota?.q5h_util;
-        if (q5hUtil !== undefined && q5hUtil !== null) {
+        const quota = ctx.meta?._overageQuota;
+        if (quota) {
           const sample = {
             t: Date.now(),
-            q5h: q5hUtil,
+            q5h: quota.util, // utilisation of window `w`: the 7d one when the reply has no 5h header
             input: u.input_tokens || 0,
             cache_creation: u.cache_creation_input_tokens || 0,
             cache_read: u.cache_read_input_tokens || 0,
             output: 0,
           };
-          recordSample({ window: _window }, sample);
+          recordSample({ window: _windows[quota.w] }, sample);
           // Hand the response its own sample reference. message_delta updates
           // THIS sample only — never the window's last sample, which could
           // belong to a different response under interleaving.
@@ -344,7 +352,7 @@ export default {
 
         const allowed = checkAndMarkDedup(
           w.trigger.surpassed_threshold,
-          w.snapshot.q5h_resets_at,
+          w.raw.window_resets_at,
         );
         if (!allowed) {
           w.emitted = true;
@@ -352,7 +360,7 @@ export default {
         }
 
         const ts = new Date().toISOString();
-        const projection = computeProjection(_window, Date.now());
+        const projection = computeProjection(_windows[ctx.meta?._overageQuota?.w ?? "5h"], Date.now());
         const projectionForOutput =
           projection.window_samples >= WARM_UP_MIN_SAMPLES &&
           projection.min_to_100 !== null

@@ -483,6 +483,50 @@ test("end-to-end: two responses → second has non-zero deltas", async () => {
   }
 });
 
+// --- A reply without a 5h header is not a reading of 0 ---
+
+// Measured live from an account whose 5h limit was removed: no 5h key at all.
+const LIVE_NO_5H = JSON.parse(await readFile(new URL("./fixtures/live-headers-no-5h.json", import.meta.url), "utf8"));
+
+async function logReplies(replies) {
+  const mod = await freshExt();
+  const dir = await newTmp();
+  const path = join(dir, "usage.jsonl");
+  process.env.CACHE_FIX_USAGE_LOG = path;
+  try {
+    for (const responseHeaders of replies) {
+      const ctx = { meta: {}, event: mkMessageStart(), telemetry: {}, responseHeaders };
+      await mod.default.onStreamEvent(ctx);
+      ctx.event = { type: "message_delta", usage: { output_tokens: 1 } };
+      await mod.default.onStreamEvent(ctx);
+    }
+    return (await readFile(path, "utf8")).split("\n").filter(Boolean).map((l) => JSON.parse(l));
+  } finally {
+    delete process.env.CACHE_FIX_USAGE_LOG;
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+test("a reply with no 5h header logs q5h 0 and q5h_reset 0, and a delta of 0 against the last reading", () => {
+  const record = assembleRecord({
+    start: extractMessageStartFields(mkMessageStart()),
+    delta: { output_tokens: 1 },
+    quota: parseQuotaHeaders(LIVE_NO_5H),
+    sid: "abcdef01",
+    prevQ5h: 0.34,
+  });
+  assert.equal(record.q5h, 0);
+  assert.equal(record.q5h_reset, 0);
+  assert.equal(record.q5h_delta, 0);
+  assert.equal(record.q7d, 0.96);
+});
+
+test("a reply with no 5h header keeps the last 5h reading for the next 5h reply's delta", async () => {
+  const q5h = (v) => mkHeaders({ "anthropic-ratelimit-unified-5h-utilization": v });
+  const rows = await logReplies([q5h("0.34"), LIVE_NO_5H, q5h("0.40")]);
+  assert.deepEqual(rows.map((r) => Math.round(r.q5h_delta * 100)), [0, 0, 6]);
+});
+
 // --- request_id field (directive: proxy-usage-log-request-id) ---
 //
 // Schema: request_id?: string, max 64 chars.

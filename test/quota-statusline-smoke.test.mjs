@@ -5,11 +5,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
+import cacheTelemetry from "../proxy/extensions/cache-telemetry.mjs";
 
 const SCRIPT = resolve(fileURLToPath(import.meta.url), "..", "..", "tools", "quota-statusline.sh");
 
@@ -581,4 +582,57 @@ test("T7 (security #108). injection in non-session_id fields is also inert", () 
   } finally {
     env.cleanup();
   }
+});
+
+// Key presence decides: accounts without a 5h limit have no five_hour key.
+
+function renderAccount(acc, session) {
+  const env = setupHome();
+  try {
+    writeFileSync(env.account, JSON.stringify({ status: "allowed", overage_status: "allowed", timestamp: FORMAT_NOW_ISO, ...acc }));
+    if (session) writeFileSync(join(env.sessionsDir, "x.json"), session);
+    const r = runScript(env.home, '{"session_id":"x"}');
+    assert.equal(r.status, 0, r.stderr);
+    return r.stdout.trim();
+  } finally {
+    env.cleanup();
+  }
+}
+
+// Measured live from an account whose 5h limit was removed: no 5h key at all.
+const LIVE_NO_5H = JSON.parse(readFileSync(new URL("./fixtures/live-headers-no-5h.json", import.meta.url), "utf8"));
+
+test("T18 (absent window). the account file the proxy writes for a reply with no 5h headers: no Q5h segment, Q7d leads without a separator", async () => {
+  const env = setupHome();
+  const oldHome = process.env.HOME;
+  process.env.HOME = env.home;
+  try {
+    cacheTelemetry.__resetForTests();
+    const meta = {};
+    await cacheTelemetry.onRequest({ headers: { "x-claude-code-session-id": "x" }, meta });
+    await cacheTelemetry.onResponseStart({ headers: LIVE_NO_5H, meta });
+    const usage = { input_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 100 };
+    await cacheTelemetry.onStreamEvent({ event: { type: "message_start", message: { usage } }, telemetry: {}, meta });
+    await cacheTelemetry.onStreamEvent({ event: { type: "message_delta", usage: { output_tokens: 1 } }, telemetry: {}, meta });
+    const r = runScript(env.home, '{"session_id":"x"}');
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /^Q7d \[.{10}\] 96%/);
+    assert.doesNotMatch(r.stdout, /Q5h/);
+  } finally {
+    process.env.HOME = oldHome;
+    env.cleanup();
+  }
+});
+
+test("T19 (absent window). a null five_hour from an older writer is absent, not a crash", () => {
+  const out = renderAccount({ five_hour: null, seven_day: { pct: 53 } });
+  assert.match(out, /^Q7d /);
+  assert.doesNotMatch(out, /Q5h/);
+});
+
+test("T20 (absent window). five_hour without a pct is absent; no window at all leaves no leading separator", () => {
+  assert.doesNotMatch(renderAccount({ five_hour: {}, seven_day: { pct: 53 } }), /Q5h/);
+  const out = renderAccount({}, SESSION_JSON);
+  assert.match(out, /^TTL:1h/);
+  assert.doesNotMatch(out, /Q5h|Q7d/);
 });
