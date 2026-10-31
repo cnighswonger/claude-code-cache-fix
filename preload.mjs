@@ -2647,7 +2647,8 @@ globalThis.fetch = async function (url, options) {
         }
       }
 
-      if (h5 || h7d) {
+      // An error reply loses its ratelimit headers entirely: leave the file alone.
+      if (h5 || h7d || status) {
         const quotaFile = join(homedir(), ".claude", "quota-status.json");
         let quota = {};
         try { quota = JSON.parse(readFileSync(quotaFile, "utf8")); } catch {}

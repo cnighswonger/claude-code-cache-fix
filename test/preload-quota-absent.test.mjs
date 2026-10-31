@@ -30,16 +30,19 @@ await (await globalThis.fetch("https://api.anthropic.com/v1/messages", { method:
 for (let i = 0; i < 200 && !existsSync(process.env.CACHE_FIX_USAGE_LOG); i++) await new Promise((r) => setTimeout(r, 25));
 `;
 
+// Left behind by a previous account that did have both windows.
+const SEEDED = JSON.stringify({
+  five_hour: { utilization: 0.9, pct: 90, resets_at: 1700000000 },
+  seven_day: { utilization: 0.5, pct: 50, resets_at: 1700500000 },
+  status: "allowed",
+});
+
 function reply(replyHeaders) {
   const home = mkdtempSync(join(tmpdir(), "preload-quota-"));
   const quotaFile = join(home, ".claude", "quota-status.json");
   const usageFile = join(home, "usage.jsonl");
   mkdirSync(join(home, ".claude"), { recursive: true });
-  // Left behind by a previous account that did have a 5h window.
-  writeFileSync(quotaFile, JSON.stringify({
-    five_hour: { utilization: 0.9, pct: 90, resets_at: 1700000000 },
-    seven_day: { utilization: 0.5, pct: 50, resets_at: 1700500000 },
-  }));
+  writeFileSync(quotaFile, SEEDED);
   try {
     const r = spawnSync(process.execPath, ["--input-type=module", "-e", CHILD], {
       env: { ...process.env, HOME: home, CACHE_FIX_USAGE_LOG: usageFile, REPLY_HEADERS: JSON.stringify(replyHeaders) },
@@ -82,4 +85,32 @@ test("a reply with both windows still writes both", () => {
   });
   assert.deepEqual(quota.five_hour, { utilization: 0, pct: 0, resets_at: 1700100000 });
   assert.equal(row.q5h_pct, 0, "a 5h reading of 0 is a reading");
+});
+
+test("a reply with a 5h window and no 7d drops the stale seven_day", () => {
+  const { quota } = reply({
+    "anthropic-ratelimit-unified-5h-utilization": "0.2",
+    "anthropic-ratelimit-unified-5h-reset": "1700100000",
+    "anthropic-ratelimit-unified-status": "allowed",
+  });
+  assert.ok(!("seven_day" in quota), "seven_day is removed, not kept from the previous account");
+  assert.equal(quota.five_hour.pct, 20);
+});
+
+test("a reply with status and overage headers but neither window drops both stale windows", () => {
+  const { quota } = reply({
+    "anthropic-ratelimit-unified-status": "allowed_warning",
+    "anthropic-ratelimit-unified-overage-status": "allowed",
+    "anthropic-ratelimit-unified-overage-reset": "1780272000",
+  });
+  assert.ok(!("five_hour" in quota), "five_hour is removed");
+  assert.ok(!("seven_day" in quota), "seven_day is removed");
+  assert.equal(quota.status, "allowed_warning");
+  assert.equal(quota.overage_status, "allowed");
+});
+
+test("a reply with no rate-limit headers (an error reply) leaves the quota file as it was", () => {
+  // The TTL drain adds its own cache block; every other key is the header writer's.
+  const { cache, ...rest } = reply({}).quota;
+  assert.deepEqual(rest, JSON.parse(SEEDED));
 });
