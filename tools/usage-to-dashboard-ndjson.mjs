@@ -190,12 +190,13 @@ export function translateRecord(entry) {
   const responseHeaders = {};
   if (entry.q5h_pct != null) {
     responseHeaders['anthropic-ratelimit-unified-5h-utilization'] = String(entry.q5h_pct / 100);
-  } else if (entry.q5h != null) {
+  } else if (entry.q5h != null && entry.q5h_reset !== 0) {
+    // v:1 logs a window with no header as q5h 0 and q5h_reset 0: no reading to reconstruct.
     responseHeaders['anthropic-ratelimit-unified-5h-utilization'] = String(entry.q5h);
   }
   if (entry.q7d_pct != null) {
     responseHeaders['anthropic-ratelimit-unified-7d-utilization'] = String(entry.q7d_pct / 100);
-  } else if (entry.q7d != null) {
+  } else if (entry.q7d != null && entry.q7d_reset !== 0) {
     responseHeaders['anthropic-ratelimit-unified-7d-utilization'] = String(entry.q7d);
   }
 

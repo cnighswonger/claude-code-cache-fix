@@ -142,8 +142,10 @@ function strOf(headers, key) {
 export function parseQuotaHeaders(headers) {
   const h = headers || {};
   return {
-    q5h: num(h, "anthropic-ratelimit-unified-5h-utilization") ?? 0,
-    q7d: num(h, "anthropic-ratelimit-unified-7d-utilization") ?? 0,
+    // null when the header is absent: the row logs 0 for it (the schema needs a
+    // number), but a 0 that is no reading must not become a delta or the baseline.
+    q5h: num(h, "anthropic-ratelimit-unified-5h-utilization"),
+    q7d: num(h, "anthropic-ratelimit-unified-7d-utilization"),
     q5h_reset: intOf(h, "anthropic-ratelimit-unified-5h-reset"),
     q7d_reset: intOf(h, "anthropic-ratelimit-unified-7d-reset"),
     qstatus: strOf(h, "anthropic-ratelimit-unified-status"),
@@ -394,8 +396,8 @@ export default {
 
       // Update delta tracking AFTER assembly so the first call's delta is 0
       // (per the directive contract: first call after restart → deltas zero).
-      _lastQ5h = quota.q5h;
-      _lastQ7d = quota.q7d;
+      if (quota.q5h !== null) _lastQ5h = quota.q5h;
+      if (quota.q7d !== null) _lastQ7d = quota.q7d;
 
       await appendJsonl(record, logPath());
     } catch {
