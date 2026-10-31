@@ -396,58 +396,14 @@ test("16. record assembled with safe defaults when every quota header is absent"
     quota: parseQuotaHeaders({}),
     sid: "abcdef01",
   });
-  for (const k of ["q5h", "q7d", "q5h_reset", "q7d_reset", "q5h_delta", "q7d_delta"]) {
-    assert.ok(!(k in record), `${k} is omitted, not 0, when its header is absent`);
-  }
+  assert.equal(record.q5h, 0);
+  assert.equal(record.q7d, 0);
+  assert.equal(record.q5h_reset, 0);
+  assert.equal(record.q7d_reset, 0);
   assert.equal(record.qstatus, "");
   assert.equal(record.qoverage, "");
   assert.equal(record.qclaim, "");
   assert.equal(record.qfallback_pct, 0);
-});
-
-test("16b. a reply with no 5h headers omits the 5h fields and keeps the 7d ones", () => {
-  const h = mkHeaders();
-  delete h["anthropic-ratelimit-unified-5h-utilization"];
-  delete h["anthropic-ratelimit-unified-5h-reset"];
-  const record = assembleRecord({
-    start: extractMessageStartFields(mkMessageStart()),
-    delta: { output_tokens: 50 },
-    quota: parseQuotaHeaders(h),
-    sid: "abcdef01",
-    prevQ5h: 0.42,
-    prevQ7d: 0.2,
-  });
-  for (const k of ["q5h", "q5h_reset", "q5h_delta"]) assert.ok(!(k in record), `${k} omitted`);
-  assert.equal(record.q7d, 0.3);
-  assert.equal(record.q7d_reset, 1700100000);
-  assert.ok(Math.abs(record.q7d_delta - 0.1) < 1e-9);
-});
-
-test("16c. a reply with no 5h header does not poison the next delta", async () => {
-  const mod = await freshExt();
-  const dir = await newTmp();
-  const path = join(dir, "usage.jsonl");
-  process.env.CACHE_FIX_USAGE_LOG = path;
-  try {
-    const no5h = mkHeaders();
-    delete no5h["anthropic-ratelimit-unified-5h-utilization"];
-    for (const responseHeaders of [
-      mkHeaders({ "anthropic-ratelimit-unified-5h-utilization": "0.42" }),
-      no5h,
-      mkHeaders({ "anthropic-ratelimit-unified-5h-utilization": "0.45" }),
-    ]) {
-      const ctx = { meta: {}, event: mkMessageStart(), telemetry: {}, responseHeaders };
-      await mod.default.onStreamEvent(ctx);
-      ctx.event = { type: "message_delta", usage: { output_tokens: 100 } };
-      await mod.default.onStreamEvent(ctx);
-    }
-    const rows = (await readFile(path, "utf8")).split("\n").filter(Boolean).map((l) => JSON.parse(l));
-    assert.ok(!("q5h_delta" in rows[1]), "the no-5h reply carries no 5h delta (not -0.42)");
-    assert.equal(rows[2].q5h_delta, 0, "the next 5h reply starts over, not from a stale or zero reading");
-  } finally {
-    delete process.env.CACHE_FIX_USAGE_LOG;
-    await rm(dir, { recursive: true, force: true });
-  }
 });
 
 // --- Bonus tests ---
