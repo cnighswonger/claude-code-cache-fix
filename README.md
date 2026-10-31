@@ -1352,8 +1352,8 @@ The `usage-log` extension (opt-in via `proxy/extensions.json`) appends one JSON 
 | `ephemeral_1h_input_tokens` | int ≥0 | response usage |
 | `ephemeral_5m_input_tokens` | int ≥0 | response usage |
 | `web_search_requests` | int ≥0 | response usage |
-| `q5h` / `q7d` | float 0–2 | `anthropic-ratelimit-unified-{5h,7d}-utilization` headers |
-| `q5h_reset` / `q7d_reset` | int (unix sec) | corresponding reset headers |
+| `q5h` / `q7d` | float 0–2 (omitted when its header is absent) | `anthropic-ratelimit-unified-{5h,7d}-utilization` headers |
+| `q5h_reset` / `q7d_reset` | int (unix sec; omitted when its header is absent) | corresponding reset headers |
 | `qstatus`, `qoverage`, `qclaim` | lowercase enums | unified status / overage / claim headers |
 | `qfallback_pct` | float 0–1 | unified fallback percentage |
 | `qoverage_util` | float ≥0 (optional) | overage utilization header |
@@ -1361,7 +1361,7 @@ The `usage-log` extension (opt-in via `proxy/extensions.json`) appends one JSON 
 | `org_id` | 16-char hex (optional) | `sha256(anthropic-organization-id).slice(0, 16)` — never raw |
 | `overage_disabled_reason` | string ≤64 (optional) | overage-disabled-reason header |
 | `cache_hit_rate` | float 0–1 | `cache_read_input_tokens / (input + cache_creation + cache_read)` |
-| `q5h_delta`, `q7d_delta` | float | per-call delta from the previous row's q5h/q7d; 0 on first call after restart |
+| `q5h_delta`, `q7d_delta` | float | per-call delta from the previous row's q5h/q7d; 0 on first call after restart; omitted with q5h/q7d |
 | `request_id` | string ≤64 (optional) | upstream `request-id` response header. **Default-on as of v4.2.0.** `CACHE_FIX_USAGE_LOG_REQID=off` is a kill-switch (omits the field) for operators stuck on a pre-meter-v0.7.0 install. **Cross-repo gate:** `claude-code-meter >= v0.7.0` accepts the optional field; older meter installs reject unknown keys via the strict-object schema. |
 
 **Why `request_id` matters operationally.** The `sid` field is generated once at proxy boot and shared across every CC session that proxy serves. On hosts running multiple concurrent CC sessions through one proxy (common in agent fleets), every session's rows collapse into the same `sid` — there's no way to ask "which session burned 80% of today's Opus tokens?" from `usage.jsonl` alone. CC's per-session JSONL transcripts at `~/.claude/projects/<project>/<session-uuid>.jsonl` already carry `requestId` for every API call. Capturing the same value in the meter row makes the post-hoc join trivial:

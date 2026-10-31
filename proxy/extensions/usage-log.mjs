@@ -16,8 +16,8 @@
 //   input_tokens, output_tokens, cache_creation_input_tokens,
 //   cache_read_input_tokens, ephemeral_1h_input_tokens,
 //   ephemeral_5m_input_tokens, web_search_requests: int ≥ 0
-//   q5h, q7d: float 0–2
-//   q5h_reset, q7d_reset: int (unix sec)
+//   q5h, q7d: float 0–2 (omitted when its utilization header is absent)
+//   q5h_reset, q7d_reset: int (unix sec) (omitted when its reset header is absent)
 //   qstatus, qoverage, qclaim: string lowercase enums
 //   qfallback_pct: float 0–1
 //   qoverage_util?: float ≥ 0                        (optional)
@@ -25,7 +25,7 @@
 //   org_id?: 16-char hex (sha256(raw header).digest("hex").slice(0,16))
 //   overage_disabled_reason?: string ≤64             (optional)
 //   cache_hit_rate: float 0–1
-//   q5h_delta, q7d_delta: float (0 on first call after restart)
+//   q5h_delta, q7d_delta: float (0 on first call after restart; omitted with q5h/q7d)
 //   request_id?: string ≤64                          (optional, gated)
 //
 // `peak_hour` is NOT in the wire format. It can be derived from `ts` if any
@@ -142,8 +142,8 @@ function strOf(headers, key) {
 export function parseQuotaHeaders(headers) {
   const h = headers || {};
   return {
-    q5h: num(h, "anthropic-ratelimit-unified-5h-utilization") ?? 0,
-    q7d: num(h, "anthropic-ratelimit-unified-7d-utilization") ?? 0,
+    q5h: num(h, "anthropic-ratelimit-unified-5h-utilization"),
+    q7d: num(h, "anthropic-ratelimit-unified-7d-utilization"),
     q5h_reset: intOf(h, "anthropic-ratelimit-unified-5h-reset"),
     q7d_reset: intOf(h, "anthropic-ratelimit-unified-7d-reset"),
     qstatus: strOf(h, "anthropic-ratelimit-unified-status"),
@@ -189,10 +189,10 @@ export function assembleRecord({ start, delta, quota, requestedModel, sid, prevQ
     ephemeral_1h_input_tokens: s.ephemeral_1h_input_tokens || 0,
     ephemeral_5m_input_tokens: s.ephemeral_5m_input_tokens || 0,
     web_search_requests: s.web_search_requests || 0,
-    q5h: q.q5h ?? 0,
-    q7d: q.q7d ?? 0,
-    q5h_reset: q.q5h_reset || 0,
-    q7d_reset: q.q7d_reset || 0,
+    q5h: q.q5h,
+    q7d: q.q7d,
+    q5h_reset: q.q5h_reset,
+    q7d_reset: q.q7d_reset,
     qstatus: q.qstatus || "",
     qoverage: q.qoverage || "",
     qclaim: q.qclaim || "",
@@ -203,6 +203,14 @@ export function assembleRecord({ start, delta, quota, requestedModel, sid, prevQ
   };
 
   // Optional fields are OMITTED (not present as undefined) when source absent.
+  // An absent window header is absent from the row: never 0, never a delta from it.
+  for (const k of ["q5h", "q7d"]) {
+    if (q[k] == null) {
+      delete record[k];
+      delete record[`${k}_delta`];
+    }
+    if (!q[`${k}_reset`]) delete record[`${k}_reset`];
+  }
   if (requestedModel) {
     record.requested_model = requestedModel;
     if (record.model && requestedModel !== record.model) {
