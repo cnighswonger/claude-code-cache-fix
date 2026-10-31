@@ -3,9 +3,7 @@
 // absent: not a previous account's value in the file, not 0 in the row.
 //
 // The interceptor is driven in a child process (it patches globalThis.fetch at
-// import, and reads HOME at load). ASSUMPTION: a real reply without the 5h
-// header still carries the 7d and status headers; no such reply was captured,
-// so the fixture is built from the header names the 5h-bearing replies use.
+// import, and reads HOME at load).
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -14,6 +12,9 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "nod
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+
+// Measured live from an account whose 5h limit was removed: no 5h key at all.
+const LIVE_NO_5H = JSON.parse(readFileSync(new URL("./fixtures/live-headers-no-5h.json", import.meta.url), "utf8"));
 
 const PRELOAD = resolve(fileURLToPath(import.meta.url), "..", "..", "preload.mjs");
 
@@ -58,28 +59,22 @@ function reply(replyHeaders) {
   }
 }
 
-const SEVEN_DAY = {
-  "anthropic-ratelimit-unified-7d-utilization": "0.15",
-  "anthropic-ratelimit-unified-7d-reset": "1700600000",
-  "anthropic-ratelimit-unified-status": "allowed",
-};
-
 test("a reply with no 5h header drops the stale five_hour from the quota file", () => {
-  const { quota } = reply(SEVEN_DAY);
+  const { quota } = reply(LIVE_NO_5H);
   assert.ok(!("five_hour" in quota), "five_hour is removed, not kept from the previous account");
-  assert.equal(quota.seven_day.pct, 15);
-  assert.equal(quota.status, "allowed");
+  assert.equal(quota.seven_day.pct, 96);
+  assert.equal(quota.status, "allowed_warning");
 });
 
 test("a reply with no 5h header logs no 5h reading", () => {
-  const { row } = reply(SEVEN_DAY);
+  const { row } = reply(LIVE_NO_5H);
   assert.equal(row.q5h_pct, null, "an absent 5h header is not logged as 0");
-  assert.equal(row.q7d_pct, 15);
+  assert.equal(row.q7d_pct, 96);
 });
 
 test("a reply with both windows still writes both", () => {
   const { quota, row } = reply({
-    ...SEVEN_DAY,
+    ...LIVE_NO_5H,
     "anthropic-ratelimit-unified-5h-utilization": "0",
     "anthropic-ratelimit-unified-5h-reset": "1700100000",
   });

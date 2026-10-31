@@ -18,6 +18,9 @@ const QUOTA_HEADERS = {
   "anthropic-ratelimit-unified-overage-status": "allowed",
 };
 
+// Measured live from an account whose 5h limit was removed: no 5h key at all.
+const LIVE_NO_5H = JSON.parse(readFileSync(new URL("./fixtures/live-headers-no-5h.json", import.meta.url), "utf8"));
+
 function setupTmpHome() {
   const dir = mkdtempSync(join(tmpdir(), "ct-"));
   const oldHome = process.env.HOME;
@@ -403,12 +406,12 @@ test("6a. overage-billing account: writes files when only unified/overage-reset 
 test("6b. a reply with 7d headers and no 5h headers omits five_hour from the file", async () => {
   const env = setupTmpHome();
   try {
-    const { ["anthropic-ratelimit-unified-5h-utilization"]: _u, ["anthropic-ratelimit-unified-5h-reset"]: _r, ...no5h } = QUOTA_HEADERS;
-    await driveResponse({ requestHeaders: { "x-claude-code-session-id": "no5h" }, responseHeaders: no5h });
+    await driveResponse({ requestHeaders: { "x-claude-code-session-id": "no5h" }, responseHeaders: LIVE_NO_5H });
     const acc = JSON.parse(readFileSync(join(env.home, ".claude", "quota-status", "account.json"), "utf8"));
     assert.ok(!("five_hour" in acc), "no five_hour key on disk, not null and not 0");
-    assert.strictEqual(acc.seven_day.pct, 15);
-    assert.strictEqual(acc.status, "allowed");
+    assert.strictEqual(acc.seven_day.pct, 96);
+    assert.strictEqual(acc.seven_day.resets_at, 1793944800);
+    assert.strictEqual(acc.status, "allowed_warning");
   } finally {
     env.cleanup();
   }
