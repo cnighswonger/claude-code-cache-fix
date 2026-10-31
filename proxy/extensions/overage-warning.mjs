@@ -49,12 +49,15 @@ const WINDOW_MS = 15 * 60 * 1000;
 const WINDOW_MAX_SAMPLES = 60;
 const WARM_UP_MIN_SAMPLES = 3;
 
-const _window = []; // { t, q5h, input, cache_creation, cache_read, output }
+// One sample list per source window, so a reply from an account without a 5h
+// limit never costs a 5h account its samples (5h and 7d utilisations are not
+// comparable, and one slope never spans both).
+const _windows = { "5h": [], "7d": [] }; // { t, q5h, input, cache_creation, cache_read, output }
 let _dedupWindowResetsAt = 0;
 let _dedupThresholds = new Set();
 
 function resetState() {
-  _window.length = 0;
+  for (const w of Object.values(_windows)) w.length = 0;
   _dedupWindowResetsAt = 0;
   _dedupThresholds = new Set();
 }
@@ -224,8 +227,6 @@ export function formatJsonlRecord({ ts, trigger, snapshot, projection }) {
 // --- Window management ---
 
 export function recordSample(state, sample) {
-  // One slope never spans two windows (5h and 7d utilisations are not comparable).
-  if (state.window.length && state.window[0].w !== sample.w) state.window.length = 0;
   state.window.push(sample);
   const cutoff = sample.t - WINDOW_MS;
   while (state.window.length && state.window[0].t < cutoff) state.window.shift();
@@ -323,13 +324,12 @@ export default {
           const sample = {
             t: Date.now(),
             q5h: quota.util, // utilisation of window `w`: the 7d one when the reply has no 5h header
-            w: quota.w,
             input: u.input_tokens || 0,
             cache_creation: u.cache_creation_input_tokens || 0,
             cache_read: u.cache_read_input_tokens || 0,
             output: 0,
           };
-          recordSample({ window: _window }, sample);
+          recordSample({ window: _windows[quota.w] }, sample);
           // Hand the response its own sample reference. message_delta updates
           // THIS sample only — never the window's last sample, which could
           // belong to a different response under interleaving.
@@ -360,7 +360,7 @@ export default {
         }
 
         const ts = new Date().toISOString();
-        const projection = computeProjection(_window, Date.now());
+        const projection = computeProjection(_windows[ctx.meta?._overageQuota?.w ?? "5h"], Date.now());
         const projectionForOutput =
           projection.window_samples >= WARM_UP_MIN_SAMPLES &&
           projection.min_to_100 !== null

@@ -34,7 +34,6 @@ function mkHeaders({
   q5h = "0.78",
   q7d = "0.82",
   q5hReset = "1712345678",
-  q7dReset = "1712999999",
 } = {}) {
   return {
     "anthropic-ratelimit-unified-status": status,
@@ -44,18 +43,15 @@ function mkHeaders({
     "anthropic-ratelimit-unified-5h-utilization": q5h,
     "anthropic-ratelimit-unified-7d-utilization": q7d,
     "anthropic-ratelimit-unified-5h-reset": q5hReset,
-    "anthropic-ratelimit-unified-7d-reset": q7dReset,
   };
 }
 
-// A reply with the 7d and status headers but no 5h header (accounts without a
-// 5h limit). ASSUMPTION: no such reply was captured for this fixture; it is
-// built from the header names the 5h-bearing replies use.
-function noFiveHour(headers) {
-  delete headers["anthropic-ratelimit-unified-5h-utilization"];
-  delete headers["anthropic-ratelimit-unified-5h-reset"];
-  return headers;
-}
+// A reply measured live from an account whose 5h limit was removed: the 7d and
+// status headers, and no 5h key at all.
+const LIVE_NO_5H = JSON.parse(await readFile(new URL("./fixtures/live-headers-no-5h.json", import.meta.url), "utf8"));
+const live = (over = {}) => ({ ...LIVE_NO_5H, ...over });
+const U7 = "anthropic-ratelimit-unified-7d-utilization";
+const COOL = { "anthropic-ratelimit-unified-status": "allowed" };
 
 // --- 1. Trigger detection ---
 
@@ -534,16 +530,16 @@ const readLines = async (dir) =>
   (await readFile(join(dir, "overage-warnings.jsonl"), "utf8")).split("\n").filter(Boolean).map((l) => JSON.parse(l));
 
 test("N1. stderr line omits Q5h= when the 5h header is absent", () => {
-  const { snapshot, trigger } = parseTriggerFromHeaders(noFiveHour(mkHeaders()));
+  const { snapshot, trigger } = parseTriggerFromHeaders(live());
   assert.equal(snapshot.q5h_pct, null, "the record keeps null for an absent 5h reading");
   const line = formatStderrLine({ ts: "t", trigger, snapshot, projection: null });
   assert.doesNotMatch(line, /Q5h=/);
-  assert.match(line, /Q7d=82%/);
+  assert.match(line, /Q7d=96%/);
 });
 
 test("N2. a 7d-only reply records a sample and projects from the 7d slope", async () => {
   await withEnv(async (dir, ext) => {
-    const cool = (q7d) => noFiveHour(mkHeaders({ status: "allowed", surpassed: "", q7d }));
+    const cool = (q7d) => live({ ...COOL, [U7]: q7d });
     const first = await runResponse(ext, cool("0.80"));
     assert.equal(first.meta._overageSample?.q5h, 0.8, "7d utilisation is sampled when 5h is absent");
     const second = await runResponse(ext, cool("0.81"));
@@ -552,7 +548,7 @@ test("N2. a 7d-only reply records a sample and projects from the 7d slope", asyn
     first.meta._overageSample.t -= 3 * 60_000;
     second.meta._overageSample.t -= 2 * 60_000;
     third.meta._overageSample.t -= 60_000;
-    await runResponse(ext, noFiveHour(mkHeaders({ q7d: "0.83" })));
+    await runResponse(ext, live({ [U7]: "0.83" }));
     const [rec] = await readLines(dir);
     assert.equal(rec.projection.window_samples, 4);
     assert.equal(rec.projection.min_to_100, 17, "0.01 per minute from 0.83 is 17 minutes");
@@ -563,8 +559,8 @@ test("N2. a 7d-only reply records a sample and projects from the 7d slope", asyn
 
 test("N3. dedup re-arms when the 7d reset changes and holds when it does not", async () => {
   await withEnv(async (dir, ext) => {
-    for (const q7dReset of ["1713000000", "1713000000", "1713600000"]) {
-      await runResponse(ext, noFiveHour(mkHeaders({ q7dReset })));
+    for (const reset of ["1793944800", "1793944800", "1794549600"]) {
+      await runResponse(ext, live({ "anthropic-ratelimit-unified-7d-reset": reset }));
     }
     assert.equal((await readLines(dir)).length, 2, "same reset warns once, a new reset warns again");
   });
@@ -575,8 +571,19 @@ test("N4. a 5h sample and a 7d sample never share one slope", async () => {
     const cool = mkHeaders({ status: "allowed", surpassed: "" });
     await runResponse(ext, cool);
     await runResponse(ext, cool);
-    await runResponse(ext, noFiveHour(mkHeaders({ q7d: "0.83" })));
+    await runResponse(ext, live({ [U7]: "0.83" }));
     const [rec] = await readLines(dir);
-    assert.equal(rec.projection.window_samples, 1, "the window restarts when the source window changes");
+    assert.equal(rec.projection.window_samples, 1, "a 7d slope starts from 7d samples only");
+  });
+});
+
+test("N5. a 7d reply between 5h replies does not cost the 5h window its samples", async () => {
+  await withEnv(async (dir, ext) => {
+    const cool = mkHeaders({ status: "allowed", surpassed: "" });
+    for (let i = 0; i < 3; i++) await runResponse(ext, cool);
+    await runResponse(ext, live(COOL));
+    await runResponse(ext, mkHeaders());
+    const [rec] = await readLines(dir);
+    assert.equal(rec.projection.window_samples, 4, "three 5h samples and the warning reply");
   });
 });
