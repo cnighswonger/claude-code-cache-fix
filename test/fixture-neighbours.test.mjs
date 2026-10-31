@@ -12,7 +12,7 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { DEAD_HOP, byEnv, orphanTargets, sweepTargets, upstreamFixture } from "./proc-helpers.mjs";
+import { DEAD_HOP, byEnv, directFixture, orphanTargets, sweepTargets, upstreamFixture } from "./proc-helpers.mjs";
 
 const epipeChild = fileURLToPath(new URL("./fixtures/stdio-epipe-child.mjs", import.meta.url));
 
@@ -48,6 +48,34 @@ it("an upstream fixture records the request that carries its marker, not every c
     assert.deepEqual(trace, ["UPSTREAM"], "control: a request carrying the marker was not recorded");
   } finally {
     up.close();
+  }
+});
+
+// The fail-open case asks "did the proxy dial the target?" of the fixture where a
+// direct dial lands. Counting every ACCEPT answered a different question: another
+// test file's client reusing that port number read as the proxy's dial (measured:
+// ["DIRECT","DIRECT","DIRECT"] for an expected ["DIRECT"] in a full run under load).
+// Only a connection whose first bytes are the marker the case's own client sends
+// behind its CONNECT, which the proxy writes into the tunnel it dials, is the proxy's.
+it("a direct-dial fixture records a connection that opens with its marker, not every connection", async () => {
+  const trace = [];
+  const direct = directFixture("mark-under-test", trace);
+  await new Promise((r) => direct.listen(0, "127.0.0.1", r));
+  const { port } = direct.address();
+  const dial = (bytes) => new Promise((r) => {
+    const s = net.connect(port, "127.0.0.1", () => s.end(bytes));
+    s.on("error", () => {});
+    s.on("close", r);
+  });
+  try {
+    await Promise.all([...Array.from({ length: 10 }, () => dial()), dial("GET / HTTP/1.1\r\n\r\n")]);
+    assert.deepEqual(trace, [], "connections that did not open with the marker were counted as the proxy's dial");
+
+    // The control: a double dial by the proxy still shows as two.
+    await Promise.all([dial("mark-under-test"), dial("mark-under-test")]);
+    assert.deepEqual(trace, ["DIRECT", "DIRECT"], "control: connections that opened with the marker were not recorded");
+  } finally {
+    direct.close();
   }
 });
 

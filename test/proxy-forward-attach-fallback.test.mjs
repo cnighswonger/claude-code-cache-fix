@@ -20,7 +20,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { startProxy } from "../proxy/server.mjs";
-import { DEAD_HOP, upstreamFixture } from "./proc-helpers.mjs";
+import { DEAD_HOP, directFixture, upstreamFixture } from "./proc-helpers.mjs";
 
 const ENV_KEYS = [
   "CACHE_FIX_FORWARD_PROXY", "CACHE_FIX_CA_DIR", "CACHE_FIX_PROXY_UPSTREAM",
@@ -63,6 +63,19 @@ function get(port, path) {
 function listen(server) {
   return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(server.address().port)));
 }
+
+// CONNECT `target` through the proxy, with `mark` as the bytes right behind the request.
+// The proxy writes those into the tunnel it opens, so a dial it makes opens with `mark`
+// and a stranger's connection does not. Resolves with the status, or ERR:/TIMEOUT.
+const connect = (port, target, mark) => new Promise((resolve) => {
+  const req = http.request({ host: "127.0.0.1", port, method: "CONNECT",
+                             path: target, headers: { host: target } });
+  // Node fires 'connect' even for a denial, which is how the status reaches us.
+  req.on("connect", (res, socket) => { socket.destroy(); resolve(res.statusCode); });
+  req.on("error", (e) => resolve(`ERR:${e.code}`));
+  req.setTimeout(4_000, () => { req.destroy(); resolve("TIMEOUT"); });
+  req.end(mark);
+});
 
 const swallowerCount = () =>
   process.listeners("uncaughtException").length + process.listeners("unhandledRejection").length;
@@ -264,8 +277,10 @@ test("CONNECT traverses the fallback chain when only a fallback is configured", 
     sock.on("error", () => {});
   });
   const hopPort = await listen(hop);
-  // Where a DIRECT dial would land. Nothing may reach it.
-  const direct = net.createServer((sock) => { seen.push("DIRECT"); sock.destroy(); });
+  // Where a DIRECT dial would land. Nothing may reach it. Only a connection that opens
+  // with `mark` counts, which connect() sends behind the CONNECT.
+  const mark = "connect-fallback";
+  const direct = directFixture(mark, seen);
   const directPort = await listen(direct);
 
   let handle;
@@ -283,14 +298,7 @@ test("CONNECT traverses the fallback chain when only a fallback is configured", 
 
     // A host CCF does not MITM, so this is the blind tunnel — the failing path.
     const target = `127.0.0.1:${directPort}`;
-    await new Promise((resolve) => {
-      const req = http.request({ host: "127.0.0.1", port: handle.port, method: "CONNECT",
-                                 path: target, headers: { host: target } });
-      req.on("connect", (_res, socket) => { socket.destroy(); resolve(); });
-      req.on("error", () => resolve());
-      req.setTimeout(4_000, () => { req.destroy(); resolve(); });
-      req.end();
-    });
+    await connect(handle.port, target, mark);
     await new Promise((r) => setTimeout(r, 150));   // let the hop record it
 
     assert.ok(!seen.includes("DIRECT"),
@@ -342,8 +350,12 @@ test("CONNECT falls open to a direct dial, unless CACHE_FIX_REQUIRE_HOP says oth
   // the same day: when an assertion discards the evidence, the fix is a
   // tripwire that survives it, not a louder message on the same assertion.
   const trace = [];
-  // Where a direct dial lands. Reaching it is the fail-OPEN outcome.
-  const direct = net.createServer((sock) => { seen.push("DIRECT"); trace.push("DIRECT"); sock.destroy(); });
+  // Where a direct dial lands. Reaching it is the fail-OPEN outcome. Like the upstream
+  // below it records only what carries `mark` (connect() sends it behind the CONNECT, so
+  // a dial the proxy makes opens with it): a stranger connecting to this ephemeral port
+  // is not counted as the dial.
+  const mark = "require-hop-relay";
+  const direct = directFixture(mark, seen, trace);
   const directPort = await listen(direct);
   // A LOCAL upstream that answers unmistakably. Without it config.upstream is
   // the real https://api.anthropic.com and the relayed probe below dials it for
@@ -357,21 +369,10 @@ test("CONNECT falls open to a direct dial, unless CACHE_FIX_REQUIRE_HOP says oth
   // stranger connecting to its ephemeral port is not the proxy dialling out
   // (measured: ten foreign connects read as ten "UPSTREAM" and failed the
   // relayed-path assertion below, though the proxy refused before dialling).
-  const mark = "require-hop-relay";
   const upstream = upstreamFixture(mark, trace);
   await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
 
   let handle;
-  const connect = (port, target) => new Promise((resolve) => {
-    const req = http.request({ host: "127.0.0.1", port, method: "CONNECT",
-                               path: target, headers: { host: target } });
-    // Node fires 'connect' even for a denial, which is how the status reaches us.
-    req.on("connect", (res, socket) => { socket.destroy(); resolve(res.statusCode); });
-    req.on("error", (e) => resolve(`ERR:${e.code}`));
-    req.setTimeout(4_000, () => { req.destroy(); resolve("TIMEOUT"); });
-    req.end();
-  });
-
   try {
     process.env.CACHE_FIX_FORWARD_PROXY = "on";
     process.env.CACHE_FIX_CA_DIR = caDir;
@@ -390,7 +391,7 @@ test("CONNECT falls open to a direct dial, unless CACHE_FIX_REQUIRE_HOP says oth
 
     handle = await startProxy({ port: 0, watch: false });
     const target = `127.0.0.1:${directPort}`;
-    assert.equal(await connect(handle.port, target), 200,
+    assert.equal(await connect(handle.port, target, mark), 200,
       "the default refused a tunnel instead of falling open — a hop restarting " +
       "would strand every session wired to this proxy");
     await new Promise((r) => setTimeout(r, 100));
@@ -403,7 +404,7 @@ test("CONNECT falls open to a direct dial, unless CACHE_FIX_REQUIRE_HOP says oth
     seen.length = 0;
     process.env.CACHE_FIX_REQUIRE_HOP = "1";
     handle = await startProxy({ port: 0, watch: false });
-    assert.equal(await connect(handle.port, target), 502,
+    assert.equal(await connect(handle.port, target, mark), 502,
       "CACHE_FIX_REQUIRE_HOP=1 still handed the client a tunnel");
     await new Promise((r) => setTimeout(r, 100));
     assert.deepEqual(seen, [],

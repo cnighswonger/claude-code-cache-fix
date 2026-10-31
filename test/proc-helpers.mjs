@@ -195,6 +195,18 @@ export const upstreamFixture = (mark, trace) => http.createServer((q, r) => {
   r.writeHead(418); r.end("teapot");
 });
 
+// Where a direct dial lands. Logs "DIRECT" into every `logs` array only for a
+// connection whose first bytes start with `mark`, which the case's own client
+// sends behind its CONNECT and the proxy writes into the tunnel it dials: a
+// stranger connecting to its ephemeral port is not the proxy dialling out.
+export const directFixture = (mark, ...logs) => net.createServer((sock) => {
+  sock.on("error", () => {});
+  sock.once("data", (d) => {
+    if (String(d).startsWith(mark)) for (const log of logs) log.push("DIRECT");
+    sock.destroy();
+  });
+});
+
 // Polls find() every 50 ms until it answers non-null; throws `timedOut` one whole
 // sleep after the budget. The deadline is read BEFORE each sleep: a sleep a runner
 // stall outlasts ends in the timers phase, ahead of the poll phase that delivers
