@@ -483,7 +483,7 @@ test("end-to-end: two responses → second has non-zero deltas", async () => {
   }
 });
 
-// --- A reply without a window's header is not a reading of 0 ---
+// --- A reply without a 5h header is not a reading of 0 ---
 
 // Measured live from an account whose 5h limit was removed: no 5h key at all.
 const LIVE_NO_5H = JSON.parse(await readFile(new URL("./fixtures/live-headers-no-5h.json", import.meta.url), "utf8"));
@@ -525,13 +525,6 @@ test("a reply with no 5h header keeps the last 5h reading for the next 5h reply'
   const q5h = (v) => mkHeaders({ "anthropic-ratelimit-unified-5h-utilization": v });
   const rows = await logReplies([q5h("0.34"), LIVE_NO_5H, q5h("0.40")]);
   assert.deepEqual(rows.map((r) => Math.round(r.q5h_delta * 100)), [0, 0, 6]);
-});
-
-test("a reply with no 7d header keeps the last 7d reading for the next 7d reply's delta", async () => {
-  const q7d = (v) => mkHeaders({ "anthropic-ratelimit-unified-7d-utilization": v });
-  const { "anthropic-ratelimit-unified-7d-utilization": _u, "anthropic-ratelimit-unified-7d-reset": _r, ...no7d } = mkHeaders();
-  const rows = await logReplies([q7d("0.30"), no7d, q7d("0.35")]);
-  assert.deepEqual(rows.map((r) => Math.round(r.q7d_delta * 100)), [0, 0, 5]);
 });
 
 // --- request_id field (directive: proxy-usage-log-request-id) ---

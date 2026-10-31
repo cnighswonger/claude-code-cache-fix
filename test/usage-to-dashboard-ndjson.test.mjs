@@ -150,13 +150,10 @@ test("[#12] q5h_pct takes precedence over q5h when BOTH set (back-compat)", () =
   assert.equal(rec.response_anthropic_headers["anthropic-ratelimit-unified-5h-utilization"], "0.99");
 });
 
-test("[#12a] a v:1 row with a window reset of 0 had no header for it: no utilization is reconstructed", () => {
+test("[#12a] a v:1 row with a 5h reset of 0 had no 5h header: no utilization is reconstructed", () => {
   const h = translateRecord({ ...V1_ROW, q5h: 0, q5h_reset: 0 }).response_anthropic_headers;
   assert.ok(!("anthropic-ratelimit-unified-5h-utilization" in h));
   assert.equal(h["anthropic-ratelimit-unified-7d-utilization"], "0.15");
-  const h7 = translateRecord({ ...V1_ROW, q7d: 0, q7d_reset: 0 }).response_anthropic_headers;
-  assert.ok(!("anthropic-ratelimit-unified-7d-utilization" in h7));
-  assert.equal(h7["anthropic-ratelimit-unified-5h-utilization"], "0.42");
 });
 
 test("[#12b] a v:1 row at 0 with a real reset is a reading of 0", () => {

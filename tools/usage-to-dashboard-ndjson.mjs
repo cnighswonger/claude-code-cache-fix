@@ -196,7 +196,7 @@ export function translateRecord(entry) {
   }
   if (entry.q7d_pct != null) {
     responseHeaders['anthropic-ratelimit-unified-7d-utilization'] = String(entry.q7d_pct / 100);
-  } else if (entry.q7d != null && entry.q7d_reset !== 0) {
+  } else if (entry.q7d != null) {
     responseHeaders['anthropic-ratelimit-unified-7d-utilization'] = String(entry.q7d);
   }
 
